@@ -1,0 +1,6 @@
+# Created at run time - never commit backups, logs, reports or gate evidence (AD values, names)
+Backups/
+logs/
+reports/
+tests/evidence/
+*.tmp
