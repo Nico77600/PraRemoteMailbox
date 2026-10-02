@@ -10,6 +10,17 @@ safety: Backup before every change
 
 # PRA Remote Mailbox — Administrator guide
 
+> [!IMPORTANT]
+> Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
+>
+> ```powershell
+> Get-ChildItem "C:\Chemin\Du\Dossier" -Recurse -File -Force | Unblock-File
+> ```
+>
+> Replace the example path with the folder where you downloaded or extracted this project.
+>
+> If an `Install-Module` command reports that the module already exists, add `-Force`. If the installed version still conflicts, close PowerShell, run `Uninstall-Module <ModuleName> -AllVersions` if appropriate, then install the required version again.
+
 > When the on-premises Exchange servers are lost, **PRA Remote Mailbox** turns the on-premises mailboxes into **remote mailboxes**, so that every user gets a mailbox in **Exchange Online** within the hour — and rolls everything back when Exchange is available again. Only Active Directory is changed on-premises, and **every change is backed up first**.
 
 ```cards
@@ -195,8 +206,8 @@ check | Done | on-premises again
 ```powershell
 # Windows PowerShell 5.1, as administrator
 Install-WindowsFeature RSAT-AD-PowerShell                       # Windows Server (client: RSAT optional feature)
-Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers
-Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllUsers
+Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -Force
+Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllUsers -Force
 ```
 
 > [!NOTE]
