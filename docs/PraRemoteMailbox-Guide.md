@@ -3,12 +3,14 @@ title: PRA Remote Mailbox
 subtitle: Administrator guide
 version: 2.0.0
 author: Nicolas Fabert
-updated: 2026-10-01
+updated: 2026-10-02
 runtime: Windows PowerShell 5.1
 safety: Backup before every change
 ---
 
 # PRA Remote Mailbox — Administrator guide
+
+> When the on-premises Exchange servers are lost, **PRA Remote Mailbox** turns the on-premises mailboxes into **remote mailboxes**, so that every user gets a mailbox in **Exchange Online** within the hour — and rolls everything back when Exchange is available again. Only Active Directory is changed on-premises, and **every change is backed up first**.
 
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
@@ -19,9 +21,7 @@ safety: Backup before every change
 >
 > Replace the example path with the folder where you downloaded or extracted this project.
 >
-> If an `Install-Module` command reports that the module already exists, add `-Force`. If the installed version still conflicts, close PowerShell, run `Uninstall-Module <ModuleName> -AllVersions` if appropriate, then install the required version again.
-
-> When the on-premises Exchange servers are lost, **PRA Remote Mailbox** turns the on-premises mailboxes into **remote mailboxes**, so that every user gets a mailbox in **Exchange Online** within the hour — and rolls everything back when Exchange is available again. Only Active Directory is changed on-premises, and **every change is backed up first**.
+> The `Install-Module` commands in this documentation use `-Force`, so they also update or reinstall a module that is already installed. If an older version still conflicts, close every PowerShell window, open a new one (as administrator for `-Scope AllUsers`), run `Uninstall-Module <ModuleName> -AllVersions -Force`, then run the `Install-Module` command again.
 
 ```cards
 target | What it does | **Convert**: on-premises mailbox → remote mailbox (AD attributes, licence group, Entra Connect, shared mailbox permissions in Exchange Online).
@@ -229,7 +229,7 @@ Certificate sign-in for unattended runs: annex C.
 ## 5. Installation
 
 1. Copy the package folder (`PraRemoteMailbox-2.0.0`, produced by `tools\New-PraPackage.ps1`) to the server, for example `D:\PRA\PraRemoteMailbox`.
-2. Unblock the files if they were downloaded: `Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse | Unblock-File`.
+2. Unblock the files if they were downloaded: `Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File`.
 3. Put `Backups` on a durable volume (default: `.\Backups` in the tool folder; see `Storage.BackupFolder`).
 4. Fill in the configuration (chapter 6), then run a **Preview**: it checks the configuration, AD access and the scope without writing anything.
 
