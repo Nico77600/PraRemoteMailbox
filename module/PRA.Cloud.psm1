@@ -518,7 +518,7 @@ function Connect-PraCloudSession {
         $exo = Get-PraValue $Context.Config 'Exo' @{}
         $min = [version][string](Get-PraValue $exo 'MinModuleVersion' '3.10.0')
         $installed = @(Get-Module ExchangeOnlineManagement -ListAvailable | Sort-Object Version -Descending)
-        if ($installed.Count -eq 0) { throw 'ExchangeOnlineManagement module not found (Install-Module ExchangeOnlineManagement); the tool never installs modules.' }
+        if ($installed.Count -eq 0) { throw 'ExchangeOnlineManagement module not found (Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -Force); the tool never installs modules.' }
         $s.Subprocess = [bool](Get-PraValue $exo 'UseSubprocess' $false) -or $installed[0].Version -lt $min
         if ($s.Subprocess) {
             if (-not $app) { throw 'Exchange Online child process required (Exo.UseSubprocess or old module): certificate sign-in is mandatory.' }
