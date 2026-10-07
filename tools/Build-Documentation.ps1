@@ -27,16 +27,19 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0 (from the Purview DLP Report builder)
+    Version : 2.0.1 (from the Purview DLP Report builder)
     PowerShell pitfall: never name a variable $matches — every -match overwrites the automatic
     $Matches, and variable names are case-insensitive.
 #>
 [CmdletBinding()]
 param(
-    [string]$Source = (Join-Path $PSScriptRoot '..\docs\PraRemoteMailbox-Guide.md'),
-    [string]$Destination = (Join-Path $PSScriptRoot '..\docs\PraRemoteMailbox-Guide.html')
+    [string]$Source,
+    [string]$Destination
 )
 $ErrorActionPreference = 'Stop'
+# Defaults here, not in param(): $PSScriptRoot can be empty in param() defaults (Windows PowerShell 5.1 with -File).
+if (-not $Source) { $Source = Join-Path $PSScriptRoot '..\docs\PraRemoteMailbox-Guide.md' }
+if (-not $Destination) { $Destination = Join-Path $PSScriptRoot '..\docs\PraRemoteMailbox-Guide.html' }
 $Source = (Resolve-Path $Source).Path
 $Destination = [IO.Path]::GetFullPath($Destination)
 $docs = Split-Path $Source -Parent

@@ -4,6 +4,20 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
+## 2.0.1 — 2026-10-07
+
+### Fixed
+- **Scheduled task / `powershell.exe -File`:** Windows PowerShell 5.1 leaves `$PSScriptRoot` empty in the
+  default values of `param()` when a script runs with `-File`. The default `-ConfigPath` of
+  `Invoke-PraRemoteMailbox.ps1` (and `-Source` / `-Destination` of `tools\Build-Documentation.ps1`) was built
+  there, so the script stopped at once with `Join-Path: Cannot bind argument to parameter 'Path' because it is an
+  empty string`. The defaults are now resolved in the script body; an explicit `-ConfigPath` behaves as before.
+  Found while building the scenario 2 tool (PRA Cloud Mailbox), whose Collect runs as a scheduled task.
+
+### Tests
+- New block "Scripts start with powershell.exe -File (scheduled task)": no `param()` default of the entry script
+  or of the tools may read `$PSScriptRoot`, `$PSCommandPath` or `$MyInvocation`.
+
 ## 2.0.0 — 2026-10-01
 
 Rewrite of the operator experience on the model of Purview DLP Report: one entry script driven by the

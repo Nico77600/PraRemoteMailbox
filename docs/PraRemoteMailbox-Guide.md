@@ -1,7 +1,7 @@
 ---
 title: PRA Remote Mailbox
 subtitle: Administrator guide
-version: 2.0.0
+version: 2.0.1
 author: Nicolas Fabert
 updated: 2026-10-02
 runtime: Windows PowerShell 5.1
@@ -228,7 +228,7 @@ Certificate sign-in for unattended runs: annex C.
 <!-- icon: download -->
 ## 5. Installation
 
-1. Copy the package folder (`PraRemoteMailbox-2.0.0`, produced by `tools\New-PraPackage.ps1`) to the server, for example `D:\PRA\PraRemoteMailbox`.
+1. Copy the package folder (`PraRemoteMailbox-2.0.1`, produced by `tools\New-PraPackage.ps1`) to the server, for example `D:\PRA\PraRemoteMailbox`.
 2. Unblock the files if they were downloaded: `Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File`.
 3. Put `Backups` on a durable volume (default: `.\Backups` in the tool folder; see `Storage.BackupFolder`).
 4. Fill in the configuration (chapter 6), then run a **Preview**: it checks the configuration, AD access and the scope without writing anything.
@@ -766,7 +766,7 @@ Every JSON has a `.sha256` file; a mismatch is refused. **Version 2.0.0 reads th
 <!-- icon: tag -->
 ## Annex E — Versioning and upgrade from 1.3.6
 
-- The version is in `Invoke-PraRemoteMailbox.ps1` (`Version = '2.0.0'`, help `.NOTES`), in each module header, in the configuration header, in `README.md` and `CHANGELOG.md`, and in the front matter of this guide. Change them together.
+- The version is in `Invoke-PraRemoteMailbox.ps1` (`Version = '2.0.1'`, help `.NOTES`), in each module header, in the configuration header, in `README.md` and `CHANGELOG.md`, and in the front matter of this guide. Change them together.
 - Release checklist: gate PASS · lab campaign (annex B) · `pwsh tools\Build-Documentation.ps1` (PowerShell 7.4+, documentation only) · `tools\New-PraPackage.ps1` · git tag `vX.Y.Z`.
 
 **From 1.3.6**: keep the old `Backups` folders; copy the values of `DRP-Config.psd1` into the new file (same sections; `ADConnect` → `EntraConnect`; `BackupFolder/LogFolder/ReportFolder` → `Storage/Logging/Report`; `Safety` → `Storage.ForbiddenBackupRoots`); keep the same `Environment` to use the old batches. Command mapping: see `CHANGELOG.md` (table "Changed").

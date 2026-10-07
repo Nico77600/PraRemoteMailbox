@@ -9,7 +9,7 @@
     No legacy Assert-MockCalled: counters are mutable objects.
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.0.0
+    Version: 2.0.1
     Run it through tests\Invoke-TestGate.ps1 (evidence, PSScriptAnalyzer, mandatory tests).
 #>
 #Requires -Version 5.1
@@ -3456,6 +3456,24 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
     }
 }
 
+Describe 'Scripts start with powershell.exe -File (scheduled task)' {
+    It 'never reads $PSScriptRoot in a param() default (empty in Windows PowerShell 5.1 with -File)' {
+        $files = @(Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1') + @(Get-ChildItem -LiteralPath (Join-Path $global:PraGate.Release 'tools') -Filter '*.ps1' | ForEach-Object FullName)
+        $found = @(foreach ($file in $files) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$null)
+            foreach ($block in @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ParamBlockAst] }, $true))) {
+                foreach ($parameter in $block.Parameters) {
+                    if ($parameter.DefaultValue -and $parameter.DefaultValue.Extent.Text -match 'PSScriptRoot|PSCommandPath|MyInvocation') { '{0}: {1}' -f (Split-Path $file -Leaf), $parameter.Name.Extent.Text }
+                }
+            }
+        })
+        $found | Should -BeNullOrEmpty
+    }
+    It 'resolves the default configuration path in the script body' {
+        $text = [IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1'))
+        $text | Should -Match "if \(-not \`$ConfigPath\) \{ \`$ConfigPath = Join-Path \`$PSScriptRoot 'config\\PraRemoteMailbox\.config\.psd1' \}"
+    }
+}
 AfterAll {
     $env:PSModulePath=$global:PraGate.OriginalModulePath
     $env:PRA_GATE_NONET=$global:PraGate.OriginalNonet

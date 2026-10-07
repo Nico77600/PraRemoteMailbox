@@ -12,7 +12,7 @@
     powershell.exe -NoLogo -NoProfile -NonInteractive -File .\tests\Invoke-TestGate.ps1
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.0.0
+    Version: 2.0.1
 #>
 #Requires -Version 5.1
 #Requires -PSEdition Desktop

@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.0
+    Version : 2.0.1
     History : see CHANGELOG.md
 #>
 #Requires -Version 5.1
@@ -26,7 +26,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '2.0.0'
+$script:ToolVersion = '2.0.1'
 $script:TranscriptOwner = $null
 # Columns of the CSV report, in this order (also the fields copied from each result row).
 $script:RowFields = @('ObjectGuid','SamAccountName','UserPrincipalName','Action','IsShared','ADApplied','ADVerified',
@@ -280,7 +280,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v2.0.0 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v2.0.1 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)

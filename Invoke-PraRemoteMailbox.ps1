@@ -93,7 +93,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 2.0.0
+    Version    : 2.0.1
     Requires   : Windows PowerShell 5.1 (not PowerShell 7), RSAT ActiveDirectory, ExchangeOnlineManagement
                  3.10+, Microsoft.Graph.Authentication and Microsoft.Graph.Users (cloud part), ADSync (sync).
     Exit codes : 0 = done, 1 = failed, 2 = done but a next step is required (Pending objects).
@@ -111,7 +111,7 @@ param(
     [ValidateSet('All','UsersOnly','SharedOnly')][string]$Scope = 'All',
     [ValidateRange(0, 2147483647)][int]$MaxObjects = 0,
     [ValidateSet('Provisioned','Deprovisioned','Retained')][string]$Expect = 'Provisioned',
-    [string]$ConfigPath = (Join-Path $PSScriptRoot 'config\PraRemoteMailbox.config.psd1'),
+    [string]$ConfigPath,
     [switch]$Force,
     [switch]$Once,
     [switch]$PassThru
@@ -120,6 +120,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# Not a parameter default: Windows PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults when the script
+# runs with powershell.exe -File (scheduled task). An explicit -ConfigPath is unchanged ($script:ConfigPathBound).
+if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'config\PraRemoteMailbox.config.psd1' }
 Import-Module (Join-Path $PSScriptRoot 'module\PRA.Common.psm1') -Force -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'module\PRA.Directory.psm1') -Force -ErrorAction Stop
 
@@ -143,7 +146,7 @@ function New-PraApprovalCallback {
     }.GetNewClosure()
 }
 $context = @{
-    Root = $PSScriptRoot; Version = '2.0.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
+    Root = $PSScriptRoot; Version = '2.0.1'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
     StartTime = Get-Date; Action = $Action; Mode = $effectiveMode; Phase = ''
     CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 0; Warnings = 0
     Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
