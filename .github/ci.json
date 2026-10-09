@@ -1,0 +1,11 @@
+{
+  "runtimeRoot": ".",
+  "testMode": "gate",
+  "testEntry": "tests/Invoke-TestGate.ps1",
+  "tests": [
+    "tests/PraRemoteMailbox.Tests.ps1",
+    "tests/PraRemoteMailbox.Gui.Tests.ps1"
+  ],
+  "packageBuilder": "tools/New-PraPackage.ps1",
+  "packageEntry": "Invoke-PraRemoteMailbox.ps1"
+}
