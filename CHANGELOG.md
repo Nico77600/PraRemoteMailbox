@@ -4,6 +4,32 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
+## 2.1.0 — 2026-10-09
+
+### Added
+- **Direct target selection for Convert AD/Both:** configuration, OU (DN or read-only directory
+  picker) and CSV (Identity column, comma/semicolon). Run-specific `-SearchBase`/`-CsvPath` overrides
+  never rewrite the configuration; source/file changes invalidate Preview. Users and shared
+  mailboxes continue through the same eligibility, duplicate and backup guards.
+- **WPF window** (`-Gui`) for Convert, Recover, Finalize and Check, with explicit AD + cloud, AD-only
+  and cloud-only execution. Native Fluent with PowerShell 7.5+; compatible WPF controls with Windows
+  PowerShell 5.1. Every operation still runs the existing Windows PowerShell 5.1 engine.
+- Preview before Apply, typed confirmation, batch selection, progress and activity, result rows,
+  log/report access and the next-server handoff instructions. Changing the request or its input
+  files invalidates the preview. A failed or incomplete preview never authorizes Apply.
+- Optional structured JSONL events from the common module for the window; ordinary CLI output,
+  reports, transcripts and backup formats stay unchanged. GUI module and XAML included in packaging.
+- Offline GUI Pester suite and regressions for event/result coherence and split recovery.
+
+### Changed
+- **Recover -Phase Cloud now always packages final AD restoration**, even when ActiveDirectory is
+  installed and `DeferOnPremRestore = $false`. Run Finalize on the AD server using the package printed
+  in the result. Phase Both retains its existing inline restoration unless explicitly deferred.
+- `-Gui` can run in either PowerShell edition; actual command-line operations still require Desktop.
+  No GUI action runs live on startup, and the window cannot close while its engine is running.
+
+This version has offline validation only; no new live-tenant campaign has been performed.
+
 ## 2.0.1 — 2026-10-07
 
 ### Fixed
@@ -98,11 +124,11 @@ addressed in 2.0.0. No defect of the backup/proof engine was found.
 
 ### Validation
 
-- Test gate (Windows PowerShell 5.1, Pester 6.0.0, PSScriptAnalyzer 1.25.0): **279 / 279 passed**,
+- Test gate on VMLLM (Windows PowerShell 5.1, Pester 6.0.0, PSScriptAnalyzer 1.25.0): **279 / 279 passed**,
   0 analyzer error (evidence `tests\evidence\gate\v2.0.0-release`). The 61 tests of the removed path options
   of 1.3.6 are replaced by tests of `-Batch` and of the confirmation (1.3.6: 325 tests).
-- Lab campaign 2026-09-30 / 2026-10-01 (real Active Directory, Entra Connect and Exchange Online tenant):
-  28 runs — Convert, Recover on one and two servers, Finalize, Check, Recover of a 1.3.6
+- Lab campaign 2026-09-30 / 2026-10-01 on `exlab.lab` + tenant M365CPI89259425 (real AD, Entra Connect and
+  Exchange Online): 28 runs — Convert, Recover on one and two servers, Finalize, Check, Recover of a 1.3.6
   batch, shared mailbox permissions given to a group (nested group included), SendAs actually granted,
   SendOnBehalf (guide, annex B). 26 PASS; the 5 defects found (approval callback with `-Force` in a
   non-interactive process; certificate session guard; recipient 404 during the Recover check; Graph after

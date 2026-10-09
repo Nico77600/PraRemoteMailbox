@@ -9,6 +9,7 @@
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;&middot;&nbsp;
   <a href="#convert-and-recover"><b>Convert and Recover</b></a> &nbsp;&middot;&nbsp;
   <a href="#shared-mailbox-permissions"><b>Shared mailboxes</b></a> &nbsp;&middot;&nbsp;
+  <a href="#wpf-window"><b>WPF window</b></a> &nbsp;&middot;&nbsp;
   <a href="#reports"><b>Reports</b></a> &nbsp;&middot;&nbsp;
   <a href="#quick-start"><b>Quick start</b></a> &nbsp;&middot;&nbsp;
   <a href="docs/PraRemoteMailbox-Guide.md"><b>Administrator guide</b></a>
@@ -31,6 +32,8 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
+**Author:** Nicolas Fabert · **Version:** 2.1.0 ([changelog](CHANGELOG.md)).
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-principles-dark.png">
   <img alt="Design principles: backup before any write, preview first, stop at the first error, reversible" src="docs/images/readme-principles-light.png">
@@ -47,6 +50,29 @@ Done by hand, this means rewriting about ten Exchange attributes per object in A
 - **Preview by default.** Without `-Mode Apply` the tool only reads. With `-Mode Apply` it shows the plan and asks **one** confirmation (`-Force` for unattended runs).
 - **One batch ID** links the steps: every Apply prints it with the exact next command, and `-Action Recover -Batch <id>` rolls the batch back.
 - **One or two servers**: everything from one server, or the AD part on-premises and the cloud part on an isolated server.
+
+## WPF window
+
+Open the window with `pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui` for native Fluent on
+PowerShell 7.5+, or `powershell.exe -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui` for compatible
+WPF controls. It starts no operation automatically; each operation runs the existing engine in a
+separate **Windows PowerShell 5.1** process.
+
+Choose Convert, Recover, Finalize or Check, with explicit **AD + cloud**, **AD only** or **Cloud only**
+execution. Preview is mandatory before Apply, which requires typing the action name. The window
+shows progress, results, logs/reports and the next-server commands. Changed inputs invalidate Preview.
+
+For **Convert AD/Both**, select the configured scope, an **OU** (typed DN or read-only directory
+picker), or an **Identity CSV** (comma/semicolon). The choice applies only to this run and never
+rewrites the configuration. Users and shared mailboxes are supported: use **All** for a mixed CSV,
+or UsersOnly/SharedOnly for a list containing only the corresponding type.
+
+For split Recover, **AD** takes the original Convert batch; **Cloud** takes the new Recover batch
+and produces a Finalize package if AD restoration remains; **Finalize** runs on the AD server.
+Cloud-only never restores AD, even with RSAT installed. Copy complete batch folders between servers;
+the window does not transfer them. See the administrator guide, chapter 8.
+
+![WPF Fluent window - synthetic preview, no live operation](docs/images/gui-fluent.png)
 
 ## Convert and Recover
 
@@ -99,7 +125,7 @@ Every run also writes a log, a PowerShell transcript and a CSV. Exit codes: 0 = 
 | Item | Requirement |
 |---|---|
 | Scenario | Hybrid Exchange organisation (Exchange Server + Exchange Online) synchronised by **Entra Connect**. Exchange on-premises is not needed (it is down); Active Directory and Entra Connect must work (both lost: [PRA Cloud Mailbox](https://github.com/Nico77600/PraCloudMailbox)) |
-| PowerShell | **Windows PowerShell 5.1** (`powershell.exe`), not PowerShell 7 |
+| PowerShell | Operations: **Windows PowerShell 5.1** (`powershell.exe`). Window: PowerShell 7.5+ for native Fluent, or Windows PowerShell 5.1 for compatible WPF controls |
 | Modules | RSAT `ActiveDirectory`, `ExchangeOnlineManagement` 3.10 or later, `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users` |
 | Permissions | Active Directory: write the Exchange attributes of the objects in scope and the members of the licence group. Entra Connect: `ADSyncOperators` (or local administrator), WinRM when remote. Exchange Online: **Exchange Recipient Administrator**. Microsoft Graph: `User.Read.All`. Unattended runs: an application with a certificate (guide, annex C) |
 | Licences | A licence group that gives Exchange Online to the users (shared mailboxes need no licence) |
@@ -112,8 +138,14 @@ git clone https://github.com/Nico77600/PraRemoteMailbox.git
 cd PraRemoteMailbox
 notepad .\config\PraRemoteMailbox.config.psd1      # scope, licence group, routing domain, Entra Connect, tenant
 
+# Optional window; actual operations still run in Windows PowerShell 5.1.
+pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui
+
+# Command line: run these commands in Windows PowerShell 5.1.
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Identity jdupont@contoso.com   # preview for one user: nothing is written
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert                                 # preview of the configured scope (e.g. an OU)
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -SearchBase "OU=Mailboxes,DC=contoso,DC=com"
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Both -CsvPath .\config\Targets.sample.csv
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Mode Apply                     # backup, AD, sync, Exchange Online
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Scope SharedOnly -Mode Apply   # only the shared mailboxes of the scope
 .\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 1d5ac20b                 # preview of the roll-back of that batch
@@ -137,7 +169,13 @@ The **administrator guide** covers the disaster scenario, what changes in Active
 powershell.exe -NoProfile -File .\tests\Invoke-TestGate.ps1     # no directory, no tenant needed
 ```
 
-The gate runs the real entry script against a synthetic Active Directory, Entra Connect and Exchange Online (279 tests): no write before the complete backup, stop at the first error, no write in Preview, no Apply without confirmation, memory bounds, proofs and Finalize packages. The tool was also validated on a real Active Directory, Entra Connect and Microsoft 365 tenant (guide, annex B). Only `tools\Build-Documentation.ps1`, which rebuilds the HTML guide on a workstation, needs PowerShell 7.4+.
+The gate runs the real entry script against a synthetic Active Directory, Entra Connect and Exchange Online:
+no write before the complete backup, stop at the first error, no write in Preview, no Apply without
+confirmation, memory bounds, proofs and Finalize packages. It also exercises WPF selection,
+Preview/Apply guards and OU/CSV targeting. Earlier versions were validated on a real Active Directory,
+Entra Connect and Microsoft 365 tenant (guide, annex B); **2.1.0 has offline validation only, not a new
+live-tenant campaign**. `tools\Build-Documentation.ps1`, which rebuilds the HTML guide on a workstation,
+needs PowerShell 7.4+.
 
 ## License
 

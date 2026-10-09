@@ -1,10 +1,10 @@
 ---
 title: PRA Remote Mailbox
 subtitle: Administrator guide
-version: 2.0.1
+version: 2.1.0
 author: Nicolas Fabert
-updated: 2026-10-02
-runtime: Windows PowerShell 5.1
+updated: 2026-10-09
+runtime: Windows PowerShell 5.1 engine; PowerShell 7.5+ Fluent window
 safety: Backup before every change
 ---
 
@@ -45,6 +45,11 @@ Keep the batch ID | The summary prints it (e.g. `efb9d60a`) with the next comman
 
 > [!TIP]
 > **Ready-to-use commands** — one user, a whole OU, only the shared mailboxes, a list, the roll-back: chapter 8, recipes 1 to 6.
+
+The **window** opens with `pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui` (native Fluent with
+PowerShell 7.5+), or `powershell.exe -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui` (compatible WPF).
+It starts no operation automatically. Version **2.1.0** has offline validation only; no new
+live-tenant campaign has been performed for this version.
 
 # Part I · Understand
 
@@ -197,7 +202,7 @@ check | Done | on-premises again
 | Item | AD server (phase AD / Both) | Cloud server (phase Cloud / Both) |
 |---|---|---|
 | Windows PowerShell **5.1** (`powershell.exe`, not `pwsh`) | required | required |
-| RSAT module `ActiveDirectory` | required | optional (without it, a Recover writes a Finalize package) |
+| RSAT module `ActiveDirectory` | required | not required for phase Cloud; final AD restoration always runs separately |
 | Entra Connect | the tool runs on the Entra Connect server, **or** WinRM to `EntraConnect.Server` | — |
 | `ExchangeOnlineManagement` **3.10** or later | phase Both | required |
 | `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users` | phase Both | required |
@@ -212,6 +217,11 @@ Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllU
 
 > [!NOTE]
 > Run the tool in a **new** Windows PowerShell window: it refuses an Exchange Online or Microsoft Graph session that already exists in the console (it must know which session it signs out).
+
+**Window only:** PowerShell 7.5+ (.NET 9+) supplies the native WPF Fluent controls. It is optional:
+Windows PowerShell 5.1 can also open the window with compatible WPF controls. The window launches
+every actual operation in a fresh **Windows PowerShell 5.1** process on the same computer, under the
+same Windows account. Install the AD/cloud modules for that engine, not just for PowerShell 7.
 
 ### Permissions
 
@@ -228,7 +238,7 @@ Certificate sign-in for unattended runs: annex C.
 <!-- icon: download -->
 ## 5. Installation
 
-1. Copy the package folder (`PraRemoteMailbox-2.0.1`, produced by `tools\New-PraPackage.ps1`) to the server, for example `D:\PRA\PraRemoteMailbox`.
+1. Copy the package folder (`PraRemoteMailbox-2.1.0`, produced by `tools\New-PraPackage.ps1`) to the server, for example `D:\PRA\PraRemoteMailbox`.
 2. Unblock the files if they were downloaded: `Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File`.
 3. Put `Backups` on a durable volume (default: `.\Backups` in the tool folder; see `Storage.BackupFolder`).
 4. Fill in the configuration (chapter 6), then run a **Preview**: it checks the configuration, AD access and the scope without writing anything.
@@ -239,7 +249,7 @@ Certificate sign-in for unattended runs: annex C.
 |---|---|
 | `Invoke-PraRemoteMailbox.ps1` | the only script to run |
 | `config\` | `PraRemoteMailbox.config.psd1` + CSV samples |
-| `module\` | `PRA.Common` (console, log, configuration, reports), `PRA.Directory` (AD), `PRA.Backup` (capture), `PRA.Cloud` (Exchange Online, Graph) |
+| `module\` | `PRA.Common` (console, log, configuration, reports), `PRA.Directory` (AD), `PRA.Backup` (capture), `PRA.Cloud` (Exchange Online, Graph), `PRA.Gui.psm1` and `PRA.Gui.xaml` (window) |
 | `templates\` | HTML report template |
 | `docs\` | this guide (Markdown + HTML) |
 | `Backups\`, `logs\`, `reports\` | created by the runs |
@@ -285,7 +295,7 @@ Everything is set in `config\PraRemoteMailbox.config.psd1` — the command line 
 | `GrantFullAccess`, `GrantSendAs`, `GrantSendOnBehalf`, `AutoMapping` | What is granted in Exchange Online. |
 | `ExcludeTrusteeSamAccountNames` | Accounts never reproduced (e.g. service or admin accounts found in the ACLs). |
 | `KeepCloudSharedOnRecover` | `$true` = Recover keeps the cloud shared mailbox (rare). |
-| `DeferOnPremRestore` | `$true` = on two servers, the cloud phase always writes a Finalize package. |
+| `DeferOnPremRestore` | With phase Both, `$true` defers final AD restoration to Finalize. Phase Cloud always packages it, regardless of this setting. |
 
 ### Entra Connect
 
@@ -344,11 +354,13 @@ Everything else comes from the configuration file; the command line only says **
 
 | Parameter | Values | Use |
 |---|---|---|
-| `-Action` | `Convert`, `Recover`, `Finalize`, `Check` | required |
+| `-Action` | `Convert`, `Recover`, `Finalize`, `Check` | required for command-line operations; mutually exclusive with `-Gui` |
 | `-Mode` | `Preview` (default), `Apply` | `Apply` writes, after one confirmation |
 | `-Phase` | `Both`, `AD`, `Cloud` | Convert / Recover on two servers; default `Execution.Phase` |
 | `-Batch` | batch ID (8 characters) or path of the batch JSON | Recover, `-Phase Cloud`, Finalize; optional for Check |
 | `-Identity` | UPN, sAMAccountName, DN or GUID | one object only |
+| `-SearchBase` | OU distinguished name | Convert AD/Both only; run-specific OU + child OUs, without changing configuration |
+| `-CsvPath` | path of an Identity CSV | Convert AD/Both only; run-specific comma/semicolon list, without changing configuration |
 | `-Scope` | `All` (default), `UsersOnly`, `SharedOnly` | filters the scope or the batch |
 | `-MaxObjects` | number (0 = no limit) | Convert: first N objects |
 | `-Expect` | `Provisioned` (default), `Deprovisioned`, `Retained` | Check only |
@@ -356,9 +368,86 @@ Everything else comes from the configuration file; the command line only says **
 | `-Force` | switch | Apply without the confirmation (unattended) |
 | `-Once` | switch | cloud checks: one pass, no wait |
 | `-PassThru` | switch | also returns the result object (chapter 7) |
+| `-Gui` | switch | opens the window; may be combined with `-ConfigPath`, not with an operation |
 | `-WhatIf` / `-Verbose` | switches | `-WhatIf` = Preview; `-Verbose` shows the debug lines of the log |
 
 **The routine is always the same**: run the command **without** `-Mode Apply` (preview: nothing is written), read the plan, run the **same** command **with** `-Mode Apply`, answer `Y`, and **note the batch ID** printed at the end — it is the key of the roll-back. The recipes below are complete: copy them, change the names.
+
+### The WPF window
+
+![WPF Fluent window - synthetic preview, no live operation](images/gui-fluent.png)
+
+```powershell
+# Native Fluent controls; the business engine still runs in Windows PowerShell 5.1.
+pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui
+
+# Compatible WPF controls when PowerShell 7.5+ is not installed.
+powershell.exe -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui -ConfigPath .\config\PraRemoteMailbox.config.psd1
+```
+
+Choose the action and the **execution phase** before previewing. The default phase comes from
+`Execution.Phase`; it is always displayed and passed explicitly to the engine. Opening the window,
+refreshing local state or selecting a batch does not connect to AD or Microsoft 365.
+
+| Operation | Required input | Where it runs / next step |
+|---|---|---|
+| Convert, AD + cloud | configured scope or one identity; no input batch | this host performs AD, sync and cloud |
+| Convert, AD only | configured scope or one identity; no input batch | copy the new Convert batch folder to the cloud host |
+| Convert, Cloud only | Convert batch produced by AD | cloud checks and permissions; no AD writes |
+| Recover, AD + cloud | original Convert batch | this host restores AD, syncs, checks cloud and finishes AD restoration |
+| Recover, AD only | original Convert batch | copy the **new Recover folder and original Convert folder** to the cloud host |
+| Recover, Cloud only | **Recover batch**, not the Convert ID | cloud checks; when needed, copy the new Finalize folder back to AD |
+| Finalize | RecoverFinalize package | AD host only; restores deferred shared attributes/tags and syncs |
+| Check | Convert batch or one identity | read-only cloud check; use a UPN for an identity without AD access |
+
+For **Convert AD / AD + cloud**, choose the target source directly in the window:
+
+| Source | Selection |
+|---|---|
+| Configuration | use `Scope` from the selected configuration, or fill in one identity to override it |
+| OU | type its distinguished name or click **Choisir une OU** to browse/filter the OU list on the configured DC; child OUs are included |
+| Csv | click **Charger un CSV** and select a list with an `Identity` column (UPN, sAMAccountName, DN or GUID); comma and semicolon are supported |
+
+The source is passed to the engine as `-SearchBase` or `-CsvPath`; the original configuration is
+**not rewritten**. OU and CSV are mutually exclusive and cannot be combined with a single identity.
+The source controls are hidden for Cloud, Recover, Finalize and Check, whose batch/identity rules
+remain unchanged. The OU browser reads AD only when clicked, in a separate Desktop process; no
+directory or cloud module is imported into the WPF host.
+
+**Users and shared mailboxes are supported:** use `All` (with `Scope.IncludeShared = $true`, the
+default), `UsersOnly` or `SharedOnly`. A single identity can be a user or a shared mailbox. For a
+CSV, every explicit object must be eligible for the selected type: wrong types, exclusions,
+duplicates and non-mailbox objects are refused before any write, not silently converted or skipped.
+
+```csv
+Identity
+user01@contoso.com
+shared01@contoso.com
+```
+
+Selecting another OU/list or changing the CSV contents invalidates the previous Preview.
+The list is revalidated and hashed before Apply. Missing/empty lists and a missing Identity column
+keep Apply locked. AD still verifies the real object types and complete backups before writing.
+
+You can browse a batch JSON file from a copied folder, or use its ID. Keep the **whole folder**
+unchanged: JSON, data-only CLIXML, SHA-256, State proof and journals. Both hosts must use the same
+version and `Environment`, but each has its own configuration and installed prerequisites. The
+window does **not** copy files, invoke the other host or bypass the engine's proof checks.
+
+Set the optional identity/type filters and, for Convert on AD, the maximum number of objects.
+For Check, choose the expected state and whether to make one pass instead of waiting.
+Preview first, inspect the result table, activity and HTML report, then Apply and type **CONVERT**,
+**RECOVER** or **FINALIZE** in the confirmation. Apply uses the same request as the preview;
+changing the phase, filters, configuration or batch/proof files requires another preview.
+An errored, unfinished or empty preview does not enable Apply. The engine independently rereads
+the directory, backs up and verifies the targets before every write; a GUI preview is not a frozen
+copy of AD state.
+
+The window stays responsive while the child process runs. Progress shows the current step and
+object; the result preserves exit codes **0/1/2**, the batch ID, report/log paths and exact next
+commands. **Pending is not failure and not completion:** finish the indicated Cloud or Finalize
+step. Do not close or forcibly stop the engine mid-batch; closing the window is blocked while an
+operation is running so that backup/proof creation is not interrupted.
 
 ### Recipe 1 — Convert one user
 
@@ -472,6 +561,10 @@ Copy back | Copy the `Finalize-<id>` folder to the `Backups` folder of the AD se
 AD server | `-Action Finalize -Batch <finalize id> -Mode Apply` — restores the shared mailboxes and the retention tags.
 ```
 
+Since 2.1.0, `-Phase Cloud` never performs the last AD restore itself, **even with RSAT installed**.
+Phase Both retains inline restoration unless `DeferOnPremRestore` is enabled. Finalize is only
+required when the result supplies a Finalize package (deferred shared attributes or retention tags).
+
 ### What you see
 
 ![Preview of a Convert](images/console-preview.png)
@@ -582,6 +675,7 @@ The run state is one hashtable, the **context** (`$context`), created by the ent
 | `module\PRA.Directory.psm1` | 1 receipts and files · 2 directory reads (`Get-PraTarget`, `Get-PraUser`) · 3 attribute states and before/after display · 4 shared permissions from AD · 5 plans (`New-PraPlan`) · 6 backups and proofs · 7 writes (`Invoke-PraAdBatch`) · 8 Entra Connect (`Invoke-PraSync`). |
 | `module\PRA.Backup.psm1` | Data-only CLIXML codec (write, stream-validate). |
 | `module\PRA.Cloud.psm1` | Exchange Online worker (fixed commands, identity checks), sessions, pre-check, cloud phase (polling, grants), retention check. |
+| `module\PRA.Gui.psm1`, `module\PRA.Gui.xaml` | WPF layout/theme, local state and input selection, preview guard, confirmation and Desktop child-process supervision. Optional `PRA_EVENT_FILE` JSONL channel carries start, step, item, summary and result events from the common module. |
 
 <!-- icon: wrench -->
 ## 12. Modifying the tool
@@ -631,11 +725,11 @@ Texts and icons: `PRA.Common.psm1`, region 1-2. The HTML report: `templates\Repo
 powershell.exe -NoProfile -File .\tests\Invoke-TestGate.ps1
 ```
 
-It checks every file (parse, UTF-8 BOM, help), runs PSScriptAnalyzer (Windows PowerShell 5.1 compatibility profiles), then the Pester suite `tests\PraRemoteMailbox.Tests.ps1`: synthetic AD and ADSync modules, a synthetic cloud barrier, the **real** entry script in a separate Windows PowerShell process. It proves in particular: no write before the complete backup, stop at the first error, no write in Preview/-WhatIf, no Apply without confirmation in a non-interactive process, memory bounds with 13 shared mailboxes × 500 trustees, proofs and Finalize packages. Evidence: `tests\evidence\gate\<date>\` (`RESULT.txt`, `gate-result.json`, Pester XML).
+It checks every file (parse, UTF-8 BOM, help), runs PSScriptAnalyzer (Windows PowerShell 5.1 compatibility profiles), then the Pester suites `tests\PraRemoteMailbox.Tests.ps1` and `tests\PraRemoteMailbox.Gui.Tests.ps1`: synthetic AD and ADSync modules, a synthetic cloud barrier, the **real** entry script in a separate Windows PowerShell process, and the WPF window without live connections. It proves in particular: no write before the complete backup, stop at the first error, no write in Preview/-WhatIf, no Apply without confirmation in a non-interactive process, memory bounds with 13 shared mailboxes × 500 trustees, proofs and Finalize packages, GUI phase/command boundaries and preview invalidation. Evidence: `tests\evidence\gate\<date>\` (`RESULT.txt`, `gate-result.json`, Pester XML).
 
 Requirements: Pester 5 or later and PSScriptAnalyzer 1.25.0 (machine-wide modules). Every test is mandatory: a skipped or missing test fails the gate.
 
-Release 2.0.0 (2026-10-01, Windows PowerShell 5.1): **279 tests, 279 passed**, 0 analyzer error, about 12 minutes — evidence `tests\evidence\gate\v2.0.0-release`. The only analyzer warnings on the delivered files are expected: `Write-Host` in the console module (14, by design) and `ConvertFrom-Markdown` in the documentation builder (6, PowerShell 7 tool). Compared with the 325 tests of 1.3.6, the 61 combinations of the removed path options (`-BackupFile`, `-StateFile`, `-LogPath`, `-TranscriptPath`, `-ReportDirectory`) are replaced by 9 tests of `-Batch` and of the confirmation.
+Release 2.0.0 (2026-10-01, VMLLM): **279 tests, 279 passed**, 0 analyzer error, about 12 minutes — evidence `tests\evidence\gate\v2.0.0-release`. The only analyzer warnings on the delivered files are expected: `Write-Host` in the console module (14, by design) and `ConvertFrom-Markdown` in the documentation builder (6, PowerShell 7 tool). Compared with the 325 tests of 1.3.6, the 61 combinations of the removed path options (`-BackupFile`, `-StateFile`, `-LogPath`, `-TranscriptPath`, `-ReportDirectory`) are replaced by 9 tests of `-Batch` and of the confirmation.
 
 ### The lab campaign
 
@@ -672,9 +766,9 @@ After a change of the engine, repeat the campaign of annex B on the lab: Preview
 <!-- icon: check -->
 ## Annex B — Lab test campaign 2026-09-30
 
-Lab: one Active Directory domain with two domain controllers, Entra Connect on its own server, Exchange servers stopped (= disaster), a Microsoft 365 test tenant; a dedicated operator account, certificate sign-in. Objects of a test OU: `pra-user04`, `pra-user05` (user mailboxes), `pra-shared02`, `pra-shared03` (shared mailboxes, 3 FullAccess + 3 SendAs each).
+Lab `exlab.lab` (DC1, DC2, Entra Connect on AADC, Exchange servers stopped = disaster), tenant `M365CPI89259425`, operator account `EXLAB\pra-operator`, certificate sign-in. Objects of `OU=PRA-PILOT-OU`: `pra-user04`, `pra-user05` (user mailboxes), `pra-shared02`, `pra-shared03` (shared mailboxes, 3 FullAccess + 3 SendAs each).
 
-All runs were made with the **real** script on a lab administration server (Windows PowerShell 5.1), against the real directory, the real Entra Connect server and the real tenant. Result: **28 runs**: 26 PASS, and 2 runs (T17, T18) that found defects 3 and 4, fixed since and covered by the gate (list below).
+All runs were made with the **real** script on `VMLLM` (Windows PowerShell 5.1), against the real directory, the real Entra Connect server and the real tenant. Result: **28 runs**: 26 PASS, and 2 runs (T17, T18) that found defects 3 and 4, fixed since and covered by the gate (list below).
 
 | # | Command (short form) | What was checked | Result |
 |---|---|---|---|
@@ -716,7 +810,7 @@ Defects found by the campaign and fixed in 2.0.0 (all now covered by the gate):
 
 The lab was left as before the tests: T16 test material removed (groups deleted, `msExchMailboxSecurityDescriptor` identical to its copy taken before the test, `publicDelegates` empty), `pra-shared03` back on-premises.
 
-Lab fix made before the campaign (outside the tool): the second domain controller had stopped replicating from the first one (Kerberos `0x80090322`, stale KDC ticket); fixed by purging the tickets of the computer account and forcing the replication. The operator account and the lab application (annex C) were created for the campaign.
+Lab fixes made before the campaign (outside the tool): domain controller `DC2` had not replicated from `DC1` since 2026-09-18 (Kerberos `0x80090322`, stale KDC ticket); fixed by purging the tickets of the computer account and forcing the replication. Account `EXLAB\pra-operator` and the lab application (annex C) were created for the campaign.
 
 <!-- icon: key -->
 ## Annex C — Certificate sign-in (application)
@@ -766,7 +860,7 @@ Every JSON has a `.sha256` file; a mismatch is refused. **Version 2.0.0 reads th
 <!-- icon: tag -->
 ## Annex E — Versioning and upgrade from 1.3.6
 
-- The version is in `Invoke-PraRemoteMailbox.ps1` (`Version = '2.0.1'`, help `.NOTES`), in each module header, in the configuration header, in `README.md` and `CHANGELOG.md`, and in the front matter of this guide. Change them together.
+- The version is in `Invoke-PraRemoteMailbox.ps1` (`Version = '2.1.0'`, GUI call and help `.NOTES`), in each module header, in the configuration header, in `README.md` and `CHANGELOG.md`, and in the front matter of this guide. Change them together.
 - Release checklist: gate PASS · lab campaign (annex B) · `pwsh tools\Build-Documentation.ps1` (PowerShell 7.4+, documentation only) · `tools\New-PraPackage.ps1` · git tag `vX.Y.Z`.
 
 **From 1.3.6**: keep the old `Backups` folders; copy the values of `DRP-Config.psd1` into the new file (same sections; `ADConnect` → `EntraConnect`; `BackupFolder/LogFolder/ReportFolder` → `Storage/Logging/Report`; `Safety` → `Storage.ForbiddenBackupRoots`); keep the same `Environment` to use the old batches. Command mapping: see `CHANGELOG.md` (table "Changed").

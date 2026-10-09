@@ -18,15 +18,14 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.1
+    Version : 2.1.0
     History : see CHANGELOG.md
 #>
 #Requires -Version 5.1
-#Requires -PSEdition Desktop
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:ToolVersion = '2.0.1'
+$script:ToolVersion = '2.1.0'
 $script:TranscriptOwner = $null
 # Columns of the CSV report, in this order (also the fields copied from each result row).
 $script:RowFields = @('ObjectGuid','SamAccountName','UserPrincipalName','Action','IsShared','ADApplied','ADVerified',
@@ -193,6 +192,26 @@ function Add-PraWarning {
     })
 }
 
+function Write-PraEvent {
+    <# Optional JSONL channel to the window; CLI runs without PRA_EVENT_FILE are unchanged. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateSet('start','step','item','summary','result')][string]$Kind, [hashtable]$Data = @{})
+    if (-not $env:PRA_EVENT_FILE) { return }
+    $record = [ordered]@{ time = [datetime]::UtcNow.ToString('o'); kind = $Kind }
+    foreach ($key in $Data.Keys) { $record[$key] = $Data[$key] }
+    $line = ($record | ConvertTo-Json -Compress -Depth 8) + "`n"
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            [IO.File]::AppendAllText($env:PRA_EVENT_FILE, $line, (New-Object Text.UTF8Encoding($false)))
+            return
+        }
+        catch [IO.IOException] {
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
 function Write-PraLogFile {
     <# Appends one line to the log file. A log that cannot be written stops the run (audit). #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost','',Justification='Last-resort console message when the log is broken.')]
@@ -252,6 +271,10 @@ function Write-PraLog {
             Write-PraHost @('      ', (Get-PraIcon $status), $text) -Color $textColor
         }
     }
+    if ($Level -in @('Info','Sub','Success','Warning','Error')) {
+        Write-PraEvent -Kind item -Data @{ status = @{ Info='Info'; Sub='Sub'; Success='Ok'; Warning='Warn'; Error='Fail' }[$Level]
+            text = $text; identity = [string](Get-PraValue $Context 'CurrentIdentity' '') }
+    }
 }
 
 function Write-PraItem {
@@ -272,6 +295,7 @@ function Write-PraItem {
     Write-PraHost @('      ', $symbol, $Text) -Color $textColor
     if ($Status -eq 'Warn') { $Context.Warnings = [int](Get-PraValue $Context 'Warnings' 0) + 1; Add-PraWarning $Context $Text }
     Write-PraLogFile -Context $Context -Level (@{ Ok='OK'; Warn='WARN'; Fail='FAIL'; Info='INFO'; Skip='SKIP' }[$Status]) -Message $Text
+    Write-PraEvent -Kind item -Data @{ status = $Status; text = $Text; identity = [string](Get-PraValue $Context 'CurrentIdentity' '') }
 }
 
 function Write-PraBanner {
@@ -280,7 +304,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v2.0.1 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v2.1.0 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)
@@ -306,6 +330,7 @@ function Write-PraBanner {
     }
     Write-PraHost @(,@(('  ' + $F.BottomLeft + ($F.Horizontal * $width) + $F.BottomRight), $T.Accent))
     Write-PraLogFile -Context $Context -Level 'STEP' -Message ("=== $Title v$($Context.Version) - run $($Context.RunId) ===")
+    $eventDetails = [ordered]@{}
     if ($Details) {
         foreach ($key in $Details.Keys) {
             $value = $Details[$key]
@@ -313,8 +338,13 @@ function Write-PraBanner {
             if ($value -is [array]) { $icon = Get-PraIcon $value[0]; $text = $value[1] }
             Write-PraHost @('     ', $icon, ('{0,-11}' -f $key), (' ' + $text))
             Write-PraLogFile -Context $Context -Level 'INFO' -Message ('{0}: {1}' -f $key, $text)
+            $eventDetails[$key] = [string]$text
         }
     }
+    Write-PraEvent -Kind start -Data @{ title = $Title; action = [string](Get-PraValue $Context 'Action' '')
+        mode = [string](Get-PraValue $Context 'Mode' ''); phase = [string](Get-PraValue $Context 'Phase' '')
+        version = [string]$Context.Version; runId = [string]$Context.RunId
+        logFile = [string](Get-PraValue $Context 'LogFile' ''); details = $eventDetails }
 }
 
 function Write-PraStep {
@@ -336,6 +366,7 @@ function Write-PraStep {
     Write-Host ''
     Write-PraHost @('  ', ('{0,5}' -f $number), '  ', (Get-PraIcon $Icon), $Title) -Color $script:Theme.Accent
     Write-PraLogFile -Context $Context -Level 'STEP' -Message ("[$number] $Title")
+    Write-PraEvent -Kind step -Data @{ index = $Context.StepIndex; total = $total; title = $Title }
 }
 
 function Write-PraSummary {
@@ -376,6 +407,13 @@ function Write-PraSummary {
         }
     }
     Write-PraHost @(,@(('  ' + $F.BottomLeft + ($F.Horizontal * $width) + $F.BottomRight), $color))
+    $eventValues = [ordered]@{}
+    foreach ($key in $Values.Keys) {
+        $value = $Values[$key]
+        $text = if ($value -is [array] -and $value.Count -eq 2 -and $script:Icons.ContainsKey([string]$value[0])) { $value[1] } else { $value }
+        $eventValues[$key] = @(@($text) | ForEach-Object { [string]$_ })
+    }
+    Write-PraEvent -Kind summary -Data @{ title = $Title; status = $Status; values = $eventValues }
 }
 #endregion
 
@@ -454,6 +492,39 @@ function Get-PraDefaultConfiguration {
     }
 }
 
+function Get-PraTargetOverride {
+    <# Run-specific targeting; the original data file is never rewritten. #>
+    [CmdletBinding()]
+    param([string]$SearchBase = '', [string]$CsvPath = '', [string]$Identity = '')
+    foreach ($value in @($SearchBase,$CsvPath)) {
+        if ($value -match '[\x00-\x1f]' -or ($value -and [string]::IsNullOrWhiteSpace($value))) { throw 'Target OU/CSV contains an empty value or a control character.' }
+    }
+    if ($SearchBase -and $CsvPath) { throw 'Choose one source: SearchBase (OU) or CsvPath, not both.' }
+    if ($Identity -and ($SearchBase -or $CsvPath)) { throw 'Identity cannot be combined with a selected OU or CSV.' }
+    if ($SearchBase) { return @{ Mode='OU'; SearchBase=$SearchBase.Trim(); CsvPath=''; GroupDN='' } }
+    if ($CsvPath) { return @{ Mode='Csv'; CsvPath=$CsvPath.Trim(); SearchBase=''; GroupDN='' } }
+    return @{}
+}
+
+function Read-PraTargetCsv {
+    <# Same local validation in the window and the engine; directory eligibility is checked later. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $text = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+    if ([string]::IsNullOrWhiteSpace($text)) { throw "The target CSV file is empty: $Path" }
+    $header = ($text -split '\r?\n',2)[0]
+    $delimiter = if ($header -match '(?i)(^|,)\s*"?Identity"?\s*(,|$)') { ',' }
+        elseif ($header -match '(?i)(^|;)\s*"?Identity"?\s*(;|$)') { ';' }
+        else { throw 'The target CSV requires an Identity column (UPN, sAMAccountName, DN or GUID).' }
+    $rows = @(ConvertFrom-Csv -InputObject $text -Delimiter $delimiter -ErrorAction Stop)
+    if (-not $rows.Count) { throw "The target CSV file has no objects: $Path" }
+    foreach ($row in $rows) {
+        $identity = [string](Get-PraValue $row 'Identity' '')
+        if ([string]::IsNullOrWhiteSpace($identity) -or $identity -match '[\x00-\x1f]') { throw 'A line of the target CSV file has no valid Identity: batch refused.' }
+        [pscustomobject]@{ Identity=$identity.Trim() }
+    }
+}
+
 function Import-PraConfiguration {
     <#
     .SYNOPSIS
@@ -467,11 +538,15 @@ function Import-PraConfiguration {
         SharedMailbox.CsvPath, Storage.ForbiddenBackupRoots) are returned as full paths.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root)
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root, [hashtable]$ScopeOverride = @{})
     $file = Resolve-PraPath $Path 'ConfigPath' $Root
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Configuration file not found: $file" }
     $config = Import-PowerShellDataFile -LiteralPath $file -ErrorAction Stop
     Merge-PraConfiguration $config (Get-PraDefaultConfiguration)
+    foreach ($key in $ScopeOverride.Keys) {
+        if ($key -notin @('Mode','SearchBase','CsvPath','GroupDN') -or $ScopeOverride[$key] -isnot [string]) { throw 'Unsupported target scope override.' }
+        $config.Scope[$key] = $ScopeOverride[$key]
+    }
 
     if ($config.Environment -notmatch '^[A-Za-z0-9_.-]{1,64}$') { throw 'Configuration: Environment must be 1 to 64 letters, digits, dot, dash or underscore (it is used in file names).' }
     if ($config.DomainController -and $config.DomainController -notmatch '^[A-Za-z0-9.-]+$') { throw 'Configuration: DomainController must be a host name.' }
@@ -903,7 +978,7 @@ function Complete-PraRun {
     }
     $outcome = Get-PraOutcome $Context
     $Context.ExitCode = $outcome.ExitCode; $Context.ResultStatus = $outcome.Status
-    return [pscustomobject][ordered]@{
+    $result = [pscustomobject][ordered]@{
         RunId = $Context.RunId; Version = $Context.Version; Action = $Context.Action; Mode = $Context.Mode; Phase = $Context.Phase
         Status = $outcome.Status; ExitCode = $outcome.ExitCode; SuccessCount = $outcome.Counts.Success; ErrorCount = $outcome.Counts.Error
         PendingCount = $outcome.Counts.Pending; SkippedCount = $outcome.Counts.Skipped; PlannedCount = $outcome.Counts.Planned
@@ -916,8 +991,17 @@ function Complete-PraRun {
         WarningCount = @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ }).Count
         Warnings = [object[]]@(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
     }
+    Write-PraEvent -Kind result -Data @{ status = $result.Status; exitCode = $result.ExitCode
+        action = $result.Action; mode = $result.Mode; phase = $result.Phase
+        success = $result.SuccessCount; error = $result.ErrorCount; pending = $result.PendingCount
+        skipped = $result.SkippedCount; planned = $result.PlannedCount; total = $result.TotalCount
+        seconds = [int]$result.Duration.TotalSeconds; batchId = $result.BatchId; nextSteps = @($result.NextSteps)
+        logFile = $result.LogFile; csvReport = $result.CsvReport; htmlReport = $result.HtmlReport
+        warnings = $result.WarningCount; backupFiles = @($result.BackupFiles); stateFiles = @($result.StateFiles)
+        issues = @($result.Issues | ForEach-Object { [string](Get-PraValue $_ 'Message' ([string]$_)) }) }
+    return $result
 }
 #endregion
 
 Export-ModuleMember -Function Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
-    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun
+    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraTargetOverride, Read-PraTargetCsv
