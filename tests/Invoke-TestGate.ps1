@@ -71,9 +71,9 @@ try {
     $help=Get-Help $main -Full
     $helpText=$help | Out-String -Width 240
     [IO.File]::WriteAllText((Join-Path $EvidenceDirectory 'main-help.txt'),$helpText,$encoding)
-    $helpPass=($helpText -match 'SYNOPSIS|SYNOPSIS' -and @($help.examples.example).Count -ge 3 -and $helpText -match 'WhatIf')
-    $checks.Add([pscustomobject]@{Name='CommentBasedHelp';File=$main;Passed=$helpPass;Details='Get-Help only; no script invocation.'})
-    if (-not $helpPass) { $failures.Add('Comment-based help missing examples/WhatIf.') }
+    $helpPass=(-not [string]::IsNullOrWhiteSpace([string]$help.Synopsis) -and @($help.examples.example).Count -ge 3 -and @($help.parameters.parameter.name) -contains 'WhatIf')
+    $checks.Add([pscustomobject]@{Name='CommentBasedHelp';File=$main;Passed=$helpPass;Details='Structured synopsis/examples/WhatIf metadata; Get-Help only; no script invocation.'})
+    if (-not $helpPass) { $failures.Add('Comment-based help missing synopsis/examples/WhatIf.') }
     Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -ErrorAction Stop
     $analyzer=Get-Module PSScriptAnalyzer
     $summary.AnalyzerVersion=[string]$analyzer.Version

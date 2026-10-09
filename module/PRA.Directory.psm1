@@ -103,7 +103,23 @@ function Write-PraDataFingerprint {
     if ($Value -is [array]) {
         if ($Value.Rank -ne 1) { throw 'Unsupported array in a receipt.' }
         $writer.Write([byte]7); $writer.Write([int]$Value.Length)
-        foreach ($item in $Value) { Write-PraDataFingerprint -State $State -Value $item -Depth ($Depth + 1) }
+        foreach ($item in $Value) {
+            # Permission lists dominate large receipts. Keep the same wire bytes and limits
+            # without creating an advanced-function invocation for every individual string.
+            if ($item -is [string]) {
+                if ($Depth -ge 64) { throw 'Receipt data too deep or cyclic.' }
+                $State.Nodes++
+                if ($State.Nodes -gt 10000000) { throw 'Receipt data too large.' }
+                $writer.Write([byte]1); $writer.Write([int]$item.Length)
+                for ($offset = 0; $offset -lt $item.Length; $offset += 1024) {
+                    $count = [math]::Min(1024, $item.Length - $offset)
+                    $item.CopyTo($offset, $State.Characters, 0, $count)
+                    [Buffer]::BlockCopy($State.Characters, 0, $State.Bytes, 0, ($count * 2))
+                    $writer.Write($State.Bytes, 0, ($count * 2))
+                }
+            }
+            else { Write-PraDataFingerprint -State $State -Value $item -Depth ($Depth + 1) }
+        }
         return
     }
     if ($Value -is [hashtable] -or $Value -is [Collections.Specialized.OrderedDictionary]) {

@@ -28,6 +28,14 @@ a PATCH version fixes a defect. The backup formats have their own version (see t
 - `-Gui` can run in either PowerShell edition; actual command-line operations still require Desktop.
   No GUI action runs live on startup, and the window cannot close while its engine is running.
 
+### Fixed
+- Large-batch receipt fingerprints and raw backup validation avoid redundant per-string
+  PowerShell binding and regex callbacks. Structural hashes, raw XML bytes, live tamper checks
+  and the existing memory/time watchdogs remain unchanged.
+- The offline gate validates structured help metadata instead of matching localized headings.
+  French and English help both pass, while a missing synopsis, insufficient examples or a missing
+  real `WhatIf` parameter still fail the gate.
+
 This version has offline validation only; no new live-tenant campaign has been performed.
 
 ## 2.0.1 — 2026-10-07
