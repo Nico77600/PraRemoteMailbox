@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     The package contains only what Invoke-PraRemoteMailbox.ps1 needs at run time, plus the guide:
-        Invoke-PraRemoteMailbox.ps1, README.md, CHANGELOG.md, module\*.psm1, templates\,
+        Invoke-PraRemoteMailbox.ps1, README.md, CHANGELOG.md, module\*.psm1 and PRA.Gui.xaml, templates\,
         config\ (configuration + CSV samples), docs\PraRemoteMailbox-Guide.html and .md (with images)
     It never copies Backups\, logs\, reports\, tests\ or tools\: backups hold AD values of real objects.
 
@@ -23,11 +23,11 @@
 
 .EXAMPLE
     .\tools\New-PraPackage.ps1
-    Creates ..\package\PraRemoteMailbox-2.0.1.
+    Creates ..\package\PraRemoteMailbox-2.1.0.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.1
+    Version : 2.1.0
 #>
 [CmdletBinding()]
 param(
@@ -59,7 +59,7 @@ if (Test-Path -LiteralPath $Destination) {
 $files = New-Object 'Collections.Generic.List[string]'
 foreach ($f in 'Invoke-PraRemoteMailbox.ps1', 'README.md', 'CHANGELOG.md', 'templates\Report.template.html',
     'config\Targets.sample.csv', 'config\SharedPermissions.sample.csv', 'docs\PraRemoteMailbox-Guide.html', 'docs\PraRemoteMailbox-Guide.md') { $files.Add($f) }
-foreach ($m in 'PRA.Common.psm1', 'PRA.Directory.psm1', 'PRA.Backup.psm1', 'PRA.Cloud.psm1') { $files.Add("module\$m") }
+foreach ($m in 'PRA.Common.psm1', 'PRA.Directory.psm1', 'PRA.Backup.psm1', 'PRA.Cloud.psm1', 'PRA.Gui.psm1', 'PRA.Gui.xaml', 'PRA.Gui.Directory.ps1') { $files.Add("module\$m") }
 Get-ChildItem -LiteralPath (Join-Path $root 'docs\images') -File -ErrorAction SilentlyContinue | ForEach-Object { $files.Add('docs\images\' + $_.Name) }
 
 foreach ($f in $files) {
@@ -100,7 +100,7 @@ foreach ($name in 'Backups', 'reports', 'logs', 'tests', 'tools') {
 }
 # -Include is ignored with -LiteralPath in Windows PowerShell 5.1: filter on the extension instead.
 Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { $_.Extension -in '.clixml', '.jsonl', '.sha256' } | ForEach-Object { $problems.Add("Backup file in the package: $($_.Name)") }
-$textFiles = Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1', '.csv' }
+$textFiles = Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1', '.csv', '.xaml' }
 foreach ($value in ($emptied | Select-Object -Unique)) {
     foreach ($file in $textFiles) {
         if ([IO.File]::ReadAllText($file.FullName).IndexOf($value, [StringComparison]::OrdinalIgnoreCase) -ge 0) {

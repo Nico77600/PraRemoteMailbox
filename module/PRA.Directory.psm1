@@ -27,7 +27,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.1
+    Version : 2.1.0
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -416,8 +416,7 @@ function Get-PraTarget {
     if ($Identity) { $explicit = $true; $users.Add((Get-PraUser $Context $Identity)) }
     elseif ($scope.Mode -eq 'Csv') {
         $explicit = $true
-        $entries = @(Import-Csv -LiteralPath $scope.CsvPath -ErrorAction Stop)
-        if ($entries.Count -eq 0) { throw "The target CSV file is empty: $($scope.CsvPath)" }
+        $entries = @(Read-PraTargetCsv -Path $scope.CsvPath)
         foreach ($entry in $entries) {
             $id = [string](Get-PraValue $entry 'Identity' '')
             if ([string]::IsNullOrWhiteSpace($id)) { throw 'A line of the target CSV file has no Identity: batch refused.' }

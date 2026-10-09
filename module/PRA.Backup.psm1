@@ -21,7 +21,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.1 (format PraDataOnlyClixml-v1, unchanged since 1.3.3)
+    Version : 2.1.0 (format PraDataOnlyClixml-v1, unchanged since 1.3.3)
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

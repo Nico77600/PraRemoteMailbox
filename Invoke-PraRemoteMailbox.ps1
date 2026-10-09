@@ -34,7 +34,8 @@
     Convert and Recover only. Default: Execution.Phase in the configuration.
       Both   AD part, synchronisation, then Exchange Online part on this server.
       AD     AD part only (and synchronisation). The cloud part runs later with -Phase Cloud.
-      Cloud  Exchange Online part only, from the batch of the AD part (-Batch).
+      Cloud  Exchange Online part only, from the batch of the AD part (-Batch). Recover packages
+             any final AD restoration for Finalize on the AD server; it never restores AD here.
 
 .PARAMETER Batch
     Batch ID printed at the end of an Apply (8 characters are enough), or the full path of the batch
@@ -47,6 +48,14 @@
 
 .PARAMETER Scope
     All (default), UsersOnly or SharedOnly: filters the configured scope or the batch.
+
+.PARAMETER SearchBase
+    Convert AD/Both only: select an OU (distinguished name), including its child OUs, for this run.
+    Overrides Scope.Mode/SearchBase without changing the configuration. Cannot be combined with Identity or CsvPath.
+
+.PARAMETER CsvPath
+    Convert AD/Both only: select a CSV with an Identity column for this run (comma or semicolon).
+    Overrides the configured scope without rewriting it. Cannot be combined with Identity or SearchBase.
 
 .PARAMETER MaxObjects
     Convert: process at most N objects (after sorting by sAMAccountName). 0 = no limit.
@@ -66,6 +75,14 @@
 .PARAMETER PassThru
     Also returns the result of the run as an object (Status, ExitCode, BatchId, NextSteps, counters,
     log and report paths), for a script or an orchestrator. Without it, nothing is written to the pipeline.
+
+.PARAMETER Gui
+    Opens the WPF window. PowerShell 7.5+ uses the native Fluent theme; Windows PowerShell 5.1 uses
+    compatible WPF controls. Every operation runs in its own Windows PowerShell 5.1 process.
+
+.EXAMPLE
+    pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui
+    Opens the Fluent window with explicit AD + cloud, AD-only and cloud-only execution.
 
 .EXAMPLE
     .\Invoke-PraRemoteMailbox.ps1 -Action Convert
@@ -93,28 +110,30 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 2.0.1
+    Version    : 2.1.0
     Requires   : Windows PowerShell 5.1 (not PowerShell 7), RSAT ActiveDirectory, ExchangeOnlineManagement
                  3.10+, Microsoft.Graph.Authentication and Microsoft.Graph.Users (cloud part), ADSync (sync).
     Exit codes : 0 = done, 1 = failed, 2 = done but a next step is required (Pending objects).
     Documentation : docs\PraRemoteMailbox-Guide.md (or .html)
 #>
 #Requires -Version 5.1
-#Requires -PSEdition Desktop
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Run')]
 param(
-    [Parameter(Mandatory)][ValidateSet('Convert','Recover','Finalize','Check')][string]$Action,
-    [ValidateSet('Preview','Apply')][string]$Mode = 'Preview',
-    [ValidateSet('Both','AD','Cloud')][string]$Phase,
-    [string]$Batch,
-    [string]$Identity,
-    [ValidateSet('All','UsersOnly','SharedOnly')][string]$Scope = 'All',
-    [ValidateRange(0, 2147483647)][int]$MaxObjects = 0,
-    [ValidateSet('Provisioned','Deprovisioned','Retained')][string]$Expect = 'Provisioned',
+    [Parameter(Mandatory, ParameterSetName = 'Run')][ValidateSet('Convert','Recover','Finalize','Check')][string]$Action,
+    [Parameter(ParameterSetName = 'Run')][ValidateSet('Preview','Apply')][string]$Mode = 'Preview',
+    [Parameter(ParameterSetName = 'Run')][ValidateSet('Both','AD','Cloud')][string]$Phase,
+    [Parameter(ParameterSetName = 'Run')][string]$Batch,
+    [Parameter(ParameterSetName = 'Run')][string]$Identity,
+    [Parameter(ParameterSetName = 'Run')][string]$SearchBase,
+    [Parameter(ParameterSetName = 'Run')][string]$CsvPath,
+    [Parameter(ParameterSetName = 'Run')][ValidateSet('All','UsersOnly','SharedOnly')][string]$Scope = 'All',
+    [Parameter(ParameterSetName = 'Run')][ValidateRange(0, 2147483647)][int]$MaxObjects = 0,
+    [Parameter(ParameterSetName = 'Run')][ValidateSet('Provisioned','Deprovisioned','Retained')][string]$Expect = 'Provisioned',
     [string]$ConfigPath,
-    [switch]$Force,
-    [switch]$Once,
-    [switch]$PassThru
+    [Parameter(ParameterSetName = 'Run')][switch]$Force,
+    [Parameter(ParameterSetName = 'Run')][switch]$Once,
+    [Parameter(ParameterSetName = 'Run')][switch]$PassThru,
+    [Parameter(Mandatory, ParameterSetName = 'Gui')][switch]$Gui
 )
 
 Set-StrictMode -Version Latest
@@ -123,6 +142,19 @@ $ProgressPreference = 'SilentlyContinue'
 # Not a parameter default: Windows PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults when the script
 # runs with powershell.exe -File (scheduled task). An explicit -ConfigPath is unchanged ($script:ConfigPathBound).
 if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'config\PraRemoteMailbox.config.psd1' }
+if ($Gui) {
+    try {
+        Import-Module (Join-Path $PSScriptRoot 'module\PRA.Common.psm1') -Force -ErrorAction Stop
+        Import-Module (Join-Path $PSScriptRoot 'module\PRA.Gui.psm1') -Force -ErrorAction Stop
+        Show-PraGui -Root $PSScriptRoot -ConfigPath $ConfigPath -Version '2.1.0'
+        exit 0
+    }
+    catch { Write-Error ('The window could not open: {0}' -f $_.Exception.Message) -ErrorAction Continue; exit 1 }
+}
+if ($PSVersionTable.PSEdition -ne 'Desktop') {
+    Write-Error "$Action runs in Windows PowerShell 5.1 Desktop (powershell.exe), not PowerShell 7. Use powershell.exe -File .\Invoke-PraRemoteMailbox.ps1 with the same parameters, or -Gui for the window." -ErrorAction Continue
+    exit 1
+}
 Import-Module (Join-Path $PSScriptRoot 'module\PRA.Common.psm1') -Force -ErrorAction Stop
 Import-Module (Join-Path $PSScriptRoot 'module\PRA.Directory.psm1') -Force -ErrorAction Stop
 
@@ -146,7 +178,7 @@ function New-PraApprovalCallback {
     }.GetNewClosure()
 }
 $context = @{
-    Root = $PSScriptRoot; Version = '2.0.1'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
+    Root = $PSScriptRoot; Version = '2.1.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
     StartTime = Get-Date; Action = $Action; Mode = $effectiveMode; Phase = ''
     CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 0; Warnings = 0
     Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
@@ -185,6 +217,8 @@ function Get-PraCommandLine {
         if ($Identity) { $parts += "-Identity '$Identity'" }
         if ($Scope -ne 'All') { $parts += "-Scope $Scope" }
         if ($MaxObjects -gt 0) { $parts += "-MaxObjects $MaxObjects" }
+        if ($SearchBase) { $parts += "-SearchBase '" + $SearchBase.Replace("'","''") + "'" }
+        if ($CsvPath) { $parts += "-CsvPath '" + $CsvPath.Replace("'","''") + "'" }
     }
     # On another server the configuration file is that server's own: -ConfigPath is not repeated.
     if ($script:ConfigPathBound -and -not $OtherServer) { $parts += "-ConfigPath '$ConfigPath'" }
@@ -457,7 +491,8 @@ try {
     # Configuration, audit files, banner.
     # ---------------------------------------------------------------------------------------------
     $context.CurrentOperation = 'Read-Configuration'
-    $context.Config = Import-PraConfiguration -Path $ConfigPath -Root $PSScriptRoot
+    $targetOverride = Get-PraTargetOverride -SearchBase $SearchBase -CsvPath $CsvPath -Identity $Identity
+    $context.Config = Import-PraConfiguration -Path $ConfigPath -Root $PSScriptRoot -ScopeOverride $targetOverride
     $config = $context.Config
     $context.BackupFolder = $config.Storage.BackupFolder
     $context.LogFolder = $config.Logging.Folder
@@ -474,6 +509,9 @@ try {
         default { if ($Phase) { $Phase } else { $config.Execution.Phase } }
     }
     $context.Phase = $effectivePhase
+    if (($SearchBase -or $CsvPath) -and ($Action -ne 'Convert' -or $effectivePhase -notin @('AD','Both'))) {
+        throw 'SearchBase/CsvPath are only available for Convert -Phase AD or Both.'
+    }
 
     Initialize-PraAudit $context
 
@@ -736,7 +774,7 @@ try {
             Confirm-PraApply ("Complete {0} object(s) in Exchange Online (wait for the mailboxes, grant up to {1} shared mailbox permission(s))?" -f $context.Rows.Count, $grants)
         }
         elseif ($context.AllowMutation -and $effectivePhase -eq 'Cloud' -and $Action -eq 'Recover') {
-            Confirm-PraApply ("Check the deprovisioning of {0} object(s) in Exchange Online, then restore or package the shared mailboxes and tags?" -f $context.Rows.Count)
+            Confirm-PraApply ("Check the deprovisioning of {0} object(s) in Exchange Online, then package any final shared mailbox and tag restoration for the AD server?" -f $context.Rows.Count)
         }
         Initialize-PraCloudAuthority
         Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
@@ -755,8 +793,9 @@ try {
                 $followup = @($context.Rows | Where-Object { -not $_.PreserveCloudMailbox -and ($_.DeproPending -or $_ -in $tagged) })
                 foreach ($row in $followup) { if ($row.CloudStatus -ne 'Success' -or $row.DeprovisionConfirmed -ne $true -or $row.ADVerified -ne $true) { throw 'Cloud deprovisioning or AD proof not confirmed: restore and tag clean-up blocked.' } }
                 if (-not $followup.Count) { Write-PraItem -Context $context -Status Skip -Text 'Nothing left to restore.' }
-                elseif ($defer -or -not @(Get-Module -ListAvailable ActiveDirectory).Count) {
-                    if (-not $defer) { Write-PraItem -Context $context -Status Info -Text 'ActiveDirectory module not found on this server: the restore is packaged for the AD server.' }
+                elseif ($effectivePhase -eq 'Cloud' -or $defer -or -not @(Get-Module -ListAvailable ActiveDirectory).Count) {
+                    if ($effectivePhase -eq 'Cloud') { Write-PraItem -Context $context -Status Info -Text 'Cloud-only phase: final AD restoration is packaged for Finalize on the AD server.' }
+                    elseif (-not $defer) { Write-PraItem -Context $context -Status Info -Text 'ActiveDirectory module not found on this server: the restore is packaged for the AD server.' }
                     Save-PraFinalizePackage $followup
                 }
                 else {
