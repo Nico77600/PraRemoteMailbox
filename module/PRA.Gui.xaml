@@ -1,0 +1,192 @@
+<!-- Native WPF Fluent resources on .NET 9+, matching light resources on Windows PowerShell 5.1. -->
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="PRA Remote Mailbox" Width="1420" Height="920" MinWidth="1060" MinHeight="700"
+        WindowStartupLocation="CenterScreen" Background="{DynamicResource ApplicationBackgroundBrush}"
+        FontFamily="Segoe UI Variable Text, Segoe UI" FontSize="14" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="PraCard" TargetType="Border">
+      <Setter Property="Background" Value="{DynamicResource CardBackgroundFillColorDefaultBrush}"/>
+      <Setter Property="BorderBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}"/>
+      <Setter Property="BorderThickness" Value="1"/><Setter Property="CornerRadius" Value="8"/>
+      <Setter Property="Padding" Value="18,14"/><Setter Property="Margin" Value="0,0,0,12"/>
+    </Style>
+    <Style x:Key="PraTitle" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="16"/><Setter Property="FontWeight" Value="SemiBold"/>
+      <Setter Property="Margin" Value="0,0,0,8"/><Setter Property="Foreground" Value="{DynamicResource TextFillColorPrimaryBrush}"/>
+    </Style>
+    <Style x:Key="PraText" TargetType="TextBlock">
+      <Setter Property="TextWrapping" Value="Wrap"/><Setter Property="Margin" Value="0,0,0,8"/>
+      <Setter Property="Foreground" Value="{DynamicResource TextFillColorSecondaryBrush}"/>
+    </Style>
+    <Style TargetType="Button">
+      <Setter Property="Padding" Value="12,6"/><Setter Property="Margin" Value="0,0,8,6"/><Setter Property="MinWidth" Value="90"/>
+    </Style>
+    <Style TargetType="TextBox"><Setter Property="Padding" Value="7,5"/></Style>
+    <Style TargetType="ComboBox"><Setter Property="Padding" Value="7,5"/><Setter Property="MinWidth" Value="120"/></Style>
+    <Style x:Key="PraGrid" TargetType="DataGrid">
+      <Setter Property="AutoGenerateColumns" Value="False"/><Setter Property="IsReadOnly" Value="True"/>
+      <Setter Property="CanUserAddRows" Value="False"/><Setter Property="CanUserDeleteRows" Value="False"/>
+      <Setter Property="RowHeaderWidth" Value="0"/><Setter Property="HeadersVisibility" Value="Column"/>
+      <Setter Property="EnableRowVirtualization" Value="True"/><Setter Property="GridLinesVisibility" Value="Horizontal"/>
+      <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource CardStrokeColorDefaultBrush}"/>
+    </Style>
+  </Window.Resources>
+  <Grid Background="{DynamicResource ApplicationBackgroundBrush}" Margin="24,18">
+    <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+    <Grid Margin="0,0,0,16">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+      <Border Background="{DynamicResource PraBrand}" CornerRadius="10" Width="46" Height="46">
+        <TextBlock Text="&#xE777;" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Foreground="White" FontSize="22" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+      </Border>
+      <StackPanel Grid.Column="1" Margin="14,0">
+        <TextBlock Text="EXCHANGE DISASTER RECOVERY · HYBRIDE · AD → CLOUD → FINALIZE" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource PraBrand}"/>
+        <TextBlock Text="PRA Remote Mailbox" FontSize="25" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorPrimaryBrush}"/>
+        <TextBlock x:Name="HeaderInfo" Style="{StaticResource PraText}" Margin="0"/>
+      </StackPanel>
+      <StackPanel Grid.Column="2">
+        <ComboBox x:Name="ThemeChoice" SelectedIndex="0"><ComboBoxItem Content="System"/><ComboBoxItem Content="Light"/><ComboBoxItem Content="Dark"/></ComboBox>
+        <TextBlock x:Name="VersionText" HorizontalAlignment="Right" Margin="0,5" Style="{StaticResource PraText}" FontSize="12"/>
+      </StackPanel>
+    </Grid>
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="16"/><ColumnDefinition Width="380"/></Grid.ColumnDefinitions>
+      <TabControl x:Name="Pages">
+        <TabItem Header="Vue d'ensemble">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="12">
+              <Border Style="{StaticResource PraCard}">
+                <StackPanel>
+                  <TextBlock Text="Configuration et environnement" Style="{StaticResource PraTitle}"/>
+                  <DockPanel><Button x:Name="BrowseConfig" Content="Parcourir" DockPanel.Dock="Right"/><Button x:Name="Reload" Content="Recharger" DockPanel.Dock="Right"/><TextBox x:Name="ConfigPathText" Margin="0,0,8,6"/></DockPanel>
+                  <TextBlock x:Name="ConfigStatus" Style="{StaticResource PraText}"/>
+                  <TextBlock x:Name="HostStatus" Style="{StaticResource PraText}"/>
+                  <TextBlock Text="Toutes les opérations utilisent Windows PowerShell 5.1 Desktop, dans un processus séparé. Aucun module AD ou cloud n'est importé dans cette fenêtre. Les prérequis et les preuves sont contrôlés par le moteur avant toute écriture." Style="{StaticResource PraText}"/>
+                  <TextBlock Text="AD / Finalize : RSAT ActiveDirectory, droits AD et synchronisation Entra Connect configurée. Cloud / Check : modules EXO 3.10+ et Microsoft.Graph, authentification configurée, accès au tenant. Both : les deux ensembles. Une identité UPN pour Check évite la recherche AD." Style="{StaticResource PraText}"/>
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource PraCard}">
+                <StackPanel>
+                  <TextBlock Text="Passage entre serveurs — conserver les dossiers complets" Style="{StaticResource PraTitle}"/>
+                  <TextBlock Text="Convert AD : Preview puis Apply, sans batch d'entrée. Copier le nouveau dossier Batch-… (JSON, données brutes, SHA-256 et State/preuve AD) sur le serveur cloud. Convert Cloud utilise ce batch Convert vérifié." Style="{StaticResource PraText}"/>
+                  <TextBlock Text="Recover AD : utiliser le batch Convert ORIGINAL. Copier le nouveau batch Recover ET le dossier Convert original dans Storage.BackupFolder du serveur cloud. Recover Cloud utilise le batch RECOVER, vérifie le cloud et produit un dossier Finalize-… si une restauration finale AD reste à faire ; il n'écrit jamais dans AD, même si RSAT est installé." Style="{StaticResource PraText}"/>
+                  <TextBlock Text="Finalize (si un package a été produit) : copier le dossier Finalize-… complet sur le serveur AD, choisir son manifeste RecoverFinalize, puis Preview et Apply. Finalize restaure uniquement les derniers attributs AD, sans appel cloud. Un résultat Pending (code 2) est un passage de relais / contrôle restant, pas un échec ni une fin complète." Style="{StaticResource PraText}"/>
+                  <TextBlock Text="Chaque serveur utilise sa propre configuration, avec le même Environment. Ne pas interrompre le processus : sauvegarde et preuve AD portent sur le batch entier ; aucun arrêt/reprise par objet n'est proposé." Style="{StaticResource PraText}" FontWeight="SemiBold"/>
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource PraCard}">
+                <StackPanel>
+                  <TextBlock Text="Inventaire local (métadonnées, pas une autorisation d'écrire)" Style="{StaticResource PraTitle}"/>
+                  <TextBlock x:Name="BatchStatus" Style="{StaticResource PraText}"/>
+                  <DataGrid x:Name="BatchGrid" Style="{StaticResource PraGrid}" Height="215">
+                    <DataGrid.Columns>
+                      <DataGridTextColumn Header="Type" Binding="{Binding Operation}" Width="100"/>
+                      <DataGridTextColumn Header="ID" Binding="{Binding BatchId}" Width="100"/>
+                      <DataGridTextColumn Header="État" Binding="{Binding Status}" Width="*"/>
+                      <DataGridTextColumn Header="Fichier" Binding="{Binding Path}" Width="220"/>
+                    </DataGrid.Columns>
+                  </DataGrid>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+        </TabItem>
+        <TabItem Header="Opérations">
+          <ScrollViewer x:Name="OperationsScroll" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+          <StackPanel Margin="12">
+            <Border Style="{StaticResource PraCard}">
+              <StackPanel>
+                <TextBlock Text="Opération et sélection" Style="{StaticResource PraTitle}"/>
+                <WrapPanel Margin="0,0,0,10">
+                  <TextBlock Text="Action " VerticalAlignment="Center"/><ComboBox x:Name="ActionChoice" SelectedIndex="0" Margin="0,0,18,0"><ComboBoxItem Content="Convert"/><ComboBoxItem Content="Recover"/><ComboBoxItem Content="Finalize"/><ComboBoxItem Content="Check"/></ComboBox>
+                  <TextBlock Text="Phase " VerticalAlignment="Center"/><ComboBox x:Name="PhaseChoice" SelectedIndex="0"><ComboBoxItem Content="Both"/><ComboBoxItem Content="AD"/><ComboBoxItem Content="Cloud"/></ComboBox>
+                </WrapPanel>
+                <TextBlock x:Name="OperationGuide" Style="{StaticResource PraText}"/>
+                <StackPanel x:Name="SourcePanel" Margin="0,0,0,8">
+                  <TextBlock Text="Source des objets à convertir (utilisateurs / boîtes partagées)" Style="{StaticResource PraText}" Margin="0,0,0,3"/>
+                  <ComboBox x:Name="SourceChoice" SelectedIndex="0" Margin="0,0,0,8">
+                    <ComboBoxItem Content="Configuration"/><ComboBoxItem Content="OU"/><ComboBoxItem Content="Csv"/>
+                  </ComboBox>
+                  <StackPanel x:Name="OuPanel" Visibility="Collapsed">
+                    <DockPanel><Button x:Name="ChooseOu" Content="Choisir une OU…" DockPanel.Dock="Right"/><TextBox x:Name="OuText" Margin="0,0,8,6" ToolTip="DN de l'OU ; ses sous-OU sont incluses"/></DockPanel>
+                    <TextBlock Text="DN de l'OU, sous-OU incluses. Le sélecteur lit uniquement l'AD sur le DC configuré, à votre demande." Style="{StaticResource PraText}" FontSize="12"/>
+                  </StackPanel>
+                  <StackPanel x:Name="CsvPanel" Visibility="Collapsed">
+                    <DockPanel><Button x:Name="BrowseCsv" Content="Charger un CSV…" DockPanel.Dock="Right"/><TextBox x:Name="CsvText" Margin="0,0,8,6"/></DockPanel>
+                    <TextBlock x:Name="CsvInfo" Text="Colonne Identity : UPN, sam, DN ou GUID. Séparateur virgule ou point-virgule." Style="{StaticResource PraText}" FontSize="12"/>
+                  </StackPanel>
+                  <TextBlock Text="Ce choix s'applique à cette exécution uniquement ; la configuration n'est pas réécrite." Style="{StaticResource PraText}" FontSize="12"/>
+                </StackPanel>
+                <StackPanel x:Name="BatchPanel">
+                  <TextBlock Text="Batch : ID hexadécimal (8+), fichier JSON ou dossier" Style="{StaticResource PraText}" Margin="0,0,0,3"/>
+                  <DockPanel><Button x:Name="BrowseBatch" Content="JSON…" DockPanel.Dock="Right"/><Button x:Name="BrowseBatchFolder" Content="Dossier…" DockPanel.Dock="Right"/><TextBox x:Name="BatchText" Margin="0,0,8,6"/></DockPanel>
+                  <ComboBox x:Name="BatchChoice" DisplayMemberPath="Label" Margin="0,0,0,8"/>
+                  <Button x:Name="OpenBatch" Content="Ouvrir le dossier sélectionné" HorizontalAlignment="Left"/>
+                </StackPanel>
+                <TextBlock x:Name="IdentityLabel" Text="Une identité facultative (UPN / sam / DN / GUID) ; vide = périmètre configuré ou batch" Style="{StaticResource PraText}" Margin="0,0,0,3"/>
+                <TextBox x:Name="IdentityText" Margin="0,0,0,10"/>
+                <WrapPanel>
+                  <TextBlock Text="Périmètre " VerticalAlignment="Center"/><ComboBox x:Name="ScopeChoice" SelectedIndex="0" Margin="0,0,16,6"><ComboBoxItem Content="All"/><ComboBoxItem Content="UsersOnly"/><ComboBoxItem Content="SharedOnly"/></ComboBox>
+                  <StackPanel x:Name="LimitPanel" Orientation="Horizontal"><TextBlock Text="Maximum (0 = tous) " VerticalAlignment="Center"/><TextBox x:Name="LimitText" Text="0" Width="70" Margin="0,0,16,6"/></StackPanel>
+                  <StackPanel x:Name="ExpectPanel" Orientation="Horizontal"><TextBlock Text="Attendu " VerticalAlignment="Center"/><ComboBox x:Name="ExpectChoice" SelectedIndex="0" Margin="0,0,0,6"><ComboBoxItem Content="Provisioned"/><ComboBoxItem Content="Deprovisioned"/><ComboBoxItem Content="Retained"/></ComboBox></StackPanel>
+                </WrapPanel>
+                <CheckBox x:Name="OnceCheck" Content="Once — un seul passage de vérification cloud" Margin="0,4,0,8"/>
+                <TextBlock x:Name="ValidationText" Style="{StaticResource PraText}" Foreground="{DynamicResource PraCritical}"/>
+              </StackPanel>
+            </Border>
+            <Border Style="{StaticResource PraCard}">
+              <StackPanel>
+                <TextBlock x:Name="ConfirmationInfo" Style="{StaticResource PraText}"/>
+                <WrapPanel>
+                  <Button x:Name="Preview" Content="Preview / vérifier"/>
+                  <TextBox x:Name="ConfirmationText" Width="145" Margin="0,0,8,6" ToolTip="Saisir exactement CONVERT, RECOVER ou FINALIZE après le Preview"/>
+                  <Button x:Name="Apply" Content="Apply" IsEnabled="False"/>
+                  <Button x:Name="CopyCommand" Content="Copier la commande"/>
+                </WrapPanel>
+                <TextBox x:Name="CommandText" IsReadOnly="True" TextWrapping="Wrap" FontFamily="Consolas" FontSize="11" MaxHeight="80" VerticalScrollBarVisibility="Auto"/>
+              </StackPanel>
+            </Border>
+            <DataGrid x:Name="PreviewGrid" Style="{StaticResource PraGrid}" Height="260" MinHeight="150">
+              <DataGrid.Columns>
+                <DataGridTextColumn Header="UPN" Binding="{Binding UserPrincipalName}" Width="180"/>
+                <DataGridTextColumn Header="sam" Binding="{Binding SamAccountName}" Width="100"/>
+                <DataGridCheckBoxColumn Header="Shared" Binding="{Binding IsShared}" Width="65"/>
+                <DataGridTextColumn Header="Résultat" Binding="{Binding FinalStatus}" Width="90"/>
+                <DataGridTextColumn Header="AD appliqué" Binding="{Binding ADApplied}" Width="90"/>
+                <DataGridTextColumn Header="AD vérifié" Binding="{Binding ADVerified}" Width="90"/>
+                <DataGridTextColumn Header="Cloud" Binding="{Binding CloudStatus}" Width="100"/>
+                <DataGridTextColumn Header="Détail" Binding="{Binding Detail}" Width="250"/>
+                <DataGridTextColumn Header="Cloud détail" Binding="{Binding CloudDetail}" Width="250"/>
+                <DataGridTextColumn Header="Sauvegarde" Binding="{Binding BackupPath}" Width="220"/>
+                <DataGridTextColumn Header="GUID" Binding="{Binding ObjectGuid}" Width="230"/>
+                <DataGridTextColumn Header="Avertissements" Binding="{Binding Warnings}" Width="200"/>
+              </DataGrid.Columns>
+            </DataGrid>
+          </StackPanel>
+          </ScrollViewer>
+        </TabItem>
+      </TabControl>
+      <Border Grid.Column="2" Style="{StaticResource PraCard}" Margin="0">
+        <Grid>
+          <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+          <StackPanel>
+            <TextBlock Text="Activité" Style="{StaticResource PraTitle}"/>
+            <TextBlock x:Name="RunStatus" Text="Prêt — aucune opération lancée" Style="{StaticResource PraText}"/>
+            <TextBlock x:Name="RunStep" Style="{StaticResource PraText}"/>
+            <ProgressBar x:Name="RunProgress" Height="6" Minimum="0" Maximum="100" Margin="0,0,0,8"/>
+            <TextBlock x:Name="RunCounts" Text="OK 0 · Warn 0 · Fail 0" Style="{StaticResource PraText}"/>
+          </StackPanel>
+          <ListBox Grid.Row="1" x:Name="ActivityLog" BorderThickness="0" Background="Transparent" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+            <ListBox.ItemTemplate><DataTemplate><TextBlock Text="{Binding Text}" Foreground="{Binding Brush}" TextWrapping="Wrap" FontSize="12" Margin="0,3"/></DataTemplate></ListBox.ItemTemplate>
+          </ListBox>
+          <StackPanel Grid.Row="2" Margin="0,10,0,0">
+            <TextBlock x:Name="ResultText" Style="{StaticResource PraText}" FontWeight="SemiBold"/>
+            <TextBlock x:Name="ResultBatch" Style="{StaticResource PraText}"/>
+            <TextBox x:Name="NextStepsText" IsReadOnly="True" TextWrapping="Wrap" MaxHeight="145" VerticalScrollBarVisibility="Auto" Margin="0,0,0,8"/>
+            <WrapPanel><Button x:Name="OpenLog" Content="Log" IsEnabled="False"/><Button x:Name="OpenCsv" Content="CSV" IsEnabled="False"/><Button x:Name="OpenHtml" Content="Rapport" IsEnabled="False"/><Button x:Name="CopyBatch" Content="Copier l'ID" IsEnabled="False"/><Button x:Name="OpenBackup" Content="Sauvegardes" IsEnabled="False"/></WrapPanel>
+          </StackPanel>
+        </Grid>
+      </Border>
+    </Grid>
+    <TextBlock Grid.Row="2" Text="Preview obligatoire sur la même sélection et les mêmes fichiers · Aucun arrêt forcé : attendre la fin avant de fermer." TextWrapping="Wrap" FontSize="12" Margin="0,12,0,0" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+  </Grid>
+</Window>

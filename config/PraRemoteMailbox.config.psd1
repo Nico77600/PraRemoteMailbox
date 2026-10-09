@@ -2,7 +2,7 @@
 #  PRA Remote Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 2.0.1
+#  Version : 2.1.0
 #
 #  This file is read by Invoke-PraRemoteMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -92,8 +92,9 @@
         # Recover: the cloud shared mailbox is deprovisioned before its on-premises attributes come
         # back (default). $true = keep the cloud shared mailbox (rare).
         KeepCloudSharedOnRecover = $false
-        # Recover on two servers: $true = the cloud server always writes a Finalize package for the
-        # AD server (automatic when the ActiveDirectory module is not on the cloud server).
+        # Recover -Phase Cloud always writes a Finalize package; it never restores AD.
+        # With -Phase Both, $true also defers final AD restoration to a separate Finalize run
+        # (automatic when the ActiveDirectory module is not on this server).
         DeferOnPremRestore  = $false
     }
 

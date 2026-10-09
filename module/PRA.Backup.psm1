@@ -21,7 +21,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.0.1 (format PraDataOnlyClixml-v1, unchanged since 1.3.3)
+    Version : 2.1.0 (format PraDataOnlyClixml-v1, unchanged since 1.3.3)
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -296,6 +296,8 @@ function Assert-PraRawSnapshot {
 
 function Write-PraRawString {
     param([Xml.XmlWriter]$Writer,[AllowEmptyString()][string]$Value)
+    if ($Value.Length -eq 0) { return }
+    if (-not $script:PraRawEscape.IsMatch($Value)) { $Writer.WriteString($Value); return }
     # Escaping every underscore avoids _xHHHH_ ambiguity across buffer boundaries.
     # Encode UTF-16 surrogate code units too, including isolated surrogates, without XML loss.
     for ($offset=0; $offset -lt $Value.Length; $offset+=4096) {
@@ -402,6 +404,7 @@ function Write-PraRawCapture {
 
 function ConvertFrom-PraRawString {
     param([AllowEmptyString()][string]$Value)
+    if ($Value.IndexOf('_x',[StringComparison]::Ordinal) -lt 0) { return $Value }
     return $script:PraRawUnescape.Replace($Value,[Text.RegularExpressions.MatchEvaluator]{
         param($match)
         return [string][char][Convert]::ToInt32($match.Groups[1].Value,16)
