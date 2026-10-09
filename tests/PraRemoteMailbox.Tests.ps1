@@ -1394,6 +1394,71 @@ namespace Microsoft.ActiveDirectory.Management {
     }
 }
 
+Describe 'Receipt fingerprint string-array compatibility and limits' -Tag 'OOM' {
+    BeforeAll {
+        $fingerprintModule=Get-Module PRA.Directory
+        function Write-GateFingerprintReference {
+            param([IO.BinaryWriter]$Writer,[AllowNull()]$Value)
+            if ($null -eq $Value) { $Writer.Write([byte]0); return }
+            if ($Value -is [array]) {
+                $Writer.Write([byte]7); $Writer.Write([int]$Value.Length)
+                foreach ($item in $Value) { Write-GateFingerprintReference -Writer $Writer -Value $item }
+                return
+            }
+            if ($Value -is [string]) {
+                $Writer.Write([byte]1); $Writer.Write([int]$Value.Length)
+                foreach ($character in $Value.ToCharArray()) { $Writer.Write([uint16]$character) }
+                return
+            }
+            if ($Value -is [bool]) { $Writer.Write([byte]2); $Writer.Write([bool]$Value); return }
+            if ($Value -is [int]) { $Writer.Write([byte]3); $Writer.Write([int]$Value); return }
+            throw 'Unsupported value in the independent fingerprint test reference.'
+        }
+    }
+    It 'preserves exact UTF-16 wire bytes and node counts for <Case>' -ForEach @(
+        @{Case='Strings';Nodes=10;Data=[string[]]@('','duplicate','duplicate',('x'*1023),('x'*1024),('x'*1025),('x'*2049),([string][char]0xD800),([string][char]0x00E9+[char]0+[char]0x6F22))},
+        @{Case='Mixed';Nodes=5;Data=[object[]]@('same',$null,[int]42,$false)},
+        @{Case='Nested';Nodes=9;Data=[object[]]@([string[]]@('first','last'),[object[]]@([string[]]@('inner'),$null),'end')}
+    ) {
+        $expectedStream=New-Object IO.MemoryStream
+        $expectedWriter=New-Object IO.BinaryWriter($expectedStream)
+        $actualStream=New-Object IO.MemoryStream
+        $actualWriter=New-Object IO.BinaryWriter($actualStream)
+        try {
+            Write-GateFingerprintReference -Writer $expectedWriter -Value $Data
+            $state=@{Writer=$actualWriter;Characters=(New-Object char[] 1024);Bytes=(New-Object byte[] 2048);Nodes=0L}
+            & $fingerprintModule { param($s,$v) Write-PraDataFingerprint -State $s -Value $v } $state $Data
+            $expectedWriter.Flush(); $actualWriter.Flush()
+            [Convert]::ToBase64String($actualStream.ToArray()) | Should -BeExactly ([Convert]::ToBase64String($expectedStream.ToArray()))
+            $state.Nodes | Should -Be $Nodes
+        }
+        finally { $expectedWriter.Dispose(); $expectedStream.Dispose(); $actualWriter.Dispose(); $actualStream.Dispose() }
+    }
+    It 'preserves <Case> errors, partial bytes and node accounting' -ForEach @(
+        @{Case='Depth64';Depth=63;InitialNodes=0L;Nodes=3L;ExpectedError='';Written=2},
+        @{Case='Depth65';Depth=64;InitialNodes=0L;Nodes=1L;ExpectedError='*Receipt data too deep or cyclic*';Written=0},
+        @{Case='NodeLimit';Depth=0;InitialNodes=9999998L;Nodes=10000001L;ExpectedError='*Receipt data too large*';Written=1}
+    ) {
+        $expectedStream=New-Object IO.MemoryStream
+        $expectedWriter=New-Object IO.BinaryWriter($expectedStream)
+        $actualStream=New-Object IO.MemoryStream
+        $actualWriter=New-Object IO.BinaryWriter($actualStream)
+        try {
+            $values=[string[]]@('first','last')
+            $expectedWriter.Write([byte]7); $expectedWriter.Write([int]2)
+            for ($index=0;$index -lt $Written;$index++) { Write-GateFingerprintReference -Writer $expectedWriter -Value $values[$index] }
+            $state=@{Writer=$actualWriter;Characters=(New-Object char[] 1024);Bytes=(New-Object byte[] 2048);Nodes=$InitialNodes}
+            $invoke={ & $fingerprintModule { param($s,$v,$d) Write-PraDataFingerprint -State $s -Value $v -Depth $d } $state $values $Depth }
+            if ($ExpectedError) { $invoke | Should -Throw $ExpectedError }
+            else { & $invoke }
+            $expectedWriter.Flush(); $actualWriter.Flush()
+            [Convert]::ToBase64String($actualStream.ToArray()) | Should -BeExactly ([Convert]::ToBase64String($expectedStream.ToArray()))
+            $state.Nodes | Should -Be $Nodes
+        }
+        finally { $expectedWriter.Dispose(); $expectedStream.Dispose(); $actualWriter.Dispose(); $actualStream.Dispose() }
+    }
+}
+
 Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' -Tag 'OOM' {
     BeforeEach {
         $global:PraGate.Runtime=New-GateRuntime -Name 'oom-shared' -Shared13
@@ -1618,7 +1683,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
         }
     }
     It 'rejects in-place validated receipt mutation <Field> without expanding an arbitrary getter' -ForEach @(
-        @{Field='Attribute'},@{Field='SendAs'},@{Field='Server'},@{Field='RunId'},@{Field='SourceBackupHash'},@{Field='Legacy'},@{Field='Opaque'}
+        @{Field='Attribute'},@{Field='SendAs'},@{Field='SendAsElement'},@{Field='Server'},@{Field='RunId'},@{Field='SourceBackupHash'},@{Field='Legacy'},@{Field='Opaque'}
     ) {
         $context=$global:PraGate.Context
         $plan=New-PraPlan $context 'user1' 'Convert'
@@ -1626,6 +1691,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
         switch ($Field) {
             'Attribute' { $receipt.Data.Records[0].Attributes.homeMDB.Value='CN=Injected,DC=gate,DC=invalid' }
             'SendAs' { $receipt.Data.Records[0].SharedPermissions.SendAs=@('injected@gate.invalid') }
+            'SendAsElement' { $receipt.Data.Records[0].SharedPermissions.SendAs[0]='injected@gate.invalid' }
             'Server' { $receipt.Data.Server='dc-other.gate.invalid' }
             'RunId' { $receipt.Data.RunId='injected-run-id' }
             'SourceBackupHash' { $receipt.Data.SourceBackupHash=('a'*64) }
@@ -3732,6 +3798,50 @@ Describe 'GUI events mirror the existing engine without extra mutations' -Tag 'G
         $request=New-PraGuiRequest -Action Recover -Phase AD -Batch deadbeef
         Test-PraGuiPreview -Result $result -Request $request -NativeExitCode $run.ExitCode | Should -BeFalse
         @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+}
+
+Describe 'Culture-neutral test gate help validation' {
+    BeforeAll {
+        $gatePath=Join-Path $global:PraGate.Release 'tests\Invoke-TestGate.ps1'
+        $gateAst=[Management.Automation.Language.Parser]::ParseFile($gatePath,[ref]$null,[ref]$null)
+        $helpAssignment=$gateAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -eq 'helpPass'
+        },$true)
+        if ($null -eq $helpAssignment) { throw 'The gate help validation assignment is missing.' }
+        $helpValidation=[scriptblock]::Create($helpAssignment.Right.Extent.Text)
+    }
+    It 'accepts actual structured help independently of the displayed culture <Culture>' -ForEach @(
+        @{Culture='fr-FR'},@{Culture='en-US'}
+    ) {
+        $thread=[Threading.Thread]::CurrentThread
+        $originalCulture=$thread.CurrentUICulture
+        try {
+            $thread.CurrentUICulture=[Globalization.CultureInfo]::GetCultureInfo($Culture)
+            $help=Get-Help (Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1') -Full
+            $helpText='Localized headings are deliberately not part of the help contract.'
+            (& $helpValidation) | Should -BeTrue
+        }
+        finally { $thread.CurrentUICulture=$originalCulture }
+    }
+    It 'still rejects missing help metadata <Missing>' -ForEach @(
+        @{Missing='Synopsis'},@{Missing='Examples'},@{Missing='WhatIf'}
+    ) {
+        $help=@{
+            Synopsis='An authored synopsis.'
+            examples=@{example=@('example 1','example 2','example 3')}
+            parameters=@{parameter=@(@{name='Action'},@{name='WhatIf'})}
+        }
+        switch ($Missing) {
+            Synopsis { $help.Synopsis='' }
+            Examples { $help.examples.example=@('example 1','example 2') }
+            WhatIf { $help.parameters.parameter=@(@{name='Action'}) }
+        }
+        $helpText='SYNOPSIS WhatIf: formatted text cannot substitute for missing structured metadata.'
+        (& $helpValidation) | Should -BeFalse
     }
 }
 
