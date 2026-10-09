@@ -9,7 +9,7 @@
     No legacy Assert-MockCalled: counters are mutable objects.
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.0.1
+    Version: 2.1.0
     Run it through tests\Invoke-TestGate.ps1 (evidence, PSScriptAnalyzer, mandatory tests).
 #>
 #Requires -Version 5.1
@@ -17,7 +17,7 @@
 BeforeAll {
     $global:PraGate = @{
         Release = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-        Root = Join-Path (Join-Path $env:SystemRoot 'Temp') ('PG-' + [guid]::NewGuid().ToString('N').Substring(0,8))
+        Root = Join-Path ([IO.Path]::GetTempPath()) ('PG-' + [guid]::NewGuid().ToString('N').Substring(0,8))
         OriginalModulePath = $env:PSModulePath
         OriginalNonet = $env:PRA_GATE_NONET
         OriginalState = $env:PRA_GATE_STATE
@@ -219,12 +219,20 @@ function Get-ADObject {
     }
     [pscustomobject]@{ DistinguishedName=[string]$Identity; objectClass='organizationalUnit' }
 }
+function Get-ADOrganizationalUnit {
+    [CmdletBinding()]
+    param([string]$Filter,[string]$Server,[string]$SearchBase,[string]$SearchScope)
+    Assert-GateServer $Server
+    Write-GateEvent 'Get-ADOrganizationalUnit' '*' $Server @{SearchBase=$SearchBase;SearchScope=$SearchScope}
+    if ($SearchBase -cne 'DC=gate,DC=invalid' -or $SearchScope -cne 'Subtree') { throw 'Synthetic OU search scope mismatch.' }
+    @([pscustomobject]@{Name='Users';DistinguishedName='OU=Users,DC=gate,DC=invalid'},[pscustomobject]@{Name='Shared';DistinguishedName='OU=Shared,DC=gate,DC=invalid'})
+}
 function Set-ADUser {
     [CmdletBinding(SupportsShouldProcess)]
     param([object]$Identity,[hashtable]$Replace,[string[]]$Clear,[string]$Server)
     Assert-GateServer $Server
     Assert-GateBackupBarrier
-    Write-GateEvent 'Set-ADUser' $Identity $Server
+    Write-GateEvent 'Set-ADUser' $Identity $Server @{Replace=$Replace;Clear=$Clear}
     $user=@($global:PraGateAd.Users | Where-Object ObjectGUID -eq ([string]$Identity))[0]
     if ($null -ne $Replace) { foreach ($key in $Replace.Keys) { $user.$key=$Replace[$key] } }
     foreach ($key in $Clear) { $user.$key=$null }
@@ -260,7 +268,7 @@ function Remove-ADGroupMember {
     }
 }
 Write-GateEvent 'Import-SyntheticAD' '' '' $PSCommandPath
-Export-ModuleMember -Function Get-ADDomainController,Get-ADRootDSE,Get-ADUser,Get-ADGroup,Get-ADGroupMember,Get-ADObject,Set-ADUser,Add-ADGroupMember,Remove-ADGroupMember
+Export-ModuleMember -Function Get-ADDomainController,Get-ADRootDSE,Get-ADUser,Get-ADGroup,Get-ADGroupMember,Get-ADObject,Get-ADOrganizationalUnit,Set-ADUser,Add-ADGroupMember,Remove-ADGroupMember
 '@
     $global:PraGate.CloudSource = @'
 # SYNTHETIC orchestration barrier, NOT the production Cloud implementation.
@@ -348,6 +356,7 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         [IO.File]::WriteAllText((Join-Path $modules 'ADSync\ADSync.psm1'),$global:PraGate.SyncSource,(New-Object Text.UTF8Encoding($true)))
         Copy-Item -LiteralPath (Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1') -Destination $package
         foreach ($name in @('PRA.Common.psm1','PRA.Backup.psm1','PRA.Directory.psm1')) { Copy-Item -LiteralPath (Join-Path $global:PraGate.Release ('module\'+$name)) -Destination (Join-Path $package 'module') }
+        Copy-Item -LiteralPath (Join-Path $global:PraGate.Release 'module\PRA.Gui.Directory.ps1') -Destination (Join-Path $package 'module')
         [IO.File]::WriteAllText((Join-Path $package 'module\PRA.Cloud.psm1'),$global:PraGate.CloudSource,(New-Object Text.UTF8Encoding($true)))
         Copy-Item -LiteralPath (Join-Path $global:PraGate.Release 'templates\Report.template.html') -Destination (Join-Path $package 'templates') -ErrorAction SilentlyContinue
         $users=@((New-GateUser 1),(New-GateUser 2))
@@ -1385,6 +1394,71 @@ namespace Microsoft.ActiveDirectory.Management {
     }
 }
 
+Describe 'Receipt fingerprint string-array compatibility and limits' -Tag 'OOM' {
+    BeforeAll {
+        $fingerprintModule=Get-Module PRA.Directory
+        function Write-GateFingerprintReference {
+            param([IO.BinaryWriter]$Writer,[AllowNull()]$Value)
+            if ($null -eq $Value) { $Writer.Write([byte]0); return }
+            if ($Value -is [array]) {
+                $Writer.Write([byte]7); $Writer.Write([int]$Value.Length)
+                foreach ($item in $Value) { Write-GateFingerprintReference -Writer $Writer -Value $item }
+                return
+            }
+            if ($Value -is [string]) {
+                $Writer.Write([byte]1); $Writer.Write([int]$Value.Length)
+                foreach ($character in $Value.ToCharArray()) { $Writer.Write([uint16]$character) }
+                return
+            }
+            if ($Value -is [bool]) { $Writer.Write([byte]2); $Writer.Write([bool]$Value); return }
+            if ($Value -is [int]) { $Writer.Write([byte]3); $Writer.Write([int]$Value); return }
+            throw 'Unsupported value in the independent fingerprint test reference.'
+        }
+    }
+    It 'preserves exact UTF-16 wire bytes and node counts for <Case>' -ForEach @(
+        @{Case='Strings';Nodes=10;Data=[string[]]@('','duplicate','duplicate',('x'*1023),('x'*1024),('x'*1025),('x'*2049),([string][char]0xD800),([string][char]0x00E9+[char]0+[char]0x6F22))},
+        @{Case='Mixed';Nodes=5;Data=[object[]]@('same',$null,[int]42,$false)},
+        @{Case='Nested';Nodes=9;Data=[object[]]@([string[]]@('first','last'),[object[]]@([string[]]@('inner'),$null),'end')}
+    ) {
+        $expectedStream=New-Object IO.MemoryStream
+        $expectedWriter=New-Object IO.BinaryWriter($expectedStream)
+        $actualStream=New-Object IO.MemoryStream
+        $actualWriter=New-Object IO.BinaryWriter($actualStream)
+        try {
+            Write-GateFingerprintReference -Writer $expectedWriter -Value $Data
+            $state=@{Writer=$actualWriter;Characters=(New-Object char[] 1024);Bytes=(New-Object byte[] 2048);Nodes=0L}
+            & $fingerprintModule { param($s,$v) Write-PraDataFingerprint -State $s -Value $v } $state $Data
+            $expectedWriter.Flush(); $actualWriter.Flush()
+            [Convert]::ToBase64String($actualStream.ToArray()) | Should -BeExactly ([Convert]::ToBase64String($expectedStream.ToArray()))
+            $state.Nodes | Should -Be $Nodes
+        }
+        finally { $expectedWriter.Dispose(); $expectedStream.Dispose(); $actualWriter.Dispose(); $actualStream.Dispose() }
+    }
+    It 'preserves <Case> errors, partial bytes and node accounting' -ForEach @(
+        @{Case='Depth64';Depth=63;InitialNodes=0L;Nodes=3L;ExpectedError='';Written=2},
+        @{Case='Depth65';Depth=64;InitialNodes=0L;Nodes=1L;ExpectedError='*Receipt data too deep or cyclic*';Written=0},
+        @{Case='NodeLimit';Depth=0;InitialNodes=9999998L;Nodes=10000001L;ExpectedError='*Receipt data too large*';Written=1}
+    ) {
+        $expectedStream=New-Object IO.MemoryStream
+        $expectedWriter=New-Object IO.BinaryWriter($expectedStream)
+        $actualStream=New-Object IO.MemoryStream
+        $actualWriter=New-Object IO.BinaryWriter($actualStream)
+        try {
+            $values=[string[]]@('first','last')
+            $expectedWriter.Write([byte]7); $expectedWriter.Write([int]2)
+            for ($index=0;$index -lt $Written;$index++) { Write-GateFingerprintReference -Writer $expectedWriter -Value $values[$index] }
+            $state=@{Writer=$actualWriter;Characters=(New-Object char[] 1024);Bytes=(New-Object byte[] 2048);Nodes=$InitialNodes}
+            $invoke={ & $fingerprintModule { param($s,$v,$d) Write-PraDataFingerprint -State $s -Value $v -Depth $d } $state $values $Depth }
+            if ($ExpectedError) { $invoke | Should -Throw $ExpectedError }
+            else { & $invoke }
+            $expectedWriter.Flush(); $actualWriter.Flush()
+            [Convert]::ToBase64String($actualStream.ToArray()) | Should -BeExactly ([Convert]::ToBase64String($expectedStream.ToArray()))
+            $state.Nodes | Should -Be $Nodes
+        }
+        finally { $expectedWriter.Dispose(); $expectedStream.Dispose(); $actualWriter.Dispose(); $actualStream.Dispose() }
+    }
+}
+
 Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' -Tag 'OOM' {
     BeforeEach {
         $global:PraGate.Runtime=New-GateRuntime -Name 'oom-shared' -Shared13
@@ -1609,7 +1683,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
         }
     }
     It 'rejects in-place validated receipt mutation <Field> without expanding an arbitrary getter' -ForEach @(
-        @{Field='Attribute'},@{Field='SendAs'},@{Field='Server'},@{Field='RunId'},@{Field='SourceBackupHash'},@{Field='Legacy'},@{Field='Opaque'}
+        @{Field='Attribute'},@{Field='SendAs'},@{Field='SendAsElement'},@{Field='Server'},@{Field='RunId'},@{Field='SourceBackupHash'},@{Field='Legacy'},@{Field='Opaque'}
     ) {
         $context=$global:PraGate.Context
         $plan=New-PraPlan $context 'user1' 'Convert'
@@ -1617,6 +1691,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
         switch ($Field) {
             'Attribute' { $receipt.Data.Records[0].Attributes.homeMDB.Value='CN=Injected,DC=gate,DC=invalid' }
             'SendAs' { $receipt.Data.Records[0].SharedPermissions.SendAs=@('injected@gate.invalid') }
+            'SendAsElement' { $receipt.Data.Records[0].SharedPermissions.SendAs[0]='injected@gate.invalid' }
             'Server' { $receipt.Data.Server='dc-other.gate.invalid' }
             'RunId' { $receipt.Data.RunId='injected-run-id' }
             'SourceBackupHash' { $receipt.Data.SourceBackupHash=('a'*64) }
@@ -3219,7 +3294,6 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
         $state.SchemaVersion | Should -Be 2
         $state.Records.Count | Should -Be 13
         $before=@(Get-GateWrites $runtime).Count
-        Set-GateConfigText $runtime { param($t) $t.Replace('SharedMailbox=@{Enabled=$true;', 'SharedMailbox=@{Enabled=$true;DeferOnPremRestore=$true;') }
         $cloud=Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$recoverPath} -TimeoutSeconds 120
         $cloud.ExitCode | Should -Be 2
         @($cloud.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 1
@@ -3263,7 +3337,7 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
             $run.MainResult.HtmlReport | Should -BeNullOrEmpty
         }
     }
-    It 'rejects pwsh Core before any AD read or write, with fake modules still installed' {
+    It 'rejects pwsh Core before any AD read or write, with fake modules still installed' -Tag 'GuiIntegration' {
         $runtime=New-GateRuntime -Name 'main-core-rejected'
         $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath} -Core
         $run.ExitCode | Should -Not -Be 0
@@ -3456,6 +3530,321 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
     }
 }
 
+Describe 'Split cloud recovery never restores AD implicitly' -Tag 'GuiIntegration' {
+    It 'packages confirmed cleanup with RSAT present and DeferOnPremRestore false, then Finalize restores the tags on the AD host' {
+        $runtime=New-GateRuntime -Name 'gui-split-recover' -Case CloudConfirmed13
+        $env:PRA_GATE_STATE=$runtime.StatePath
+        $env:PSModulePath=$runtime.Modules+';'+(Join-Path $PSHOME 'Modules')
+        Get-Module ActiveDirectory -All | Remove-Module -Force
+        Import-Module ActiveDirectory -Force -Global
+        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Directory.psm1') -Force -Global
+        $context=New-GateContext $runtime
+        $bundles=New-GateSourceBundles $context -ApplySnapshots
+        [IO.File]::WriteAllText($runtime.StatePath,[Management.Automation.PSSerializer]::Serialize($global:PraGateAd,35))
+        $before=@(Get-GateWrites $runtime).Count
+        $config=Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package
+        $beforeEvents=@(Get-GateEvents $runtime).Count
+        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Gui.psm1') -Force
+        $guiState=Read-PraGuiState -Root $runtime.Package -ConfigPath $runtime.ConfigPath
+        (Read-PraGuiBatch -Path $bundles.Source -Environment $config.Environment).Valid | Should -BeTrue
+        (Read-PraGuiBatch -Path $bundles.Recover -Environment $config.Environment).Valid | Should -BeTrue
+        $convertData=[IO.File]::ReadAllText($bundles.Source) | ConvertFrom-Json
+        (Resolve-PraGuiBatch -Value $convertData.BatchId.Substring(0,8) -Operation Convert -State $guiState).Valid | Should -BeTrue
+        $guiCloudRequest=New-PraGuiRequest -Action Recover -Phase Cloud -Batch $bundles.Recover
+        Get-PraGuiGuard -Root $runtime.Package -ConfigPath $runtime.ConfigPath -Request $guiCloudRequest | Should -Match '^[0-9a-fA-F]{64}$'
+        $config.SharedMailbox.DeferOnPremRestore | Should -BeFalse
+        @(Get-Module -ListAvailable ActiveDirectory).Count | Should -BeGreaterThan 0
+        $cloud=Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Recover}
+        $cloud.ExitCode | Should -Be 2
+        $cloud.MainResult.PendingCount | Should -Be 2
+        @(Get-GateWrites $runtime).Count | Should -Be $before
+        @($cloud.Events | Select-Object -Skip $beforeEvents | Where-Object Operation -Match 'Get-ADUser|ADSync').Count | Should -Be 0
+        $manifest=@(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Finalize-*.json' |
+            Where-Object { ([IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json).Operation -eq 'RecoverFinalize' })[0]
+        (Read-PraGuiBatch -Path $manifest.FullName -Environment $config.Environment).Valid | Should -BeTrue
+        $guiFinalizeRequest=New-PraGuiRequest -Action Finalize -Batch $manifest.FullName
+        Get-PraGuiGuard -Root $runtime.Package -ConfigPath $runtime.ConfigPath -Request $guiFinalizeRequest | Should -Match '^[0-9a-fA-F]{64}$'
+        $cloud.MainResult.NextSteps -join ' ' | Should -Match 'Action Finalize'
+        $beforeFinalizeEvents=@(Get-GateEvents $runtime).Count
+        $finalize=Invoke-GateProcess $runtime @{Action='Finalize';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$manifest.FullName}
+        $finalize.ExitCode | Should -Be 0
+        $finalize.MainResult.SuccessCount | Should -Be 2
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan $before
+        $restores=@($finalize.Events | Select-Object -Skip $beforeFinalizeEvents | Where-Object Operation -eq 'Set-ADUser')
+        $restores.Count | Should -Be 2
+        $restores[0].Detail.Replace.extensionAttribute1 | Should -BeExactly 'OriginalTag-1'
+        $restores[1].Detail.Replace.extensionAttribute1 | Should -BeExactly 'OriginalTag-2'
+        $rows=@(Import-Csv -LiteralPath $finalize.MainResult.CsvReport -Delimiter ';')
+        @($rows | Where-Object { $_.ADVerified -eq 'True' -and $_.FinalStatus -eq 'Success' }).Count | Should -Be 2
+    }
+}
+
+Describe 'Direct OU and CSV targeting' -Tag 'Targeting' {
+    It 'applies OU/CSV overrides before scope validation without rewriting the configuration' {
+        $runtime=New-GateRuntime -Name 'scope-overrides'
+        Set-GateConfigText $runtime { param($t) $t.Replace("Mode='Auto';SearchBase='OU=Tests,DC=gate,DC=invalid'","Mode='OU';SearchBase=''") }
+        $hash=(Get-FileHash $runtime.ConfigPath).Hash
+        $override=Get-PraTargetOverride -SearchBase 'OU=Selected,DC=gate,DC=invalid'
+        $cfg=Import-PraConfiguration $runtime.ConfigPath $runtime.Package -ScopeOverride $override
+        $cfg.Scope.Mode | Should -BeExactly 'OU'
+        $cfg.Scope.SearchBase | Should -BeExactly 'OU=Selected,DC=gate,DC=invalid'
+        $override=Get-PraTargetOverride -CsvPath '.\selection.csv'
+        $cfg=Import-PraConfiguration $runtime.ConfigPath $runtime.Package -ScopeOverride $override
+        $cfg.Scope.Mode | Should -BeExactly 'Csv'
+        $cfg.Scope.SearchBase | Should -BeNullOrEmpty
+        (Get-FileHash $runtime.ConfigPath).Hash | Should -BeExactly $hash
+        { Get-PraTargetOverride -SearchBase 'OU=A' -CsvPath 'targets.csv' } | Should -Throw
+        { Get-PraTargetOverride -SearchBase 'OU=A' -Identity user1 } | Should -Throw
+    }
+    It 'reads comma and semicolon CSVs with literal identities and refuses incomplete lists' {
+        $runtime=New-GateRuntime -Name 'csv-validation'
+        $path=Join-Path $runtime.Root 'targets.csv'
+        foreach ($delimiter in @(',',';')) {
+            [IO.File]::WriteAllText($path,('"Identity"'+$delimiter+'"Name"'+"`r`n"+'"user1@gate.invalid"'+$delimiter+'"One"'+"`r`n"+'"user2@gate.invalid"'+$delimiter+'"Two"'),(New-Object Text.UTF8Encoding($true)))
+            $rows=@(Read-PraTargetCsv $path)
+            $rows.Count | Should -Be 2
+            $rows[1].Identity | Should -BeExactly 'user2@gate.invalid'
+        }
+        foreach ($bad in @('',"Identity`r`n","Wrong`r`nuser1","Identity;Name`r`n;missing")) {
+            [IO.File]::WriteAllText($path,$bad)
+            { Read-PraTargetCsv $path } | Should -Throw
+        }
+    }
+    It 'routes a selected mixed user/shared CSV through the real entry and target selector' {
+        $runtime=New-GateRuntime -Name 'csv-mixed-mailboxes'
+        $runtime.State.Users[1].msExchRecipientTypeDetails=[long]4
+        [IO.File]::WriteAllText($runtime.StatePath,[Management.Automation.PSSerializer]::Serialize($runtime.State,35))
+        Set-GateConfigText $runtime { param($t) $t.Replace('IncludeShared=$false','IncludeShared=$true') }
+        $path=Join-Path $runtime.Root 'targets.csv'
+        [IO.File]::WriteAllText($path,"Identity;Name`r`nuser1@gate.invalid;User`r`nuser2@gate.invalid;Shared")
+        $configHash=(Get-FileHash $runtime.ConfigPath).Hash
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='AD';CsvPath=$path;ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        $run.MainResult.PlannedCount | Should -Be 2
+        $rows=@(Import-Csv $run.MainResult.CsvReport -Delimiter ';')
+        @($rows | Where-Object IsShared -eq 'True').Count | Should -Be 1
+        @($rows | Where-Object IsShared -eq 'False').Count | Should -Be 1
+        ($run.MainResult.NextSteps -join ' ') | Should -Match 'CsvPath'
+        (Get-FileHash $runtime.ConfigPath).Hash | Should -BeExactly $configHash
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'rejects OU/CSV selection in Cloud, Recover and conflicting selectors before directory access' -ForEach @(
+        @{Action='Convert';Phase='Cloud';Params=@{SearchBase='OU=Wrong,DC=gate,DC=invalid';Batch='deadbeef'}},
+        @{Action='Recover';Phase='AD';Params=@{CsvPath='targets.csv';Batch='deadbeef'}},
+        @{Action='Convert';Phase='AD';Params=@{SearchBase='OU=Wrong,DC=gate,DC=invalid';Identity='user1'}}
+    ) {
+        $runtime=New-GateRuntime -Name 'invalid-source'
+        $arguments=@{Action=$Action;Phase=$Phase;Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath}
+        foreach ($key in $Params.Keys) { $arguments[$key]=$Params[$key] }
+        $run=Invoke-GateProcess $runtime $arguments
+        $run.ExitCode | Should -Be 1
+        @($run.Events | Where-Object Operation -Match '^(Get-AD|Set-|Add-|Remove-|CloudPhase|Start-ADSync)').Count | Should -Be 0
+    }
+    It 'previews a selected OU and a single shared identity without consulting the cloud' -ForEach @(@{Source='OU'},@{Source='Shared'}) {
+        $runtime=New-GateRuntime -Name 'ou-or-shared'
+        $arguments=@{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath}
+        if ($Source -eq 'OU') { $arguments.SearchBase='OU=Selected,DC=gate,DC=invalid' }
+        else {
+            $runtime.State.Users[1].msExchRecipientTypeDetails=[long]4
+            [IO.File]::WriteAllText($runtime.StatePath,[Management.Automation.PSSerializer]::Serialize($runtime.State,35))
+            $arguments.Identity='user2@gate.invalid'
+        }
+        $run=Invoke-GateProcess $runtime $arguments
+        $run.ExitCode | Should -Be 0
+        if ($Source -eq 'OU') {
+            @($run.Events | Where-Object { $_.Operation -eq 'Get-ADUser' -and $_.Detail.SearchBase -eq $arguments.SearchBase }).Count | Should -BeGreaterThan 0
+        }
+        else { $run.MainResult.PlannedCount | Should -Be 1 }
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        @($run.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 0
+    }
+    It 'reads OU choices on the fixed synthetic DC using the real Desktop helper without writes' {
+        $runtime=New-GateRuntime -Name 'ou-readonly-child'
+        $resultPath=Join-Path $runtime.Root 'ou.json'
+        $code=@"
+`$env:PRA_GATE_NONET='SYNTHETIC-NO-NETWORK'
+`$env:PRA_GATE_STATE='$($runtime.StatePath)'
+`$env:PSModulePath='$($runtime.Modules);$(Join-Path $PSHOME 'Modules')'
+Import-Module '$($runtime.Modules)\ActiveDirectory\ActiveDirectory.psm1' -Force -Global
+& '$($runtime.Package)\module\PRA.Gui.Directory.ps1' -ConfigPath '$($runtime.ConfigPath)' -ResultPath '$resultPath'
+exit `$LASTEXITCODE
+"@
+        $info=New-Object Diagnostics.ProcessStartInfo
+        $info.FileName=Join-Path $PSHOME 'powershell.exe'
+        $info.Arguments='-NoProfile -NonInteractive -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+        $info.UseShellExecute=$false; $info.CreateNoWindow=$true; $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+        $p=[Diagnostics.Process]::Start($info)
+        try {
+            $out=$p.StandardOutput.ReadToEndAsync(); $err=$p.StandardError.ReadToEndAsync()
+            $p.WaitForExit(30000) | Should -BeTrue
+            $p.ExitCode | Should -Be 0 -Because ($out.Result+$err.Result)
+            $data=[IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
+            $data.Success | Should -BeTrue
+            $data.Server | Should -BeExactly $runtime.State.Server
+            $data.Units.Count | Should -Be 2
+            @(Get-GateWrites $runtime).Count | Should -Be 0
+        } finally { $p.Dispose() }
+    }
+}
+
+Describe 'GUI entry routing uses no directory or cloud module' -Tag 'GuiRouting' {
+    It 'routes -Gui before Desktop-only imports using <Engine>, and refuses mixed operation parameters' -ForEach @(
+        @{Engine='powershell.exe'}, @{Engine='pwsh.exe'}
+    ) {
+        $runtime=New-GateRuntime -Name 'gui-entry-routing'
+        $stub=@'
+function Show-PraGui {
+    param([string]$Root,[string]$ConfigPath,[string]$Version)
+    [IO.File]::WriteAllText((Join-Path $Root 'opened.json'),(@{
+        Root=$Root;ConfigPath=$ConfigPath;Version=$Version;Edition=$PSVersionTable.PSEdition
+        DirectoryLoaded=@(Get-Module PRA.Directory,ActiveDirectory,PRA.Cloud).Count
+    } | ConvertTo-Json))
+}
+Export-ModuleMember -Function Show-PraGui
+'@
+        [IO.File]::WriteAllText((Join-Path $runtime.Package 'module\PRA.Gui.psm1'),$stub,(New-Object Text.UTF8Encoding($true)))
+        $entry=Join-Path $runtime.Package 'Invoke-PraRemoteMailbox.ps1'
+        $exe=(Get-Command $Engine -CommandType Application -ErrorAction Stop).Source
+        foreach ($mixed in @($false,$true)) {
+            $info=New-Object Diagnostics.ProcessStartInfo
+            $info.FileName=$exe
+            $info.Arguments='-NoLogo -NoProfile -NonInteractive -STA -File "'+$entry+'" -Gui -ConfigPath "'+$runtime.ConfigPath+'"'
+            if ($mixed) { $info.Arguments+=' -Action Convert' }
+            $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+            $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
+            $process=[Diagnostics.Process]::Start($info)
+            try {
+                $out=$process.StandardOutput.ReadToEndAsync(); $err=$process.StandardError.ReadToEndAsync()
+                $process.WaitForExit(30000) | Should -BeTrue
+                $output=$out.GetAwaiter().GetResult()+$err.GetAwaiter().GetResult()
+                $marker=Join-Path $runtime.Package 'opened.json'
+                if ($mixed) {
+                    $process.ExitCode | Should -Not -Be 0
+                    Test-Path -LiteralPath $marker | Should -BeFalse
+                }
+                else {
+                    $process.ExitCode | Should -Be 0 -Because $output
+                    $opened=[IO.File]::ReadAllText($marker) | ConvertFrom-Json
+                    $opened.Version | Should -BeExactly '2.1.0'
+                    $opened.DirectoryLoaded | Should -Be 0
+                    $opened.ConfigPath | Should -BeExactly $runtime.ConfigPath
+                    Remove-Item -LiteralPath $marker -Force
+                }
+            }
+            finally { $process.Dispose() }
+        }
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+}
+
+Describe 'GUI events mirror the existing engine without extra mutations' -Tag 'GuiEvents' {
+    BeforeEach {
+        $oldEventPath=$env:PRA_EVENT_FILE
+        $runtime=New-GateRuntime -Name 'gui-event-channel'
+        $env:PRA_EVENT_FILE=Join-Path $runtime.Root 'gui.events.jsonl'
+    }
+    AfterEach { $env:PRA_EVENT_FILE=$oldEventPath }
+
+    It 'does nothing on the pipeline and creates no event file for an ordinary CLI run' {
+        $env:PRA_EVENT_FILE=''
+        @(Write-PraEvent -Kind item -Data @{text='not emitted'}).Count | Should -Be 0
+        Test-Path (Join-Path $runtime.Root 'gui.events.jsonl') | Should -BeFalse
+    }
+    It 'emits a complete UTF8 line with literal Unicode and newlines, without contaminating the pipeline' {
+        $text='message '+[char]0x00E9+"`n"+"'; exit 73; #"
+        @(Write-PraEvent -Kind item -Data @{text=$text;status='Info';identity='user@gate.invalid'}).Count | Should -Be 0
+        $bytes=[IO.File]::ReadAllBytes($env:PRA_EVENT_FILE)
+        $bytes[-1] | Should -Be 10
+        $bytes[0] | Should -Be 123
+        $event=[IO.File]::ReadAllText($env:PRA_EVENT_FILE) | ConvertFrom-Json
+        $event.kind | Should -BeExactly 'item'
+        $event.text | Should -BeExactly $text
+        $event.identity | Should -BeExactly 'user@gate.invalid'
+    }
+    It 'surfaces an unavailable event channel rather than pretending the window received the event' {
+        $env:PRA_EVENT_FILE=Join-Path $runtime.Root 'missing\events.jsonl'
+        { Write-PraEvent -Kind item -Data @{text='not delivered'} } | Should -Throw
+    }
+    It 'reports the actual Preview result and phase, preserving the native result and write-free behavior' {
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        $events=@(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
+        @($events | Where-Object kind -eq 'start').Count | Should -Be 1
+        @($events | Where-Object kind -eq 'step').Count | Should -BeGreaterThan 0
+        @($events | Where-Object kind -eq 'summary').Count | Should -Be 1
+        @($events | Where-Object kind -eq 'result').Count | Should -Be 1
+        $result=@($events | Where-Object kind -eq 'result')[0]
+        $result.phase | Should -BeExactly 'AD'
+        $result.action | Should -BeExactly 'Convert'
+        $result.mode | Should -BeExactly 'Preview'
+        $result.exitCode | Should -Be $run.ExitCode
+        $result.total | Should -Be $run.MainResult.TotalCount
+        $result.planned | Should -Be 2
+        $result.csvReport | Should -BeExactly $run.MainResult.CsvReport
+        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Gui.psm1') -Force
+        $request=New-PraGuiRequest -Action Convert -Phase AD
+        Test-PraGuiPreview -Result $result -Request $request -NativeExitCode $run.ExitCode | Should -BeTrue
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'reports a failed run as failed, including its issue and native exit code' {
+        $run=Invoke-GateProcess $runtime @{Action='Recover';Phase='AD';Mode='Preview';Batch='deadbeef';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 1
+        $result=@(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object kind -eq 'result')[0]
+        $result.exitCode | Should -Be 1
+        $result.status | Should -BeExactly 'Failed'
+        $result.issues -join ' ' | Should -Match 'not found'
+        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Gui.psm1') -Force
+        $request=New-PraGuiRequest -Action Recover -Phase AD -Batch deadbeef
+        Test-PraGuiPreview -Result $result -Request $request -NativeExitCode $run.ExitCode | Should -BeFalse
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+}
+
+Describe 'Culture-neutral test gate help validation' {
+    BeforeAll {
+        $gatePath=Join-Path $global:PraGate.Release 'tests\Invoke-TestGate.ps1'
+        $gateAst=[Management.Automation.Language.Parser]::ParseFile($gatePath,[ref]$null,[ref]$null)
+        $helpAssignment=$gateAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -eq 'helpPass'
+        },$true)
+        if ($null -eq $helpAssignment) { throw 'The gate help validation assignment is missing.' }
+        $helpValidation=[scriptblock]::Create($helpAssignment.Right.Extent.Text)
+    }
+    It 'accepts actual structured help independently of the displayed culture <Culture>' -ForEach @(
+        @{Culture='fr-FR'},@{Culture='en-US'}
+    ) {
+        $thread=[Threading.Thread]::CurrentThread
+        $originalCulture=$thread.CurrentUICulture
+        try {
+            $thread.CurrentUICulture=[Globalization.CultureInfo]::GetCultureInfo($Culture)
+            $help=Get-Help (Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1') -Full
+            $helpText='Localized headings are deliberately not part of the help contract.'
+            (& $helpValidation) | Should -BeTrue
+        }
+        finally { $thread.CurrentUICulture=$originalCulture }
+    }
+    It 'still rejects missing help metadata <Missing>' -ForEach @(
+        @{Missing='Synopsis'},@{Missing='Examples'},@{Missing='WhatIf'}
+    ) {
+        $help=@{
+            Synopsis='An authored synopsis.'
+            examples=@{example=@('example 1','example 2','example 3')}
+            parameters=@{parameter=@(@{name='Action'},@{name='WhatIf'})}
+        }
+        switch ($Missing) {
+            Synopsis { $help.Synopsis='' }
+            Examples { $help.examples.example=@('example 1','example 2') }
+            WhatIf { $help.parameters.parameter=@(@{name='Action'}) }
+        }
+        $helpText='SYNOPSIS WhatIf: formatted text cannot substitute for missing structured metadata.'
+        (& $helpValidation) | Should -BeFalse
+    }
+}
+
 Describe 'Scripts start with powershell.exe -File (scheduled task)' {
     It 'never reads $PSScriptRoot in a param() default (empty in Windows PowerShell 5.1 with -File)' {
         $files = @(Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1') + @(Get-ChildItem -LiteralPath (Join-Path $global:PraGate.Release 'tools') -Filter '*.ps1' | ForEach-Object FullName)
@@ -3478,12 +3867,11 @@ AfterAll {
     $env:PSModulePath=$global:PraGate.OriginalModulePath
     $env:PRA_GATE_NONET=$global:PraGate.OriginalNonet
     $env:PRA_GATE_STATE=$global:PraGate.OriginalState
-    Remove-Module ActiveDirectory,ADSync,PRA.Directory,PRA.Backup,PRA.Common -Force -ErrorAction SilentlyContinue
+    Remove-Module ActiveDirectory,ADSync,PRA.Directory,PRA.Backup,PRA.Common,PRA.Gui -Force -ErrorAction SilentlyContinue
     if ($env:PRA_GATE_EVIDENCE) {
         [IO.File]::WriteAllText((Join-Path $env:PRA_GATE_EVIDENCE 'fixture-provenance.txt'),"SYNTHETIC ONLY. AD and ADSync from temporary PSModulePath; production main/Common/Directory copied unchanged. Main Cloud replaced by declared synthetic barrier. No real AD/EXO/Graph/ADSync executed. Temporary fixture root: $($global:PraGate.Root)")
     }
-    Remove-Item -LiteralPath $global:PraGate.Root -Recurse -Force -ErrorAction SilentlyContinue
+    if ([IO.Directory]::Exists($global:PraGate.Root)) { [IO.Directory]::Delete($global:PraGate.Root,$true) }
     foreach ($name in @('New-GateUser','New-GateRuntime','New-GateContext','Get-GateEvents','Set-GateConfigText','Get-GateWrites','Save-GateDeltaEvidence','Invoke-GateProcess','New-GateSourceBundles','Get-GateCodec','Get-GateExpectedNodes','Assert-GateWireSnapshot','Save-GateOomEvidence')) { Remove-Item -LiteralPath ('Function:\'+$name) -ErrorAction SilentlyContinue }
     Remove-Variable PraGateAd,PraGate -Scope Global -ErrorAction SilentlyContinue
 }
-

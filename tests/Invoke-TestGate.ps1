@@ -12,7 +12,7 @@
     powershell.exe -NoLogo -NoProfile -NonInteractive -File .\tests\Invoke-TestGate.ps1
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.0.1
+    Version: 2.1.0
 #>
 #Requires -Version 5.1
 #Requires -PSEdition Desktop
@@ -54,7 +54,8 @@ try {
     $testRoot=[IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')+'\'
     $files=@(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { $_.Extension -in @('.ps1','.psm1','.psd1') -and -not $_.FullName.StartsWith($testRoot,[StringComparison]::OrdinalIgnoreCase) })
     $files+=@(Get-ChildItem -LiteralPath $PSScriptRoot -File | Where-Object Extension -eq '.ps1')
-    $hashes=@(foreach ($file in $files) { $hash=Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256; [pscustomobject]@{Path=$file.FullName;SHA256=$hash.Hash;Length=$file.Length} })
+    $hashFiles=@($files)+@(Get-Item -LiteralPath (Join-Path $root 'module\PRA.Gui.xaml') -ErrorAction Stop)
+    $hashes=@(foreach ($file in $hashFiles) { $hash=Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256; [pscustomobject]@{Path=$file.FullName;SHA256=$hash.Hash;Length=$file.Length} })
     [IO.File]::WriteAllText((Join-Path $EvidenceDirectory 'source-hashes.json'),($hashes | ConvertTo-Json -Depth 5),$encoding)
     foreach ($file in $files) {
         $tokens=$null; $errors=$null
@@ -70,9 +71,9 @@ try {
     $help=Get-Help $main -Full
     $helpText=$help | Out-String -Width 240
     [IO.File]::WriteAllText((Join-Path $EvidenceDirectory 'main-help.txt'),$helpText,$encoding)
-    $helpPass=($helpText -match 'SYNOPSIS|SYNOPSIS' -and @($help.examples.example).Count -ge 3 -and $helpText -match 'WhatIf')
-    $checks.Add([pscustomobject]@{Name='CommentBasedHelp';File=$main;Passed=$helpPass;Details='Get-Help only; no script invocation.'})
-    if (-not $helpPass) { $failures.Add('Comment-based help missing examples/WhatIf.') }
+    $helpPass=(-not [string]::IsNullOrWhiteSpace([string]$help.Synopsis) -and @($help.examples.example).Count -ge 3 -and @($help.parameters.parameter.name) -contains 'WhatIf')
+    $checks.Add([pscustomobject]@{Name='CommentBasedHelp';File=$main;Passed=$helpPass;Details='Structured synopsis/examples/WhatIf metadata; Get-Help only; no script invocation.'})
+    if (-not $helpPass) { $failures.Add('Comment-based help missing synopsis/examples/WhatIf.') }
     Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -ErrorAction Stop
     $analyzer=Get-Module PSScriptAnalyzer
     $summary.AnalyzerVersion=[string]$analyzer.Version
@@ -130,7 +131,7 @@ try {
     if ($pester.Version.Major -lt 5) { throw 'Pester >= 5 is mandatory.' }
     $summary.PesterVersion=[string]$pester.Version; $summary.PesterPath=$pester.Path
     $configuration=New-PesterConfiguration
-    $configuration.Run.Path=Join-Path $PSScriptRoot 'PraRemoteMailbox.Tests.ps1'
+    $configuration.Run.Path=@((Join-Path $PSScriptRoot 'PraRemoteMailbox.Tests.ps1'),(Join-Path $PSScriptRoot 'PraRemoteMailbox.Gui.Tests.ps1'))
     $configuration.Run.PassThru=$true
     $configuration.Run.Exit=$false
     $configuration.Output.Verbosity='Detailed'
@@ -175,4 +176,3 @@ finally {
     $env:PRA_GATE_EVIDENCE=$originalEvidence
 }
 exit $exitCode
-
