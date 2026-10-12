@@ -115,7 +115,15 @@
                  3.10+, Microsoft.Graph.Authentication and Microsoft.Graph.Users (cloud part), ADSync (sync).
     Exit codes : 0 = done, 1 = failed, 2 = done but a next step is required (Pending objects).
     Documentation : docs\PraRemoteMailbox-Guide.md (or .html)
-#>
+
+    Disclaimer:
+    This Script is a Personal project.
+    It's provided "AS-IS". It's not an official Microsoft product so no support can be expected from Microsoft.
+
+    As any scripts you must read carefully the documentation and test it first in a Test environment before any run in Production.
+
+    The tool changes production objects in Active Directory and creates mailboxes in Exchange Online: run the preview, review the plan, keep the backups and test in a lab before using it in a real disaster.
+#>
 #Requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Run')]
 param(
