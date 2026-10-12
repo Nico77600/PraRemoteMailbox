@@ -600,6 +600,22 @@ exit `$code
     Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Directory.psm1') -Force -Global
 }
 
+Describe 'Runtime disclaimer' -Tag 'Disclaimer' {
+    It 'keeps public script help identical to the root runtime readme disclaimer' {
+        $readme = [IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'README.md')).Replace("`r`n", "`n")
+        $sections = [regex]::Matches($readme, '(?ms)^## Disclaimer\n\n(?<Text>.*?)(?=^## |\z)')
+        $sections.Count | Should -Be 1
+        $canonical = $sections[0].Groups['Text'].Value.TrimEnd([char[]]"`n")
+        $canonical | Should -Not -BeNullOrEmpty
+
+        $entry = Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1'
+        $notes = ((Get-Help $entry -Full).alertSet.alert.Text -join "`n").Replace("`r`n", "`n")
+        $disclaimers = [regex]::Matches($notes, '(?ms)^Disclaimer:\n(?<Text>.*?)(?=\n\nRequires -Version|\z)')
+        $disclaimers.Count | Should -Be 1
+        $disclaimers[0].Groups['Text'].Value.TrimEnd([char[]]"`n") | Should -BeExactly $canonical
+    }
+}
+
 Describe 'Directory internal invariants - synthetic modules only' {
     BeforeEach {
         $global:PraGate.Runtime=New-GateRuntime -Name 'unit'
