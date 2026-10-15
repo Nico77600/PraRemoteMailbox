@@ -1,13 +1,16 @@
 ﻿#Requires -Version 5.1
 # Synthetic only: no AD, Exchange, Graph, network or production configuration.
 BeforeAll {
-    $script:GuiProjectRoot=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+    $script:GuiEvidence=Join-Path $PSScriptRoot ('evidence\gui-'+[guid]::NewGuid().ToString('N'))
+    $null=New-Item -ItemType Directory -Path $script:GuiEvidence -Force
+    # Controlled package copy (signature call substituted, real bootstrap/verifier/hash logic); see IntegrityFixture.ps1.
+    . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
+    $script:GuiProjectRoot=Join-Path $script:GuiEvidence 'package-fixture'
+    New-PraIntegrityFixture -SourcePackage ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\package'))) -Destination $script:GuiProjectRoot -Changelog ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\CHANGELOG.md')))
     $script:GuiModule=Join-Path $script:GuiProjectRoot 'module\PRA.Gui.psm1'
     $script:GuiCommon=Join-Path $script:GuiProjectRoot 'module\PRA.Common.psm1'
     Import-Module $script:GuiCommon -Force
     Import-Module $script:GuiModule -Force
-    $script:GuiEvidence=Join-Path $PSScriptRoot ('evidence\gui-'+[guid]::NewGuid().ToString('N'))
-    $null=New-Item -ItemType Directory -Path $script:GuiEvidence -Force
     $script:GuiEncoding=New-Object Text.UTF8Encoding($true)
 
     function Write-GuiTestFile {

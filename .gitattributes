@@ -1,0 +1,40 @@
+# Signed and hashed package files are byte-exact: no end-of-line conversion, so the Authenticode signature and the manifest SHA256 stay valid.
+# Do not add a global autocrlf rule for these paths.
+package/docs/** linguist-documentation
+
+# Owner-signed files (eight PowerShell files and the manifest); cr-at-eol because their working-tree line endings are CRLF.
+package/Invoke-PraRemoteMailbox.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Common.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Directory.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Backup.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Cloud.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.psm1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/PRA.Gui.Directory.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/module/Test-PackageIntegrity.ps1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/PackageIntegrity.psd1 -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+
+# Stable hashed files (SHA256 in the signed manifest) and the distribution copy of the changelog.
+package/module/PRA.Gui.xaml -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/templates/Report.template.html -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/config/Targets.sample.csv -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/config/SharedPermissions.sample.csv -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/README.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/LICENSE -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/docs/PraRemoteMailbox-Guide.html -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/docs/PraRemoteMailbox-Guide.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
+package/docs/images/console-apply.png -text
+package/docs/images/console-preview.png -text
+package/docs/images/gui-fluent.png -text
+package/docs/images/readme-banner-dark.png -text
+package/docs/images/readme-banner-light.png -text
+package/docs/images/readme-flows-dark.png -text
+package/docs/images/readme-flows-light.png -text
+package/docs/images/readme-how-dark.png -text
+package/docs/images/readme-how-light.png -text
+package/docs/images/readme-permissions-dark.png -text
+package/docs/images/readme-permissions-light.png -text
+package/docs/images/readme-principles-dark.png -text
+package/docs/images/readme-principles-light.png -text
+package/docs/images/report-warning.png -text
+package/docs/images/report.png -text
+CHANGELOG.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
