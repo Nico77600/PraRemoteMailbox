@@ -7,7 +7,7 @@
     Uses the guide's CSS and icon table, with the Purview README banner layout.
     Runs Microsoft Edge locally; no Exchange, tenant or lab connection is made.
 .PARAMETER OutputFolder
-    Defaults to docs\images. Only readme-banner-light.png and readme-banner-dark.png are written.
+    Defaults to package\docs\images. Only readme-banner-light.png and readme-banner-dark.png are written.
 .NOTES
     Author: Nicolas Fabert
     Repository documentation tool; not included in the runtime package.
@@ -17,13 +17,13 @@ param([string]$OutputFolder)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
-if (-not $OutputFolder) { $OutputFolder = Join-Path $root 'docs\images' }
+if (-not $OutputFolder) { $OutputFolder = Join-Path $root 'package\docs\images' }
 $OutputFolder = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputFolder)
-$runtime = [IO.File]::ReadAllText((Join-Path $root 'Invoke-PraRemoteMailbox.ps1'))
+$runtime = [IO.File]::ReadAllText((Join-Path $root 'package\Invoke-PraRemoteMailbox.ps1'))
 $versions = [regex]::Matches($runtime, '(?m)^\s*Version\s*:\s*(\d+\.\d+\.\d+)\s*$')
 if ($versions.Count -ne 1) { throw 'A unique runtime version was not found in Invoke-PraRemoteMailbox.ps1.' }
 $version = $versions[0].Groups[1].Value
-$guide = [IO.File]::ReadAllText((Join-Path $root 'docs\PraRemoteMailbox-Guide.md'))
+$guide = [IO.File]::ReadAllText((Join-Path $root 'package\docs\PraRemoteMailbox-Guide.md'))
 $guideVersion = [regex]::Match($guide, '(?m)^version:\s*(\S+)').Groups[1].Value
 if ($guideVersion -ne $version) { throw "Guide version $guideVersion differs from runtime version $version." }
 
@@ -43,7 +43,7 @@ function Get-ReadmeIcon([string]$Name, [string]$Class = 'icon') {
     if (-not $icons.ContainsKey($Name)) { throw "Unknown guide icon: $Name" }
     "<svg class=""$Class"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""1.7"" stroke-linecap=""round"" stroke-linejoin=""round"">$($icons[$Name])</svg>"
 }
-$guideHtml = [IO.File]::ReadAllText((Join-Path $root 'docs\PraRemoteMailbox-Guide.html'))
+$guideHtml = [IO.File]::ReadAllText((Join-Path $root 'package\docs\PraRemoteMailbox-Guide.html'))
 $css = [regex]::Match($guideHtml, '(?s)<style>(.*?)</style>').Groups[1].Value
 if (-not $css) { throw 'Guide CSS was not found. Build the HTML guide first.' }
 $css += @'

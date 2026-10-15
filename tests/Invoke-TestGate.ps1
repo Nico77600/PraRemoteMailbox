@@ -12,7 +12,7 @@
     powershell.exe -NoLogo -NoProfile -NonInteractive -File .\tests\Invoke-TestGate.ps1
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.1.0
+    Version: 2.2.0
 #>
 #Requires -Version 5.1
 #Requires -PSEdition Desktop
@@ -46,7 +46,7 @@ $summary=[ordered]@{
     PesterVersion=''; PesterPath=''; AnalyzerVersion=''; AnalyzerProfiles=@(); TotalCount=0; PassedCount=0; FailedCount=0
     FailedBlocksCount=0; FailedContainersCount=0; AnalyzerErrorCount=0; AnalyzerWarningCount=0
     ReleaseDefaultWarningCount=0; ReleaseCompatibilityWarningCount=0; GateWarningCount=0
-    Checks=@(); Failures=@(); RuntimeMilliseconds=0; ExitCode=1; RESULT='FAIL'; EvidenceDirectory=$EvidenceDirectory
+    NativeSignatureState=@(); Checks=@(); Failures=@(); RuntimeMilliseconds=0; ExitCode=1; RESULT='FAIL'; EvidenceDirectory=$EvidenceDirectory
 }
 try {
     Start-Transcript -LiteralPath (Join-Path $EvidenceDirectory 'gate.transcript.txt') -NoClobber | Out-Null
@@ -54,7 +54,7 @@ try {
     $testRoot=[IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')+'\'
     $files=@(Get-ChildItem -LiteralPath $root -Recurse -File | Where-Object { $_.Extension -in @('.ps1','.psm1','.psd1') -and -not $_.FullName.StartsWith($testRoot,[StringComparison]::OrdinalIgnoreCase) })
     $files+=@(Get-ChildItem -LiteralPath $PSScriptRoot -File | Where-Object Extension -eq '.ps1')
-    $hashFiles=@($files)+@(Get-Item -LiteralPath (Join-Path $root 'module\PRA.Gui.xaml') -ErrorAction Stop)
+    $hashFiles=@($files)+@(Get-Item -LiteralPath (Join-Path $root 'package\module\PRA.Gui.xaml') -ErrorAction Stop)
     $hashes=@(foreach ($file in $hashFiles) { $hash=Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256; [pscustomobject]@{Path=$file.FullName;SHA256=$hash.Hash;Length=$file.Length} })
     [IO.File]::WriteAllText((Join-Path $EvidenceDirectory 'source-hashes.json'),($hashes | ConvertTo-Json -Depth 5),$encoding)
     foreach ($file in $files) {
@@ -67,7 +67,11 @@ try {
         $checks.Add([pscustomobject]@{Name='UTF8-BOM';File=$file.FullName;Passed=$bom;Details='Windows PowerShell 5.1 deterministic decoding.'})
         if (-not $bom) { $failures.Add('UTF8 BOM absent: '+$file.FullName) }
     }
-    $main=Join-Path $root 'Invoke-PraRemoteMailbox.ps1'
+    # Honest native state of the runtime signatures: Authenticode is not mocked here; the integrity tests assert fail-closed or valid.
+    $signed=@(foreach ($name in @('Invoke-PraRemoteMailbox.ps1','module\PRA.Common.psm1','module\PRA.Directory.psm1','module\PRA.Backup.psm1','module\PRA.Cloud.psm1','module\PRA.Gui.psm1','module\PRA.Gui.Directory.ps1','module\Test-PackageIntegrity.ps1','PackageIntegrity.psd1')) { $sig=Get-AuthenticodeSignature -LiteralPath (Join-Path $root ('package\'+$name)); [pscustomobject]@{Path=$name;Status=[string]$sig.Status;Signer=if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { '' };Timestamped=($null -ne $sig.TimeStamperCertificate)} })
+    [IO.File]::WriteAllText((Join-Path $EvidenceDirectory 'native-signature-state.json'),(ConvertTo-Json -InputObject $signed -Depth 4),$encoding)
+    $summary.NativeSignatureState=@($signed | ForEach-Object { $_.Path+'='+$_.Status })
+    $main=Join-Path $root 'package\Invoke-PraRemoteMailbox.ps1'
     $help=Get-Help $main -Full
     $helpText=$help | Out-String -Width 240
     [IO.File]::WriteAllText((Join-Path $EvidenceDirectory 'main-help.txt'),$helpText,$encoding)
@@ -131,7 +135,7 @@ try {
     if ($pester.Version.Major -lt 5) { throw 'Pester >= 5 is mandatory.' }
     $summary.PesterVersion=[string]$pester.Version; $summary.PesterPath=$pester.Path
     $configuration=New-PesterConfiguration
-    $configuration.Run.Path=@((Join-Path $PSScriptRoot 'PraRemoteMailbox.Tests.ps1'),(Join-Path $PSScriptRoot 'PraRemoteMailbox.Gui.Tests.ps1'))
+    $configuration.Run.Path=@((Join-Path $PSScriptRoot 'PraRemoteMailbox.Tests.ps1'),(Join-Path $PSScriptRoot 'PraRemoteMailbox.Gui.Tests.ps1'),(Join-Path $PSScriptRoot 'PackageIntegrity.Tests.ps1'),(Join-Path $PSScriptRoot 'PraReport.Tests.ps1'))
     $configuration.Run.PassThru=$true
     $configuration.Run.Exit=$false
     $configuration.Output.Verbosity='Detailed'

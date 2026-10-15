@@ -9,7 +9,7 @@
     No legacy Assert-MockCalled: counters are mutable objects.
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.1.0
+    Version: 2.2.0
     Run it through tests\Invoke-TestGate.ps1 (evidence, PSScriptAnalyzer, mandatory tests).
 #>
 #Requires -Version 5.1
@@ -23,7 +23,11 @@ BeforeAll {
         OriginalState = $env:PRA_GATE_STATE
         Runtime = $null
     }
+    $global:PraGate.Source = Join-Path $global:PraGate.Release 'package'
     $null = New-Item -ItemType Directory -Path $global:PraGate.Root -Force
+    . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
+    $global:PraGate.Package = Join-Path $global:PraGate.Root 'package-fixture'
+    New-PraIntegrityFixture -SourcePackage $global:PraGate.Source -Destination $global:PraGate.Package -Changelog (Join-Path $global:PraGate.Release 'CHANGELOG.md')
     $env:PRA_GATE_NONET = 'SYNTHETIC-NO-NETWORK'
     $global:PraGate.AdSource = @'
 # SYNTHETIC fixture. No AD management assembly, provider, network or remoting.
@@ -354,11 +358,9 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         foreach ($name in @('ActiveDirectory','ADSync')) { $null=New-Item -ItemType Directory -Path (Join-Path $modules $name) -Force }
         [IO.File]::WriteAllText((Join-Path $modules 'ActiveDirectory\ActiveDirectory.psm1'),$global:PraGate.AdSource,(New-Object Text.UTF8Encoding($true)))
         [IO.File]::WriteAllText((Join-Path $modules 'ADSync\ADSync.psm1'),$global:PraGate.SyncSource,(New-Object Text.UTF8Encoding($true)))
-        Copy-Item -LiteralPath (Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1') -Destination $package
-        foreach ($name in @('PRA.Common.psm1','PRA.Backup.psm1','PRA.Directory.psm1')) { Copy-Item -LiteralPath (Join-Path $global:PraGate.Release ('module\'+$name)) -Destination (Join-Path $package 'module') }
-        Copy-Item -LiteralPath (Join-Path $global:PraGate.Release 'module\PRA.Gui.Directory.ps1') -Destination (Join-Path $package 'module')
+        Copy-Item -Path (Join-Path $global:PraGate.Package '*') -Destination $package -Recurse -Force
         [IO.File]::WriteAllText((Join-Path $package 'module\PRA.Cloud.psm1'),$global:PraGate.CloudSource,(New-Object Text.UTF8Encoding($true)))
-        Copy-Item -LiteralPath (Join-Path $global:PraGate.Release 'templates\Report.template.html') -Destination (Join-Path $package 'templates') -ErrorAction SilentlyContinue
+        Set-PraFixtureHash -Root $package -Relative 'module\PRA.Cloud.psm1'
         $users=@((New-GateUser 1),(New-GateUser 2))
         if ($Shared13) {
             $users=@(1..13 | ForEach-Object { New-GateUser $_ })
@@ -592,23 +594,23 @@ exit `$code
                 [pscustomobject]@{Path=$file.FullName;Bytes=$file.Length;SHA256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash}
             }
         })
-        $record=[ordered]@{Synthetic=$true;Name=$Name;Runtime=$Runtime.Root;Statistics=$Statistics;Artifacts=$artifacts;SourceHashes=@(foreach ($moduleName in @('PRA.Backup.psm1','PRA.Directory.psm1')) { Get-FileHash -LiteralPath (Join-Path $global:PraGate.Release ('module\'+$moduleName)) -Algorithm SHA256 | Select-Object Path,Hash })}
+        $record=[ordered]@{Synthetic=$true;Name=$Name;Runtime=$Runtime.Root;Statistics=$Statistics;Artifacts=$artifacts;SourceHashes=@(foreach ($moduleName in @('PRA.Backup.psm1','PRA.Directory.psm1')) { Get-FileHash -LiteralPath (Join-Path $global:PraGate.Package ('module\'+$moduleName)) -Algorithm SHA256 | Select-Object Path,Hash })}
         [IO.File]::WriteAllText((Join-Path $env:PRA_GATE_EVIDENCE ((Split-Path $Runtime.Root -Leaf)+'-'+$Name+'.oom.json')),($record | ConvertTo-Json -Depth 12),(New-Object Text.UTF8Encoding($true)))
     }
-    Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Common.psm1') -Force -Global
-    Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Backup.psm1') -Force -Global
-    Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Directory.psm1') -Force -Global
+    Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+    Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Backup.psm1') -Force -Global
+    Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
 }
 
 Describe 'Runtime disclaimer' -Tag 'Disclaimer' {
     It 'keeps public script help identical to the root runtime readme disclaimer' {
-        $readme = [IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'README.md')).Replace("`r`n", "`n")
+        $readme = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'README.md')).Replace("`r`n", "`n")
         $sections = [regex]::Matches($readme, '(?ms)^## Disclaimer\n\n(?<Text>.*?)(?=^## |\z)')
         $sections.Count | Should -Be 1
         $canonical = $sections[0].Groups['Text'].Value.TrimEnd([char[]]"`n")
         $canonical | Should -Not -BeNullOrEmpty
 
-        $entry = Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1'
+        $entry = Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'
         $notes = ((Get-Help $entry -Full).alertSet.alert.Text -join "`n").Replace("`r`n", "`n")
         $disclaimers = [regex]::Matches($notes, '(?ms)^Disclaimer:\n(?<Text>.*?)(?=\n\nRequires -Version|\z)')
         $disclaimers.Count | Should -Be 1
@@ -1023,7 +1025,7 @@ function Get-ADUser {
         Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
         Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
         Import-Module $adModulePath -Force -Global -ErrorAction Stop
-        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Directory.psm1') -Force -Global -ErrorAction Stop
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global -ErrorAction Stop
         $directory=Get-Module PRA.Directory
         (Get-Command Get-ADUser).Module.Path | Should -BeExactly $adModulePath
         (& $directory { (Get-Command Get-ADUser).Module.Path }) | Should -BeExactly $adModulePath -Because 'the product module, not only the test scope, must resolve the subtree-aware fixture'
@@ -1147,13 +1149,13 @@ Describe 'OOM data-only raw codec and historical compatibility' -Tag 'OOM' {
     }
     It 'uses real streaming writer/reader and forbids raw native graph deserialization' {
         $codec=Get-GateCodec
-        $codec.Path | Should -BeExactly (Join-Path $global:PraGate.Release 'module\PRA.Backup.psm1')
+        $codec.Path | Should -BeExactly (Join-Path $global:PraGate.Package 'module\PRA.Backup.psm1')
         $text=[IO.File]::ReadAllText($codec.Path)
         $text | Should -Match 'XmlWriter'
         $text | Should -Match 'XmlReader'
         $text | Should -Match 'CreateNew'
         $text | Should -Not -Match 'PSSerializer|Import-Clixml|ReadAllText|ReadAllBytes'
-        $directoryText=[IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'module\PRA.Directory.psm1'))
+        $directoryText=[IO.File]::ReadAllText((Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1'))
         $directoryText | Should -Not -Match 'PSSerializer|Import-Clixml|ReadAllText'
         $runtime=$global:PraGate.Runtime
         (Get-FileHash (Join-Path $runtime.Package 'module\PRA.Backup.psm1')).Hash | Should -Be (Get-FileHash $codec.Path).Hash
@@ -2063,10 +2065,10 @@ Describe 'Common value and report contracts' {
             $outcome.Counts.Error | Should -Be 0
             $outcome.Rows[0].PermMissing | Should -BeExactly ''
             $html=Get-PraReportHtml -Context $context -Outcome $outcome
-            $html | Should -Match '<table id="rows">'
-            foreach ($header in @('Object','Type','Status','Active Directory','Licence group','Exchange Online','Permissions','Detail')) { $html | Should -Match ('<th>'+[regex]::Escape($header)+'</th>') }
-            $html | Should -Match '<details class="raw"><summary>All columns'
-            $html | Should -Match '<th>PermMissing</th>'
+            $html | Should -Match '<script type="application/x-pra-chunk" data-kind="rows" data-seq="0">'
+            $html | Should -Match '"rows":\{"count":1,'
+            $html | Should -Match '"fields":\[[^\]]*"PermMissing"'
+            $html | Should -Not -Match '<table id="rows">'
             $html | Should -Not -Match 'System.Object\[\]|phantom'
         }
     }
@@ -2081,10 +2083,10 @@ Describe 'Common value and report contracts' {
             $outcome.Rows[0].Warnings | Should -Match 'FullAccess S-1-5-21-1-2-3-9999'
             $html=Get-PraReportHtml -Context $context -Outcome $outcome
             $html | Should -Match '<div class="tile-label">Warnings</div><div class="tile-value">1</div>'
-            $html | Should -Match '<section class="card warnings">'
-            $html | Should -Match 'class="st-planned has-warn"'
-            $html | Should -Match '<div class="row-warn">'
-            $html | Should -Match '<th>Warnings</th>'
+            $html | Should -Match '<section class="card warnings" id="warnings-card" hidden>'
+            $html | Should -Match '"warnings":\{"count":1,'
+            $html | Should -Match '"fields":\[[^\]]*"Warnings"'
+            $html | Should -Match '<script type="application/x-pra-chunk" data-kind="warnings" data-seq="0">'
         }
     }
 }
@@ -2412,7 +2414,7 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgU
 '@
         [IO.File]::WriteAllText($global:PraGate.CloudNetworkPath,$networkSource,(New-Object Text.UTF8Encoding($true)))
         Import-Module $global:PraGate.CloudNetworkPath -Global -Force
-        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Cloud.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
     }
     BeforeEach {
         $global:PraGate.Runtime=New-GateRuntime -Name 'cloud-unit'
@@ -2715,7 +2717,7 @@ Export-ModuleMember -Function Get-ConnectionInformation,Get-EXORecipient,Get-EXO
         [IO.File]::WriteAllText($global:PraGate.NativeModulePath,$nativeSource,(New-Object Text.UTF8Encoding($true)))
         if (-not ('PraGateNativeRight' -as [type])) { Add-Type -TypeDefinition 'public enum PraGateNativeRight { FullAccess=1, SendAs=2 }' }
         Import-Module $global:PraGate.NativeModulePath -Global -Force
-        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Cloud.psm1') -Global -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Global -Force
     }
     BeforeEach {
         $global:PraGate.Runtime=New-GateRuntime -Name 'native-cloud'
@@ -2976,7 +2978,7 @@ Describe 'Actual main cloud authority closures - offline scope regression' -Tag 
     BeforeAll {
         # Parse, never execute the product main. Keep its CURRENT constructor and grant unchanged.
         $tokens=$null; $parseErrors=$null
-        $mainAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1'),[ref]$tokens,[ref]$parseErrors)
+        $mainAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'),[ref]$tokens,[ref]$parseErrors)
         if ($parseErrors.Count) { throw 'Current main has parse errors.' }
         $authorityAst=$mainAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Initialize-PraCloudAuthority'},$true)
         if ($null -eq $authorityAst) { throw 'Actual cloud authority constructor absent.' }
@@ -3002,7 +3004,7 @@ else {
 '@
         $global:PraGate.AuthorityFactory=Join-Path $global:PraGate.Root 'ActualCloudAuthority.ps1'
         [IO.File]::WriteAllText($global:PraGate.AuthorityFactory,$factoryBody.Replace('__ACTUAL_AUTHORITY__',$authorityAst.Extent.Text),(New-Object Text.UTF8Encoding($true)))
-        $cloudAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Release 'module\PRA.Cloud.psm1'),[ref]$tokens,[ref]$parseErrors)
+        $cloudAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1'),[ref]$tokens,[ref]$parseErrors)
         if ($parseErrors.Count) { throw 'Current Cloud module has parse errors.' }
         $grantAst=$cloudAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-PraPermissionGrant'},$true)
         # Only the grant guard is loaded. No real Cloud transport/connectors exist in this module.
@@ -3101,7 +3103,7 @@ Export-ModuleMember -Function Invoke-PraPermissionGrant
         $context=$global:PraGate.AuthorityContext
         $resolved=& $context.AssertCloudAuthorization.Module {param($name) Get-Command $name -ErrorAction Stop} $Command
         $resolved.ModuleName | Should -BeExactly 'PRA.Directory'
-        $resolved.Module.Path | Should -BeExactly (Join-Path $global:PraGate.Release 'module\PRA.Directory.psm1')
+        $resolved.Module.Path | Should -BeExactly (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1')
     }
     It 'retains native proof and receipt rejection for <Case> before Started' -ForEach @(
         @{Case='StateHash';Message='*AD proof (State file): SHA-256 mismatch*'},
@@ -3138,7 +3140,7 @@ Describe 'Batch resolution diagnostics - complete synthetic main invocations' -T
         Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
         Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
         Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
-        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Directory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
         $context=New-GateContext $runtime
         $context.BackupFolder=$runtime.State.BackupFolder
         $bundles=New-GateSourceBundles $context
@@ -3553,14 +3555,14 @@ Describe 'Split cloud recovery never restores AD implicitly' -Tag 'GuiIntegratio
         $env:PSModulePath=$runtime.Modules+';'+(Join-Path $PSHOME 'Modules')
         Get-Module ActiveDirectory -All | Remove-Module -Force
         Import-Module ActiveDirectory -Force -Global
-        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Directory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
         $context=New-GateContext $runtime
         $bundles=New-GateSourceBundles $context -ApplySnapshots
         [IO.File]::WriteAllText($runtime.StatePath,[Management.Automation.PSSerializer]::Serialize($global:PraGateAd,35))
         $before=@(Get-GateWrites $runtime).Count
         $config=Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package
         $beforeEvents=@(Get-GateEvents $runtime).Count
-        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Gui.psm1') -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Gui.psm1') -Force
         $guiState=Read-PraGuiState -Root $runtime.Package -ConfigPath $runtime.ConfigPath
         (Read-PraGuiBatch -Path $bundles.Source -Environment $config.Environment).Valid | Should -BeTrue
         (Read-PraGuiBatch -Path $bundles.Recover -Environment $config.Environment).Valid | Should -BeTrue
@@ -3594,6 +3596,195 @@ Describe 'Split cloud recovery never restores AD implicitly' -Tag 'GuiIntegratio
         @($rows | Where-Object { $_.ADVerified -eq 'True' -and $_.FinalStatus -eq 'Success' }).Count | Should -Be 2
     }
 }
+
+Describe 'Runtime output folders versus the authenticated package' -Tag 'Integrity' {
+    BeforeAll {
+        function global:Get-GatePackageFiles($Runtime) { @(Get-ChildItem -LiteralPath $Runtime.Package -Recurse -Force | ForEach-Object { $_.FullName.Substring($Runtime.Package.Length) } | Sort-Object) }
+        function global:Set-GateOutputFolders($Runtime,[string]$Backup,[string]$Log,[string]$Report) {
+            Set-GateConfigText $Runtime {
+                param($t)
+                $t=[regex]::Replace($t,"BackupFolder='[^']*'",[Text.RegularExpressions.MatchEvaluator]{ "BackupFolder='$Backup'" })
+                $t=[regex]::Replace($t,"Logging=@\{Folder='[^']*'\}",[Text.RegularExpressions.MatchEvaluator]{ "Logging=@{Folder='$Log'}" })
+                [regex]::Replace($t,'(Report=@\{Enabled=\$true;Folder=)''[^'']*''',[Text.RegularExpressions.MatchEvaluator]{ param($m) $m.Groups[1].Value+"'$Report'" })
+            }.GetNewClosure()
+        }
+    }
+    AfterAll { foreach ($name in 'Get-GatePackageFiles','Set-GateOutputFolders') { Remove-Item -LiteralPath ('Function:\'+$name) -ErrorAction SilentlyContinue } }
+    It 'refuses every non-canonical in-package destination before any file exists (<Name>)' -ForEach @(
+        @{Name='custom log folder';Backup='.\Backups';Log='.\audit';Report='.\reports'}
+        @{Name='custom report folder';Backup='.\Backups';Log='.\logs';Report='.\module\out'}
+        @{Name='backup folder beside the code';Backup='.\config';Log='.\logs';Report='.\reports'}
+        @{Name='folder overlapping templates';Backup='.\Backups';Log='.\templates\logs';Report='.\reports'}
+        @{Name='package root itself';Backup='.\Backups';Log='.\logs';Report='.'}
+        @{Name='wrong case of the canonical folder';Backup='.\backups';Log='.\logs';Report='.\reports'}
+        @{Name='canonical folder of another setting';Backup='.\logs';Log='.\logs';Report='.\reports'}
+        @{Name='parent segments back into the code';Backup='.\Backups\..\module';Log='.\logs';Report='.\reports'}
+    ) {
+        $runtime=New-GateRuntime -Name ('outputs-'+($Name -replace '\W','-'))
+        Set-GateOutputFolders $runtime $Backup $Log $Report
+        $before=Get-GatePackageFiles $runtime
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*inside the signed package*'
+        Import-Module (Join-Path $runtime.Package 'module\PRA.Gui.psm1') -Force
+        $state=Read-PraGuiState -Root $runtime.Package -ConfigPath $runtime.ConfigPath
+        $state.ConfigError | Should -Match 'inside the signed package'
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Not -Be 0
+        (@($run.MainResult.Issues | ForEach-Object { [string]$_.Message }) -join ' ') | Should -Match 'inside the signed package'
+        # The failed start still audits itself in the canonical folders; nothing may appear anywhere else.
+        @(Get-GatePackageFiles $runtime | Where-Object { $_ -notin $before -and $_ -cnotmatch '^\\(Backups|logs|reports)(\\|$)' }) | Should -BeNullOrEmpty
+    }
+    It 'accepts the canonical folders, their sub-folders and folders outside the package, and later runs keep working' {
+        $runtime=New-GateRuntime -Name 'outputs-valid'
+        $external=Join-Path $runtime.Root 'external-out'
+        Set-GateOutputFolders $runtime '.\Backups\site-a' '.\logs' $external
+        $config=Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package
+        $config.Report.Folder | Should -BeExactly $external
+        $config.Logging.Folder | Should -BeExactly (Join-Path $runtime.Package 'logs')
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        (Test-Path -LiteralPath (Join-Path $runtime.Package 'logs')) | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $external -File).Count | Should -BeGreaterThan 0
+        { Import-Module (Join-Path $runtime.Package 'module\PRA.Cloud.psm1') -Force } | Should -Not -Throw
+        $again=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+        $again.ExitCode | Should -Be 0
+    }
+    It 'refuses a canonical folder that is a reparse point inside the package' {
+        $runtime=New-GateRuntime -Name 'outputs-reparse'
+        $target=Join-Path $runtime.Root 'junction-target'; $null=New-Item -ItemType Directory -Path $target
+        Set-GateOutputFolders $runtime '.\Backups' '.\logs' '.\reports'
+        $link=Join-Path $runtime.Package 'logs'
+        $null=New-Item -ItemType Junction -Path $link -Target $target -ErrorAction Stop
+        try { { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*reparse point*' }
+        finally { [IO.Directory]::Delete($link) }
+    }
+    It 'refuses the protected folders through a device prefix or a junction alias, also for a missing child, before any file exists (<Name>)' -ForEach @(
+        @{Name='device prefix, code folder';Kind='Device';Child='module'}
+        @{Name='device prefix, missing child of the code folder';Kind='Device';Child='module\not-yet'}
+        @{Name='device prefix, config folder';Kind='Device';Child='config'}
+        @{Name='junction alias, code folder';Kind='Alias';Child='module'}
+        @{Name='junction alias, missing child of the code folder';Kind='Alias';Child='module\not-yet\deeper'}
+        @{Name='junction alias, package root';Kind='Alias';Child=''}
+        @{Name='junction alias, sibling name of the canonical folder';Kind='Alias';Child='logs-x'}
+    ) {
+        $runtime=New-GateRuntime -Name ('outputs-alias-'+($Name -replace '\W','-'))
+        $base=$runtime.Package
+        if ($Kind -eq 'Alias') {
+            $base=Join-Path $runtime.Root 'package-alias'
+            $null=New-Item -ItemType Junction -Path $base -Target $runtime.Package -ErrorAction Stop
+        }
+        else { $base='\\?\'+$runtime.Package }
+        try {
+            $destination=if ($Child) { $base+'\'+$Child } else { $base }
+            Set-GateOutputFolders $runtime '.\Backups' $destination '.\reports'
+            $before=Get-GatePackageFiles $runtime
+            { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*inside the signed package*'
+            Import-Module (Join-Path $runtime.Package 'module\PRA.Gui.psm1') -Force
+            (Read-PraGuiState -Root $runtime.Package -ConfigPath $runtime.ConfigPath).ConfigError | Should -Match 'inside the signed package'
+            $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+            $run.ExitCode | Should -Not -Be 0
+            @(Get-GatePackageFiles $runtime | Where-Object { $_ -notin $before -and $_ -cnotmatch '^\\(Backups|logs|reports)(\\|$)' }) | Should -BeNullOrEmpty
+        }
+        finally { if ($Kind -eq 'Alias') { [IO.Directory]::Delete($base) } }
+    }
+    It 'resolves the canonical folders through a device prefix or a junction alias to the physical package path and keeps ordinary external folders' {
+        $runtime=New-GateRuntime -Name 'outputs-alias-valid'
+        $alias=Join-Path $runtime.Root 'package-alias'
+        $null=New-Item -ItemType Junction -Path $alias -Target $runtime.Package -ErrorAction Stop
+        try {
+            $external=Join-Path $runtime.Root 'external-out'
+            Set-GateOutputFolders $runtime ('\\?\'+$runtime.Package+'\Backups\site-a') ($alias+'\logs') $external
+            $config=Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package
+            $config.Storage.BackupFolder | Should -BeExactly (Join-Path $runtime.Package 'Backups\site-a')
+            $config.Logging.Folder | Should -BeExactly (Join-Path $runtime.Package 'logs')
+            $config.Report.Folder | Should -BeExactly $external
+        }
+        finally { [IO.Directory]::Delete($alias) }
+    }
+    It 'loads and checks real configurations in a child <Engine> process: canonical and external folders are accepted, aliases and unresolved paths are refused' -ForEach @(
+        @{Engine='Windows PowerShell 5.1';Exe=(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe');Major=5}
+        @{Engine='PowerShell 7';Exe=$(if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { (Get-Command pwsh.exe).Source } else { '' });Major=7}
+    ) {
+        $Exe | Should -Not -BeNullOrEmpty -Because 'the PowerShell 7 GUI launcher uses the same module, so both engines are tested'
+        $runtime=New-GateRuntime -Name ('outputs-engine-'+$Major)
+        $alias=Join-Path $runtime.Root 'package-alias'
+        $null=New-Item -ItemType Junction -Path $alias -Target $runtime.Package -ErrorAction Stop
+        $external=Join-Path $runtime.Root 'external-out'
+        try {
+            $cases=[ordered]@{
+                valid=@('.\Backups\site-a','.\logs',$external)
+                volumeRoot=@('.\Backups','.\logs',([IO.Path]::GetPathRoot($runtime.Package)))
+                device=@(('\\?\'+$runtime.Package+'\Backups'),'.\logs','.\reports')
+                aliasCanonical=@('.\Backups',($alias+'\logs'),'.\reports')
+                deviceCode=@('.\Backups',('\\?\'+$runtime.Package+'\module'),'.\reports')
+                aliasCode=@('.\Backups','.\logs',($alias+'\module\not-yet'))
+                unknownVolume=@('.\Backups','.\logs','\\?\Volume{00000000-0000-0000-0000-000000000000}\out')
+                deviceDots=@('.\Backups','.\logs',('\\?\'+$runtime.Package+'\Backups\..\module'))
+            }
+            $list=@()
+            foreach ($key in $cases.Keys) {
+                Set-GateOutputFolders $runtime $cases[$key][0] $cases[$key][1] $cases[$key][2]
+                $path=Join-Path $runtime.Root ('case-'+$key+'.psd1'); Copy-Item -LiteralPath $runtime.ConfigPath -Destination $path
+                $list+=$path
+            }
+            $before=Get-GatePackageFiles $runtime
+            $script=@"
+`$ErrorActionPreference='Stop'
+Import-Module '$($runtime.Package.Replace("'","''"))\module\PRA.Common.psm1' -Force
+`$results=[ordered]@{ Version=`$PSVersionTable.PSVersion.ToString(); Cases=[ordered]@{} }
+foreach (`$file in @('$(($list | ForEach-Object { $_.Replace("'","''") }) -join "','")')) {
+    `$name=[IO.Path]::GetFileNameWithoutExtension(`$file).Substring(5)
+    try { `$c=Import-PraConfiguration -Path `$file -Root '$($runtime.Package.Replace("'","''"))'; `$results.Cases[`$name]=@{Ok=`$true;Backup=`$c.Storage.BackupFolder;Log=`$c.Logging.Folder;Report=`$c.Report.Folder} }
+    catch { `$results.Cases[`$name]=@{Ok=`$false;Error=`$_.Exception.Message} }
+}
+`$results.Init=& (Get-Module PRA.Common) {
+    `$first=`$script:PraNativePath; `$null=Get-PraPhysicalPath '$($runtime.Package.Replace("'","''"))\module'; `$null=Get-PraPhysicalPath '$($external.Replace("'","''"))\missing'
+    @{Created=(`$null -ne `$first); Cached=([object]::ReferenceEquals(`$first,`$script:PraNativePath)); Type=`$first.FullName; Methods=@(`$first.GetMethods() | Where-Object DeclaringType -eq `$first | ForEach-Object Name | Sort-Object)}
+}
+[IO.File]::WriteAllText('$((Join-Path $runtime.Root 'engine.json').Replace("'","''"))',(`$results | ConvertTo-Json -Depth 6),(New-Object Text.UTF8Encoding(`$false)))
+"@
+            $scriptPath=Join-Path $runtime.Root 'engine.ps1'
+            [IO.File]::WriteAllText($scriptPath,$script,(New-Object Text.UTF8Encoding($true)))
+            $output=& $Exe -NoProfile -NonInteractive -File $scriptPath 2>&1
+            $LASTEXITCODE | Should -Be 0 -Because ([string]($output -join ' '))
+            $r=[IO.File]::ReadAllText((Join-Path $runtime.Root 'engine.json')) | ConvertFrom-Json
+            [int]($r.Version.Split('.')[0]) | Should -Be $Major
+            $r.Init.Created | Should -BeTrue
+            $r.Init.Cached | Should -BeTrue
+            $r.Init.Methods | Should -Contain 'CreateFileW'
+            $r.Init.Methods | Should -Contain 'GetFinalPathNameByHandleW'
+            $r.Cases.valid.Ok | Should -BeTrue
+            $r.Cases.valid.Backup | Should -BeExactly (Join-Path $runtime.Package 'Backups\site-a')
+            $r.Cases.valid.Log | Should -BeExactly (Join-Path $runtime.Package 'logs')
+            $r.Cases.valid.Report | Should -BeExactly $external
+            $r.Cases.volumeRoot.Ok | Should -BeTrue
+            $r.Cases.volumeRoot.Report | Should -BeExactly ([IO.Path]::GetPathRoot($runtime.Package))
+            $r.Cases.device.Ok | Should -BeTrue
+            $r.Cases.device.Backup | Should -BeExactly (Join-Path $runtime.Package 'Backups')
+            $r.Cases.aliasCanonical.Ok | Should -BeTrue
+            $r.Cases.aliasCanonical.Log | Should -BeExactly (Join-Path $runtime.Package 'logs')
+            $r.Cases.deviceCode.Ok | Should -BeFalse
+            $r.Cases.deviceCode.Error | Should -Match 'inside the signed package'
+            $r.Cases.aliasCode.Ok | Should -BeFalse
+            $r.Cases.aliasCode.Error | Should -Match 'inside the signed package'
+            $r.Cases.unknownVolume.Ok | Should -BeFalse
+            $r.Cases.unknownVolume.Error | Should -Match 'cannot be checked against the signed package'
+            $r.Cases.deviceDots.Ok | Should -BeFalse
+            $r.Cases.deviceDots.Error | Should -Match 'cannot be checked against the signed package'
+            @(Get-GatePackageFiles $runtime) | Should -Be $before
+        }
+        finally { [IO.Directory]::Delete($alias) }
+    }
+    It 'refuses a destination whose physical location cannot be resolved instead of treating it as external (<Name>)' -ForEach @(
+        @{Name='unknown volume namespace';Path='\\?\Volume{00000000-0000-0000-0000-000000000000}\out'}
+        @{Name='device namespace with parent segments';Path='\\?\C:\a\..\b'}
+        @{Name='device namespace with a current-folder segment';Path='\\.\C:\a\.\b'}
+    ) {
+        $runtime=New-GateRuntime -Name ('outputs-unresolved-'+($Name -replace '\W','-'))
+        Set-GateOutputFolders $runtime '.\Backups' '.\logs' $Path
+        $before=Get-GatePackageFiles $runtime
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*cannot be checked against the signed package*'
+        @(Get-GatePackageFiles $runtime) | Should -Be $before
+    }}
 
 Describe 'Direct OU and CSV targeting' -Tag 'Targeting' {
     It 'applies OU/CSV overrides before scope validation without rewriting the configuration' {
@@ -3719,6 +3910,7 @@ function Show-PraGui {
 Export-ModuleMember -Function Show-PraGui
 '@
         [IO.File]::WriteAllText((Join-Path $runtime.Package 'module\PRA.Gui.psm1'),$stub,(New-Object Text.UTF8Encoding($true)))
+        Set-PraFixtureHash -Root $runtime.Package -Relative 'module\PRA.Gui.psm1'
         $entry=Join-Path $runtime.Package 'Invoke-PraRemoteMailbox.ps1'
         $exe=(Get-Command $Engine -CommandType Application -ErrorAction Stop).Source
         foreach ($mixed in @($false,$true)) {
@@ -3741,7 +3933,7 @@ Export-ModuleMember -Function Show-PraGui
                 else {
                     $process.ExitCode | Should -Be 0 -Because $output
                     $opened=[IO.File]::ReadAllText($marker) | ConvertFrom-Json
-                    $opened.Version | Should -BeExactly '2.1.0'
+                    $opened.Version | Should -BeExactly '2.2.0'
                     $opened.DirectoryLoaded | Should -Be 0
                     $opened.ConfigPath | Should -BeExactly $runtime.ConfigPath
                     Remove-Item -LiteralPath $marker -Force
@@ -3797,7 +3989,7 @@ Describe 'GUI events mirror the existing engine without extra mutations' -Tag 'G
         $result.total | Should -Be $run.MainResult.TotalCount
         $result.planned | Should -Be 2
         $result.csvReport | Should -BeExactly $run.MainResult.CsvReport
-        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Gui.psm1') -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Gui.psm1') -Force
         $request=New-PraGuiRequest -Action Convert -Phase AD
         Test-PraGuiPreview -Result $result -Request $request -NativeExitCode $run.ExitCode | Should -BeTrue
         @(Get-GateWrites $runtime).Count | Should -Be 0
@@ -3810,7 +4002,7 @@ Describe 'GUI events mirror the existing engine without extra mutations' -Tag 'G
         $result.exitCode | Should -Be 1
         $result.status | Should -BeExactly 'Failed'
         $result.issues -join ' ' | Should -Match 'not found'
-        Import-Module (Join-Path $global:PraGate.Release 'module\PRA.Gui.psm1') -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Gui.psm1') -Force
         $request=New-PraGuiRequest -Action Recover -Phase AD -Batch deadbeef
         Test-PraGuiPreview -Result $result -Request $request -NativeExitCode $run.ExitCode | Should -BeFalse
         @(Get-GateWrites $runtime).Count | Should -Be 0
@@ -3837,7 +4029,7 @@ Describe 'Culture-neutral test gate help validation' {
         $originalCulture=$thread.CurrentUICulture
         try {
             $thread.CurrentUICulture=[Globalization.CultureInfo]::GetCultureInfo($Culture)
-            $help=Get-Help (Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1') -Full
+            $help=Get-Help (Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1') -Full
             $helpText='Localized headings are deliberately not part of the help contract.'
             (& $helpValidation) | Should -BeTrue
         }
@@ -3863,7 +4055,7 @@ Describe 'Culture-neutral test gate help validation' {
 
 Describe 'Scripts start with powershell.exe -File (scheduled task)' {
     It 'never reads $PSScriptRoot in a param() default (empty in Windows PowerShell 5.1 with -File)' {
-        $files = @(Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1') + @(Get-ChildItem -LiteralPath (Join-Path $global:PraGate.Release 'tools') -Filter '*.ps1' | ForEach-Object FullName)
+        $files = @(Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1') + @(Get-ChildItem -LiteralPath (Join-Path $global:PraGate.Release 'tools') -Filter '*.ps1' | ForEach-Object FullName)
         $found = @(foreach ($file in $files) {
             $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$null)
             foreach ($block in @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.ParamBlockAst] }, $true))) {
@@ -3875,7 +4067,7 @@ Describe 'Scripts start with powershell.exe -File (scheduled task)' {
         $found | Should -BeNullOrEmpty
     }
     It 'resolves the default configuration path in the script body' {
-        $text = [IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'Invoke-PraRemoteMailbox.ps1'))
+        $text = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'))
         $text | Should -Match "if \(-not \`$ConfigPath\) \{ \`$ConfigPath = Join-Path \`$PSScriptRoot 'config\\PraRemoteMailbox\.config\.psd1' \}"
     }
 }
