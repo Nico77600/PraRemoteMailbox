@@ -2,14 +2,16 @@
 #  PRA Remote Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 2.1.0
+#  Version : 2.2.0
 #
 #  This file is read by Invoke-PraRemoteMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
 #  Lines starting with # are comments. An unknown setting is refused
 #  (spelling mistakes are detected).
 #
-#  Relative paths (.\Backups, .\logs ...) are relative to the tool folder.
+#  Relative paths (.\Backups, .\logs ...) are relative to the tool folder. Inside the tool folder only
+#  .\Backups, .\logs and .\reports are accepted for BackupFolder, Logging.Folder and Report.Folder (the signed
+#  package must not receive other files); use a folder outside the tool folder for anything else.
 #  Everything is set here; the command line only chooses the action
 #  (see docs\PraRemoteMailbox-Guide.md, chapter 6).
 #
