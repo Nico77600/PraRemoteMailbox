@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-banner-dark.png">
-    <img alt="PRA Remote Mailbox: when the on-premises Exchange servers are lost, gives every user a mailbox in Exchange Online and rolls everything back when Exchange is available again" src="docs/images/readme-banner-light.png">
+    <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-banner-dark.png">
+    <img alt="PRA Remote Mailbox: when the on-premises Exchange servers are lost, gives every user a mailbox in Exchange Online and rolls everything back when Exchange is available again" src="package/docs/images/readme-banner-light.png">
   </picture>
 </p>
 
@@ -12,7 +12,7 @@
   <a href="#wpf-window"><b>WPF window</b></a> &nbsp;&middot;&nbsp;
   <a href="#reports"><b>Reports</b></a> &nbsp;&middot;&nbsp;
   <a href="#quick-start"><b>Quick start</b></a> &nbsp;&middot;&nbsp;
-  <a href="docs/PraRemoteMailbox-Guide.md"><b>Administrator guide</b></a>
+  <a href="package/docs/PraRemoteMailbox-Guide.md"><b>Administrator guide</b></a>
 </p>
 
 > [!IMPORTANT]
@@ -32,20 +32,21 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
-**Author:** Nicolas Fabert · **Version:** 2.1.0 ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 2.2.0, unreleased source ([changelog](CHANGELOG.md)).
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-principles-dark.png">
-  <img alt="Design principles: backup before any write, preview first, stop at the first error, reversible" src="docs/images/readme-principles-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-principles-dark.png">
+  <img alt="Design principles: backup before any write, preview first, stop at the first error, reversible" src="package/docs/images/readme-principles-light.png">
 </picture>
 
 ## How it works
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-how-dark.png">
-  <img alt="The configuration is read by Invoke-PraRemoteMailbox.ps1, which backs up then writes Active Directory, runs an Entra Connect delta cycle and checks Exchange Online, then writes the batch and the reports; four actions: Convert, Recover, Finalize and Check" src="docs/images/readme-how-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-how-dark.png">
+  <img alt="The configuration is read by Invoke-PraRemoteMailbox.ps1, which backs up then writes Active Directory, runs an Entra Connect delta cycle and checks Exchange Online, then writes the batch and the reports; four actions: Convert, Recover, Finalize and Check" src="package/docs/images/readme-how-light.png">
 </picture>
 
+- **Signed package.** The runtime lives in `package\` (same layout as the extracted release ZIP). Every runtime file authenticates the owner-signed manifest before it runs; a changed, missing or unexpected stable file stops the tool before any import or operation. The configuration and your CSV lists are data, outside that check. There is no unsigned mode. The tool refuses to run from any tree whose files are not signed by the owner: use a signed release package. Backup, log and report folders inside the package are limited to the canonical `Backups`, `logs` and `reports`. See [package/README.md](package/README.md).
 - **One script, one configuration file.** The scope is one object (`-Identity`), an OU, the members of an AD group or a CSV list — users only, shared mailboxes only, or both.
 - **Preview by default.** Without `-Mode Apply` the tool only reads. With `-Mode Apply` it shows the plan and asks **one** confirmation (`-Force` for unattended runs).
 - **One batch ID** links the steps: every Apply prints it with the exact next command, and `-Action Recover -Batch <id>` rolls the batch back.
@@ -53,8 +54,8 @@ Done by hand, this means rewriting about ten Exchange attributes per object in A
 
 ## WPF window
 
-Open the window with `pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui` for native Fluent on
-PowerShell 7.5+, or `powershell.exe -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui` for compatible
+Open the window with `pwsh -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui` for native Fluent on
+PowerShell 7.5+, or `powershell.exe -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui` for compatible
 WPF controls. It starts no operation automatically; each operation runs the existing engine in a
 separate **Windows PowerShell 5.1** process.
 
@@ -72,13 +73,13 @@ and produces a Finalize package if AD restoration remains; **Finalize** runs on 
 Cloud-only never restores AD, even with RSAT installed. Copy complete batch folders between servers;
 the window does not transfer them. See the administrator guide, chapter 8.
 
-![WPF Fluent window - synthetic preview, no live operation](docs/images/gui-fluent.png)
+![WPF Fluent window - synthetic preview, no live operation](package/docs/images/gui-fluent.png)
 
 ## Convert and Recover
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-flows-dark.png">
-  <img alt="Convert: read AD, backup, write AD, Entra Connect sync, Exchange Online. Recover: from the Convert batch, AD restored, Exchange Online check, final restore of the shared mailboxes, on-premises again" src="docs/images/readme-flows-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-flows-dark.png">
+  <img alt="Convert: read AD, backup, write AD, Entra Connect sync, Exchange Online. Recover: from the Convert batch, AD restored, Exchange Online check, final restore of the shared mailboxes, on-premises again" src="package/docs/images/readme-flows-light.png">
 </picture>
 
 What a Convert changes in Active Directory (a Recover puts the saved values back):
@@ -99,8 +100,8 @@ What a Convert changes in Active Directory (a Recover puts the saved values back
 ## Shared mailbox permissions
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-permissions-dark.png">
-  <img alt="Shared mailbox permissions: read the 3 attributes in AD, groups expanded to users, saved in the batch, every holder checked in Exchange Online, each right granted once then re-read; FullAccess from msExchMailboxSecurityDescriptor, SendAs from the Send As right, SendOnBehalf from publicDelegates" src="docs/images/readme-permissions-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-permissions-dark.png">
+  <img alt="Shared mailbox permissions: read the 3 attributes in AD, groups expanded to users, saved in the batch, every holder checked in Exchange Online, each right granted once then re-read; FullAccess from msExchMailboxSecurityDescriptor, SendAs from the Send As right, SendOnBehalf from publicDelegates" src="package/docs/images/readme-permissions-light.png">
 </picture>
 
 Exchange on-premises is down, so the tool reads the permissions where Exchange keeps a copy: on the account of the shared mailbox in Active Directory. The preview lists who will get each right; the log has the complete lists. A permission already present in Exchange Online is only verified, never added twice.
@@ -109,12 +110,12 @@ Exchange on-premises is down, so the tool reads the permissions where Exchange k
 
 <table>
   <tr>
-    <td width="50%" valign="top"><a href="docs/images/console-preview.png"><img alt="Preview of a Convert" src="docs/images/console-preview.png"></a><br><sub><b>Preview</b> &middot; the plan of each object: only the attributes that change, the holders of each permission; nothing is written</sub></td>
-    <td width="50%" valign="top"><a href="docs/images/console-apply.png"><img alt="Convert Apply" src="docs/images/console-apply.png"></a><br><sub><b>Apply</b> &middot; pre-check, backup, AD writes, Entra Connect, Exchange Online; summary card with the batch ID and the next command</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/console-preview.png"><img alt="Preview of a Convert" src="package/docs/images/console-preview.png"></a><br><sub><b>Preview</b> &middot; the plan of each object: only the attributes that change, the holders of each permission; nothing is written</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/console-apply.png"><img alt="Convert Apply" src="package/docs/images/console-apply.png"></a><br><sub><b>Apply</b> &middot; pre-check, backup, AD writes, Entra Connect, Exchange Online; summary card with the batch ID and the next command</sub></td>
   </tr>
   <tr>
-    <td width="50%" valign="top"><a href="docs/images/report.png"><img alt="HTML report" src="docs/images/report.png"></a><br><sub><b>HTML report</b> &middot; counters, next step, one row per object with its AD, licence, Exchange Online and permission status</sub></td>
-    <td width="50%" valign="top"><a href="docs/images/report-warning.png"><img alt="HTML report with a warning" src="docs/images/report-warning.png"></a><br><sub><b>Warnings</b> &middot; a permission of a deleted account is ignored and shown in the console, the log, the CSV and the report</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/report.png"><img alt="HTML report" src="package/docs/images/report.png"></a><br><sub><b>HTML report</b> &middot; counters, next step, then virtualized, filterable rows (tested to 100,000 rows, at most 200 rows in the page) with a filtered CSV export; needs current desktop Edge or Chrome</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/report-warning.png"><img alt="HTML report with a warning" src="package/docs/images/report-warning.png"></a><br><sub><b>Warnings</b> &middot; a permission of a deleted account is ignored and shown in the console, the log, the CSV and the report</sub></td>
   </tr>
 </table>
 
@@ -136,21 +137,21 @@ Every run also writes a log, a PowerShell transcript and a CSV. Exit codes: 0 = 
 ```powershell
 git clone https://github.com/Nico77600/PraRemoteMailbox.git
 cd PraRemoteMailbox
-notepad .\config\PraRemoteMailbox.config.psd1      # scope, licence group, routing domain, Entra Connect, tenant
+notepad .\package\config\PraRemoteMailbox.config.psd1      # scope, licence group, routing domain, Entra Connect, tenant
 
 # Optional window; actual operations still run in Windows PowerShell 5.1.
-pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui
+pwsh -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui
 
 # Command line: run these commands in Windows PowerShell 5.1.
-.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Identity jdupont@contoso.com   # preview for one user: nothing is written
-.\Invoke-PraRemoteMailbox.ps1 -Action Convert                                 # preview of the configured scope (e.g. an OU)
-.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -SearchBase "OU=Mailboxes,DC=contoso,DC=com"
-.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Both -CsvPath .\config\Targets.sample.csv
-.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Mode Apply                     # backup, AD, sync, Exchange Online
-.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Scope SharedOnly -Mode Apply   # only the shared mailboxes of the scope
-.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 1d5ac20b                 # preview of the roll-back of that batch
-.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 1d5ac20b -Mode Apply     # roll the batch back
-.\Invoke-PraRemoteMailbox.ps1 -Action Check -Identity jdupont@contoso.com     # provisioned or not in Exchange Online
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Identity jdupont@contoso.com   # preview for one user: nothing is written
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert                                 # preview of the configured scope (e.g. an OU)
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -SearchBase "OU=Mailboxes,DC=contoso,DC=com"
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Both -CsvPath .\package\config\Targets.sample.csv
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Mode Apply                     # backup, AD, sync, Exchange Online
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Scope SharedOnly -Mode Apply   # only the shared mailboxes of the scope
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 1d5ac20b                 # preview of the roll-back of that batch
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 1d5ac20b -Mode Apply     # roll the batch back
+.\package\Invoke-PraRemoteMailbox.ps1 -Action Check -Identity jdupont@contoso.com     # provisioned or not in Exchange Online
 ```
 
 Keep the `Backups` folder on a durable, protected volume: the backups are the only way back. The environment values of the configuration are empty in this repository. The zip of each [release](https://github.com/Nico77600/PraRemoteMailbox/releases) contains only the files needed to run; `.\tools\New-PraPackage.ps1` builds the same package from the repository.
@@ -159,8 +160,8 @@ Keep the `Backups` folder on a durable, protected volume: the backups are the on
 
 The **administrator guide** covers the disaster scenario, what changes in Active Directory, the shared mailbox permissions, installation, configuration, unattended execution with a certificate, ready-to-use recipes (one user, an OU, shared mailboxes only, a list, the roll-back, two servers), the reports, troubleshooting, the internals and the lab test campaign:
 
-- [docs/PraRemoteMailbox-Guide.md](docs/PraRemoteMailbox-Guide.md)
-- `docs/PraRemoteMailbox-Guide.html` — the same guide as a single HTML file, with a light and a dark theme (download it and open it locally)
+- [package/docs/PraRemoteMailbox-Guide.md](package/docs/PraRemoteMailbox-Guide.md)
+- `package/docs/PraRemoteMailbox-Guide.html` — the same guide as a single HTML file, with a light and a dark theme (download it and open it locally)
 
 ## Tests
 
@@ -173,7 +174,7 @@ The gate runs the real entry script against a synthetic Active Directory, Entra 
 no write before the complete backup, stop at the first error, no write in Preview, no Apply without
 confirmation, memory bounds, proofs and Finalize packages. It also exercises WPF selection,
 Preview/Apply guards and OU/CSV targeting. Earlier versions were validated on a real Active Directory,
-Entra Connect and Microsoft 365 tenant (guide, annex B); **2.1.0 has offline validation only, not a new
+Entra Connect and Microsoft 365 tenant (guide, annex B); **2.2.0 (unreleased source) has offline validation only, not a new
 live-tenant campaign**. `tools\Build-Documentation.ps1`, which rebuilds the HTML guide on a workstation,
 needs PowerShell 7.4+.
 

@@ -1,7 +1,7 @@
 ﻿#Requires -Version 7.4
 <#
 .SYNOPSIS
-    Builds docs\PraRemoteMailbox-Guide.html from docs\PraRemoteMailbox-Guide.md.
+    Builds package\docs\PraRemoteMailbox-Guide.html from package\docs\PraRemoteMailbox-Guide.md.
 
 .DESCRIPTION
     The Markdown guide stays readable as plain text (and on GitHub / Azure DevOps). This script
@@ -38,8 +38,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 # Defaults here, not in param(): $PSScriptRoot can be empty in param() defaults (Windows PowerShell 5.1 with -File).
-if (-not $Source) { $Source = Join-Path $PSScriptRoot '..\docs\PraRemoteMailbox-Guide.md' }
-if (-not $Destination) { $Destination = Join-Path $PSScriptRoot '..\docs\PraRemoteMailbox-Guide.html' }
+if (-not $Source) { $Source = Join-Path $PSScriptRoot '..\package\docs\PraRemoteMailbox-Guide.md' }
+if (-not $Destination) { $Destination = Join-Path $PSScriptRoot '..\package\docs\PraRemoteMailbox-Guide.html' }
 $Source = (Resolve-Path $Source).Path
 $Destination = [IO.Path]::GetFullPath($Destination)
 $docs = Split-Path $Source -Parent
