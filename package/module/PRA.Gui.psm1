@@ -786,6 +786,131 @@ function Get-PraGuiPrerequisite {
 }
 #endregion
 
+#region Microsoft 365 reachability: decides Both / AD / Cloud once the programs are installed
+# The programs alone do not make a server able to run the cloud part: it must also reach Microsoft 365. The test is an HTTPS request (HEAD, port 443)
+# to the sign-in endpoint and to the Exchange Online endpoint, sent through the default proxy of the system (HttpClient default: direct when there
+# is no proxy, the system proxy otherwise), which is what the Exchange Online and Graph modules use too: a plain TCP connect would fail behind a proxy
+# that lets HTTPS through. Any HTTP answer counts as reachable (the question is the road to Microsoft 365, not the answer). It is asynchronous: the
+# window timer polls the two tasks, so the window never waits. A test or a screenshot passes -NetworkProbe (a task per host) and no network is used.
+$script:GuiM365Hosts = @('login.microsoftonline.com','outlook.office365.com')
+$script:GuiNetLight = 'Microsoft 365 reachable'
+$script:GuiNetHttp = $null
+
+function Start-PraGuiHttpsProbe {
+    <# The default network probe: one HTTPS HEAD to the host through the default system proxy, as a task (nothing is awaited here). #>
+    param([string]$HostName, [double]$Seconds=3)
+    if (-not $script:GuiNetHttp) {
+        $handler=New-Object Net.Http.HttpClientHandler
+        $handler.AllowAutoRedirect=$false
+        $script:GuiNetHttp=New-Object Net.Http.HttpClient($handler,$true)
+        $script:GuiNetHttp.Timeout=[timespan]::FromSeconds($Seconds)
+    }
+    $request=New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Head,('https://{0}/' -f $HostName))
+    return $script:GuiNetHttp.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+}
+
+function Get-PraGuiNetworkVerdict {
+    <# Ok (every endpoint answered), Partial (some did) or Fail (none did), from the answers (Host, Ok, Why). #>
+    param([object[]]$Answers)
+    $good=@($Answers | Where-Object { $_.Ok }).Count
+    if ($good -ge @($Answers).Count -and $good -gt 0) { return 'Ok' }
+    if ($good -gt 0) { return 'Partial' }
+    return 'Fail'
+}
+
+function Get-PraGuiNetworkState {
+    <# The state of the Microsoft 365 test as the detection carries it: '' (not tested), Checking, Ok, Partial or Fail. #>
+    param($Detect)
+    if ($null -eq $Detect) { return '' }
+    $property=$Detect.PSObject.Properties['Net']
+    if ($null -eq $property) { return '' }
+    return [string]$property.Value
+}
+
+function Test-PraGuiNetworkDown {
+    $g=$script:Gui
+    return ($g.Detect -and (Test-GuiOrdinalIn (Get-PraGuiNetworkState $g.Detect) @('Fail','Partial') -IgnoreCase))
+}
+
+function Test-PraGuiPhaseForced {
+    <# True when the operator chose the phase in Expert mode (a new Convert or Recover): the console then does not second-guess the choice. #>
+    $g=$script:Gui
+    return (Test-GuiOrdinalIn $g.Action @('Convert','Recover') -IgnoreCase) -and (Test-GuiOrdinal $g.Mode 'New' -IgnoreCase) -and (-not (Test-GuiOrdinal (Get-PraGuiField 'ExpPhase') 'Auto' -IgnoreCase))
+}
+
+function Stop-PraGuiNetworkCheck {
+    $g=$script:Gui
+    $g.NetJob=$null; $g.NetResult=$null
+}
+
+function Start-PraGuiNetworkCheck {
+    <# Sends the requests and returns at once; Complete-PraGuiNetworkCheck (window timer) reads the answers. #>
+    $g=$script:Gui
+    $g.NetResult=$null
+    $targets=@(foreach ($name in $script:GuiM365Hosts) {
+        $task=$null; $failure=''
+        try { $task=& $g.NetProbe $name $g.NetSeconds } catch { $failure=$_.Exception.Message }
+        [pscustomobject]@{ Host=$name; Task=$task; Failure=$failure }
+    })
+    $g.NetJob=@{ Targets=$targets; Clock=[Diagnostics.Stopwatch]::StartNew() }
+    $g.Timer.Start()
+}
+
+function Complete-PraGuiNetworkCheck {
+    <# Called by the window timer: does nothing until both answers are in or the time is up (a host that did not answer in time is not reachable). #>
+    $g=$script:Gui; $job=$g.NetJob
+    if (-not $job) { return }
+    $expired=$job.Clock.Elapsed.TotalSeconds -ge $g.NetSeconds
+    $waiting=@($job.Targets | Where-Object { $_.Task -and -not $_.Task.IsCompleted })
+    if ($waiting.Count -and -not $expired) { return }
+    $answers=@(foreach ($target in $job.Targets) {
+        $ok=$false; $why=''
+        if (-not $target.Task) { $why=[string]$target.Failure }
+        elseif (-not $target.Task.IsCompleted) { $why=('no answer within {0} seconds' -f $g.NetSeconds) }
+        elseif ($target.Task.IsCanceled) { $why=('no answer within {0} seconds' -f $g.NetSeconds) }
+        elseif ($target.Task.IsFaulted) { $why=[string]$target.Task.Exception.GetBaseException().Message }
+        else {
+            $ok=$true
+            $response=$target.Task.Result
+            if ($response -is [IDisposable]) { $response.Dispose() }
+        }
+        [pscustomobject]@{ Host=[string]$target.Host; Ok=$ok; Why=$why }
+    })
+    $g.NetJob=$null
+    $g.NetResult=[pscustomobject]@{ State=(Get-PraGuiNetworkVerdict $answers); Answers=$answers }
+    Sync-PraGuiTimer
+    $text=@($answers | ForEach-Object { if ($_.Ok) { '{0}: reachable' -f $_.Host } else { '{0}: not reachable ({1})' -f $_.Host,$_.Why } }) -join '; '
+    Add-PraGuiLine ('Microsoft 365 check from this server. ' + $text) $(if ((Test-GuiOrdinal $g.NetResult.State 'Ok' -IgnoreCase)) { 'Info' } else { 'Warn' })
+    if (-not $g.Run) { Reset-PraGuiPreview }
+    Invoke-PraGuiDetection
+    Update-PraGuiView
+}
+
+function Add-PraGuiNetworkLight {
+    <# Adds the Microsoft 365 light and settles the role, once the programs are installed (the light is absent when the cloud cannot run anyway: the page stays short). #>
+    $g=$script:Gui; $d=$g.Detect
+    if (-not $g.NetProbe -or -not $d -or -not $d.Cloud) { return }
+    if (-not $g.NetResult -and -not $g.NetJob) { Start-PraGuiNetworkCheck }
+    $state=if ($g.NetJob) { 'Checking' } else { [string]$g.NetResult.State }
+    $unreached=@(if ($g.NetResult) { $g.NetResult.Answers | Where-Object { -not $_.Ok } | ForEach-Object { $_.Host } })
+    $twoServers='the cloud part must run on another machine that reaches the Internet (two servers).'
+    switch ($state) {
+        'Checking' { $role='Checking'; $status='Info'; $detail='Checking that Microsoft 365 can be reached from this server (a few seconds)...' }
+        'Ok' { $role=$(if ($d.AD) { 'Both' } else { 'Cloud' }); $status='Ok'; $detail=('Reachable from this server ({0}).' -f ($script:GuiM365Hosts -join ' and ')) }
+        default {
+            $role=$(if ($d.AD) { 'AD' } else { 'None' })
+            $status=$(if ($d.AD) { 'Warn' } else { 'Fail' })
+            $which=$(if ((Test-GuiOrdinal $state 'Partial')) { ' ({0} does not answer)' -f ($unreached -join ', ') } else { '' })
+            $detail=$(if ($d.AD) { 'Microsoft 365 not reachable from this server{0}: {1}' -f $which,$twoServers } else { 'Microsoft 365 not reachable from this server{0}: the cloud part cannot run here. Check the Internet access (or the proxy), or use a machine that reaches the Internet.' -f $which })
+        }
+    }
+    $light=[ordered]@{ Name=$script:GuiNetLight; Status=$status; Detail=$detail }
+    Add-Member -InputObject $d -NotePropertyName Lights -NotePropertyValue @(@($d.Lights) + $light) -Force
+    Add-Member -InputObject $d -NotePropertyName Role -NotePropertyValue $role -Force
+    Add-Member -InputObject $d -NotePropertyName Net -NotePropertyValue $state -Force
+}
+#endregion
+
 
 #region Window: run settings (fields, overrides), phase, task, batches
 $script:GuiTextFields = @('Env','Dc','Tenant','Org','AppId','Thumb','ExpMax','ExpConfig','Identity','Ou','Csv','CheckUpn')
@@ -931,6 +1056,10 @@ function Get-PraGuiBlocker {
     $phase=Get-PraGuiPhase
     $needAd=(Test-GuiOrdinal $g.Action 'Finalize' -IgnoreCase) -or ((Test-GuiOrdinalIn $g.Action @('Convert','Recover') -IgnoreCase) -and (Test-GuiOrdinalIn $phase @('AD','Both') -IgnoreCase))
     if ($needAd -and -not $g.Detect.AD) { return 'This server cannot do the Active Directory part yet: RSAT ActiveDirectory is not installed. Install it, or run this on the AD server.' }
+    if ((Test-PraGuiNeedsCloud) -and $g.Detect.Cloud -and (Test-PraGuiNetworkDown) -and -not (Test-PraGuiPhaseForced)) {
+        $net=@($g.Detect.Lights | Where-Object { Test-GuiOrdinal $_.Name $script:GuiNetLight })
+        return ('This server cannot do the cloud part yet: {0} Run this on the cloud server, or fix the access on the Setup page.' -f $(if ($net.Count) { [string]$net[0].Detail } else { 'Microsoft 365 is not reachable from this server.' }))
+    }
     if ((Test-PraGuiNeedsCloud) -and -not $g.Detect.Cloud) {
         $reason=''
         foreach ($light in $g.Detect.Lights) {
@@ -998,6 +1127,13 @@ function Get-PraGuiBasePlanTitle {
     }
 }
 
+function Get-PraGuiNetworkPhaseNote {
+    <# The reason why the phase is AD when the programs of both sides are installed here (empty otherwise, or when the operator forced the phase). #>
+    $g=$script:Gui
+    if ((Test-PraGuiNetworkDown) -and $g.Detect.Cloud -and $g.Detect.AD -and -not (Test-PraGuiPhaseForced)) { return ' Microsoft 365 is not reachable from this server, so the cloud part cannot run here.' }
+    return ''
+}
+
 function Get-PraGuiPhaseText {
     $g=$script:Gui
     $phase=Get-PraGuiPhase
@@ -1007,12 +1143,12 @@ function Get-PraGuiPhaseText {
         'Convert' {
             if ((Test-GuiOrdinal $phase 'Cloud' -IgnoreCase)) { return 'This server checks the package brought from the AD server, then converts the mailboxes in Exchange Online.' }
             if ((Test-GuiOrdinal $phase 'Both' -IgnoreCase)) { return 'This server backs up and changes the Active Directory objects, synchronises, then completes the mailboxes in Exchange Online, all in one run. Everything is done here: no transfer package is needed.' }
-            return 'This server backs up and changes the Active Directory objects, then writes ONE transfer package. The cloud part is done afterwards, on the cloud server.'
+            return ('This server backs up and changes the Active Directory objects, then writes ONE transfer package. The cloud part is done afterwards, on the cloud server.' + (Get-PraGuiNetworkPhaseNote))
         }
         'Recover' {
             if ((Test-GuiOrdinal $phase 'Cloud' -IgnoreCase)) { return 'This server checks the rollback in Exchange Online and, if a final Active Directory restore remains, writes ONE package for the AD server. It never writes to Active Directory.' }
             if ((Test-GuiOrdinal $phase 'Both' -IgnoreCase)) { return 'This server puts the original values back in Active Directory using the backup of the conversion, then checks the rollback in Exchange Online. Everything is done here: no transfer package is needed.' }
-            return 'This server puts the original values back in Active Directory using the backup of the conversion, then writes ONE transfer package for the cloud server.'
+            return ('This server puts the original values back in Active Directory using the backup of the conversion, then writes ONE transfer package for the cloud server.' + (Get-PraGuiNetworkPhaseNote))
         }
         default { return '' }
     }
@@ -1154,8 +1290,9 @@ function Invoke-PraGuiDetection {
         $request.MinExoVersion=[string]$cfg.Exo.MinModuleVersion; $request.DisableWam=[bool]$cfg.Exo.DisableWAM
         $request.SyncEnabled=[bool]$cfg.EntraConnect.Sync; $request.SyncServer=[string]$cfg.EntraConnect.Server
     }
-    if ($Refresh) { $request.Refresh=$true }
+    if ($Refresh) { $request.Refresh=$true; Stop-PraGuiNetworkCheck }
     $g.Detect=& $g.Probe $request
+    Add-PraGuiNetworkLight
     $g.LightRows.Clear()
     foreach ($light in @($g.Detect.Lights)) { $g.LightRows.Add((New-PraGuiRow @{ Name=[string]$light.Name; Status=[string]$light.Status; Detail=[string]$light.Detail })) }
 }
@@ -1206,9 +1343,16 @@ function Update-PraGuiSettingsView {
     $role=if ($g.Detect) { [string]$g.Detect.Role } else { 'None' }
     switch ($role) {
         'Both' { $c.RoleName.Text='AD + Cloud'; Set-PraGuiPill $c.RolePill $c.RoleName 'Ok'; $c.RoleText.Text='This server can run every part: Active Directory and cloud.' }
-        'AD' { $c.RoleName.Text='AD'; Set-PraGuiPill $c.RolePill $c.RoleName 'Warn'; $c.RoleText.Text='Can run the Active Directory parts. The cloud parts need the red light below fixed, or must run on the cloud server.' }
+        'AD' {
+            $c.RoleName.Text='AD'; Set-PraGuiPill $c.RolePill $c.RoleName 'Warn'
+            $c.RoleText.Text=$(if (Test-PraGuiNetworkDown) { 'Can run the Active Directory parts. Microsoft 365 is not reachable from this server: the cloud parts must run on another machine that reaches the Internet (two servers).' } else { 'Can run the Active Directory parts. The cloud parts need the red light below fixed, or must run on the cloud server.' })
+        }
         'Cloud' { $c.RoleName.Text='Cloud'; Set-PraGuiPill $c.RolePill $c.RoleName 'Warn'; $c.RoleText.Text='Can run the cloud parts. The Active Directory parts must run on the AD server (RSAT is missing here).' }
-        default { $c.RoleName.Text='Nothing yet'; Set-PraGuiPill $c.RolePill $c.RoleName 'Fail'; $c.RoleText.Text='Nothing can run here until the red lights below are fixed.' }
+        'Checking' { $c.RoleName.Text='Checking...'; Set-PraGuiPill $c.RolePill $c.RoleName 'Info'; $c.RoleText.Text='Checking that Microsoft 365 can be reached from this server. This takes a few seconds.' }
+        default {
+            $c.RoleName.Text='Nothing yet'; Set-PraGuiPill $c.RolePill $c.RoleName 'Fail'
+            $c.RoleText.Text=$(if (Test-PraGuiNetworkDown) { 'Nothing can run here until Microsoft 365 can be reached from this server: see the red light below.' } else { 'Nothing can run here until the red lights below are fixed.' })
+        }
     }
     $labels=[ordered]@{ Env='Environment'; Dc='Domain controller'; Scope='Mailbox scope'; Signin='Sign-in'; Tenant='Tenant ID'; Org='Organization'; AppId='Application ID'; Thumb='Certificate'; ExpPhase='Phase'; ExpMax='Max objects'; ExpExpect='Expected state'; ExpOnce='Check once'; Repl='AD replication' }
     $names=New-Object 'Collections.Generic.List[string]'
@@ -1468,7 +1612,7 @@ function Update-PraGuiButtons {
     $next=$c.BtnNext
     $next.IsEnabled=$true
     switch ($g.Page) {
-        1 { $next.Content="Choose a task  $arrow"; $next.IsEnabled=(-not $g.State.ConfigError) -and -not (Get-PraGuiSettingsProblem) -and -not $busy }
+        1 { $next.Content="Choose a task  $arrow"; $next.IsEnabled=(-not $g.State.ConfigError) -and -not (Get-PraGuiSettingsProblem) -and -not $busy -and -not $g.NetJob }
         2 { $next.Content="Continue to verification  $arrow"; $next.IsEnabled=(Test-PraGuiTaskReady) -and -not $busy }
         3 {
             $next.Content=Get-PraGuiRunLabel
@@ -1487,7 +1631,7 @@ function Update-PraGuiButtons {
         5 { $next.Content='Start a new task' }
     }
     $c.Footer.Text=switch ($g.Page) {
-        1 { 'Check the lights and the run settings. Changes here are for this run only.' }
+        1 { if ($g.NetJob) { 'Checking that Microsoft 365 can be reached from this server (a few seconds)...' } else { 'Check the lights and the run settings. Changes here are for this run only.' } }
         2 { 'Pick what you want to do. The console works out the phase for you.' }
         3 { if ((Test-GuiOrdinal $g.Action 'Check' -IgnoreCase)) { 'A check only reads. Nothing is written.' } else { 'The preview comes first. Run unlocks after the preview and the confirmation word.' } }
         4 { if ($g.Run) { 'Do not close this window: the backup and the AD proof cover the whole batch. There is no stop per object.' } else { '' } }
@@ -1553,7 +1697,7 @@ function Test-PraGuiPageReachable {
     if (Test-PraGuiApplied) { return $Number -ge 4 -and $null -ne $g.LastRun }
     switch ($Number) {
         1 { return $true }
-        2 { return -not $g.State.ConfigError }
+        2 { return (-not $g.State.ConfigError) -and -not $g.NetJob }
         3 { return [bool](Test-PraGuiTaskReady) }
         4 { return $null -ne $g.Model }
         5 { return $null -ne $g.LastRun }
@@ -2182,6 +2326,7 @@ function Complete-PraGuiRun {
 function Invoke-PraGuiTick {
     $g=$script:Gui
     if (-not $g -or $g.InTick) { return }
+    if ($g.NetJob) { Complete-PraGuiNetworkCheck }
     if ($g.PkgJob) { Complete-PraGuiPackageJob }
     if ($g.OuLookup) { Complete-PraGuiOuLookup; return }
     if ($g.IdLookup) { Complete-PraGuiIdentityLookup }
@@ -2239,7 +2384,7 @@ function Get-PraGuiPackageCommand {
 function Sync-PraGuiTimer {
     <# The window timer runs while something is running or waiting (engine, lookups, package checks) and stops when nothing is. #>
     $g=$script:Gui
-    if ($g.Run -or $g.OuLookup -or $g.IdLookup -or $g.PkgJob -or $g.PkgQueue.Count) { $g.Timer.Start() } else { $g.Timer.Stop() }
+    if ($g.Run -or $g.OuLookup -or $g.IdLookup -or $g.NetJob -or $g.PkgJob -or $g.PkgQueue.Count) { $g.Timer.Start() } else { $g.Timer.Stop() }
 }
 
 function Start-PraGuiNextPackageJob {
@@ -2702,7 +2847,7 @@ function Invoke-PraGuiClick {
             'BtnPreview' { Start-PraGuiRun -Mode Preview }
             'BtnNext' {
                 switch ($g.Page) {
-                    1 { Show-PraGuiPage 2 }
+                    1 { if (-not $g.NetJob) { Show-PraGuiPage 2 } }
                     2 {
                         if ($g.SelectedBatch -and $g.SelectedBatch.Package) {
                             Start-PraGuiPackageImport ([string]$g.SelectedBatch.Path) { param($selected) if ($selected) { Show-PraGuiPage 3 } else { Show-PraGuiError 'The package was imported but its batch is not listed: reload the page.' } }
@@ -2778,9 +2923,9 @@ function New-PraGuiXmlNamespace {
 }
 
 function New-PraGuiWindow {
-    <# Constructs and binds the window without ShowDialog and without starting an operation. -PrerequisiteProbe replaces the real detection (tests, screenshots). #>
+    <# Constructs and binds the window without ShowDialog and without starting an operation. -PrerequisiteProbe replaces the real detection (tests, screenshots); with it, Microsoft 365 is not tested unless -NetworkProbe (a task per host) is given too. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Root, [string]$ConfigPath='', [string]$Version='', [ValidateSet('System','Light','Dark')][string]$Theme='System', [scriptblock]$PrerequisiteProbe, [scriptblock]$IdentityProbe)
+    param([Parameter(Mandatory)][string]$Root, [string]$ConfigPath='', [string]$Version='', [ValidateSet('System','Light','Dark')][string]$Theme='System', [scriptblock]$PrerequisiteProbe, [scriptblock]$IdentityProbe, [scriptblock]$NetworkProbe, [double]$NetworkSeconds=3)
     if ((-not (Test-GuiOrdinal ([Threading.Thread]::CurrentThread.GetApartmentState()) 'STA' -IgnoreCase))) { throw 'WPF requires an STA host (pwsh.exe -STA).' }
     if ($script:Gui -and $script:Gui.Run) { throw 'Cannot replace a window while its engine is running.' }
     if ($script:Gui -and $script:Gui.Form.IsVisible) { throw 'A PRA window is already open in this host.' }
@@ -2799,11 +2944,12 @@ function New-PraGuiWindow {
     $timer=New-Object Windows.Threading.DispatcherTimer
     $timer.Interval=[timespan]::FromMilliseconds(250)
     $probe=if ($PrerequisiteProbe) { $PrerequisiteProbe } else { { param($Request) Get-PraGuiPrerequisite @Request } }
+    $netProbe=if ($NetworkProbe) { $NetworkProbe } elseif ($PrerequisiteProbe) { $null } else { { param($HostName,$Seconds) Start-PraGuiHttpsProbe $HostName $Seconds } }
     $script:Gui=@{
         Form=$form; Controls=$controls; Timer=$timer; Root=[IO.Path]::GetFullPath($Root); ConfigPath=$ConfigPath; InitialConfigPath=$ConfigPath
         PkgCache=@{}; PkgQueue=(New-Object 'Collections.Generic.List[object]'); PkgJob=$null
         State=$null; Run=$null; OuLookup=$null; IdLookup=$null; IdentityProbe=$IdentityProbe; Pending=$null; LastResult=$null; LastRun=$null; Model=$null; Updating=1; InTick=$false; Page=1
-        Action=''; Mode='New'; SelectedBatch=$null; EnvLock=$null; EnvSaved=$null; Defaults=$null; Detect=$null; Probe=$probe
+        Action=''; Mode='New'; SelectedBatch=$null; EnvLock=$null; EnvSaved=$null; Defaults=$null; Detect=$null; Probe=$probe; NetProbe=$netProbe; NetSeconds=$NetworkSeconds; NetJob=$null; NetResult=$null
         Previewed=$false; PreviewError=''; Filter='All'; HasFinalize=$false; KnownEnvironments=@()
         Lines=(New-Object 'Collections.ObjectModel.ObservableCollection[object]')
         LightRows=(New-Object 'Collections.ObjectModel.ObservableCollection[object]'); BatchRows=(New-Object 'Collections.ObjectModel.ObservableCollection[object]')
@@ -2876,7 +3022,7 @@ function New-PraGuiWindow {
             Add-PraGuiLine ($windowControl.Title+': closing refused, an atomic action is running. Wait for it to end; do not kill the engine.') 'Warn'
         }
     })
-    $form.Add_Closed({ $script:Gui.Timer.Stop(); $script:Gui.Pending=$null })
+    $form.Add_Closed({ $script:Gui.Timer.Stop(); $script:Gui.Pending=$null; $script:Gui.NetJob=$null; if ($script:GuiNetHttp) { $script:GuiNetHttp.Dispose(); $script:GuiNetHttp=$null } })
     $g.HandlerNames+=@('BatchList.SelectionChanged','StepList.SelectionChanged','DetObjList.SelectionChanged','ConfirmBox.TextChanged','F_ExpOnce.Checked','F_ExpOnce.Unchecked','Timer.Tick','Form.Closing','Form.Closed')
     foreach ($name in @('System','Light','Dark')) { $c['Th_'+$name].IsChecked=((Test-GuiOrdinal $name $Theme -IgnoreCase)) }
     $c.Nav1.IsChecked=$true

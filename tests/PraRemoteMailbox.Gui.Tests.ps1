@@ -1348,6 +1348,157 @@ try {
     }
 }
 
+Describe 'Release 3.1.0 - Microsoft 365 reachability decides the phase (mocked probes, no network)' {
+    It 'gives the verdict Ok, Partial or Fail from the answers of the two endpoints' {
+        $verdict={ param($a,$b) Get-PraGuiNetworkVerdict @([pscustomobject]@{Host='login';Ok=$a},[pscustomobject]@{Host='outlook';Ok=$b}) }
+        & (Get-Module PRA.Gui) $verdict $true $true | Should -BeExactly 'Ok'
+        & (Get-Module PRA.Gui) $verdict $true $false | Should -BeExactly 'Partial'
+        & (Get-Module PRA.Gui) $verdict $false $true | Should -BeExactly 'Partial'
+        & (Get-Module PRA.Gui) $verdict $false $false | Should -BeExactly 'Fail'
+    }
+    It 'tests the two Microsoft 365 hosts over HTTPS through the default proxy, only in the default probe, with no runtime C#' {
+        $source=[IO.File]::ReadAllText($script:GuiModule)
+        $hosts=& (Get-Module PRA.Gui) { $script:GuiM365Hosts }
+        $hosts | Should -Be @('login.microsoftonline.com','outlook.office365.com')
+        $source | Should -Match 'Net\.Http\.HttpClientHandler'
+        $source | Should -Not -Match 'Add-Type\s+(-TypeDefinition|-MemberDefinition)'
+        $source | Should -Not -Match 'TcpClient|Test-NetConnection'
+        ([regex]::Matches($source,'Start-PraGuiHttpsProbe')).Count | Should -Be 2 -Because 'the definition and the default probe of the window only'
+    }
+    It 'proposes Both, AD or Cloud from the programs and from the answer of Microsoft 365, without ever blocking the window' {
+        $runtime=New-GuiTestRoot
+        $probe=Join-Path $runtime.Root 'wpf-probe-net.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+function Settle($Window,[int]$Seconds=10){ $end=[datetime]::UtcNow.AddSeconds($Seconds); while($Window.NetJob -and [datetime]::UtcNow -lt $end){ Pump 50 }; if($Window.NetJob){throw 'The Microsoft 365 check never ended'}; Pump 80 }
+function Light($Window){ return ,@($Window.LightRows | Where-Object Name -ceq 'Microsoft 365 reachable')[0] }
+$script:HasAd=$true
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status=$(if($script:HasAd){'Ok'}else{'Fail'});Detail='synthetic'},[ordered]@{Name='ExchangeOnlineManagement';Status='Ok';Detail='synthetic'}); AD=$script:HasAd; Cloud=$true; Role=$(if($script:HasAd){'Both'}else{'Cloud'}) } }
+$script:Mode=@{}
+$script:Calls=New-Object 'Collections.Generic.List[string]'
+$net={ param($HostName,$Seconds)
+  $script:Calls.Add($HostName)
+  switch ($script:Mode[$HostName]) {
+    'ok' { [Threading.Tasks.Task]::FromResult([Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::Unauthorized)) }
+    'fail' { [Threading.Tasks.Task]::FromException([Net.Http.HttpRequestException]::new('No such host is known.')) }
+    default { ([Threading.Tasks.TaskCompletionSource[object]]::new()).Task } } }
+function New-NetWindow([bool]$Ad,[string]$Login,[string]$Outlook,[double]$Seconds=3){
+  $script:HasAd=$Ad; $script:Mode=@{'login.microsoftonline.com'=$Login;'outlook.office365.com'=$Outlook}; $script:Calls.Clear()
+  $window=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect -NetworkProbe $net -NetworkSeconds $Seconds
+  $window.Form.Show(); return $window
+}
+function Phase($Window,[string]$Tile){ Click $Window 'BtnNext'; $Window.Controls[$Tile].IsChecked=$true; Pump 80; return $Window.Controls.PhasePillText.Text }
+
+# --- A: programs and both endpoints reach: Both, as before. The window is usable while the answer is awaited (the check is only pending, nothing waits).
+$g=New-NetWindow $true 'ok' 'ok'
+try {
+ $c=$g.Controls
+ if(-not $g.NetJob){throw 'The check did not start in the background'}
+ if($c.RoleName.Text -cne 'Checking...' -or $c.BtnNext.IsEnabled){throw 'Both must not be proposed before the test ends'}
+ if((Light $g).Status -cne 'Info'){throw ('No light while checking: '+(Light $g).Status+' of '+$g.LightRows.Count+' lights')}
+ Settle $g
+ if($c.RoleName.Text -cnotmatch 'AD \+ Cloud' -or (Light $g).Status -cne 'Ok' -or -not $c.BtnNext.IsEnabled){throw ('Reachable: '+$c.RoleName.Text+' / '+(Light $g).Status)}
+ if($script:Calls.Count -ne 2 -or $script:Calls[0] -cne 'login.microsoftonline.com' -or $script:Calls[1] -cne 'outlook.office365.com'){throw 'The two endpoints are tested once each'}
+ if((Phase $g 'T_Convert') -cne 'Phase: Both'){throw 'Phase must be Both when Microsoft 365 is reachable'}
+ # Typing in a field does not test the network again; Check again does.
+ & (Get-Module PRA.Gui) { Show-PraGuiPage 1 }
+ $c.F_Env.Text='OtherEnv'; Pump 100
+ if($script:Calls.Count -ne 2){throw 'A change of setting must not test the network again'}
+ Click $g 'BtnRecheck'
+ if(-not $g.NetJob -or $c.RoleName.Text -cne 'Checking...'){throw 'Check again must test again'}
+ Settle $g
+ if($script:Calls.Count -ne 4){throw 'Check again did not send the two requests'}
+} finally { $g.Form.Close() }
+
+# --- B: programs here, Microsoft 365 not reachable: AD, a clear light, the cloud task is refused, Expert mode can still force the phase.
+$g=New-NetWindow $true 'fail' 'fail'
+try {
+ $c=$g.Controls
+ Settle $g
+ $light=Light $g
+ if($c.RoleName.Text -cne 'AD' -or $light.Status -cne 'Warn'){throw ('Unreachable: '+$c.RoleName.Text+' / '+$light.Status)}
+ if($light.Detail -cne 'Microsoft 365 not reachable from this server: the cloud part must run on another machine that reaches the Internet (two servers).'){throw ('Light text: '+$light.Detail)}
+ if($c.RoleText.Text -cnotmatch 'two servers'){throw 'The role text does not explain'}
+ if($g.Detect.Role -cne 'AD'){throw 'Role'}
+ if((Phase $g 'T_Convert') -cne 'Phase: AD'){throw 'Phase must be AD when Microsoft 365 is not reachable'}
+ if($c.PhaseText.Text -cnotmatch 'not reachable from this server'){throw 'The phase text does not say why'}
+ if($c.BlockBox.Visibility -ne 'Collapsed'){throw 'The AD phase must not be blocked'}
+ $c.T_Check.IsChecked=$true; Pump 80
+ if($c.BlockBox.Visibility -ne 'Visible' -or $c.BlockText.Text -cnotmatch 'cannot do the cloud part yet: Microsoft 365 not reachable'){throw ('Check on an offline server: '+$c.BlockText.Text)}
+ $c.T_Convert.IsChecked=$true; Pump 80
+ $c.S_ExpPhase_Both.IsChecked=$true; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: Both' -or $c.BlockBox.Visibility -ne 'Collapsed'){throw 'Expert mode must still be able to force the phase'}
+} finally { $g.Form.Close() }
+
+# --- C: only one endpoint answers: not reachable, the light names the one that does not answer
+$g=New-NetWindow $true 'ok' 'fail'
+try {
+ Settle $g
+ $light=Light $g
+ if($g.Controls.RoleName.Text -cne 'AD' -or $light.Status -cne 'Warn' -or $light.Detail -cnotmatch '^Microsoft 365 not reachable from this server \(outlook\.office365\.com does not answer\): the cloud part must run on another machine'){throw ('Partial: '+$g.Controls.RoleName.Text+' / '+$light.Detail)}
+ if($g.Detect.Net -cne 'Partial'){throw 'State Partial'}
+} finally { $g.Form.Close() }
+
+# --- D: no answer at all (time out): the window answers while waiting, then AD
+$g=New-NetWindow $true 'hang' 'hang' 0.8
+try {
+ $watch=[Diagnostics.Stopwatch]::StartNew()
+ Pump 150
+ if(-not $g.NetJob -or $g.Controls.BtnNext.IsEnabled){throw 'The check must still be pending after 150 ms'}
+ Settle $g
+ if($watch.Elapsed.TotalSeconds -lt 0.6){throw 'The check ended before the time limit'}
+ if($watch.Elapsed.TotalSeconds -gt 6){throw ('The check lasted too long: '+$watch.Elapsed)}
+ if($g.Controls.RoleName.Text -cne 'AD' -or (Light $g).Status -cne 'Warn' -or $g.Detect.Net -cne 'Fail'){throw 'Time out must read as not reachable'}
+ if(@($g.Lines | Where-Object { [string]$_.Text -cmatch 'no answer within' }).Count -lt 1){throw 'The time out is not written in the activity log'}
+} finally { $g.Form.Close() }
+
+# --- E: no RSAT: reachable gives Cloud, not reachable gives a red light and nothing to run
+$g=New-NetWindow $false 'ok' 'ok'
+try { Settle $g; if($g.Controls.RoleName.Text -cne 'Cloud' -or (Light $g).Status -cne 'Ok'){throw ('No RSAT, reachable: '+$g.Controls.RoleName.Text)} } finally { $g.Form.Close() }
+$g=New-NetWindow $false 'fail' 'fail'
+try {
+ Settle $g
+ $light=Light $g
+ if($g.Controls.RoleName.Text -cne 'Nothing yet' -or $light.Status -cne 'Fail' -or $light.Detail -cnotmatch 'not reachable from this server: the cloud part cannot run here'){throw ('No RSAT, unreachable: '+$g.Controls.RoleName.Text+' / '+$light.Detail)}
+ if($g.Controls.RoleText.Text -cnotmatch 'Microsoft 365 can be reached'){throw 'The role text does not explain'}
+} finally { $g.Form.Close() }
+
+# --- F: a probe that throws is a failure, not a crash; and without -NetworkProbe a probe-driven window never tests the network (existing behaviour)
+$bad={ param($HostName,$Seconds) throw 'boom' }
+$script:HasAd=$true
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect -NetworkProbe $bad -NetworkSeconds 1
+$g.Form.Show()
+try { Settle $g; if($g.Controls.RoleName.Text -cne 'AD' -or $g.Detect.Net -cne 'Fail'){throw 'A throwing probe must read as not reachable'} } finally { $g.Form.Close() }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect
+$g.Form.Show()
+try { Pump 100; if($g.NetJob -or $g.Controls.RoleName.Text -cnotmatch 'AD \+ Cloud' -or @($g.LightRows | Where-Object Name -ceq 'Microsoft 365 reachable').Count){throw 'A probe-only window must not test the network'} } finally { $g.Form.Close() }
+[Console]::WriteLine('NET-PHASE-PASS')
+'@
+        $tokens=@('-NoProfile','-NonInteractive','-STA','-File',$probe,'-Common',$script:GuiCommon,'-Gui',$script:GuiModule,'-Root',$runtime.Root,'-Config',$runtime.Config)
+        $info=New-Object Diagnostics.ProcessStartInfo
+        $info.FileName=(Join-Path $PSHOME 'pwsh.exe');$info.Arguments=(@($tokens|ForEach-Object{ConvertTo-PraGuiNativeArgument $_})-join ' ')
+        $info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+        $process=[Diagnostics.Process]::Start($info)
+        $out=$process.StandardOutput.ReadToEndAsync();$err=$process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(120000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result+$err.Result)
+            $out.Result | Should -Match 'NET-PHASE-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
 AfterAll {
     if($script:GuiEvidence -and (Test-Path -LiteralPath $script:GuiEvidence)) {
         # A child of a test may still be closing its files for a moment: bounded retries, then the error is raised (never swallowed).
