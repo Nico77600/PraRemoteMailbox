@@ -246,6 +246,17 @@ Derived from the code, not from habit: no Domain Admin, no Global Administrator.
 
 A few points depend on Microsoft services and are flagged for a lab check in the reference guide (*What the code cannot tell you*).
 
+## Quick start
+
+The short version of [Get started](#get-started), once the rights and the settings file are ready. PowerShell 7.5+, as administrator, in the tool folder:
+
+```powershell
+cd D:\PRA\PraRemoteMailbox
+Get-ChildItem . -Recurse -File -Force | Unblock-File
+pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui                       # the console: Setup, Task, Verify, Run, Next steps
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Identity alice.vance@contoso.com   # or the command line: one mailbox, preview only
+```
+
 ## Documentation
 
 The `package` folder of this repository holds exactly the files needed to run PRA Remote Mailbox, with both guides. The zip of each [release](https://github.com/Nico77600/PraRemoteMailbox/releases) contains the same run-time files with the HTML guides; `.\tools\New-PraPackage.ps1` builds that zip content from the repository.
