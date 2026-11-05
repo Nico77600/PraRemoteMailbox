@@ -894,15 +894,13 @@ function Add-PraGuiNetworkLight {
     $state=if ($g.NetJob) { 'Checking' } else { [string]$g.NetResult.State }
     $unreached=@(if ($g.NetResult) { $g.NetResult.Answers | Where-Object { -not $_.Ok } | ForEach-Object { $_.Host } })
     $twoServers='the cloud part must run on another machine that reaches the Internet (two servers).'
-    switch ($state) {
-        'Checking' { $role='Checking'; $status='Info'; $detail='Checking that Microsoft 365 can be reached from this server (a few seconds)...' }
-        'Ok' { $role=$(if ($d.AD) { 'Both' } else { 'Cloud' }); $status='Ok'; $detail=('Reachable from this server ({0}).' -f ($script:GuiM365Hosts -join ' and ')) }
-        default {
-            $role=$(if ($d.AD) { 'AD' } else { 'None' })
-            $status=$(if ($d.AD) { 'Warn' } else { 'Fail' })
-            $which=$(if ((Test-GuiOrdinal $state 'Partial')) { ' ({0} does not answer)' -f ($unreached -join ', ') } else { '' })
-            $detail=$(if ($d.AD) { 'Microsoft 365 not reachable from this server{0}: {1}' -f $which,$twoServers } else { 'Microsoft 365 not reachable from this server{0}: the cloud part cannot run here. Check the Internet access (or the proxy), or use a machine that reaches the Internet.' -f $which })
-        }
+    if (Test-GuiOrdinal $state 'Checking') { $role='Checking'; $status='Info'; $detail='Checking that Microsoft 365 can be reached from this server (a few seconds)...' }
+    elseif (Test-GuiOrdinal $state 'Ok') { $role=$(if ($d.AD) { 'Both' } else { 'Cloud' }); $status='Ok'; $detail=('Reachable from this server ({0}).' -f ($script:GuiM365Hosts -join ' and ')) }
+    else {
+        $role=$(if ($d.AD) { 'AD' } else { 'None' })
+        $status=$(if ($d.AD) { 'Warn' } else { 'Fail' })
+        $which=$(if ((Test-GuiOrdinal $state 'Partial')) { ' ({0} does not answer)' -f ($unreached -join ', ') } else { '' })
+        $detail=$(if ($d.AD) { 'Microsoft 365 not reachable from this server{0}: {1}' -f $which,$twoServers } else { 'Microsoft 365 not reachable from this server{0}: the cloud part cannot run here. Check the Internet access (or the proxy), or use a machine that reaches the Internet.' -f $which })
     }
     $light=[ordered]@{ Name=$script:GuiNetLight; Status=$status; Detail=$detail }
     Add-Member -InputObject $d -NotePropertyName Lights -NotePropertyValue @(@($d.Lights) + $light) -Force
