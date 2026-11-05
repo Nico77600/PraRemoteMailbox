@@ -1,0 +1,25 @@
+{
+    "SchemaVersion":  2,
+    "Operation":  "Recover",
+    "Kind":  "ADVerified",
+    "Environment":  "SYNTHETIC_GATE",
+    "RunId":  "20261104_034347-13d7bd9c0dc643a5933942695e443159",
+    "BackupFile":  "Recover-SYNTHETIC_GATE-20261104_034351-273f5cf3.json",
+    "BackupHash":  "a9dbeb2ffc078d28d3f17e17c9be0f87c600c1c08cfdaa2c24205d343b647ae4",
+    "SourceBackupHash":  "b54a66fcc6a5185cb31ed54b494e561441251622fedba282523129e4a9681553",
+    "CreatedUtc":  "2026-11-04T02:43:55.6585168Z",
+    "Records":  [
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000001",
+                        "Operation":  "Recover",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000002",
+                        "Operation":  "Recover",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    }
+                ]
+}

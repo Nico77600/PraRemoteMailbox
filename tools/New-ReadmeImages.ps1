@@ -1,4 +1,4 @@
-﻿#Requires -Version 7.4
+﻿#Requires -Version 7.5
 <#
 .SYNOPSIS
     Renders the README banner in light and dark themes using the existing guide assets.
@@ -64,7 +64,7 @@ body { display: block; margin: 0; padding: 0; }
 '@
 $badges = @(
     "<span class=""badge badge-accent"">Version $version</span>"
-    "<span class=""badge"">$(Get-ReadmeIcon 'terminal' 'icon-sm')Windows PowerShell 5.1</span>"
+    "<span class=""badge"">$(Get-ReadmeIcon 'terminal' 'icon-sm')PowerShell 7.5+</span>"
     "<span class=""badge"">$(Get-ReadmeIcon 'shield' 'icon-sm')Backup before every change</span>"
     "<span class=""badge"">$(Get-ReadmeIcon 'tag' 'icon-sm')MIT license</span>"
 ) -join ''
@@ -104,12 +104,12 @@ try {
             }
             if (-not ($height -and $height.Success)) { Start-Sleep -Milliseconds 250 }
         }
-        if (-not $process.WaitForExit(1000)) { Stop-Process -Id $process.Id -Force }
+        if (-not $process.WaitForExit(1000)) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
         if (-not $height.Success) { throw "Height was not measured for the $theme banner." }
         $process = Start-Process -FilePath $edge -ArgumentList ($common + @("--user-data-dir=`"$(Join-Path $work "edge-capture-$theme")`"", "--window-size=1000,$($height.Groups[1].Value)", '--force-device-scale-factor=2', "--screenshot=`"$png`"", "`"$url`"")) -PassThru -WindowStyle Hidden
         $deadline = (Get-Date).AddSeconds(45)
         while (-not (Test-Path -LiteralPath $png -PathType Leaf) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 250 }
-        if (-not $process.WaitForExit(1000)) { Stop-Process -Id $process.Id -Force }
+        if (-not $process.WaitForExit(1000)) { Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue }
         if (-not (Test-Path -LiteralPath $png -PathType Leaf)) { throw "Edge failed to write the $theme banner." }
     }
     foreach ($theme in 'light', 'dark') {

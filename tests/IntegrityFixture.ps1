@@ -2,7 +2,8 @@
 .SYNOPSIS
     Controlled integrity fixtures for the offline PRA Remote Mailbox suites (dot-sourced by the test files).
 .DESCRIPTION
-    The real package is unsigned until the owner signs it, and the runtime fails closed on that. These helpers build a
+    The runtime fails closed on any missing, invalid or untrusted signature, and on any change after signing: the package
+    in the working tree is only usable once the owner has signed the final bytes and regenerated PackageIntegrity.psd1. These helpers build a
     COPY of the package in which exactly one thing is substituted: every call of
     Microsoft.PowerShell.Security\Get-AuthenticodeSignature (one per runtime PowerShell file: the bootstrap, or the
     verifier's owner check) returns a Valid, timestamped, owner-thumbprint result. Everything else is the real code
@@ -13,9 +14,9 @@
     claimed to be equivalent.
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.2.0
+    Version: 3.0.0
 #>
-#Requires -Version 5.1
+#Requires -Version 7.5
 
 $global:PraIntegrity = @{
     Signer = '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6'
@@ -25,17 +26,30 @@ $global:PraIntegrity = @{
 
 function global:Get-PraExpectedInventory {
     # Independent from the verifier: the tests compare both, so neither can drift silently.
-    $images = 'console-apply', 'console-preview', 'gui-fluent', 'readme-banner-dark', 'readme-banner-light', 'readme-flows-dark', 'readme-flows-light',
-        'readme-how-dark', 'readme-how-light', 'readme-permissions-dark', 'readme-permissions-light', 'readme-principles-dark', 'readme-principles-light',
-        'report-warning', 'report'
+    $images = 'console-next-cloud-light','console-next-global-light', 'console-next-light',
+        'console-next-package-light', 'console-next-rollback-light', 'console-run-cloud-light', 'console-run-early-light',
+        'console-run-finished-dark', 'console-run-finished-light', 'console-run-grant-light', 'console-run-package-light',
+        'console-run-rollback-light', 'console-run-waiting-light', 'console-settings-light', 'console-setup-dark',
+        'console-setup-light', 'console-setup-lights-light', 'console-setup-next-light', 'console-setup-red-light',
+        'console-setup-red-lights-light', 'console-task-ad-light', 'console-task-check-light', 'console-task-continue-light',
+        'console-task-finalize-light', 'console-task-identity-light', 'console-task-light',
+        'console-task-package-selected-light', 'console-task-rollback-light', 'console-task-rollback-selected-light', 'console-task-scope-light',
+        'console-verify-before-light', 'console-verify-check-light', 'console-verify-cloud-light',
+        'console-verify-light', 'console-verify-rollback-light', 'console-verify-scope-light', 'guide-dictionary-light',
+        'readme-banner-dark', 'readme-banner-light', 'readme-flows-dark', 'readme-flows-light',
+        'readme-how-dark', 'readme-how-light', 'readme-path-dark', 'readme-path-light',
+        'readme-permissions-dark', 'readme-permissions-light', 'readme-principles-dark', 'readme-principles-light',
+        'readme-rights-dark', 'readme-rights-light', 'readme-transfer-dark', 'readme-transfer-light',
+        'readme-why-dark', 'readme-why-light', 'report-global-light', 'report-global-recover-light',
+        'report-phase-light', 'report-phase-warning-light'
     @(
-        'Invoke-PraRemoteMailbox.ps1'
+        'Invoke-PraRemoteMailbox.ps1', 'PraRemoteMailbox.psd1', 'PraRemoteMailbox.psm1'
         'module\PRA.Common.psm1', 'module\PRA.Directory.psm1', 'module\PRA.Backup.psm1', 'module\PRA.Cloud.psm1', 'module\PRA.Gui.psm1'
         'module\PRA.Gui.Directory.ps1', 'module\Test-PackageIntegrity.ps1', 'module\PRA.Gui.xaml'
         'templates\Report.template.html'
         'config\Targets.sample.csv', 'config\SharedPermissions.sample.csv'
         'README.md', 'LICENSE'
-        'docs\PraRemoteMailbox-Guide.html', 'docs\PraRemoteMailbox-Guide.md'
+        'docs\PraRemoteMailbox-Guide.html', 'docs\PraRemoteMailbox-Guide.md', 'docs\PraRemoteMailbox-UserGuide.html', 'docs\PraRemoteMailbox-UserGuide.md'
     ) + @($images | ForEach-Object { 'docs\images\' + $_ + '.png' }) + @('CHANGELOG.md')
 }
 
@@ -81,7 +95,8 @@ function global:New-PraIntegrityFixture {
     Copy-Item -LiteralPath $SourcePackage -Destination $Destination -Recurse
     foreach ($folder in $global:PraIntegrity.Generated) { Remove-Item -LiteralPath (Join-Path $Destination $folder) -Recurse -Force -ErrorAction SilentlyContinue }
     if (-not $KeepNativeSignatureCheck) {
-        foreach ($relative in Get-PraSignedPowerShellFiles) {
+        # The module manifest is data (no signature call); every other signed file has exactly one.
+        foreach ($relative in Get-PraSignedPowerShellFiles | Where-Object { $_ -notmatch '\.psd1$' }) {
             $path = Join-Path $Destination $relative
             $file = Read-PraFixtureText $path
             $count = ([regex]::Matches($file.Text, [regex]::Escape($global:PraIntegrity.Token))).Count

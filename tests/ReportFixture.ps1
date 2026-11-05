@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+﻿#Requires -Version 7.5
 <#
 .SYNOPSIS
     Synthetic report-only data for the HTML report tests (dot-sourced by tests\PraReport.Tests.ps1).
@@ -93,11 +93,8 @@ function global:Read-PraReportData {
     $html = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
     $metaMatch = [regex]::Match($html, '<script type="application/json" id="pra-meta">(.*?)</script>')
     if (-not $metaMatch.Success) { throw 'pra-meta not found' }
-    $meta = $metaMatch.Groups[1].Value | ConvertFrom-Json
+    $meta = $metaMatch.Groups[1].Value | ConvertFrom-Json -DateKind String
     $data = @{}
-    Add-Type -AssemblyName System.Web.Extensions
-    $serializer = New-Object Web.Script.Serialization.JavaScriptSerializer
-    $serializer.MaxJsonLength = [int]::MaxValue
     foreach ($kind in @('rows','issues','warnings')) {
         $spec = $meta.$kind
         $data[$kind] = [pscustomobject]@{ Fields = @($spec.fields); Count = 0; Dict = @(for ($f = 0; $f -lt $spec.fields.Count; $f++) { ,(New-Object 'Collections.Generic.List[object]') }); Cols = @(for ($f = 0; $f -lt $spec.fields.Count; $f++) { ,(New-Object 'Collections.Generic.List[int]') }); Chunks = (New-Object 'Collections.Generic.List[int]') }
@@ -107,7 +104,8 @@ function global:Read-PraReportData {
         $input = New-Object IO.MemoryStream (, [Convert]::FromBase64String($m.Groups[3].Value))
         $gz = New-Object IO.Compression.GZipStream($input, [IO.Compression.CompressionMode]::Decompress)
         $reader = New-Object IO.StreamReader($gz, [Text.Encoding]::UTF8)
-        $chunk = $serializer.DeserializeObject($reader.ReadToEnd())
+        # .NET Framework's JavaScriptSerializer does not exist on .NET: ConvertFrom-Json (-AsHashtable, dates kept as text) reads the chunk.
+        $chunk = $reader.ReadToEnd() | ConvertFrom-Json -AsHashtable -DateKind String
         $reader.Dispose()
         $ds.Chunks.Add([int]$chunk['n']); $ds.Count += [int]$chunk['n']
         for ($f = 0; $f -lt $ds.Fields.Count; $f++) {

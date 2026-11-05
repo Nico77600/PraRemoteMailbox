@@ -1,0 +1,91 @@
+{
+    "SchemaVersion":  2,
+    "Operation":  "Convert",
+    "Kind":  "ADVerified",
+    "Environment":  "SYNTHETIC_GATE",
+    "RunId":  "dd5ccec12233410991c6297417bce507",
+    "BackupFile":  "Convert-SYNTHETIC_GATE-20261104_034400-cf72361c.json",
+    "BackupHash":  "3c56c496e057b59b943b5c5aa283fbb61b96d6678937e20c3fe8891b3b161537",
+    "SourceBackupHash":  "",
+    "CreatedUtc":  "2026-11-04T02:44:24.2854604Z",
+    "Records":  [
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000001",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000002",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000003",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000004",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000005",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000006",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000007",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000008",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000009",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000010",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000011",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000012",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000013",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    }
+                ]
+}

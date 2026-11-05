@@ -9,10 +9,10 @@
     No legacy Assert-MockCalled: counters are mutable objects.
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.2.0
+    Version: 3.0.0
     Run it through tests\Invoke-TestGate.ps1 (evidence, PSScriptAnalyzer, mandatory tests).
 #>
-#Requires -Version 5.1
+#Requires -Version 7.5
 
 BeforeAll {
     $global:PraGate = @{
@@ -103,7 +103,7 @@ function Assert-GateBackupBarrier {
     if (-not $files.Count) { throw 'GATE: mutation before backup.' }
     $verified = $false
     foreach ($file in $files) {
-        $json = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json
+        $json = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json -DateKind String
         if ($json.SchemaVersion -ne 3 -or $json.RawFormat -cne 'PraDataOnlyClixml-v1' -or $json.Operation -notin @('Convert','Recover','Finalize')) { continue }
         $ids = @($json.Records | ForEach-Object { [string]$_.ObjectGuid })
         if (@($global:PraGateAd.ExpectedGuids | Where-Object { $_ -notin $ids }).Count) { continue }
@@ -417,12 +417,12 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
             BackupFolder=$Runtime.State.BackupFolder; LogFolder=(Join-Path $Runtime.Root 'logs'); ReportFolder=(Join-Path $Runtime.Root 'reports')
             LogFile=''; TranscriptPath=''; TranscriptStarted=$false; NoReport=$false; Server=$Runtime.State.Server; NamingContext='DC=gate,DC=invalid'
             AllowMutation=($Mode -eq 'Apply' -and $Action -ne 'Check'); Approval={param($Target,$Operation) $true}
-            SourceBackupHash=''; Source=$null; Proof=$null; JournalPath=''; ExitCode=0; ResultStatus=''; CloudConnectFailed=$false; CloudCheckScope='Both'
+            SourceBackupHash=''; Source=$null; Proof=$null; JournalPath=''; ExitCode=0; ResultStatus=''; CloudConnectFailed=$false
         }
     }
     function global:Get-GateEvents {
         param($Runtime)
-        if (Test-Path -LiteralPath $Runtime.EventPath) { foreach ($line in [IO.File]::ReadAllLines($Runtime.EventPath)) { if ($line) { $line | ConvertFrom-Json } } }
+        if (Test-Path -LiteralPath $Runtime.EventPath) { foreach ($line in [IO.File]::ReadAllLines($Runtime.EventPath)) { if ($line) { $line | ConvertFrom-Json -DateKind String } } }
     }
     function global:Set-GateConfigText {
         param($Runtime,[Parameter(Mandatory)][scriptblock]$Transform)
@@ -446,7 +446,7 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         [IO.File]::WriteAllText($path,($record | ConvertTo-Json -Depth 25),(New-Object Text.UTF8Encoding($true)))
     }
     function global:Invoke-GateProcess {
-        param($Runtime,[hashtable]$Arguments,[switch]$Core,[switch]$ExplicitArguments,[ValidateRange(10,240)][int]$TimeoutSeconds=60,[ValidateRange(256,512)][int]$MemoryLimitMB=512)
+        param($Runtime,[hashtable]$Arguments,[switch]$Desktop,[switch]$ExplicitArguments,[ValidateRange(10,240)][int]$TimeoutSeconds=60,[ValidateRange(256,512)][int]$MemoryLimitMB=512)
         $paramsPath=Join-Path $Runtime.Root ('args-'+[guid]::NewGuid().ToString('N')+'.clixml')
         [IO.File]::WriteAllText($paramsPath,[Management.Automation.PSSerializer]::Serialize($Arguments,10))
         $argumentText='@parameters'
@@ -497,8 +497,9 @@ if (`$summary.Count -ne 1 -or `$null -eq `$summary[0].PSObject.Properties['ExitC
 exit `$code
 "@
         $encoded=[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
-        $exe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-        if ($Core) { $exe=(Get-Command pwsh.exe -ErrorAction Stop).Source }
+        # PowerShell 7.5+ is the engine. -Desktop starts Windows PowerShell 5.1 only to prove that the engine refuses it.
+        $exe=Join-Path $PSHOME 'pwsh.exe'
+        if ($Desktop) { $exe=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' }
         $clock=[Diagnostics.Stopwatch]::StartNew()
         $start=New-Object Diagnostics.ProcessStartInfo
         $start.FileName=$exe; $start.Arguments='-NoLogo -NoProfile -NonInteractive -EncodedCommand '+$encoded
@@ -521,10 +522,10 @@ exit `$code
         [IO.File]::WriteAllText($Runtime.OutputPath,$out,(New-Object Text.UTF8Encoding($true)))
         [IO.File]::WriteAllText($Runtime.ErrorPath,$err,(New-Object Text.UTF8Encoding($true)))
         $summaryPath=Join-Path $Runtime.Root 'main-result.json'
-        $mainSummary=if (Test-Path -LiteralPath $summaryPath) { [IO.File]::ReadAllText($summaryPath) | ConvertFrom-Json } else { $null }
+        $mainSummary=if (Test-Path -LiteralPath $summaryPath) { [IO.File]::ReadAllText($summaryPath) | ConvertFrom-Json -DateKind String } else { $null }
         $sourceHashes=@(foreach ($file in @((Join-Path $Runtime.Package 'Invoke-PraRemoteMailbox.ps1'),(Join-Path $Runtime.Package 'module\PRA.Directory.psm1'),(Join-Path $Runtime.Package 'module\PRA.Common.psm1'),(Join-Path $Runtime.Package 'module\PRA.Backup.psm1'))) { Get-FileHash -LiteralPath $file -Algorithm SHA256 | Select-Object Path,Hash })
         $childRuntimePath=Join-Path $Runtime.Root 'child-runtime.json'
-        $childRuntime=if (Test-Path -LiteralPath $childRuntimePath) { [IO.File]::ReadAllText($childRuntimePath) | ConvertFrom-Json } else { $null }
+        $childRuntime=if (Test-Path -LiteralPath $childRuntimePath) { [IO.File]::ReadAllText($childRuntimePath) | ConvertFrom-Json -DateKind String } else { $null }
         $record=[ordered]@{ Synthetic=$true; ChildRuntime=$childRuntime; CaseName=$Runtime.CaseName; ExplicitArguments=[bool]$ExplicitArguments; AdProvenance='TEMP ActiveDirectory.psm1; local System.DirectoryServices security descriptors only; no AD management assembly/provider'; CloudProvenance='TEMP synthetic orchestration barrier, not production Cloud'; SourceHashes=$sourceHashes; Executable=$exe; Command=$command; Arguments=$Arguments; RuntimeMilliseconds=$clock.ElapsedMilliseconds; PeakPrivateBytes=$peakPrivate; PeakWorkingSetBytes=$peakWorkingSet; MemorySamples=$samples; MemoryLimitBytes=($MemoryLimitMB*1MB); TimeoutSeconds=$TimeoutSeconds; WatchdogStopped=$stopped; ExitCode=$code; MainResult=$mainSummary; Stdout=$out; Stderr=$err; Events=@(Get-GateEvents $Runtime) }
         if ($env:PRA_GATE_EVIDENCE) {
             $caseId=(Split-Path $Runtime.Root -Leaf)+'-'+([IO.Path]::GetFileNameWithoutExtension($paramsPath).Substring(5,6))
@@ -532,7 +533,7 @@ exit `$code
             [IO.File]::WriteAllText($path,($record | ConvertTo-Json -Depth 30),(New-Object Text.UTF8Encoding($true)))
             $artifactRoot=Join-Path $env:PRA_GATE_EVIDENCE ($caseId+'-synthetic-artifacts')
             $null=New-Item -ItemType Directory -Path $artifactRoot -Force
-            foreach ($name in @('backups','logs','reports','main-result.json','events.jsonl')) {
+            foreach ($name in @('backups','logs','reports','main-result.json','events.jsonl','engine.events.jsonl')) {
                 $sourcePath=Join-Path $Runtime.Root $name
                 if (Test-Path -LiteralPath $sourcePath) { Copy-Item -LiteralPath $sourcePath -Destination $artifactRoot -Recurse -Force }
             }
@@ -639,7 +640,7 @@ Describe 'Directory internal invariants - synthetic modules only' {
         InModuleScope PRA.Directory {
             $user=New-GateUser
             $state=Get-PraAttributeState $user $script:AttributeKinds
-            $roundtrip=($state | ConvertTo-Json -Depth 10 | ConvertFrom-Json)
+            $roundtrip=($state | ConvertTo-Json -Depth 10 | ConvertFrom-Json -DateKind String)
             $roundtrip.mDBUseDefaults.Present | Should -BeTrue
             $roundtrip.mDBUseDefaults.Value | Should -BeOfType ([bool])
             (ConvertFrom-PraStoredValue $roundtrip.mDBUseDefaults) | Should -BeFalse
@@ -896,6 +897,88 @@ Describe 'Directory internal invariants - synthetic modules only' {
         $global:PraGateAd.Users[0].mDBUseDefaults | Should -BeFalse
         $global:PraGateAd.Users[0].extensionAttribute1 | Should -Be 'OriginalTag-1'
     }
+    It 'lot 2d: Recover keeps the cloud X500 written back by Entra Connect (user and shared), once, and still removes any other added address' -Tag 'Lot2d' {
+        $context=$global:PraGate.Context
+        $global:PraGateAd.Users[1].msExchRecipientTypeDetails=[long]4
+        $convert=@(New-PraPlan $context 'user1' 'Convert';New-PraPlan $context 'user2' 'Convert')
+        $source=Invoke-PraAdBatch $context $convert 'Convert'
+        $cloudOne='X500:/o=ExchangeLabs/ou=Exchange Administrative Group (FYDIBOHF23SPDLT)/cn=Recipients/cn=aaaa1111-user1'
+        $cloudTwo='X500:/o=ExchangeLabs/ou=Exchange Administrative Group (FYDIBOHF23SPDLT)/cn=Recipients/cn=bbbb2222-user2'
+        # The writeback: user1 gets one X500, user2 gets one X500 plus a case variant of its ORIGINAL X500 and a foreign smtp address (the latter two are not cloud X500).
+        $global:PraGateAd.Users[0].proxyAddresses=[string[]]@($global:PraGateAd.Users[0].proxyAddresses)+$cloudOne
+        $global:PraGateAd.Users[1].proxyAddresses=[string[]]@($global:PraGateAd.Users[1].proxyAddresses)+$cloudTwo+'x500:/o=synthetic/ou=gate/cn=user'+'smtp:someone.else@gate.invalid'
+        $context.Action='Recover'; $context.Source=$source; $context.SourceBackupHash=$source.Hash
+        $recover=@(foreach ($record in $source.Data.Records) { New-PraPlan $context $record.ObjectGuid 'Recover' $record -RestoreRetention })
+        @($recover[0].Record.KeptX500) | Should -BeExactly @($cloudOne)
+        @($recover[1].Record.KeptX500) | Should -BeExactly @($cloudTwo)
+        $recover[0].Row.Detail | Should -Match '1 cloud X500 address\(es\) kept'
+        $receipt=Invoke-PraAdBatch $context $recover 'Recover'
+        $original=@(1,2 | ForEach-Object { @((New-GateUser $_).proxyAddresses) })
+        $final1=@($global:PraGateAd.Users[0].proxyAddresses | Sort-Object { $_ } -CaseSensitive)
+        $expected1=@(@((New-GateUser 1).proxyAddresses)+$cloudOne | Sort-Object { $_ } -CaseSensitive)
+        ($final1 -join '|') | Should -BeExactly ($expected1 -join '|')
+        $expected2=@(@((New-GateUser 2).proxyAddresses)+$cloudTwo | Sort-Object { $_ } -CaseSensitive)
+        (@($global:PraGateAd.Users[1].proxyAddresses | Sort-Object { $_ } -CaseSensitive) -join '|') | Should -BeExactly ($expected2 -join '|')
+        @($global:PraGateAd.Users[1].proxyAddresses | Where-Object { $_ -ceq 'smtp:someone.else@gate.invalid' }).Count | Should -Be 0
+        @($global:PraGateAd.Users[1].proxyAddresses | Where-Object { $_ -match '^x500:/o=synthetic' -and $_ -cne 'X500:/o=Synthetic/ou=Gate/cn=User' }).Count | Should -Be 0
+        # The batch records the kept list, and a re-read of the backup matches it.
+        $saved=Import-PraBackup $context $receipt.Path
+        @($saved.Data.Records[0].KeptX500) | Should -BeExactly @($cloudOne)
+        @($saved.Data.Records[1].KeptX500) | Should -BeExactly @($cloudTwo)
+    }
+    It 'lot 2d: nothing is kept when no X500 was added, and an X500 that is already original is not duplicated' -Tag 'Lot2d' {
+        $context=$global:PraGate.Context
+        $convert=@(New-PraPlan $context 'user1' 'Convert';New-PraPlan $context 'user2' 'Convert')
+        $source=Invoke-PraAdBatch $context $convert 'Convert'
+        $context.Action='Recover'; $context.Source=$source; $context.SourceBackupHash=$source.Hash
+        $plan=New-PraPlan $context $source.Data.Records[0].ObjectGuid 'Recover' $source.Data.Records[0]
+        @($plan.Record.KeptX500).Count | Should -Be 0
+        (@($plan.Desired.proxyAddresses.Value | Sort-Object { $_ } -CaseSensitive) -join '|') | Should -BeExactly ((@((New-GateUser 1).proxyAddresses) | Sort-Object { $_ } -CaseSensitive) -join '|')
+        $plan.Row.Detail | Should -Not -Match 'X500'
+    }
+    It 'lot 2d: a record written before 3.0.0 (no KeptX500) is read, and a kept list that is not X500 is refused' -Tag 'Lot2d' {
+        InModuleScope PRA.Directory {
+            $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
+            $record=($plan.Record | ConvertTo-Json -Depth 20 | ConvertFrom-Json -DateKind String)
+            $record.PSObject.Properties.Remove('KeptX500')
+            { Assert-PraStoredRecord $record } | Should -Not -Throw
+            $record | Add-Member -NotePropertyName KeptX500 -NotePropertyValue @('smtp:not.x500@gate.invalid')
+            { Assert-PraStoredRecord $record } | Should -Throw '*kept X500*'
+        }
+    }
+    It 'lot 2d: Finalize accepts a writeback that only added X500 entries since the AD proof, and refuses anything else' -Tag 'Lot2d' -ForEach @(
+        @{Case='X500Only'; Throws=''}, @{Case='X500PlusOtherAddress'; Throws='*AD proof is out of date*'},
+        @{Case='X500PlusAttribute'; Throws='*homeMDB differs from the AD proof*'}, @{Case='VersionOnly'; Throws='*AD proof is out of date*'}
+    ) {
+        $global:PraGate.Change=$Case; $global:PraGate.Expect=$Throws
+        InModuleScope PRA.Directory {
+            $context=$global:PraGate.Context
+            $convert=@(New-PraPlan $context 'user1' 'Convert';New-PraPlan $context 'user2' 'Convert')
+            $source=Invoke-PraAdBatch $context $convert 'Convert'
+            $context.Action='Recover'; $context.Source=$source; $context.SourceBackupHash=$source.Hash
+            $restore=@(foreach ($record in $source.Data.Records) { New-PraPlan $context $record.ObjectGuid 'Recover' $record })
+            $receipt=Invoke-PraAdBatch $context $restore 'Recover'
+            $proof=Import-PraProof $context $receipt.StatePath $source 'Recover'
+            $user=$global:PraGateAd.Users[0]
+            $cloud='X500:/o=ExchangeLabs/ou=Exchange Administrative Group (FYDIBOHF23SPDLT)/cn=Recipients/cn=cccc3333-user1'
+            if ($global:PraGate.Change -ne 'VersionOnly') { $user.proxyAddresses=[string[]]@($user.proxyAddresses)+$cloud }
+            if ($global:PraGate.Change -eq 'X500PlusOtherAddress') { $user.proxyAddresses=[string[]]@($user.proxyAddresses)+'smtp:added.by.someone@gate.invalid' }
+            if ($global:PraGate.Change -eq 'X500PlusAttribute') { $user.homeMDB='CN=ThirdParty,DC=gate,DC=invalid' }
+            $user.uSNChanged=[long]$user.uSNChanged+3
+            $writesBefore=@(Get-GateWrites $global:PraGate.Runtime).Count
+            $followup=New-PraPlan $context 'user1' 'RestoreTag' $source.Data.Records[0]
+            if ($global:PraGate.Expect) { { Assert-PraFollowupState $context $followup $proof } | Should -Throw $global:PraGate.Expect }
+            else {
+                { Assert-PraFollowupState $context $followup $proof } | Should -Not -Throw
+                $followup.Row.Detail | Should -Match 'writeback'
+                # The final restore of the tag keeps the X500 (the proxyAddresses of a RestoreTag plan are the current ones).
+                $null=Invoke-PraAdBatch $context @($followup) 'Finalize'
+                @($user.proxyAddresses | Where-Object { $_ -ceq $cloud }).Count | Should -Be 1
+                $user.extensionAttribute1 | Should -BeExactly 'OriginalTag-1'
+            }
+            if ($global:PraGate.Expect) { @(Get-GateWrites $global:PraGate.Runtime).Count | Should -Be $writesBefore }
+        }
+    }
     It 'rechecks uSNChanged after approval and refuses a concurrent edit before the first write' {
         $plans=@(New-PraPlan $global:PraGate.Context 'user1' 'Convert';New-PraPlan $global:PraGate.Context 'user2' 'Convert')
         $global:PraGate.Context.Approval={ param($Target,$Operation) $global:PraGateAd.Users[0].uSNChanged++; $true }
@@ -924,7 +1007,7 @@ Describe 'Directory internal invariants - synthetic modules only' {
     It 'refuses a legacy backup missing a required original attribute' {
         InModuleScope PRA.Directory {
             $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
-            $record=($plan.Record | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
+            $record=($plan.Record | ConvertTo-Json -Depth 20 | ConvertFrom-Json -DateKind String)
             $record | Add-Member -NotePropertyName AddedToLicenseGroup -NotePropertyValue $false
             $record.Attributes.PSObject.Properties.Remove('msExchMailboxGuid')
             { Assert-PraStoredRecord $record -Legacy } | Should -Throw '*msExchMailboxGuid*'
@@ -933,7 +1016,7 @@ Describe 'Directory internal invariants - synthetic modules only' {
     }
     It 'refuses a legacy group removal without the original group GUID' {
         $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
-        $record=$plan.Record | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+        $record=$plan.Record | ConvertTo-Json -Depth 20 | ConvertFrom-Json -DateKind String
         $record.PSObject.Properties.Remove('Licensing')
         $record | Add-Member -NotePropertyName AddedToLicenseGroup -NotePropertyValue $true
         $record | Add-Member -NotePropertyName LicenseGroupDN -NotePropertyValue 'CN=RecreatedGroup,DC=gate,DC=invalid'
@@ -1257,15 +1340,9 @@ namespace Microsoft.ActiveDirectory.Management {
     }
 }
 '@
-        $compiler=New-Object Microsoft.CSharp.CSharpCodeProvider
-        $parameters=New-Object CodeDom.Compiler.CompilerParameters
-        $parameters.GenerateInMemory=$true
-        $parameters.TempFiles=New-Object CodeDom.Compiler.TempFileCollection($global:PraGate.Runtime.Root,$false)
-        $null=$parameters.ReferencedAssemblies.Add('System.dll')
-        try { $compiled=$compiler.CompileAssemblyFromSource($parameters,$source) }
-        finally { $compiler.Dispose() }
-        $compiled.Errors.HasErrors | Should -BeFalse
-        $type=$compiled.CompiledAssembly.GetType('Microsoft.ActiveDirectory.Management.ADUser',$true)
+        # CodeDom does not compile on .NET: Add-Type (Roslyn) builds the synthetic native-shape type in a dynamic assembly.
+        $type=Add-Type -TypeDefinition $source -PassThru | Where-Object FullName -ceq 'Microsoft.ActiveDirectory.Management.ADUser'
+        $type | Should -Not -BeNullOrEmpty
         $type.Assembly.GetName().Name | Should -Not -Be 'Microsoft.ActiveDirectory.Management'
         $user=[Activator]::CreateInstance($type)
         $user.ObjectGUID=[guid]'00000000-0000-0000-0000-000000000001'
@@ -1306,7 +1383,7 @@ namespace Microsoft.ActiveDirectory.Management {
     }
     It 'rejects an unsupported complex attribute without walking its getter or using a ToString fallback' {
         if (-not ('PraGateOpaqueValue' -as [type])) {
-            Add-Type -TypeDefinition 'public sealed class PraGateOpaqueValue { public static int GetterCalls; public static int StringCalls; public PraGateOpaqueValue Child { get { GetterCalls++; return this; } } public static string LastStringStack; public static System.Collections.Generic.List<string> StringStacks=new System.Collections.Generic.List<string>(); public static int BinderCalls; public static int UnexpectedCalls; public override string ToString() { StringCalls++; var frames=new System.Diagnostics.StackTrace().GetFrames(); bool binder=frames.Length>3 && frames[1].GetMethod().DeclaringType!=null && frames[2].GetMethod().DeclaringType!=null && frames[3].GetMethod().DeclaringType!=null && frames[1].GetMethod().DeclaringType.FullName=="System.Management.Automation.PSObject" && frames[1].GetMethod().Name=="ToString" && frames[2].GetMethod().DeclaringType.FullName=="System.Management.Automation.PSObject" && frames[2].GetMethod().Name=="ToString" && frames[3].GetMethod().DeclaringType.FullName=="System.Management.Automation.ParameterBinderBase" && frames[3].GetMethod().Name=="BindParameter"; if(!binder && frames.Length>5){string[] names={"ToString","ToStringEmptyBaseObject","ToString","ToString","BindParameter"};binder=true;for(int j=1;j<=5;j++){var m=frames[j].GetMethod();string type=j==5?"System.Management.Automation.ParameterBinderBase":"System.Management.Automation.PSObject";if(m.DeclaringType==null || m.DeclaringType.FullName!=type || m.Name!=names[j-1]){binder=false;break;}}} if(binder){BinderCalls++;}else{UnexpectedCalls++;} var text=new System.Text.StringBuilder(); for(int i=0;i<System.Math.Min(8,frames.Length);i++){var method=frames[i].GetMethod(); text.AppendLine((method.DeclaringType==null?"<dynamic>":method.DeclaringType.FullName)+"."+method.Name);} LastStringStack=text.ToString(); if(StringStacks.Count<8){StringStacks.Add(LastStringStack);} return "opaque"; } }'
+            Add-Type -TypeDefinition 'public sealed class PraGateOpaqueValue { public static int GetterCalls; public static int StringCalls; public PraGateOpaqueValue Child { get { GetterCalls++; return this; } } public static string LastStringStack; public static System.Collections.Generic.List<string> StringStacks=new System.Collections.Generic.List<string>(); public static int BinderCalls; public static int UnexpectedCalls; public override string ToString() { StringCalls++; var frames=new System.Diagnostics.StackTrace().GetFrames(); /* The engine''s own parameter binder converts the value to text when a command is bound to it. Every frame between ToString and the binder is a PSObject method (the JIT may inline some of them, so their number is not fixed); a ToString called from anything else is not accepted. */ bool binder=false; int j=1; while(j<frames.Length){var m=frames[j].GetMethod(); if(m.DeclaringType!=null && m.DeclaringType.FullName=="System.Management.Automation.PSObject"){j++;continue;} break;} if(j>1 && j<frames.Length){var bind=frames[j].GetMethod(); binder=bind.DeclaringType!=null && bind.DeclaringType.FullName=="System.Management.Automation.ParameterBinderBase" && bind.Name=="BindParameter";} if(binder){BinderCalls++;}else{UnexpectedCalls++;} var text=new System.Text.StringBuilder(); for(int i=0;i<System.Math.Min(8,frames.Length);i++){var method=frames[i].GetMethod(); text.AppendLine((method.DeclaringType==null?"<dynamic>":method.DeclaringType.FullName)+"."+method.Name);} LastStringStack=text.ToString(); if(StringStacks.Count<8){StringStacks.Add(LastStringStack);} return "opaque"; } }'
         }
         [PraGateOpaqueValue]::GetterCalls=0; [PraGateOpaqueValue]::StringCalls=0; [PraGateOpaqueValue]::BinderCalls=0; [PraGateOpaqueValue]::UnexpectedCalls=0; [PraGateOpaqueValue]::LastStringStack=''; [PraGateOpaqueValue]::StringStacks.Clear()
         $user=New-GateUser; $user | Add-Member -NotePropertyName Opaque -NotePropertyValue (New-Object PraGateOpaqueValue)
@@ -1334,7 +1411,7 @@ namespace Microsoft.ActiveDirectory.Management {
     It 'accepts safe schema <Version> historical ordinary fixtures without native deserialization' -ForEach @(@{Version=1},@{Version=2}) {
         $context=$global:PraGate.Context; $runtime=$global:PraGate.Runtime
         $plan=New-PraPlan $context 'user1' 'Convert'
-        $record=$plan.Record | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+        $record=$plan.Record | ConvertTo-Json -Depth 30 | ConvertFrom-Json -DateKind String
         if ($Version -eq 1) { $record | Add-Member AddedToLicenseGroup $false }
         $raw=Join-Path $runtime.Root 'historical.clixml'
         # This legacy graph is an ordinary bounded fake, never an ActiveDirectorySecurity.
@@ -1403,7 +1480,7 @@ namespace Microsoft.ActiveDirectory.Management {
         $context=$global:PraGate.Context
         $plan=New-PraPlan $context 'user1' 'Convert'
         $receipt=& (Get-Module PRA.Directory) { param($c,$p) Save-PraBatch $c @($p) 'Convert' } $context $plan
-        $data=[IO.File]::ReadAllText($receipt.Path) | ConvertFrom-Json; $data.RawFormat=$Marker
+        $data=[IO.File]::ReadAllText($receipt.Path) | ConvertFrom-Json -DateKind String; $data.RawFormat=$Marker
         [IO.File]::WriteAllText($receipt.Path,($data | ConvertTo-Json -Depth 30))
         [IO.File]::WriteAllText(($receipt.Path+'.sha256'),(Get-PraHash $receipt.Path))
         $fresh=New-GateContext $global:PraGate.Runtime
@@ -1620,7 +1697,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
         $source.Data.SchemaVersion | Should -Be 3
         $source.Data.RawFormat | Should -BeExactly 'PraDataOnlyClixml-v1'
         $source.Data.Records.Count | Should -Be 13
-        $state=[IO.File]::ReadAllText($source.StatePath) | ConvertFrom-Json
+        $state=[IO.File]::ReadAllText($source.StatePath) | ConvertFrom-Json -DateKind String
         $state.SchemaVersion | Should -Be 2
         $events=@(Get-GateEvents $runtime)
         $first=@($events | Where-Object Operation -eq 'Set-ADUser')[0]
@@ -1639,7 +1716,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
         $receipt=Invoke-PraAdBatch $context $recover 'Recover'
         $receipt.Data.SchemaVersion | Should -Be 3
         $receipt.Data.RawFormat | Should -BeExactly 'PraDataOnlyClixml-v1'
-        ([IO.File]::ReadAllText($receipt.StatePath) | ConvertFrom-Json).SchemaVersion | Should -Be 2
+        ([IO.File]::ReadAllText($receipt.StatePath) | ConvertFrom-Json -DateKind String).SchemaVersion | Should -Be 2
         @(Get-GateWrites $runtime).Count | Should -Be 26
         foreach ($user in $global:PraGateAd.Users) {
             $original=@($global:PraGateAd.Originals | Where-Object ObjectGUID -eq $user.ObjectGUID)[0]
@@ -1691,7 +1768,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
             $global:PraGate.DiskCorruptReached | Should -Be 1
             $plans[12].RawSnapshot.Attributes['Description'].Value | Should -BeExactly 'ForensicOriginal-user13'
             $jsonPath=@(Get-ChildItem -LiteralPath $context.BackupFolder -Recurse -File -Filter 'Convert-*.json')[0].FullName
-            $json=[IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json
+            $json=[IO.File]::ReadAllText($jsonPath) | ConvertFrom-Json -DateKind String
             $rawPath=Join-Path (Split-Path $jsonPath -Parent) $json.RawFile
             (Get-PraHash $rawPath) | Should -BeExactly $json.RawHash -Because 'hash was computed AFTER disk corruption; ExpectedSnapshots alone must reject forensic loss'
             (Test-PraRawCapture -Context $context -LiteralPath $rawPath -Records @($json.Records) -RawFormat $json.RawFormat).Count | Should -Be 13
@@ -1715,7 +1792,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
             'SourceBackupHash' { $receipt.Data.SourceBackupHash=('a'*64) }
             'Legacy' { $receipt.Legacy=$true }
             'Opaque' {
-                if (-not ('PraGateReceiptOpaque' -as [type])) { Add-Type -TypeDefinition 'public sealed class PraGateReceiptOpaque { public static int GetterCalls; public static int StringCalls; public PraGateReceiptOpaque Child { get { GetterCalls++; return this; } } public static string LastStringStack; public static System.Collections.Generic.List<string> StringStacks=new System.Collections.Generic.List<string>(); public static int BinderCalls; public static int UnexpectedCalls; public override string ToString() { StringCalls++; var frames=new System.Diagnostics.StackTrace().GetFrames(); bool binder=frames.Length>3 && frames[1].GetMethod().DeclaringType!=null && frames[2].GetMethod().DeclaringType!=null && frames[3].GetMethod().DeclaringType!=null && frames[1].GetMethod().DeclaringType.FullName=="System.Management.Automation.PSObject" && frames[1].GetMethod().Name=="ToString" && frames[2].GetMethod().DeclaringType.FullName=="System.Management.Automation.PSObject" && frames[2].GetMethod().Name=="ToString" && frames[3].GetMethod().DeclaringType.FullName=="System.Management.Automation.ParameterBinderBase" && frames[3].GetMethod().Name=="BindParameter"; if(!binder && frames.Length>5){string[] names={"ToString","ToStringEmptyBaseObject","ToString","ToString","BindParameter"};binder=true;for(int j=1;j<=5;j++){var m=frames[j].GetMethod();string type=j==5?"System.Management.Automation.ParameterBinderBase":"System.Management.Automation.PSObject";if(m.DeclaringType==null || m.DeclaringType.FullName!=type || m.Name!=names[j-1]){binder=false;break;}}} if(binder){BinderCalls++;}else{UnexpectedCalls++;} var text=new System.Text.StringBuilder(); for(int i=0;i<System.Math.Min(8,frames.Length);i++){var method=frames[i].GetMethod(); text.AppendLine((method.DeclaringType==null?"<dynamic>":method.DeclaringType.FullName)+"."+method.Name);} LastStringStack=text.ToString(); if(StringStacks.Count<8){StringStacks.Add(LastStringStack);} return "opaque"; } }' }
+                if (-not ('PraGateReceiptOpaque' -as [type])) { Add-Type -TypeDefinition 'public sealed class PraGateReceiptOpaque { public static int GetterCalls; public static int StringCalls; public PraGateReceiptOpaque Child { get { GetterCalls++; return this; } } public static string LastStringStack; public static System.Collections.Generic.List<string> StringStacks=new System.Collections.Generic.List<string>(); public static int BinderCalls; public static int UnexpectedCalls; public override string ToString() { StringCalls++; var frames=new System.Diagnostics.StackTrace().GetFrames(); /* The engine''s own parameter binder converts the value to text when a command is bound to it. Every frame between ToString and the binder is a PSObject method (the JIT may inline some of them, so their number is not fixed); a ToString called from anything else is not accepted. */ bool binder=false; int j=1; while(j<frames.Length){var m=frames[j].GetMethod(); if(m.DeclaringType!=null && m.DeclaringType.FullName=="System.Management.Automation.PSObject"){j++;continue;} break;} if(j>1 && j<frames.Length){var bind=frames[j].GetMethod(); binder=bind.DeclaringType!=null && bind.DeclaringType.FullName=="System.Management.Automation.ParameterBinderBase" && bind.Name=="BindParameter";} if(binder){BinderCalls++;}else{UnexpectedCalls++;} var text=new System.Text.StringBuilder(); for(int i=0;i<System.Math.Min(8,frames.Length);i++){var method=frames[i].GetMethod(); text.AppendLine((method.DeclaringType==null?"<dynamic>":method.DeclaringType.FullName)+"."+method.Name);} LastStringStack=text.ToString(); if(StringStacks.Count<8){StringStacks.Add(LastStringStack);} return "opaque"; } }' }
                 [PraGateReceiptOpaque]::GetterCalls=0; [PraGateReceiptOpaque]::StringCalls=0; [PraGateReceiptOpaque]::BinderCalls=0; [PraGateReceiptOpaque]::UnexpectedCalls=0; [PraGateReceiptOpaque]::LastStringStack=''; [PraGateReceiptOpaque]::StringStacks.Clear()
                 $receipt.Data.Records[0].Attributes.homeMDB.Value=New-Object PraGateReceiptOpaque
             }
@@ -1778,7 +1855,7 @@ Describe 'OOM permission cache, receipt identity and thirteen shared snapshots' 
         $context.Approval={
             param($Target,$Operation)
             $path=$global:PraGate.Context.BackupFiles[0]
-            if ($global:PraGate.TamperArtifact -eq 'Raw') { $data=[IO.File]::ReadAllText($path) | ConvertFrom-Json; $path=Join-Path (Split-Path $path -Parent) $data.RawFile }
+            if ($global:PraGate.TamperArtifact -eq 'Raw') { $data=[IO.File]::ReadAllText($path) | ConvertFrom-Json -DateKind String; $path=Join-Path (Split-Path $path -Parent) $data.RawFile }
             elseif ($global:PraGate.TamperArtifact -eq 'Sidecar') { $path+='.sha256' }
             [IO.File]::AppendAllText($path,'x'); $true
         }
@@ -2860,7 +2937,7 @@ Export-ModuleMember -Function Get-ConnectionInformation,Get-EXORecipient,Get-EXO
     Context 'Public preflight and authorized grant integration' {
         BeforeEach {
             $context=New-GateContext $global:PraGate.Runtime
-            $context.Phase='Both';$context.CheckScope='Both'
+            $context.Phase='Both'
             $context.Config.Cloud=@{TenantId=$global:PraGate.Native.Tenant;UserPrincipalName='operator@gate.invalid';CheckMailbox=$true;CheckLicense=$true;MailboxCheckVia='Exo';AppId='';CertificateThumbprint=''}
             $context.Config.Exo=@{MinModuleVersion='3.10.0';UseSubprocess=$false;DisableWAM=$true;GrantVerifyAttempts=13;GrantVerifyDelaySeconds=10}
             $context.Config.SharedMailbox.PermissionSource='AD';$context.Config.SharedMailbox.GrantFullAccess=$true;$context.Config.SharedMailbox.GrantSendAs=$true
@@ -2922,7 +2999,7 @@ Export-ModuleMember -Function Get-ConnectionInformation,Get-EXORecipient,Get-EXO
         }
         It 'stops Graph <Case> before EXO without creating connections or disconnecting unrelated sessions' -ForEach @(
             @{Case='GraphConnectFailure';Message='*Graph connection failed before any context was created*'},
-            @{Case='GraphAssemblyConflict';Message='*assembly conflict*new Windows PowerShell window*GetTokenAsync*'},
+            @{Case='GraphAssemblyConflict';Message='*assembly conflict*new PowerShell 7 window*GetTokenAsync*'},
             @{Case='GraphPreexistingContext';Message='*Graph session already exists*'}
         ) {
             $global:PraGate.Native.ConnectLifecycle=$true;$global:PraGate.Native.Case=$Case
@@ -2952,6 +3029,33 @@ Export-ModuleMember -Function Get-ConnectionInformation,Get-EXORecipient,Get-EXO
             $global:PraGate.Native.GraphConnect | Should -Be 1
             $global:PraGate.Native.GraphClose | Should -Be 1
             $global:PraGate.NativeContext.CloudConnectFailed | Should -BeTrue
+        }
+        It 'preflights a Recover (phase Both) with the same sessions, no trustee request and no identity pinning' {
+            $global:PraGate.Native.ConnectLifecycle=$true
+            $context=$global:PraGate.NativeContext
+            $context.Action='Recover'
+            try {
+                Initialize-PraCloudPreflight -Context $context -Rows @($global:PraGate.NativeRow,$global:PraGate.NativeUserRow)
+                $context['_PraCloudSession'].Preflight | Should -BeTrue
+                # A deprovisioned user becomes a MailUser: its identity is not pinned for the cloud phase of the Recover.
+                $context['_PraCloudSession'].Identities.Count | Should -Be 0
+                $global:PraGate.Native.Writes | Should -Be 0
+                $global:PraGate.Native.ExoConnect | Should -Be 1
+                $global:PraGate.Native.GraphConnect | Should -Be 1
+                $global:PraGate.Native.ConnectUpn | Should -BeExactly 'operator@gate.invalid'
+                ($global:PraGate.Native.ConnectionOrder -join ',') | Should -BeExactly 'Import-Microsoft.Graph.Authentication,Import-Microsoft.Graph.Users,Connect-MgGraph,Import-ExchangeOnlineManagement,Connect-ExchangeOnline'
+            } finally { Close-PraCloudSession $context }
+            $global:PraGate.Native.ExoClose | Should -Be 1
+            $global:PraGate.Native.GraphClose | Should -Be 1
+        }
+        It 'refuses the pre-check for anything but Convert or Recover, Apply, phase Both' -ForEach @(
+            @{Action='Finalize';Mode='Apply';Phase='Both'},@{Action='Check';Mode='Apply';Phase='Both'},@{Action='Recover';Mode='Preview';Phase='Both'},@{Action='Recover';Mode='Apply';Phase='AD'}
+        ) {
+            $context=$global:PraGate.NativeContext
+            $context.Action=$Action;$context.Mode=$Mode;$context.Phase=$Phase;$context.AllowMutation=($Mode -eq 'Apply')
+            { Initialize-PraCloudPreflight -Context $context -Rows @($global:PraGate.NativeUserRow) } | Should -Throw '*only for Convert or Recover, Apply, phase Both*'
+            $global:PraGate.Native.ExoConnect | Should -Be 0
+            $global:PraGate.Native.GraphConnect | Should -Be 0
         }
         It 'keeps proof, individual approval and Started/Applied/Verified journal bound to the exact grant' {
             $context=$global:PraGate.NativeContext
@@ -3055,7 +3159,7 @@ Export-ModuleMember -Function Invoke-PraPermissionGrant
         [object]::ReferenceEquals($heldJournal,$context) | Should -BeTrue
         Invoke-PraPermissionGrant $context $global:PraGate.AuthorityRow $global:PraGate.AuthorityParams
         $context.GateDispatchCount | Should -Be 1
-        $journal=@([IO.File]::ReadAllLines($context.JournalPath) | ForEach-Object { $_ | ConvertFrom-Json })
+        $journal=@([IO.File]::ReadAllLines($context.JournalPath) | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
         ($journal.Status -join ',') | Should -BeExactly 'Started,Applied,Verified'
         @($journal | Where-Object RunId -ne $context.RunId).Count | Should -Be 0
     }
@@ -3220,7 +3324,7 @@ Describe 'Batch resolution diagnostics - complete synthetic main invocations' -T
     }
 }
 
-Describe 'Whole main in an isolated Windows PowerShell process' {
+Describe 'Whole main in an isolated PowerShell 7 process' {
     It 'runs readonly Cloud preflight on actual planned rows before AD, then closes on AD failure' -Tag 'NativeCloud136' {
         $runtime=New-GateRuntime -Name 'main-preflight-before-ad' -Case SecondMutationFailure
         $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='Both';Force=$true;ConfigPath=$runtime.ConfigPath}
@@ -3263,7 +3367,7 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
         $barrier.Detail.ValidatedCount | Should -Be 13
         $barrier.Detail.ValidatedGuids.Count | Should -Be 13
         $barrier.Detail.ValidatorModule | Should -BeLike '*\module\PRA.Backup.psm1'
-        $backup=[IO.File]::ReadAllText($barrier.Detail.Path) | ConvertFrom-Json
+        $backup=[IO.File]::ReadAllText($barrier.Detail.Path) | ConvertFrom-Json -DateKind String
         $backup.SchemaVersion | Should -Be 3
         foreach ($record in $backup.Records) {
             foreach ($right in @('FullAccess','SendAs','SendOnBehalf')) {
@@ -3305,10 +3409,10 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
         $recover.MainResult.TotalCount | Should -Be 13
         @(Get-GateWrites $runtime).Count | Should -Be 26
         $recoverPath=@(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Recover-*.json')[0].FullName
-        $recoverData=[IO.File]::ReadAllText($recoverPath) | ConvertFrom-Json
+        $recoverData=[IO.File]::ReadAllText($recoverPath) | ConvertFrom-Json -DateKind String
         $recoverData.SchemaVersion | Should -Be 3
         $statePath=Join-Path (Split-Path $recoverPath -Parent) ('State-'+$recoverData.BatchId+'.json')
-        $state=[IO.File]::ReadAllText($statePath) | ConvertFrom-Json
+        $state=[IO.File]::ReadAllText($statePath) | ConvertFrom-Json -DateKind String
         $state.SchemaVersion | Should -Be 2
         $state.Records.Count | Should -Be 13
         $before=@(Get-GateWrites $runtime).Count
@@ -3316,14 +3420,14 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
         $cloud.ExitCode | Should -Be 2
         @($cloud.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 1
         @(Get-GateWrites $runtime).Count | Should -Be $before
-        $manifestFile=@(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Finalize-*.json' | Where-Object { ([IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json).Operation -eq 'RecoverFinalize' })[0]
-        $manifest=[IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json
+        $manifestFile=@(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Finalize-*.json' | Where-Object { ([IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json -DateKind String).Operation -eq 'RecoverFinalize' })[0]
+        $manifest=[IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -DateKind String
         $manifest.SchemaVersion | Should -Be 2
         $manifest.Items.Count | Should -Be 13
         foreach ($receiptPath in @($source.Path,$recoverPath)) {
             $copied=Join-Path $manifestFile.DirectoryName ([IO.Path]::GetFileName($receiptPath))
             (Get-FileHash $copied).Hash | Should -BeExactly (Get-FileHash $receiptPath).Hash
-            $data=[IO.File]::ReadAllText($copied) | ConvertFrom-Json
+            $data=[IO.File]::ReadAllText($copied) | ConvertFrom-Json -DateKind String
             $data.SchemaVersion | Should -Be 3
             $data.RawFormat | Should -BeExactly 'PraDataOnlyClixml-v1'
             $raw=Join-Path $manifestFile.DirectoryName $data.RawFile
@@ -3355,11 +3459,11 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
             $run.MainResult.HtmlReport | Should -BeNullOrEmpty
         }
     }
-    It 'rejects pwsh Core before any AD read or write, with fake modules still installed' -Tag 'GuiIntegration' {
-        $runtime=New-GateRuntime -Name 'main-core-rejected'
-        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath} -Core
+    It 'rejects Windows PowerShell 5.1 before any AD read or write, with fake modules still installed' -Tag 'GuiIntegration' {
+        $runtime=New-GateRuntime -Name 'main-desktop-rejected'
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath} -Desktop
         $run.ExitCode | Should -Not -Be 0
-        ($run.Output+$run.Error) | Should -Match 'Desktop|PSEdition|edition'
+        ($run.Output+$run.Error) | Should -Match '7\.5'
         @($run.Events | Where-Object Operation -Match '^(Get-AD|Set-|Add-|Remove-|CloudPhase|Start-ADSync)').Count | Should -Be 0
     }
     It 'exposes debug details only with native Verbose, while always preserving them in the log' -ForEach @(@{EnableVerbose=$false},@{EnableVerbose=$true}) {
@@ -3404,7 +3508,7 @@ Describe 'Whole main in an isolated Windows PowerShell process' {
         ($writes.Operation -join ',') | Should -Be 'Set-ADUser,Add-ADGroupMember'
         @($run.Events | Where-Object Operation -Match 'CloudPhase|ADSync').Count | Should -Be 0
         $backupPath=@($run.Events | Where-Object Operation -eq 'BackupBarrier')[0].Detail.Path
-        $backup=[IO.File]::ReadAllText($backupPath) | ConvertFrom-Json
+        $backup=[IO.File]::ReadAllText($backupPath) | ConvertFrom-Json -DateKind String
         $backup.Records.Count | Should -Be 2
         $backup.Records[0].Attributes.extensionAttribute1.Value | Should -Be 'OriginalTag-1'
         $backup.Records[0].Attributes.msExchMailboxGuid.Value | Should -Be ([Convert]::ToBase64String((New-GateUser).msExchMailboxGuid))
@@ -3566,7 +3670,7 @@ Describe 'Split cloud recovery never restores AD implicitly' -Tag 'GuiIntegratio
         $guiState=Read-PraGuiState -Root $runtime.Package -ConfigPath $runtime.ConfigPath
         (Read-PraGuiBatch -Path $bundles.Source -Environment $config.Environment).Valid | Should -BeTrue
         (Read-PraGuiBatch -Path $bundles.Recover -Environment $config.Environment).Valid | Should -BeTrue
-        $convertData=[IO.File]::ReadAllText($bundles.Source) | ConvertFrom-Json
+        $convertData=[IO.File]::ReadAllText($bundles.Source) | ConvertFrom-Json -DateKind String
         (Resolve-PraGuiBatch -Value $convertData.BatchId.Substring(0,8) -Operation Convert -State $guiState).Valid | Should -BeTrue
         $guiCloudRequest=New-PraGuiRequest -Action Recover -Phase Cloud -Batch $bundles.Recover
         Get-PraGuiGuard -Root $runtime.Package -ConfigPath $runtime.ConfigPath -Request $guiCloudRequest | Should -Match '^[0-9a-fA-F]{64}$'
@@ -3578,7 +3682,7 @@ Describe 'Split cloud recovery never restores AD implicitly' -Tag 'GuiIntegratio
         @(Get-GateWrites $runtime).Count | Should -Be $before
         @($cloud.Events | Select-Object -Skip $beforeEvents | Where-Object Operation -Match 'Get-ADUser|ADSync').Count | Should -Be 0
         $manifest=@(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Finalize-*.json' |
-            Where-Object { ([IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json).Operation -eq 'RecoverFinalize' })[0]
+            Where-Object { ([IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json -DateKind String).Operation -eq 'RecoverFinalize' })[0]
         (Read-PraGuiBatch -Path $manifest.FullName -Environment $config.Environment).Valid | Should -BeTrue
         $guiFinalizeRequest=New-PraGuiRequest -Action Finalize -Batch $manifest.FullName
         Get-PraGuiGuard -Root $runtime.Package -ConfigPath $runtime.ConfigPath -Request $guiFinalizeRequest | Should -Match '^[0-9a-fA-F]{64}$'
@@ -3701,10 +3805,9 @@ Describe 'Runtime output folders versus the authenticated package' -Tag 'Integri
         finally { [IO.Directory]::Delete($alias) }
     }
     It 'loads and checks real configurations in a child <Engine> process: canonical and external folders are accepted, aliases and unresolved paths are refused' -ForEach @(
-        @{Engine='Windows PowerShell 5.1';Exe=(Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe');Major=5}
-        @{Engine='PowerShell 7';Exe=$(if (Get-Command pwsh.exe -ErrorAction SilentlyContinue) { (Get-Command pwsh.exe).Source } else { '' });Major=7}
+        @{Engine='PowerShell 7';Exe=(Join-Path $PSHOME 'pwsh.exe');Major=7}
     ) {
-        $Exe | Should -Not -BeNullOrEmpty -Because 'the PowerShell 7 GUI launcher uses the same module, so both engines are tested'
+        $Exe | Should -Not -BeNullOrEmpty
         $runtime=New-GateRuntime -Name ('outputs-engine-'+$Major)
         $alias=Join-Path $runtime.Root 'package-alias'
         $null=New-Item -ItemType Junction -Path $alias -Target $runtime.Package -ErrorAction Stop
@@ -3746,7 +3849,7 @@ foreach (`$file in @('$(($list | ForEach-Object { $_.Replace("'","''") }) -join 
             [IO.File]::WriteAllText($scriptPath,$script,(New-Object Text.UTF8Encoding($true)))
             $output=& $Exe -NoProfile -NonInteractive -File $scriptPath 2>&1
             $LASTEXITCODE | Should -Be 0 -Because ([string]($output -join ' '))
-            $r=[IO.File]::ReadAllText((Join-Path $runtime.Root 'engine.json')) | ConvertFrom-Json
+            $r=[IO.File]::ReadAllText((Join-Path $runtime.Root 'engine.json')) | ConvertFrom-Json -DateKind String
             [int]($r.Version.Split('.')[0]) | Should -Be $Major
             $r.Init.Created | Should -BeTrue
             $r.Init.Cached | Should -BeTrue
@@ -3777,14 +3880,25 @@ foreach (`$file in @('$(($list | ForEach-Object { $_.Replace("'","''") }) -join 
     It 'refuses a destination whose physical location cannot be resolved instead of treating it as external (<Name>)' -ForEach @(
         @{Name='unknown volume namespace';Path='\\?\Volume{00000000-0000-0000-0000-000000000000}\out'}
         @{Name='device namespace with parent segments';Path='\\?\C:\a\..\b'}
-        @{Name='device namespace with a current-folder segment';Path='\\.\C:\a\.\b'}
     ) {
         $runtime=New-GateRuntime -Name ('outputs-unresolved-'+($Name -replace '\W','-'))
         Set-GateOutputFolders $runtime '.\Backups' '.\logs' $Path
         $before=Get-GatePackageFiles $runtime
         { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*cannot be checked against the signed package*'
         @(Get-GatePackageFiles $runtime) | Should -Be $before
-    }}
+    }
+    # Behaviour difference of .NET (PowerShell 7) versus .NET Framework (2.x): GetFullPath normalises the dots of a \\.\ device path and
+    # Directory.Exists answers for the volume root \\.\C:\, so the path IS resolved now instead of being unresolvable. It is then checked
+    # exactly like the \\?\ forms: an external folder is accepted, a folder that leads into the signed package is refused.
+    It 'resolves a device-namespace path with a current-folder segment after normalisation: external is accepted, the package is still refused' {
+        $runtime=New-GateRuntime -Name 'outputs-device-dot'
+        $external=Join-Path $runtime.Root 'external-dot'
+        Set-GateOutputFolders $runtime '.\Backups' '.\logs' ('\\.\'+$external.Replace('\','\.\'))
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Not -Throw
+        Set-GateOutputFolders $runtime '.\Backups' '.\logs' ('\\.\'+$runtime.Package+'\module\.\x')
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*inside the signed package*'
+    }
+}
 
 Describe 'Direct OU and CSV targeting' -Tag 'Targeting' {
     It 'applies OU/CSV overrides before scope validation without rewriting the configuration' {
@@ -3865,7 +3979,7 @@ Describe 'Direct OU and CSV targeting' -Tag 'Targeting' {
         @(Get-GateWrites $runtime).Count | Should -Be 0
         @($run.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 0
     }
-    It 'reads OU choices on the fixed synthetic DC using the real Desktop helper without writes' {
+    It 'reads OU choices on the fixed synthetic DC using the real PowerShell 7 helper without writes' {
         $runtime=New-GateRuntime -Name 'ou-readonly-child'
         $resultPath=Join-Path $runtime.Root 'ou.json'
         $code=@"
@@ -3877,7 +3991,7 @@ Import-Module '$($runtime.Modules)\ActiveDirectory\ActiveDirectory.psm1' -Force 
 exit `$LASTEXITCODE
 "@
         $info=New-Object Diagnostics.ProcessStartInfo
-        $info.FileName=Join-Path $PSHOME 'powershell.exe'
+        $info.FileName=Join-Path $PSHOME 'pwsh.exe'
         $info.Arguments='-NoProfile -NonInteractive -EncodedCommand '+[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
         $info.UseShellExecute=$false; $info.CreateNoWindow=$true; $info.RedirectStandardOutput=$true; $info.RedirectStandardError=$true
         $p=[Diagnostics.Process]::Start($info)
@@ -3885,7 +3999,7 @@ exit `$LASTEXITCODE
             $out=$p.StandardOutput.ReadToEndAsync(); $err=$p.StandardError.ReadToEndAsync()
             $p.WaitForExit(30000) | Should -BeTrue
             $p.ExitCode | Should -Be 0 -Because ($out.Result+$err.Result)
-            $data=[IO.File]::ReadAllText($resultPath) | ConvertFrom-Json
+            $data=[IO.File]::ReadAllText($resultPath) | ConvertFrom-Json -DateKind String
             $data.Success | Should -BeTrue
             $data.Server | Should -BeExactly $runtime.State.Server
             $data.Units.Count | Should -Be 2
@@ -3895,8 +4009,8 @@ exit `$LASTEXITCODE
 }
 
 Describe 'GUI entry routing uses no directory or cloud module' -Tag 'GuiRouting' {
-    It 'routes -Gui before Desktop-only imports using <Engine>, and refuses mixed operation parameters' -ForEach @(
-        @{Engine='powershell.exe'}, @{Engine='pwsh.exe'}
+    It 'routes -Gui before the directory imports using <Engine>, and refuses mixed operation parameters' -ForEach @(
+        @{Engine='pwsh.exe'}
     ) {
         $runtime=New-GateRuntime -Name 'gui-entry-routing'
         $stub=@'
@@ -3932,8 +4046,8 @@ Export-ModuleMember -Function Show-PraGui
                 }
                 else {
                     $process.ExitCode | Should -Be 0 -Because $output
-                    $opened=[IO.File]::ReadAllText($marker) | ConvertFrom-Json
-                    $opened.Version | Should -BeExactly '2.2.0'
+                    $opened=[IO.File]::ReadAllText($marker) | ConvertFrom-Json -DateKind String
+                    $opened.Version | Should -BeExactly (Get-PraToolVersion)
                     $opened.DirectoryLoaded | Should -Be 0
                     $opened.ConfigPath | Should -BeExactly $runtime.ConfigPath
                     Remove-Item -LiteralPath $marker -Force
@@ -3964,7 +4078,7 @@ Describe 'GUI events mirror the existing engine without extra mutations' -Tag 'G
         $bytes=[IO.File]::ReadAllBytes($env:PRA_EVENT_FILE)
         $bytes[-1] | Should -Be 10
         $bytes[0] | Should -Be 123
-        $event=[IO.File]::ReadAllText($env:PRA_EVENT_FILE) | ConvertFrom-Json
+        $event=[IO.File]::ReadAllText($env:PRA_EVENT_FILE) | ConvertFrom-Json -DateKind String
         $event.kind | Should -BeExactly 'item'
         $event.text | Should -BeExactly $text
         $event.identity | Should -BeExactly 'user@gate.invalid'
@@ -3976,7 +4090,7 @@ Describe 'GUI events mirror the existing engine without extra mutations' -Tag 'G
     It 'reports the actual Preview result and phase, preserving the native result and write-free behavior' {
         $run=Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath}
         $run.ExitCode | Should -Be 0
-        $events=@(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json })
+        $events=@(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
         @($events | Where-Object kind -eq 'start').Count | Should -Be 1
         @($events | Where-Object kind -eq 'step').Count | Should -BeGreaterThan 0
         @($events | Where-Object kind -eq 'summary').Count | Should -Be 1
@@ -3997,7 +4111,7 @@ Describe 'GUI events mirror the existing engine without extra mutations' -Tag 'G
     It 'reports a failed run as failed, including its issue and native exit code' {
         $run=Invoke-GateProcess $runtime @{Action='Recover';Phase='AD';Mode='Preview';Batch='deadbeef';ConfigPath=$runtime.ConfigPath}
         $run.ExitCode | Should -Be 1
-        $result=@(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json } |
+        $result=@(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String } |
             Where-Object kind -eq 'result')[0]
         $result.exitCode | Should -Be 1
         $result.status | Should -BeExactly 'Failed'
@@ -4053,8 +4167,8 @@ Describe 'Culture-neutral test gate help validation' {
     }
 }
 
-Describe 'Scripts start with powershell.exe -File (scheduled task)' {
-    It 'never reads $PSScriptRoot in a param() default (empty in Windows PowerShell 5.1 with -File)' {
+Describe 'Scripts start with pwsh.exe -File (scheduled task)' {
+    It 'never reads $PSScriptRoot in a param() default (kept from 2.x, where it was empty in Windows PowerShell 5.1 with -File)' {
         $files = @(Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1') + @(Get-ChildItem -LiteralPath (Join-Path $global:PraGate.Release 'tools') -Filter '*.ps1' | ForEach-Object FullName)
         $found = @(foreach ($file in $files) {
             $ast = [System.Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$null)
@@ -4071,6 +4185,2240 @@ Describe 'Scripts start with powershell.exe -File (scheduled task)' {
         $text | Should -Match "if \(-not \`$ConfigPath\) \{ \`$ConfigPath = Join-Path \`$PSScriptRoot 'config\\PraRemoteMailbox\.config\.psd1' \}"
     }
 }
+Describe 'Release 2.3.0 - entry casing, Recover pre-check, journal order and next steps' -Tag 'Release230' {
+    BeforeEach {
+        $runtime=New-GateRuntime -Name 'release230'
+        $env:PRA_GATE_STATE=$runtime.StatePath
+        $env:PSModulePath=$runtime.Modules+';'+(Join-Path $PSHOME 'Modules')
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+        Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        $context=New-GateContext $runtime
+        $context.BackupFolder=$runtime.State.BackupFolder
+        $bundles=New-GateSourceBundles $context
+        Remove-Item -LiteralPath $runtime.EventPath -Force -ErrorAction SilentlyContinue
+    }
+    It 'accepts Recover -Phase Cloud -Mode Apply typed as <Action>/<Phase>/<Mode>: the proof is compared with its official spelling' -ForEach @(
+        @{Action='recover';Phase='cloud';Mode='apply'},@{Action='RECOVER';Phase='CLOUD';Mode='APPLY'},@{Action='rEcOvEr';Phase='cLoUd';Mode='aPpLy'}
+    ) {
+        $run=Invoke-GateProcess $runtime @{Action=$Action;Mode=$Mode;Phase=$Phase;Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Recover}
+        $messages=($run.MainResult.Issues.Message -join ' ')
+        # The proof was accepted (the synthetic cloud then confirms nothing); a case mismatch would stop at the proof.
+        $messages | Should -Match 'Cloud deprovisioning or AD proof not confirmed'
+        $messages | Should -Not -Match 'does not match'
+        $run.MainResult.Action | Should -BeExactly 'Recover'
+        $run.MainResult.Phase | Should -BeExactly 'Cloud'
+        $run.MainResult.Mode | Should -BeExactly 'Apply'
+        @($run.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 1
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'accepts Convert -Phase Cloud -Mode Apply typed as <Action>/<Phase>/<Mode> with an AD-verified Convert batch' -ForEach @(
+        @{Action='convert';Phase='cloud';Mode='apply'},@{Action='CONVERT';Phase='CLOUD';Mode='APPLY'}
+    ) {
+        $fresh=New-GateContext $runtime
+        $plans=@(New-PraPlan $fresh 'user1' 'Convert'; New-PraPlan $fresh 'user2' 'Convert')
+        $source=Invoke-PraAdBatch $fresh $plans 'Convert'
+        [IO.File]::WriteAllText($runtime.StatePath,[Management.Automation.PSSerializer]::Serialize($global:PraGateAd,35))
+        Remove-Item -LiteralPath $runtime.EventPath -Force -ErrorAction SilentlyContinue
+        $run=Invoke-GateProcess $runtime @{Action=$Action;Mode=$Mode;Phase=$Phase;Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$source.Path}
+        (@($run.MainResult.Issues | ForEach-Object { [string]$_.Message }) -join ' ') | Should -Not -Match 'does not match|AD proof'
+        $run.ExitCode | Should -BeIn @(0,2)
+        $run.MainResult.Action | Should -BeExactly 'Convert'
+        $run.MainResult.Phase | Should -BeExactly 'Cloud'
+        $run.MainResult.Mode | Should -BeExactly 'Apply'
+        @($run.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 1
+    }
+    It 'canonicalizes every ValidateSet parameter of the entry (Action, Mode, Phase, Scope, Expect) and reports the tool version' {
+        $run=Invoke-GateProcess $runtime @{Action='cHECK';Mode='pREVIEW';Identity='user1@gate.invalid';Scope='uSERSonly';Expect='rETAINED';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        $run.MainResult.Action | Should -BeExactly 'Check'
+        $run.MainResult.Mode | Should -BeExactly 'Preview'
+        $run.MainResult.Version | Should -BeExactly (Get-PraToolVersion)
+        $run.MainResult.Version | Should -Match '^\d+\.\d+\.\d+$'
+    }
+    It 'ships the canonicalization loop at the entry, before the GUI branch and the engine imports' {
+        $text=[IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'))
+        $loop=$text.IndexOf('ValidateSetAttribute')
+        $loop | Should -BeGreaterThan 0
+        $loop | Should -BeLessThan $text.IndexOf('if ($Gui) {')
+        $loop | Should -BeLessThan $text.IndexOf("Import-Module (Join-Path `$PSScriptRoot 'PraRemoteMailbox.psd1')")
+        # The strict downstream comparison of the proof is still case-sensitive.
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Directory.psm1')) | Should -Match 'Test-PraOrdinalEqual \$data\.Operation \$Operation'
+    }
+    It 'runs the readonly cloud pre-check on the planned rows BEFORE the first AD write of Recover -Phase Both' {
+        $module=Get-Module PRA.Directory
+        foreach ($plan in $bundles.Plans) {
+            $user=@($runtime.State.Users | Where-Object ObjectGUID -eq $plan.Record.ObjectGuid)[0]
+            foreach ($key in $plan.Kinds.Keys) { $user.$key=& $module { param($state) ConvertFrom-PraStoredValue $state } $plan.Desired[$key] }
+            $user.uSNChanged=[long]101
+        }
+        $runtime.State.Group.member=@($runtime.State.Users | ForEach-Object DistinguishedName)
+        [IO.File]::WriteAllText($runtime.StatePath,[Management.Automation.PSSerializer]::Serialize($runtime.State,35))
+        $run=Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='Both';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $operations=@($run.Events.Operation)
+        @($run.Events | Where-Object Operation -eq 'CloudPreflight-SyntheticBarrier').Count | Should -Be 1
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0
+        [array]::IndexOf($operations,'CloudPreflight-SyntheticBarrier') | Should -BeLessThan ([array]::IndexOf($operations,'Set-ADUser'))
+        $preflight=@($run.Events | Where-Object Operation -eq 'CloudPreflight-SyntheticBarrier')[0]
+        $preflight.Rows.Count | Should -Be 2
+        @($preflight.Rows | Where-Object ADVerified).Count | Should -Be 0
+        $run.Output | Should -Match 'Exchange Online pre-check'
+    }
+    It 'stops Recover -Phase Both with zero AD writes and no backup when the cloud pre-check is refused' {
+        $module=Get-Module PRA.Directory
+        foreach ($plan in $bundles.Plans) {
+            $user=@($runtime.State.Users | Where-Object ObjectGUID -eq $plan.Record.ObjectGuid)[0]
+            foreach ($key in $plan.Kinds.Keys) { $user.$key=& $module { param($state) ConvertFrom-PraStoredValue $state } $plan.Desired[$key] }
+            $user.uSNChanged=[long]101
+        }
+        $runtime.State.Group.member=@($runtime.State.Users | ForEach-Object DistinguishedName)
+        $runtime.State.Case='CloudPreflightFailure'
+        [IO.File]::WriteAllText($runtime.StatePath,[Management.Automation.PSSerializer]::Serialize($runtime.State,35))
+        $before=@(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File).Count
+        $run=Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='Both';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $run.ExitCode | Should -Be 1
+        ($run.MainResult.Issues.Message -join ' ') | Should -Match 'cloud preflight refused before AD'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        @($run.MainResult.BackupFiles).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File).Count | Should -Be $before
+        @($run.Events | Where-Object Operation -eq 'CloudPreflight-SyntheticBarrier').Count | Should -Be 1
+        @($run.Events | Where-Object Operation -eq 'CloudClose-SyntheticBarrier').Count | Should -Be 1
+        @($run.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 0
+    }
+    It 'does not run any cloud pre-check for a Recover -Phase Both Preview' {
+        $run=Invoke-GateProcess $runtime @{Action='Recover';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        @($run.Events | Where-Object Operation -eq 'CloudPreflight-SyntheticBarrier').Count | Should -Be 0
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'creates the cloud journal folder only after the confirmation (an unconfirmed cloud Apply leaves no folder)' {
+        $fresh=New-GateContext $runtime
+        $plans=@(New-PraPlan $fresh 'user1' 'Convert'; New-PraPlan $fresh 'user2' 'Convert')
+        $source=Invoke-PraAdBatch $fresh $plans 'Convert'
+        [IO.File]::WriteAllText($runtime.StatePath,[Management.Automation.PSSerializer]::Serialize($global:PraGateAd,35))
+        $refused=Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='Cloud';ConfigPath=$runtime.ConfigPath;Batch=$source.Path}
+        $refused.ExitCode | Should -Be 1
+        ($refused.MainResult.Issues.Message -join ' ') | Should -Match 'Apply needs a confirmation'
+        @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory -Filter '*-cloud').Count | Should -Be 0
+        $confirmed=Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$source.Path}
+        $confirmed.ExitCode | Should -BeIn @(0,2)
+        $journals=@(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory -Filter '*-cloud')
+        $journals.Count | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $journals[0].FullName 'CloudOperations.jsonl') | Should -BeTrue
+    }
+    It 'quotes every free-text value of the next-step command as data (apostrophes and typographic quotes in -ConfigPath)' {
+        $quotes=-join (@(0x2018,0x2019,0x201A,0x201B) | ForEach-Object { [char]$_ })
+        $literalConfig=Join-Path $runtime.Root ("operator's "+$quotes+'.psd1')
+        Copy-Item -LiteralPath $runtime.ConfigPath -Destination $literalConfig
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='AD';ConfigPath=$literalConfig} -ExplicitArguments
+        $run.ExitCode | Should -Be 0
+        $next=@($run.MainResult.NextSteps | Where-Object { $_ -match '-ConfigPath' })
+        $next.Count | Should -Be 1
+        $escaped=("operator's "+$quotes+'.psd1').Replace("'","''")
+        foreach ($code in @(0x2018,0x2019,0x201A,0x201B)) { $quote=[string][char]$code; $escaped=$escaped.Replace($quote,$quote+$quote) }
+        $next[0] | Should -BeLike ("*-ConfigPath '*"+$escaped+"'")
+        # The suggested command parses back to exactly the original path.
+        $tokens=$null;$errors=$null
+        $ast=[Management.Automation.Language.Parser]::ParseInput($next[0],[ref]$tokens,[ref]$errors)
+        $errors.Count | Should -Be 0
+        $literal=$ast.Find({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] -and $n.Value -like '*.psd1' },$true)
+        $literal.Value | Should -BeExactly $literalConfig
+    }
+}
+
+Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single version source (entry functions)' -Tag 'Release230' {
+    BeforeAll {
+        function global:Get-EntryFunctionText([string]$Name) {
+            $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'),[ref]$null,[ref]$null)
+            $node=$ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $Name },$true)
+            if (-not $node) { throw "Entry function not found: $Name" }
+            $node.Extent.Text
+        }
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\Get-EntryFunctionText' -ErrorAction SilentlyContinue }
+    It 'asks once and, on yes, lets the run continue with no further prompt' {
+        try {
+            $caller=New-Object psobject
+            $answer=$true
+            $asked=New-Object 'Collections.Generic.List[string]'
+            $caller | Add-Member ScriptMethod ShouldContinue ({ param($Query,$Caption) [void]$asked.Add([string]$Query); $answer }.GetNewClosure())
+            $Force=$false; $script:ConfirmBound=$false
+            $context=@{ AllowMutation=$true; CurrentOperation=''; CurrentIdentity=''; ConfirmPreference='High'; LogFile=''; Warnings=0; Issues=(New-Object 'Collections.Generic.List[object]') }
+            . ([scriptblock]::Create((Get-EntryFunctionText 'Confirm-PraApply')))
+            Confirm-PraApply 'Convert the 2 object(s)?'
+            $asked.Count | Should -Be 1
+            $asked[0] | Should -Be 'Convert the 2 object(s)?'
+            $context.AllowMutation | Should -BeTrue
+            $context.ConfirmPreference | Should -BeExactly 'None'
+        } finally { Remove-Variable -Name ConfirmPreference -Scope Script -ErrorAction SilentlyContinue }
+    }
+    It 'cancels without any write when the operator answers no' {
+        try {
+            $caller=New-Object psobject
+            $answer=$false
+            $asked=New-Object 'Collections.Generic.List[string]'
+            $caller | Add-Member ScriptMethod ShouldContinue ({ param($Query,$Caption) [void]$asked.Add([string]$Query); $answer }.GetNewClosure())
+            $Force=$false; $script:ConfirmBound=$false
+            $context=@{ AllowMutation=$true; CurrentOperation=''; CurrentIdentity=''; ConfirmPreference='High'; LogFile=''; Warnings=0; Issues=(New-Object 'Collections.Generic.List[object]') }
+            . ([scriptblock]::Create((Get-EntryFunctionText 'Confirm-PraApply')))
+            { Confirm-PraApply 'Roll back?' } | Should -Throw '*Cancelled by the operator*'
+            $asked.Count | Should -Be 1
+            $context.AllowMutation | Should -BeFalse
+            $context.ConfirmPreference | Should -BeExactly 'High'
+        } finally { Remove-Variable -Name ConfirmPreference -Scope Script -ErrorAction SilentlyContinue }
+    }
+    It 'never asks with <Name> (documented behaviour, including -Confirm:$false)' -ForEach @(@{Name='-Force';ForceOn=$true;Bound=$false},@{Name='an explicit -Confirm';ForceOn=$false;Bound=$true}) {
+        try {
+            $caller=New-Object psobject
+            $asked=New-Object 'Collections.Generic.List[string]'
+            $caller | Add-Member ScriptMethod ShouldContinue ({ param($Query,$Caption) [void]$asked.Add([string]$Query); $true }.GetNewClosure())
+            $Force=$ForceOn; $script:ConfirmBound=$Bound
+            $context=@{ AllowMutation=$true; CurrentOperation=''; CurrentIdentity=''; ConfirmPreference='High'; LogFile=''; Warnings=0; Issues=(New-Object 'Collections.Generic.List[object]') }
+            . ([scriptblock]::Create((Get-EntryFunctionText 'Confirm-PraApply')))
+            Confirm-PraApply 'Question'
+            $asked.Count | Should -Be 0
+            $context.AllowMutation | Should -BeTrue
+        } finally { Remove-Variable -Name ConfirmPreference -Scope Script -ErrorAction SilentlyContinue }
+    }
+    It 'documents the -Confirm:$false behaviour in the help of the entry script' {
+        $help=Get-Help (Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1') -Parameter Force
+        ($help | Out-String) | Should -Match 'Confirm:\$false'
+        $scope=Get-Help (Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1') -Parameter Scope
+        ($scope | Out-String) | Should -Match 'Identity ignores -Scope'
+    }
+    It 'quotes apostrophes, typographic quotes and spaces in every free-text option of the suggested command line' {
+        $quotes=-join (@(0x2018,0x2019,0x201A,0x201B) | ForEach-Object { [char]$_ })
+        . ([scriptblock]::Create((Get-EntryFunctionText 'ConvertTo-PraLiteral')))
+        . ([scriptblock]::Create((Get-EntryFunctionText 'Get-PraCommandLine')))
+        $Identity="o'brien@gate.invalid"; $Scope='SharedOnly'; $MaxObjects=5; $BaseConfigPath=''
+        $SearchBase="OU=O'Neil,DC=gate,DC=invalid"; $CsvPath="C:\lists\o'x $quotes.csv"; $ConfigPath="C:\cfg\it's.psd1"; $script:ConfigPathBound=$true
+        $line=Get-PraCommandLine -ActionName Convert -PhaseName AD -KeepFilters
+        $line | Should -BeLike "*-Identity 'o''brien@gate.invalid'*"
+        $line | Should -BeLike "*-SearchBase 'OU=O''Neil,DC=gate,DC=invalid'*"
+        $line | Should -BeLike "*-ConfigPath 'C:\cfg\it''s.psd1'"
+        $line | Should -Match ([regex]::Escape("o''x "+$quotes.Substring(0,1)+$quotes.Substring(0,1)))
+        $batch=Get-PraCommandLine -ActionName Recover -PhaseName Cloud -BatchId "C:\x y\it's\batch.json"
+        $batch | Should -BeLike "*-Batch 'C:\x y\it''s\batch.json'*"
+        $plain=Get-PraCommandLine -ActionName Recover -BatchId '0a1b2c3d' -OtherServer
+        $plain | Should -BeLike '*-Batch 0a1b2c3d'
+        $plain | Should -Not -Match "-Batch '"
+        # Every suggested line is a valid PowerShell statement.
+        $errors=$null
+        [void][Management.Automation.Language.Parser]::ParseInput($line,[ref]$null,[ref]$errors)
+        $errors.Count | Should -Be 0
+    }
+    It 'has ONE version source: ToolVersion of the common module, used by the entry, the builder and every header comment' {
+        $version=Get-PraToolVersion
+        $version | Should -Match '^\d+\.\d+\.\d+$'
+        # External anchors: the version is not only compared with the files that quote it. It must be the release that this tree is
+        # (update this literal with the release) and the newest heading of the change log.
+        $version | Should -BeExactly '3.0.0'
+        $heading=[regex]::Match([IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'CHANGELOG.md')),'(?m)^## (\d+\.\d+\.\d+)\b')
+        $heading.Success | Should -BeTrue
+        $heading.Groups[1].Value | Should -BeExactly $version -Because 'the first "## x.y.z" heading of CHANGELOG.md is the version of the tree'
+        $entry=[IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'))
+        $entry | Should -Not -Match "Version\s*=\s*'\d+\.\d+\.\d+'"
+        $entry | Should -Not -Match "-Version\s+'\d"
+        $entry | Should -Match 'Version = \(Get-PraToolVersion\)'
+        $entry | Should -Match '-Version \(Get-PraToolVersion\)'
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'tools\New-PraPackage.ps1')) | Should -Match 'ToolVersion'
+        $literals=@(
+            'package\Invoke-PraRemoteMailbox.ps1','package\PraRemoteMailbox.psm1','package\module\PRA.Common.psm1','package\module\PRA.Directory.psm1','package\module\PRA.Backup.psm1','package\module\PRA.Cloud.psm1'
+            'package\module\PRA.Gui.psm1','package\module\PRA.Gui.Directory.ps1','package\config\PraRemoteMailbox.config.psd1','package\templates\Report.template.html'
+            'tools\New-PraPackage.ps1','tools\Build-Documentation.ps1','tests\Invoke-TestGate.ps1','tests\IntegrityFixture.ps1'
+            'tests\PackageIntegrity.Tests.ps1','tests\PraRemoteMailbox.Tests.ps1','tests\PraReport.Tests.ps1','tests\PraDocumentation.Tests.ps1','tools\New-DocumentationImages.ps1'
+        )
+        foreach ($relative in $literals) {
+            $text=[IO.File]::ReadAllText((Join-Path $global:PraGate.Release $relative))
+            $found=[regex]::Match($text,'(?m)^\s*#?\s*Version\s*:\s*(\d+\.\d+\.\d+)')
+            $found.Success | Should -BeTrue -Because $relative
+            $found.Groups[1].Value | Should -BeExactly $version -Because $relative
+        }
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'CHANGELOG.md')) | Should -Match ('(?m)^## '+[regex]::Escape($version)+' ')
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'README.md')) | Should -Match ('\*\*Version:\*\* '+[regex]::Escape($version)+',')
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'PackageIntegrity.psd1')) | Should -Match ('# PRA Remote Mailbox '+[regex]::Escape($version)+' - authenticated package integrity manifest')
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Common.psm1')) | Should -Match ('v'+[regex]::Escape($version)+' . Nicolas Fabert')
+        ([IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'docs\PraRemoteMailbox-Guide.md')) -split "`n" | Select-Object -First 8) -join "`n" | Should -Match ('(?m)^version:\s*'+[regex]::Escape($version))
+    }
+}
+
+Describe 'Release 2.3.0 - configuration coherence and validation' -Tag 'Release230' {
+    AfterAll { Remove-Item -LiteralPath 'Function:\Get-ConfigLeaves' -ErrorAction SilentlyContinue }
+    BeforeAll {
+        function global:Get-ConfigLeaves($Table,[string]$Prefix='') {
+            foreach ($key in $Table.Keys) {
+                if ($Table[$key] -is [hashtable]) { Get-ConfigLeaves $Table[$key] ($Prefix+$key+'.') }
+                else { [pscustomobject]@{ Path=$Prefix+$key; Value=(@($Table[$key]) -join '|') } }
+            }
+        }
+    }
+    It 'keeps the code defaults equal to the shipped configuration file (only the explicitly documented differences)' {
+        $shipped=Import-PowerShellDataFile -LiteralPath (Join-Path $global:PraGate.Source 'config\PraRemoteMailbox.config.psd1')
+        $defaults=InModuleScope PRA.Common { Get-PraDefaultConfiguration }
+        $shippedLeaves=@{}; foreach ($leaf in Get-ConfigLeaves $shipped) { $shippedLeaves[$leaf.Path]=$leaf.Value }
+        $differences=foreach ($leaf in Get-ConfigLeaves $defaults) {
+            if (-not $shippedLeaves.ContainsKey($leaf.Path)) { $leaf.Path+' missing from the shipped file'; continue }
+            if ($shippedLeaves[$leaf.Path] -cne $leaf.Value) { '{0}: code={1} shipped={2}' -f $leaf.Path,$leaf.Value,$shippedLeaves[$leaf.Path] }
+        }
+        # The builder empties environment values and the shipped list names the Administrator account as an example.
+        @($differences | Where-Object { $_ -notmatch '^SharedMailbox\.ExcludeTrusteeSamAccountNames:' }) | Should -BeNullOrEmpty
+        $defaults.Exo.DisableWAM | Should -BeFalse
+        $shipped.Exo.DisableWAM | Should -BeFalse
+        $defaults.Cloud.MailboxCheckVia | Should -BeExactly 'Exo'
+        $defaults.Polling.IntervalMinutes | Should -Be $shipped.Polling.IntervalMinutes
+        $defaults.Retention.PolicyName | Should -BeExactly $shipped.Retention.PolicyName
+    }
+    It 'requires Cloud.Organization and a GUID Cloud.TenantId as soon as Cloud.AppId is set' {
+        $runtime=New-GateRuntime -Name 'cloud-appid'
+        $withCloud={ param($cloud) Set-GateConfigText $runtime ({ param($t) $t.Replace("Execution=@{Phase='Both'}","Execution=@{Phase='Both'}`r`n Cloud=@{$cloud}") }.GetNewClosure()) }
+        $guid='11111111-2222-3333-4444-555555555555'
+        & $withCloud "AppId='app';CertificateThumbprint='ABCDEF'"
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*Cloud.Organization*'
+        $runtime=New-GateRuntime -Name 'cloud-appid-tenant'
+        $withCloud={ param($cloud) Set-GateConfigText $runtime ({ param($t) $t.Replace("Execution=@{Phase='Both'}","Execution=@{Phase='Both'}`r`n Cloud=@{$cloud}") }.GetNewClosure()) }
+        foreach ($tenant in @('',"TenantId='not-a-guid';","TenantId='00000000-0000-0000-0000-000000000000';")) {
+            Set-GateConfigText $runtime { param($t) [regex]::Replace($t,'(?s) Cloud=@\{.*?\}\r?\n','') }
+            & $withCloud ($tenant+"Organization='contoso.onmicrosoft.com';AppId='app';CertificateThumbprint='ABCDEF'")
+            { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*Cloud.TenantId*'
+        }
+        Set-GateConfigText $runtime { param($t) [regex]::Replace($t,'(?s) Cloud=@\{.*?\}\r?\n','') }
+        & $withCloud ("TenantId='$guid';Organization='contoso.onmicrosoft.com';AppId='app';CertificateThumbprint='ABCDEF'")
+        $config=Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package
+        $config.Cloud.TenantId | Should -BeExactly $guid
+        # Interactive sign-in (no AppId) still needs none of them at load time.
+        Set-GateConfigText $runtime { param($t) [regex]::Replace($t,'(?s) Cloud=@\{.*?\}\r?\n','') }
+        (Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package).Cloud.AppId | Should -BeExactly ''
+    }
+    It 'refuses unknown keys and wrong types at load: <Name>' -ForEach @(
+        @{Name='unknown top-level key';Add="Typo=1";Message='*unknown setting Typo*'}
+        @{Name='unknown nested key';Add="Cloud=@{TenantIdentifier='x'}";Message='*unknown setting Cloud.TenantIdentifier*'}
+        @{Name='text where a number is expected';Add="Polling=@{IntervalMinutes='5'}";Message='*Polling.IntervalMinutes must be a whole number*'}
+        @{Name='text where a boolean is expected';Add="Retention=@{Enabled='yes'}";Message='*Retention.Enabled must be*true*false*'}
+        @{Name='number where text is expected';Add="Environment=7";Message='*Environment must be text*'}
+        @{Name='text where a list is expected';Add="Scope=@{ExcludeSamAccountNames='a'}";Message='*Scope.ExcludeSamAccountNames must be a list*'}
+        @{Name='text where a section is expected';Add="Exo='x'";Message='*Exo must be a section*'}
+    ) {
+        $runtime=New-GateRuntime -Name 'config-types'
+        if ($Add -like 'Environment=*') { Set-GateConfigText $runtime { param($t) $t.Replace("Environment='SYNTHETIC_GATE'",'Environment=7') } }
+        elseif ($Add -like 'Scope=*') { Set-GateConfigText $runtime { param($t) $t.Replace('ExcludeSamAccountNames=@()',"ExcludeSamAccountNames='a'") } }
+        elseif ($Add -like 'Retention=*') { Set-GateConfigText $runtime { param($t) $t.Replace('Retention=@{Enabled=$true;',"Retention=@{Enabled='yes';") } }
+        else { $line=$Add; Set-GateConfigText $runtime ({ param($t) $t.Replace("Execution=@{Phase='Both'}","Execution=@{Phase='Both'}`r`n $line") }.GetNewClosure()) }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw $Message
+    }
+}
+
+Describe 'Release 2.3.0 - report CSV, shared permission CSV and private output folders' -Tag 'Release230' {
+    It 'neutralizes spreadsheet formulas in the server CSV exactly as the HTML export does' {
+        $runtime=New-GateRuntime -Name 'csv-formulas'
+        InModuleScope PRA.Common -Parameters @{ Runtime=$runtime } {
+            foreach ($case in @(@('=1+1',"'=1+1"),@('+SUM(A1)',"'+SUM(A1)"),@('-2+3',"'-2+3"),@('@cmd',"'@cmd"),("`tx","'`tx"),("`rx","'`rx"),@('plain','plain'),@('a=b','a=b'),@('','') )) {
+                ConvertTo-PraCsvCell $case[0] | Should -BeExactly $case[1]
+            }
+            ConvertTo-PraCsvCell $null | Should -BeNullOrEmpty
+            $context=New-GateContext $Runtime -Mode Preview
+            $row=New-PraRow $context ([pscustomobject]@{SamAccountName='=HYPERLINK("http://x")';UserPrincipalName='user@gate.invalid';IsShared=$false})
+            $row.FinalStatus='Planned'; $row.Detail='+cmd|calc'; $context.Rows.Add($row)
+            $path=Join-Path ([IO.Path]::GetTempPath()) ('pra-csv-'+[guid]::NewGuid().ToString('N')+'.csv')
+            try {
+                Write-PraReport $context @{ Csv=$path; Html='' }
+                $rows=@(Import-Csv -LiteralPath $path -Delimiter ';' -Encoding UTF8)
+                $rows.Count | Should -Be 1
+                $rows[0].SamAccountName | Should -BeExactly "'=HYPERLINK(""http://x"")"
+                $rows[0].Detail | Should -BeExactly "'+cmd|calc"
+                $rows[0].UserPrincipalName | Should -BeExactly 'user@gate.invalid'
+                $rows[0].IsShared | Should -BeExactly 'False'
+            } finally { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    It 'reads the shared permission CSV with a comma or a semicolon, and never matches an empty name' -ForEach @(@{Delimiter=','},@{Delimiter=';'}) {
+        $runtime=New-GateRuntime -Name 'perm-csv'
+        $path=Join-Path ([IO.Path]::GetTempPath()) ('pra-perm-'+[guid]::NewGuid().ToString('N')+'.csv')
+        [IO.File]::WriteAllText($path,("Shared{0}Group`r`n{0}EmptyNameGroup`r`nshared1{0}Group1`r`nsomeone-else{0}Group2" -f $Delimiter),(New-Object Text.UTF8Encoding($true)))
+        try {
+            InModuleScope PRA.Directory -Parameters @{ Path=$path; Runtime=$runtime } {
+                Mock Get-PraGroup { [pscustomobject]@{ DistinguishedName="CN=$Identity,DC=gate,DC=invalid"; Name=$Identity } }
+                Mock Expand-PraTrustee { @('member@gate.invalid') }
+                $context=New-GateContext $Runtime
+                $context.Config.SharedMailbox=@{ Enabled=$true; PermissionSource='Csv'; CsvPath=$Path; CaptureSendOnBehalf=$false; CustomAttribute='extensionAttribute1' }
+                # No mailNickname and no DisplayName: the empty names must not match the empty Shared cell of the first line.
+                $user=[pscustomobject]@{ ObjectGUID=[guid]'00000000-0000-0000-0000-000000000009'; DistinguishedName='CN=shared1,OU=Tests,DC=gate,DC=invalid'; SamAccountName='shared1'; mailNickname=''; DisplayName=''; Name='' }
+                $result=Get-PraSharedPermission -Context $context -User $user
+                $result.FullAccess | Should -Contain 'member@gate.invalid'
+                $result.SendAs | Should -Contain 'member@gate.invalid'
+                Should -Invoke Get-PraGroup -Times 1 -Exactly -ParameterFilter { $Identity -eq 'Group1' }
+                Should -Invoke Get-PraGroup -Times 0 -ParameterFilter { $Identity -eq 'EmptyNameGroup' }
+                $none=[pscustomobject]@{ ObjectGUID=[guid]'00000000-0000-0000-0000-000000000008'; DistinguishedName='CN=x,OU=Tests,DC=gate,DC=invalid'; SamAccountName='unlisted'; mailNickname=''; DisplayName=''; Name='' }
+                { Get-PraSharedPermission -Context $context -User $none } | Should -Throw '*no line*'
+            }
+        } finally { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+    It 'creates the missing logs and reports folders with the protected private ACL of the backups, and leaves existing folders alone' {
+        $base=Join-Path ([IO.Path]::GetTempPath()) ('pra-acl-'+[guid]::NewGuid().ToString('N'))
+        try {
+            $logs=Join-Path $base 'logs'; $reports=Join-Path $base 'reports'
+            InModuleScope PRA.Common -Parameters @{ Logs=$logs; Reports=$reports } {
+                Initialize-PraPrivateFolder -Path $Logs
+                Initialize-PraPrivateFolder -Path $Reports
+                foreach ($folder in @($Logs,$Reports)) {
+                    $acl=[IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($folder))
+                    $acl.AreAccessRulesProtected | Should -BeTrue
+                    $sids=@($acl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+                    $expected=@([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,'S-1-5-18','S-1-5-32-544') | Sort-Object -Unique
+                    ($sids -join ',') | Should -BeExactly ($expected -join ',')
+                }
+            }
+            # The backups use the very same ACL source.
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+            $backup=Join-Path $base 'Backups'
+            New-PraPrivateDirectory $backup -Confirm:$false
+            $backupAcl=[IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($backup))
+            $backupAcl.AreAccessRulesProtected | Should -BeTrue
+            (@($backupAcl.GetAccessRules($true,$false,[Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique) -join ',') |
+                Should -BeExactly ((@([Security.Principal.WindowsIdentity]::GetCurrent().User.Value,'S-1-5-18','S-1-5-32-544') | Sort-Object -Unique) -join ',')
+            # An existing folder (for example prepared by the administrator) is not modified.
+            $existing=Join-Path $base 'existing'; $null=New-Item -ItemType Directory -Path $existing
+            $before=(Get-Acl -LiteralPath $existing).Sddl
+            InModuleScope PRA.Common -Parameters @{ Path=$existing } { Initialize-PraPrivateFolder -Path $Path }
+            (Get-Acl -LiteralPath $existing).Sddl | Should -BeExactly $before
+        } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'creates the log and report folders of a real run through the private ACL helper' {
+        $runtime=New-GateRuntime -Name 'private-run-folders'
+        Remove-Item -LiteralPath (Join-Path $runtime.Root 'logs'),(Join-Path $runtime.Root 'reports') -Recurse -Force
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        foreach ($name in 'logs','reports') {
+            $folder=Join-Path $runtime.Root $name
+            (Test-Path -LiteralPath $folder) | Should -BeTrue
+            ([IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($folder))).AreAccessRulesProtected | Should -BeTrue -Because $name
+            @(Get-ChildItem -LiteralPath $folder -File).Count | Should -BeGreaterThan 0
+        }
+    }
+}
+
+Describe 'Release 2.3.0 - MissingFullAccess and the Exchange Online child protocol (production Cloud module source)' -Tag 'Release230' {
+    It 'matches the MissingFullAccess answer on the exact message prefix and the trustee case-insensitively' {
+        $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Source 'module\PRA.Cloud.psm1'),[ref]$null,[ref]$null)
+        $node=$ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'MissingFullAccess' },$true)
+        $node | Should -Not -BeNullOrEmpty
+        . ([scriptblock]::Create($node.Extent.Text))
+        # The function uses the ordinal helpers defined next to it in the worker text.
+        foreach ($helper in 'SameOrdinal','SameIgnoreCase') {
+            $helperNode = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $helper },$true)
+            $helperNode | Should -Not -BeNullOrEmpty
+            . ([scriptblock]::Create($helperNode.Extent.Text))
+        }
+        function New-AnswerRecord([string]$Message,[string]$Code='NotFound') {
+            $json=@{ error=@{ code=$Code; message=$Message; innererror=@{ message=$Message; type='Microsoft.Exchange.Admin.OData.Core.ODataServiceException' } } } | ConvertTo-Json -Depth 5 -Compress
+            New-Object Management.Automation.ErrorRecord ((New-Object Exception ('HttpStatusCode=404 '+$json)),'x',[Management.Automation.ErrorCategory]::NotSpecified,$null)
+        }
+        MissingFullAccess (New-AnswerRecord 'No permissions were found for the user:Trustee@Gate.Invalid') 'trustee@gate.invalid' | Should -BeTrue
+        MissingFullAccess (New-AnswerRecord 'No permissions were found for the user:trustee@gate.invalid') 'trustee@gate.invalid' | Should -BeTrue
+        MissingFullAccess (New-AnswerRecord 'no permissions were found for the user:trustee@gate.invalid') 'trustee@gate.invalid' | Should -BeFalse
+        MissingFullAccess (New-AnswerRecord 'No permissions were found for the user:other@gate.invalid') 'trustee@gate.invalid' | Should -BeFalse
+        MissingFullAccess (New-AnswerRecord 'No permissions were found for the user:trustee@gate.invalid' 'Other') 'trustee@gate.invalid' | Should -BeFalse
+    }
+    It 'silences module warnings and information in the Exchange Online child while errors stay fatal' {
+        $child=[IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Cloud.psm1'))
+        $child | Should -Match "\`$WarningPreference='SilentlyContinue'; \`$InformationPreference='SilentlyContinue'"
+        $child | Should -Match 'Connect-ExchangeOnline @connect -WarningAction SilentlyContinue -InformationAction SilentlyContinue 6>\$null 3>\$null'
+        $child | Should -Not -Match "\`$ErrorActionPreference\s*=\s*'SilentlyContinue'"
+    }
+}
+
+Describe 'Release 3.0.0 - the PowerShell 7.5+ engine' -Tag 'Release300' {
+    BeforeAll {
+        $script:Ps7Files = @(Get-ChildItem -LiteralPath $global:PraGate.Source -Recurse -File | Where-Object { $_.Extension -in '.ps1','.psm1' })
+        $script:Ps7Runtime = @('Invoke-PraRemoteMailbox.ps1','PraRemoteMailbox.psm1','module\PRA.Common.psm1','module\PRA.Directory.psm1','module\PRA.Backup.psm1','module\PRA.Cloud.psm1','module\PRA.Gui.psm1','module\PRA.Gui.Directory.ps1','module\Test-PackageIntegrity.ps1')
+    }
+    It 'requires PowerShell 7.5 on the 9 runtime files, without an edition requirement and without a Windows PowerShell 5.1 branch' {
+        $script:Ps7Files.Count | Should -Be 9
+        foreach ($relative in $script:Ps7Runtime) {
+            $text = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source $relative))
+            $text | Should -Match '(?m)^#Requires -Version 7\.5\r?$' -Because $relative
+            $text | Should -Not -Match '(?m)^#Requires -PSEdition' -Because $relative
+            $text | Should -Not -Match '(?m)^#Requires -Version 5' -Because $relative
+            $text | Should -Not -Match "PSEdition\s+-ne\s+'Desktop'" -Because $relative
+            $text | Should -Not -Match '(?i)powershell\.exe' -Because $relative
+        }
+    }
+    It 'requires PowerShell 7.5 on the gate, the tests and the tools' {
+        # The two files of the frozen Windows PowerShell 5.1 fixtures stay 5.1-compatible on purpose: the generator must run under powershell.exe to freeze real 5.1 files
+        # (it also requires the Desktop edition), and the replay test runs on both engines.
+        $fiveOne = @('PraLegacyFixtures.Tests.ps1','New-LegacyFixtures.ps1')
+        foreach ($file in @(@(Get-ChildItem -LiteralPath (Join-Path $global:PraGate.Release 'tests') -File -Filter '*.ps1') + @(Get-ChildItem -LiteralPath (Join-Path $global:PraGate.Release 'tools') -File -Filter '*.ps1') | Where-Object { $_.Name -cnotin $fiveOne })) {
+            [IO.File]::ReadAllText($file.FullName) | Should -Match '(?m)^#Requires -Version 7\.5\r?$' -Because $file.Name
+        }
+    }
+    It 'reads JSON only through ConvertFrom-PraJson: no other ConvertFrom-Json in the package without -DateKind String' {
+        foreach ($file in $script:Ps7Files) {
+            $text = [IO.File]::ReadAllText($file.FullName)
+            $skipFrom = -1; $skipTo = -1
+            if ($file.Name -ceq 'PRA.Common.psm1') {
+                $skipFrom = $text.IndexOf('function ConvertFrom-PraJson {', [StringComparison]::Ordinal)
+                $skipTo = $text.IndexOf('function Get-PraToolVersion {', [StringComparison]::Ordinal)
+                $skipFrom | Should -BeGreaterThan 0
+                $skipTo | Should -BeGreaterThan $skipFrom
+            }
+            foreach ($match in [regex]::Matches($text, 'ConvertFrom-Json(?! -DateKind String)')) {
+                $inside = $skipFrom -ge 0 -and $match.Index -ge $skipFrom -and $match.Index -lt $skipTo
+                $inside | Should -BeTrue -Because ('bare ConvertFrom-Json at offset ' + $match.Index + ' of ' + $file.Name)
+            }
+        }
+        # The wrapper itself must use -DateKind String.
+        $common = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Common.psm1'))
+        $common | Should -Match 'end \{ \(\$parts -join "`n"\) \| ConvertFrom-Json -DateKind String -ErrorAction Stop \}'
+    }
+    It 'ConvertFrom-PraJson keeps every date as the string that was written (a bare ConvertFrom-Json does not)' {
+        $json = '{"CapturedUtc":"2026-11-03T10:11:12.1234567Z","CreatedUtc":"2026-11-03T10:11:12+00:00","N":3,"Items":[{"Utc":"2026-11-03T10:11:12.0000000Z"}]}'
+        $bare = $json | ConvertFrom-Json
+        $bare.CapturedUtc | Should -BeOfType ([datetime]) -Because 'this is the PowerShell 7 behaviour the wrapper exists for'
+        $data = $json | ConvertFrom-PraJson
+        $data.CapturedUtc | Should -BeOfType ([string])
+        $data.CapturedUtc | Should -BeExactly '2026-11-03T10:11:12.1234567Z'
+        $data.CreatedUtc | Should -BeExactly '2026-11-03T10:11:12+00:00'
+        $data.Items[0].Utc | Should -BeExactly '2026-11-03T10:11:12.0000000Z'
+        # File content arrives as one string or as lines; a JSON array is enumerated like ConvertFrom-Json does.
+        (@('{"A":', '1}') | ConvertFrom-PraJson).A | Should -Be 1
+        @('[1,2,3]' | ConvertFrom-PraJson).Count | Should -Be 3
+        { 'not json' | ConvertFrom-PraJson } | Should -Throw
+    }
+    It 'creates the private folders through FileSystemAclExtensions: protected, no inherited rule, atomic, never over an existing folder' {
+        $base = Join-Path ([IO.Path]::GetTempPath()) ('pra-acl3-' + [guid]::NewGuid().ToString('N'))
+        try {
+            $null = New-Item -ItemType Directory -Path $base
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+            $private = Join-Path $base 'Batch-private'
+            New-PraPrivateDirectory $private -Confirm:$false
+            $acl = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($private))
+            $acl.AreAccessRulesProtected | Should -BeTrue
+            @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object IsInherited).Count | Should -Be 0
+            { New-PraPrivateDirectory $private -Confirm:$false } | Should -Throw '*already exists*'
+            $logs = Join-Path $base 'logs'
+            InModuleScope PRA.Common -Parameters @{ Path = $logs } { Initialize-PraPrivateFolder -Path $Path }
+            $logAcl = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($logs))
+            $logAcl.AreAccessRulesProtected | Should -BeTrue
+            @($logAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object IsInherited).Count | Should -Be 0
+            # The package no longer calls the .NET Framework overloads.
+            foreach ($file in $script:Ps7Files) {
+                [IO.File]::ReadAllText($file.FullName) | Should -Not -Match '\[IO\.Directory\]::(CreateDirectory\([^)]*,|GetAccessControl)' -Because $file.Name
+            }
+        } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'gives only the last folder the private ACL: missing parents keep the inheritance of their own parent (Initialize-PraPrivateFolder and New-PraPrivateDirectory)' {
+        $base = Join-Path ([IO.Path]::GetTempPath()) ('pra-parents-' + [guid]::NewGuid().ToString('N'))
+        try {
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+            $null = New-Item -ItemType Directory -Path $base
+            $leafA = Join-Path $base 'a\b\logs'
+            InModuleScope PRA.Common -Parameters @{ Path = $leafA } { Initialize-PraPrivateFolder -Path $Path }
+            $leafB = Join-Path $base 'c\d\Batch-x'
+            New-PraPrivateDirectory $leafB -Confirm:$false
+            foreach ($case in @(@{ Leaf = $leafA; Parents = @('a', 'a\b') }, @{ Leaf = $leafB; Parents = @('c', 'c\d') })) {
+                $leafAcl = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new($case.Leaf))
+                $leafAcl.AreAccessRulesProtected | Should -BeTrue
+                foreach ($parent in $case.Parents) {
+                    $acl = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new((Join-Path $base $parent)))
+                    $acl.AreAccessRulesProtected | Should -BeFalse -Because ('the intermediate folder ' + $parent + ' is not private')
+                    @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object IsInherited).Count | Should -BeGreaterThan 0
+                }
+            }
+        } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'makes a missing Storage.BackupFolder private as 2.x did, and every folder created under it, but not the folders above it (New-PraPrivateDirectory -Root)' {
+        $base = Join-Path ([IO.Path]::GetTempPath()) ('pra-root-' + [guid]::NewGuid().ToString('N'))
+        try {
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+            $null = New-Item -ItemType Directory -Path $base
+            $root = Join-Path $base 'above\Backups'
+            $leaf = Join-Path $root 'mid\Batch-x'
+            New-PraPrivateDirectory $leaf -Root $root -Confirm:$false
+            foreach ($relative in @('above\Backups', 'above\Backups\mid', 'above\Backups\mid\Batch-x')) {
+                $acl = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new((Join-Path $base $relative)))
+                $acl.AreAccessRulesProtected | Should -BeTrue -Because ($relative + ' is private')
+            }
+            $above = [IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new((Join-Path $base 'above')))
+            $above.AreAccessRulesProtected | Should -BeFalse -Because 'a folder above Storage.BackupFolder keeps the inheritance of its own parent'
+            # An existing Storage.BackupFolder is left exactly as the administrator set it; only the new batch folder is private.
+            New-PraPrivateDirectory (Join-Path $root 'Batch-y') -Root $root -Confirm:$false
+            ([IO.FileSystemAclExtensions]::GetAccessControl([IO.DirectoryInfo]::new((Join-Path $root 'Batch-y')))).AreAccessRulesProtected | Should -BeTrue
+        } finally { Remove-Item -LiteralPath $base -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    It 'reads a person-made CSV with a byte order mark, as strict UTF-8 without one, and with the ANSI code page when it is not UTF-8 (Read-PraCsvText)' {
+        $path = Join-Path ([IO.Path]::GetTempPath()) ('pra-ansi-' + [guid]::NewGuid().ToString('N') + '.csv')
+        $text = "Shared;Group`r`nBo" + [char]0x00EE + "te-" + [char]0x00E9 + ";Groupe-A`r`n"
+        try {
+            $ansi = [Text.Encoding]::GetEncoding([Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage)
+            [IO.File]::WriteAllBytes($path, $ansi.GetBytes($text))
+            Read-PraCsvText -Path $path | Should -BeExactly $text
+            [IO.File]::WriteAllBytes($path, ([byte[]](0xEF, 0xBB, 0xBF)) + [Text.Encoding]::UTF8.GetBytes($text))
+            Read-PraCsvText -Path $path | Should -BeExactly $text
+            [IO.File]::WriteAllBytes($path, [Text.Encoding]::UTF8.GetBytes($text))
+            Read-PraCsvText -Path $path | Should -BeExactly $text
+            [IO.File]::WriteAllBytes($path, ([byte[]](0xFF, 0xFE)) + [Text.Encoding]::Unicode.GetBytes($text))
+            Read-PraCsvText -Path $path | Should -BeExactly $text
+            # The shared permission CSV and the target CSV both use it.
+            [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Directory.psm1')) | Should -Match 'Read-PraCsvText -Path \$settings\.CsvPath'
+            [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Common.psm1')) | Should -Match '\$text = Read-PraCsvText -Path \$Path'
+            [IO.File]::WriteAllBytes($path, $ansi.GetBytes("Identity`r`n" + [char]0x00E9 + "l" + [char]0x00E8 + "ve@gate.invalid`r`n"))
+            (Read-PraTargetCsv -Path $path).Identity | Should -BeExactly ([string][char]0x00E9 + 'l' + [char]0x00E8 + 've@gate.invalid')
+        } finally { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+    }
+    It 'writes the CSV report with a UTF-8 BOM, with rows and without rows' {
+        $runtime = New-GateRuntime -Name 'csv-bom'
+        InModuleScope PRA.Common -Parameters @{ Runtime = $runtime } {
+            foreach ($withRow in $true, $false) {
+                $context = New-GateContext $Runtime -Mode Preview
+                if ($withRow) {
+                    $row = New-PraRow $context ([pscustomobject]@{ SamAccountName = 'accentu' + [char]0x00E9; UserPrincipalName = 'user@gate.invalid'; IsShared = $false })
+                    $row.FinalStatus = 'Planned'; $context.Rows.Add($row)
+                }
+                $path = Join-Path ([IO.Path]::GetTempPath()) ('pra-bom-' + [guid]::NewGuid().ToString('N') + '.csv')
+                try {
+                    Write-PraReport $context @{ Csv = $path; Html = '' }
+                    $bytes = [IO.File]::ReadAllBytes($path)
+                    $bytes.Length | Should -BeGreaterThan 3
+                    ('{0:X2}{1:X2}{2:X2}' -f $bytes[0], $bytes[1], $bytes[2]) | Should -BeExactly 'EFBBBF'
+                    if ($withRow) { [Text.Encoding]::UTF8.GetString($bytes) | Should -Match ('accentu' + [char]0x00E9) }
+                } finally { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+    It 'accepts the .NET collection types of a capture on any runtime and keeps refusing every other type' {
+        InModuleScope PRA.Backup {
+            $budget = { @{ Left = 1000 } }
+            $list = [Collections.Generic.List[string]]::new(); $list.Add('a'); $list.Add('b')
+            $array = [Collections.ArrayList]::new(); $null = $array.Add('x')
+            $strings = [Collections.Specialized.StringCollection]::new(); $null = $strings.Add('y')
+            $readOnly = [Collections.ObjectModel.ReadOnlyCollection[string]]::new([string[]]@('r'))
+            foreach ($value in @($list, $array, $strings, $readOnly)) {
+                $descriptor = ConvertTo-PraRawDescriptor -Value $value -Attribute 'a' -ObjectGuid 'g' -Depth 0 -Budget (& $budget)
+                $descriptor.Kind | Should -BeExactly 'Collection' -Because $value.GetType().FullName
+                @($descriptor.Items).Count | Should -Be @($value).Count
+                (Test-PraRawCollectionType $descriptor.Type) | Should -BeTrue -Because $descriptor.Type
+            }
+            # Closed list of type names: no assembly list, but nothing outside the list passes.
+            foreach ($value in @([Collections.Generic.HashSet[string]]::new(), [Collections.Queue]::new(), [Collections.Generic.Dictionary[string,string]]::new(), [Collections.Hashtable]::new(), [Collections.Generic.SortedSet[string]]::new())) {
+                { ConvertTo-PraRawDescriptor -Value $value -Attribute 'a' -ObjectGuid 'g' -Depth 0 -Budget (& $budget) } | Should -Throw '*unsupported attribute*no fallback*' -Because $value.GetType().FullName
+            }
+            Test-PraRawCollectionType 'System.Collections.Generic.HashSet`1[[System.String]]' | Should -BeFalse
+            Test-PraRawCollectionType 'Evil.Collections.ArrayList' | Should -BeFalse
+            [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Backup.psm1')) | Should -Not -Match "'mscorlib'"
+        }
+    }
+    It 'imports ADSync through the Windows PowerShell compatibility layer under PowerShell 7 only, and runs the cycle on the objects it returns' {
+        $global:PraGateSync = @{ Imports = (New-Object 'Collections.Generic.List[object]'); Started = 0; Polls = 0 }
+        function global:Get-ADSyncScheduler { [CmdletBinding()] param() $global:PraGateSync.Polls++; [pscustomobject]@{ SyncCycleInProgress = $false } }
+        function global:Start-ADSyncSyncCycle { [CmdletBinding()] param([string]$PolicyType) $global:PraGateSync.Started++; [pscustomobject]@{ Result = 'Success' } }
+        try {
+            InModuleScope PRA.Directory {
+                Mock Import-Module { $global:PraGateSync.Imports.Add(@{ Name = $Name; UseWindowsPowerShell = [bool]$UseWindowsPowerShell; Bound = @($PesterBoundParameters.Keys) }) }
+                Mock Start-Sleep { }
+                # Self-contained (it also runs in the Windows PowerShell 5.1 endpoint of EntraConnect.Server): an ordinal comparison without PRA.Common.
+                $script:PraSyncCycle.ToString() | Should -Match "if \(\[string\]::Equals\(\[string\]\`$PSVersionTable\.PSEdition, 'Core', \[StringComparison\]::Ordinal\)\) \{ \`$import\.UseWindowsPowerShell = \`$true \}"
+                $result = & $script:PraSyncCycle 'Delta' 1
+                $result.Result | Should -BeExactly 'Success'
+            }
+            $global:PraGateSync.Imports.Count | Should -Be 1
+            $global:PraGateSync.Imports[0].Name | Should -BeExactly 'ADSync'
+            $global:PraGateSync.Imports[0].UseWindowsPowerShell | Should -BeTrue
+            $global:PraGateSync.Started | Should -Be 1
+        } finally {
+            Remove-Item -LiteralPath 'Function:\global:Get-ADSyncScheduler','Function:\global:Start-ADSyncSyncCycle' -ErrorAction SilentlyContinue
+            Remove-Variable PraGateSync -Scope Global -ErrorAction SilentlyContinue
+        }
+    }
+    It 'starts every child process with the PowerShell 7 that runs the engine (Exchange Online subprocess, window engine, OU helper)' {
+        $cloud = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Cloud.psm1'))
+        $cloud | Should -Match "\`$exe = Join-Path \`$PSHOME 'pwsh\.exe'"
+        $cloud | Should -Match 'ConvertFrom-Json -DateKind String -ErrorAction Stop\r?\n    if \(\$cfg\.Protocol'
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Gui.psm1') -Force
+        Get-PraGuiEngine | Should -BeExactly (Join-Path $PSHOME 'pwsh.exe')
+        (Get-PraGuiOuCommand -Root 'C:\Synthetic' -ConfigPath 'C:\Synthetic\config.psd1' -ResultPath 'C:\Synthetic\ou.json').FilePath | Should -BeExactly (Join-Path $PSHOME 'pwsh.exe')
+    }
+}
+
+Describe 'Release 3.0.0 - ordinal string comparison under .NET ICU (helpers and static guard)' -Tag 'Ordinal' {
+    BeforeAll {
+        $script:OrdFiles = @('Invoke-PraRemoteMailbox.ps1','PraRemoteMailbox.psm1','module\PRA.Common.psm1','module\PRA.Directory.psm1','module\PRA.Backup.psm1','module\PRA.Cloud.psm1','module\PRA.Gui.psm1','module\PRA.Gui.Directory.ps1','module\Test-PackageIntegrity.ps1')
+        # Commands that compare or order strings with the culture collation. Each exception needs a justification; a stale entry fails the test.
+        $script:OrdAllowList = @{
+            'module\PRA.Cloud.psm1|Sort-Object Version -Descending' = 'Orders [version] objects of the installed modules; no string is compared.'
+            'module\PRA.Gui.Directory.ps1|Sort-Object DistinguishedName' = 'Display order of the OU picker; nothing is decided from it.'
+        }
+        # Files exempted from the operator and switch checks: none (the window is checked like the others).
+        $script:OrdPendingFiles = @()
+        # A switch statement compares its input with the culture collation. Each one that is kept is keyed 'file|condition' and says why no look-alike
+        # (zero-width or control character) can reach it; a stale entry fails the test.
+        $script:OrdSwitchAllowList = @{
+            'Invoke-PraRemoteMailbox.ps1|$Action' = 'ValidateSet parameter, rewritten to its official spelling by the ordinal loop at the top of the entry script before any use.'
+            'Invoke-PraRemoteMailbox.ps1|$s.Mode' = 'Scope.Mode was validated by Import-PraConfiguration with an ordinal membership test (Auto, OU, Group, Csv).'
+            'Invoke-PraRemoteMailbox.ps1|$cloudAction' = 'Derived by the entry script from $Action and $Expect: one of the literals Convert or Recover.'
+            'module\PRA.Common.psm1|$Style' = 'Closed set chosen by PRA.Common itself; PRA_ICONS is matched ordinally (Test-PraOrdinalIn) before it is used.'
+            'module\PRA.Common.psm1|$Level' = 'Internal ValidateSet parameter: every caller of Write-PraLog passes a literal.'
+            'module\PRA.Common.psm1|$code' = 'Switch over an integer character code (deliberately not over the string).'
+            'module\PRA.Common.psm1|$outcome.Status' = 'Status computed by Get-PraOutcome from its own literals (Failed, Pending, Planned, Success).'
+            'module\PRA.Directory.psm1|$Kinds[$name]' = 'The kind table of the managed attributes is a constant of the module.'
+            'module\PRA.Directory.psm1|Resolve-PraKind $State.Kind' = 'Resolve-PraKind returns the official spelling after an ordinal match, or $null.'
+            'module\PRA.Directory.psm1|$code' = 'Switch over an integer character code (deliberately not over the string).'
+            'module\PRA.Directory.psm1|[string]$Plan.Row.FinalStatus' = 'Display text only (the next-step wording); nothing is decided from it.'
+            'module\PRA.Directory.psm1|$Plan.Operation' = 'Display text only (the planned-operation wording); nothing is decided from it.'
+            'module\PRA.Directory.psm1|$permissionSource' = 'Resolved to its official spelling by an ordinal loop just above the switch.'
+            'module\PRA.Directory.psm1|$Operation' = 'Compared ordinally with the Operation of the proof just above (Test-PraOrdinalEqual): only the caller literal reaches the switch.'
+            'module\PRA.Backup.psm1|$clrToken' = 'Closed token obtained from an ordinal dictionary lookup of the CLR type name.'
+            'module\PRA.Backup.psm1|$Type' = 'Ordinal membership in PraRawScalarTypes is tested just above the switch.'
+            'module\PRA.Backup.psm1|$kind' = 'Ordinal membership in PraRawRestoreKinds is tested just above the switch.'
+            'module\PRA.Backup.psm1|$legacyToken' = 'Closed token built from ordinal comparisons just above the switch.'
+            'module\PRA.Cloud.psm1|$Operation' = 'ValidateSet parameter of the internal Exchange Online operations; every caller passes a literal.'
+            'module\PRA.Gui.psm1|$Action' = 'Internal key: the request builder (Resolve-GuiOfficialValue, ordinal) rewrites every action to its official spelling; the window passes its own literals.'
+            'module\PRA.Gui.psm1|$g.Action' = 'Tile of the window (Convert, Recover, Finalize, Check): set from the Tag of a control of the XAML, never from typed text.'
+            'module\PRA.Gui.psm1|$script:Gui.Action' = 'Tile of the window (Convert, Recover, Finalize, Check): set from the Tag of a control of the XAML, never from typed text.'
+            'module\PRA.Gui.psm1|$g.Page' = 'Page number 1 to 5 of the window (an integer).'
+            'module\PRA.Gui.psm1|$Number' = 'Page number 1 to 5 of the window (an integer).'
+            'module\PRA.Gui.psm1|$script:Gui.Filter' = 'Filter of the verification grid chosen by the radio buttons of the window (All, User, Shared, Warn); display only.'
+            'module\PRA.Gui.psm1|$Name' = 'Name of a control of the XAML (its Tag), never typed text.'
+            'module\PRA.Gui.psm1|$Level' = 'Closed list of pill levels chosen by the window code (Ok, Warn, Fail, Brand); only colours depend on it.'
+            'module\PRA.Gui.psm1|$Status' = 'Display status of a row or a log line chosen by the window code (colour and glyph only); nothing is decided from it.'
+            'module\PRA.Gui.psm1|$Row.Status' = 'Display status of a row chosen by the window code (glyph and colour only); nothing is decided from it.'
+            'module\PRA.Gui.psm1|$role' = 'Role (Both, AD, Cloud, None) computed by the window prerequisite probe from its own literals; wording only.'
+
+            'module\PRA.Gui.psm1|Get-PraGuiField ''Source''' = 'Segmented choice of the window: the value is one of the literals of its own radio buttons.'
+            'module\PRA.Gui.psm1|$item.Operation' = 'Operation of a batch file already accepted by Read-PraGuiBatch (ordinal membership in Convert, Recover, RecoverFinalize); wording and icon only.'
+
+            'module\PRA.Gui.psm1|$kind' = 'Kind of a package accepted by the engine (ordinal membership in the three kinds, Result.transferPackageKind); wording only.'
+            'module\PRA.Gui.psm1|[string]$Record.kind' = 'Event kind: Read-PraGuiEvents already refused any kind outside its list with an ordinal membership test.'
+            'module\PRA.Cloud.psm1|$right' = 'Right name taken from the fixed list FullAccess, SendAs, SendOnBehalf built by the module.'
+        }
+    }
+    It 'exports the ordinal helpers from PRA.Common' {
+        foreach ($name in 'Test-PraOrdinalEqual','Test-PraOrdinalIgnoreCaseEqual','Test-PraOrdinalIn','Test-PraOrdinalIgnoreCaseIn','Sort-PraOrdinal','Get-PraOrdinalUnique') {
+            (Get-Command $name -ErrorAction Stop).ModuleName | Should -BeExactly 'PRA.Common'
+        }
+    }
+    It 'tells "abc" from "abc" plus <Name> and from "ab" plus <Name> plus "c" in every helper (the culture comparison does not)' -ForEach @(
+        @{Name='U+0001 (control)';Char=[string][char]0x0001},@{Name='U+0008 (control)';Char=[string][char]0x0008},@{Name='U+200B (zero-width space)';Char=[string][char]0x200B}
+        @{Name='U+00AD (soft hyphen)';Char=[string][char]0x00AD},@{Name='U+200C (zero-width non-joiner)';Char=[string][char]0x200C},@{Name='U+FEFF (byte order mark)';Char=[string][char]0xFEFF}
+    ) {
+        $plain = 'abc'; $tail = 'abc' + $Char; $middle = 'ab' + $Char + 'c'
+        foreach ($other in $tail, $middle) {
+            Test-PraOrdinalEqual $plain $other | Should -BeFalse
+            Test-PraOrdinalEqual $other $plain | Should -BeFalse
+            Test-PraOrdinalIgnoreCaseEqual $plain $other | Should -BeFalse
+            Test-PraOrdinalIgnoreCaseEqual 'ABC' $other | Should -BeFalse
+            Test-PraOrdinalIn $plain @('x', $other) | Should -BeFalse
+            Test-PraOrdinalIn $other @('x', $plain) -IgnoreCase | Should -BeFalse
+            Test-PraOrdinalIgnoreCaseIn $plain @($other) | Should -BeFalse
+            @($plain, $other | Get-PraOrdinalUnique).Count | Should -Be 2
+            @($plain, $other | Get-PraOrdinalUnique -IgnoreCase).Count | Should -Be 2
+            @($other, $plain | Sort-PraOrdinal -Unique).Count | Should -Be 2
+        }
+        # The exact same text still matches (case rules unchanged).
+        Test-PraOrdinalEqual $tail ('abc' + $Char) | Should -BeTrue
+        Test-PraOrdinalEqual 'ABC' 'abc' | Should -BeFalse
+        Test-PraOrdinalIgnoreCaseEqual 'ABC' 'abc' | Should -BeTrue
+        Test-PraOrdinalIn 'abc' @('x', 'ABC') | Should -BeFalse
+        Test-PraOrdinalIn 'abc' @('x', 'ABC') -IgnoreCase | Should -BeTrue
+    }
+    It 'handles $null, empty and non-string values like -ceq / -eq would, and sorts by UTF-16 code unit' {
+        Test-PraOrdinalEqual $null $null | Should -BeTrue
+        Test-PraOrdinalEqual $null '' | Should -BeFalse
+        Test-PraOrdinalEqual '' ([string][char]1) | Should -BeFalse -Because 'U+0001 -ceq empty is true under ICU'
+        Test-PraOrdinalIgnoreCaseEqual 7 '7' | Should -BeTrue
+        Test-PraOrdinalIn 'a' $null | Should -BeFalse
+        Test-PraOrdinalIn 'a' @() | Should -BeFalse
+        (@('b','A','a','B') | Sort-PraOrdinal) -join ',' | Should -BeExactly 'A,B,a,b'
+        (@('b','A','a','B') | Sort-PraOrdinal -Descending) -join ',' | Should -BeExactly 'b,a,B,A'
+        (@('b','A','a','B') | Sort-PraOrdinal -IgnoreCase | ForEach-Object { $_.ToLowerInvariant() }) -join ',' | Should -BeExactly 'a,a,b,b'
+        (@([pscustomobject]@{N='z'},[pscustomobject]@{N='Y'},[pscustomobject]@{N='a'}) | Sort-PraOrdinal -Property N | ForEach-Object N) -join ',' | Should -BeExactly 'Y,a,z'
+        @() | Sort-PraOrdinal | Should -BeNullOrEmpty
+        (@('x','y','x','X') | Get-PraOrdinalUnique) -join ',' | Should -BeExactly 'x,y,X'
+    }
+    It 'Get-PraValue finds a key by ordinal, case-insensitive match only' {
+        Get-PraValue @{Operation='Convert'} 'operation' 'none' | Should -BeExactly 'Convert'
+        Get-PraValue @{Operation='Convert'} ('Operation' + [char]0x200B) 'none' | Should -BeExactly 'none'
+        Get-PraValue @{('Operation' + [char]1)='Convert'} 'Operation' 'none' | Should -BeExactly 'none'
+    }
+    It 'has no culture-sensitive string comparison left in the 8 runtime files (-ceq -cne -cin -cnotin -ccontains -like family, one-argument StartsWith/EndsWith/IndexOf/CompareTo, [string]::Compare, Sort-Object, Group-Object, -Unique)' {
+        $used = New-Object 'Collections.Generic.HashSet[string]'
+        $banned = @('Ceq','Cne','Cin','Cnotin','Ccontains','Cnotcontains','Clike','Cnotlike','Like','Notlike','Ilike','Inotlike')
+        foreach ($relative in $script:OrdFiles) {
+            $tokens = $null; $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Source $relative), [ref]$tokens, [ref]$errors)
+            $errors.Count | Should -Be 0 -Because $relative
+            @($tokens | Where-Object { $_.Kind.ToString() -in $banned } | ForEach-Object { '{0}:{1} {2}' -f $relative, $_.Extent.StartLineNumber, $_.Text }) | Should -BeNullOrEmpty -Because 'comparison operators with a culture collation (use PRA.Common ordinal helpers or [StringComparison]::Ordinal)'
+            @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                $n.Member.Value -in 'StartsWith','EndsWith','IndexOf','LastIndexOf','CompareTo' -and $n.Arguments.Count -eq 1 }, $true) |
+                ForEach-Object { '{0}:{1} {2}' -f $relative, $_.Extent.StartLineNumber, $_.Extent.Text }) | Should -BeNullOrEmpty -Because 'one-argument culture overloads (pass [StringComparison]::Ordinal)'
+            @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Static -and $n.Expression.Extent.Text -eq '[string]' -and
+                $n.Member.Value -in 'Compare','Equals' -and $n.Arguments.Count -eq 2 }, $true) | ForEach-Object { '{0}:{1} {2}' -f $relative, $_.Extent.StartLineNumber, $_.Extent.Text }) | Should -BeNullOrEmpty -Because '[string]::Compare/Equals without a StringComparison'
+            $culture = @($ast.FindAll({ param($n) ($n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -in 'Sort-Object','Group-Object','Get-Unique','Compare-Object') -or
+                ($n -is [Management.Automation.Language.CommandParameterAst] -and $n.ParameterName -eq 'Unique') }, $true))
+            foreach ($node in $culture) {
+                $command = if ($node -is [Management.Automation.Language.CommandParameterAst]) { $node.Parent } else { $node }
+                $key = $relative + '|' + (($command.Extent.Text -replace '\s+', ' ').Trim())
+                if ($script:OrdAllowList.ContainsKey($key)) { [void]$used.Add($key); $script:OrdAllowList[$key] | Should -Not -BeNullOrEmpty }
+                else { $key | Should -BeNullOrEmpty -Because ('culture-sensitive command outside the allow-list at line ' + $node.Extent.StartLineNumber) }
+            }
+        }
+        foreach ($key in $script:OrdAllowList.Keys) { $used.Contains($key) | Should -BeTrue -Because ('stale allow-list entry: ' + $key) }
+    }
+    It 'has no string -eq -ne -in -notin -contains -notcontains and no unjustified switch left in the runtime files, the window included' {
+        # The guard resolves the type of a static member (for example [Windows.Input.Key]::Return in the window) to tell an enum or a number from a string:
+        # the WPF assemblies must be loaded, whatever the tests that ran before. Loading them needs no desktop.
+        Add-Type -AssemblyName PresentationCore, WindowsBase -ErrorAction Stop
+        # An operand that is certainly not a string: a number, $true/$false/$null, a negation, a type, a static member of a non-string type, a cast to a
+        # value type, or a member that is a number or a flag (Count, Length, ExitCode, Depth, NodeType, PSIsContainer).
+        $isSafe = $null
+        $isSafe = {
+            param($node)
+            if ($node -is [Management.Automation.Language.ParenExpressionAst]) { $inner = $node.Pipeline.GetPureExpression(); return ($null -ne $inner -and (& $isSafe $inner)) }
+            if ($node -is [Management.Automation.Language.ConstantExpressionAst]) { return ($node.Value -isnot [string]) }
+            if ($node -is [Management.Automation.Language.UnaryExpressionAst] -or $node -is [Management.Automation.Language.TypeExpressionAst]) { return $true }
+            if ($node -is [Management.Automation.Language.VariableExpressionAst]) { return ($node.VariablePath.UserPath -in 'true', 'false', 'null') }
+            if ($node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and -not $node.Static) { return ($node.Member.Value -in 'MoveToContent', 'GetHashCode', 'CompareTo') }
+            if ($node -is [Management.Automation.Language.MemberExpressionAst] -and $node.Static -and $node.Expression -is [Management.Automation.Language.TypeExpressionAst]) { $type = $node.Expression.TypeName.GetReflectionType(); return ($null -ne $type -and $type -ne [string]) }
+            if ($node -is [Management.Automation.Language.MemberExpressionAst] -and $node.Member -is [Management.Automation.Language.StringConstantExpressionAst]) { return ($node.Member.Value -in 'Count', 'Length', 'ExitCode', 'Depth', 'NodeType', 'PSIsContainer') }
+            if ($node -is [Management.Automation.Language.ConvertExpressionAst]) { return ($node.StaticType -in [int], [long], [bool], [double], [uint32], [uint64], [byte], [char], [version], [guid]) }
+            $false
+        }
+        $operators = 'Ieq', 'Ine', 'Iin', 'Inotin', 'Icontains', 'Inotcontains'
+        $usedSwitches = New-Object 'Collections.Generic.HashSet[string]'
+        $checked = 0
+        foreach ($relative in $script:OrdFiles) {
+            if ($relative -in $script:OrdPendingFiles) { continue }
+            $checked++
+            $tokens = $null; $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Source $relative), [ref]$tokens, [ref]$errors)
+            $errors.Count | Should -Be 0 -Because $relative
+            $comparisons = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.BinaryExpressionAst] -and $n.Operator.ToString() -in $operators }, $true) |
+                    Where-Object { -not ((& $isSafe $_.Left) -or (& $isSafe $_.Right)) } |
+                    ForEach-Object { '{0}:{1} {2}' -f $relative, $_.Extent.StartLineNumber, (($_.Extent.Text -replace '\s+', ' ')) })
+            $comparisons | Should -BeNullOrEmpty -Because 'a string comparison operator uses the culture collation under ICU (use Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalEqual or Test-PraOrdinalIn)'
+            foreach ($switch in @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.SwitchStatementAst] }, $true))) {
+                $condition = (($switch.Condition.Extent.Text -split "`n")[0] -replace '\s+', ' ').Trim()
+                $key = $relative + '|' + $condition
+                if ($script:OrdSwitchAllowList.ContainsKey($key)) { [void]$usedSwitches.Add($key); $script:OrdSwitchAllowList[$key] | Should -Not -BeNullOrEmpty }
+                else { $key | Should -BeNullOrEmpty -Because ('switch outside the allow-list at line ' + $switch.Extent.StartLineNumber + ': a switch compares strings with the culture collation') }
+            }
+        }
+        $checked | Should -BeGreaterThan 5
+        foreach ($key in $script:OrdSwitchAllowList.Keys) { $usedSwitches.Contains($key) | Should -BeTrue -Because ('stale switch allow-list entry: ' + $key) }
+        # The files still pending are named, so the exclusion cannot grow silently.
+        @($script:OrdPendingFiles).Count | Should -Be 0 -Because 'the window is covered by the operator and switch checks'
+    }
+    It 'keeps ValidateSet from being the only gate: the entry script and the window rewrite or refuse a value without an ordinal match' {
+        $entry = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'))
+        $entry | Should -Match ([regex]::Escape("Parameter -{0}: '{1}' is not one of the accepted values ({2}).")) -Because 'the refusal names the parameter, the typed value and the accepted values'
+        $entry | Should -Match '\[StringComparison\]::OrdinalIgnoreCase\)\s*\}\)'
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Gui.psm1')) | Should -Match 'function Resolve-GuiOfficialValue'
+    }
+    It 'refuses a new regular expression anchored with a bare $ on a hash, GUID or name in the verifier (the line feed that $ also accepts)' {
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\Test-PackageIntegrity.ps1')) | Should -Match "Sha256 -cnotmatch '\^\[0-9A-F\]\{64\}\\z'"
+    }
+}
+
+Describe 'Release 3.0.0 - ordinal comparison: a control or zero-width character is refused by the backup, proof and raw codec readers' -Tag 'Ordinal' {
+    BeforeEach {
+        $global:PraGate.Runtime = New-GateRuntime -Name 'ordinal-backup'
+        $env:PRA_GATE_STATE = $global:PraGate.Runtime.StatePath
+        $env:PSModulePath = $global:PraGate.Runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Import-Module ActiveDirectory -Force -Global
+        $global:PraGate.Context = New-GateContext $global:PraGate.Runtime
+        $global:PraGate.Context.LogFile = Join-Path $global:PraGate.Runtime.Root 'logs\ordinal.log'
+    }
+    It 'accepts the untouched backup (control for the refusals below)' {
+        $plan = New-PraPlan $global:PraGate.Context 'user1' 'Convert'
+        $receipt = & (Get-Module PRA.Directory) { param($c, $p) Save-PraBatch $c @($p) 'Convert' } $global:PraGate.Context $plan
+        $fresh = New-GateContext $global:PraGate.Runtime
+        (Import-PraBackup $fresh $receipt.Path).Data.Operation | Should -BeExactly 'Convert'
+    }
+    It 'refuses a backup whose <Field> carries <Name>, even with a correct JSON hash' -ForEach @(
+        @{Field='.sha256 file (batch hash)';Name='U+0001';Char=[string][char]1;Match='*does not match its .sha256*'}
+        @{Field='.sha256 file (batch hash)';Name='U+200B';Char=[string][char]0x200B;Match='*does not match its .sha256*'}
+        @{Field='Environment';Name='U+0001';Char=[string][char]1;Match='*another Environment*'}
+        @{Field='Environment';Name='U+200B';Char=[string][char]0x200B;Match='*another Environment*'}
+        @{Field='Operation';Name='U+0001';Char=[string][char]1;Match='*not an AD backup*'}
+        @{Field='Operation';Name='U+200B';Char=[string][char]0x200B;Match='*not an AD backup*'}
+        @{Field='RawFormat';Name='U+0001';Char=[string][char]1;Match='*capture format not supported*'}
+        @{Field='RawFormat';Name='U+200B';Char=[string][char]0x200B;Match='*capture format not supported*'}
+        @{Field='RawHash';Name='U+200B';Char=[string][char]0x200B;Match='*CLIXML SHA-256 mismatch*'}
+    ) {
+        $plan = New-PraPlan $global:PraGate.Context 'user1' 'Convert'
+        $receipt = & (Get-Module PRA.Directory) { param($c, $p) Save-PraBatch $c @($p) 'Convert' } $global:PraGate.Context $plan
+        if ($Field -like '.sha256*') { [IO.File]::WriteAllText(($receipt.Path + '.sha256'), ((Get-PraHash $receipt.Path) + $Char)) }
+        else {
+            $data = [IO.File]::ReadAllText($receipt.Path) | ConvertFrom-PraJson
+            $data.$Field = [string]$data.$Field + $Char
+            [IO.File]::WriteAllText($receipt.Path, ($data | ConvertTo-Json -Depth 30))
+            [IO.File]::WriteAllText(($receipt.Path + '.sha256'), (Get-PraHash $receipt.Path))
+        }
+        $fresh = New-GateContext $global:PraGate.Runtime
+        { Import-PraBackup $fresh $receipt.Path } | Should -Throw $Match
+        @(Get-GateWrites $global:PraGate.Runtime).Count | Should -Be 0
+    }
+    It 'refuses an AD proof whose <Field> carries <Name>, even with a correct hash' -ForEach @(
+        @{Field='Environment';Name='U+200B';Char=[string][char]0x200B;Message='AD proof (State file) does not match'}
+        @{Field='Operation';Name='U+200B';Char=[string][char]0x200B;Message='AD proof (State file) does not match'}
+        @{Field='Kind';Name='U+0001';Char=[string][char]1;Message='AD proof (State file) does not match'}
+        @{Field='BackupHash';Name='U+200B';Char=[string][char]0x200B;Message='AD proof does not match its backup'}
+    ) {
+        $context = $global:PraGate.Context
+        $bundles = New-GateSourceBundles $context
+        $proofPath = $bundles.State
+        # Witness: the untouched proof is accepted, so the refusal below comes from the look-alike character alone.
+        $intactContext = New-GateContext $global:PraGate.Runtime
+        $intactSource = Import-PraBackup $intactContext $bundles.Source
+        { Import-PraProof $intactContext $proofPath $intactSource 'Recover' } | Should -Not -Throw -Because 'the intact proof is accepted'
+        $proof = [IO.File]::ReadAllText($proofPath) | ConvertFrom-PraJson
+        $proof.$Field = [string]$proof.$Field + $Char
+        [IO.File]::WriteAllText($proofPath, ($proof | ConvertTo-Json -Depth 20))
+        [IO.File]::WriteAllText(($proofPath + '.sha256'), (Get-PraHash $proofPath))
+        $fresh = New-GateContext $global:PraGate.Runtime
+        $recoverSource = Import-PraBackup $fresh $bundles.Source
+        { Import-PraProof $fresh $proofPath $recoverSource 'Recover' } | Should -Throw -ExpectedMessage ('*' + $Message + '*')
+    }
+    It 'refuses a raw capture whose <Fault> carries <Name>' -ForEach @(
+        @{Fault='RawFormat marker';Name='U+200B';Char=[string][char]0x200B}
+        @{Fault='RawFormat marker';Name='U+0001 (as _x0001_)';Char='_x0001_'}
+        @{Fault='Kind value';Name='U+200B';Char=[string][char]0x200B}
+        @{Fault='Kind value';Name='U+0001 (as _x0001_)';Char='_x0001_'}
+        @{Fault='attribute name N';Name='U+200C (valid in an XML name)';Char=[string][char]0x200C}
+        @{Fault='element name S';Name='U+200C (valid in an XML name)';Char=[string][char]0x200C}
+    ) {
+        $context = $global:PraGate.Context
+        $user = New-GateUser
+        $snapshot = ConvertTo-PraRawSnapshot -User $user -CapturedUtc '2026-09-07T00:00:00.0000000Z'
+        $path = Join-Path $global:PraGate.Runtime.Root 'ordinal.clixml'
+        Write-PraRawCapture -Context $context -LiteralPath $path -Snapshots @($snapshot)
+        $records = @(@{ObjectGuid = $snapshot.ObjectGUID})
+        (Test-PraRawCapture -Context $context -LiteralPath $path -Records $records -RawFormat 'PraDataOnlyClixml-v1' -ExpectedSnapshots @($snapshot)).Count | Should -Be 1
+        $text = [IO.File]::ReadAllText($path)
+        switch ($Fault) {
+            'RawFormat marker' { $changed = $text.Replace('>PraDataOnlyClixml-v1<', ('>PraDataOnlyClixml-v1' + $Char + '<')) }
+            'Kind value'       { $changed = [regex]::Replace($text, '(<S N="Kind">)(\w+)(</S>)', ('${1}${2}' + $Char + '${3}'), 'None', [timespan]::FromSeconds(5)) }
+            'attribute name N' { $changed = $text.Replace('<S N="Kind">', ('<S N' + $Char + '="Kind">')) }
+            'element name S'   { $changed = $text.Replace('<S ', ('<S' + $Char + ' ')).Replace('</S>', ('</S' + $Char + '>')) }
+        }
+        # (Should -BeExactly is itself a culture comparison: compare ordinally.)
+        [string]::Equals($changed, $text, [StringComparison]::Ordinal) | Should -BeFalse -Because 'the fault must really change the capture'
+        [IO.File]::WriteAllText($path, $changed, (New-Object Text.UTF8Encoding($false)))
+        { Test-PraRawCapture -Context $context -LiteralPath $path -Records $records -RawFormat 'PraDataOnlyClixml-v1' -ExpectedSnapshots @($snapshot) } | Should -Throw
+        @(Get-GateWrites $global:PraGate.Runtime).Count | Should -Be 0
+    }
+}
+
+Describe 'Release 3.0.0 - ordinal comparison: the entry script and the Finalize package refuse look-alike values' -Tag 'Ordinal' {
+    BeforeAll {
+        $script:OrdRuntime = New-GateRuntime -Name 'ordinal-finalize'
+        $env:PRA_GATE_STATE = $script:OrdRuntime.StatePath
+        $env:PSModulePath = $script:OrdRuntime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Import-Module ActiveDirectory -Force -Global
+        $script:OrdContext = New-GateContext $script:OrdRuntime
+        $script:OrdBundles = New-GateSourceBundles $script:OrdContext -ApplySnapshots
+        $script:OrdFolder = Split-Path $script:OrdBundles.Manifest -Parent
+        $script:OrdWrites = @(Get-GateWrites $script:OrdRuntime).Count
+        $script:OrdMutant = {
+            param([string]$Field, [string]$Suffix, [switch]$SidecarOnly)
+            $name = 'Mutant-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.json'
+            $path = Join-Path $script:OrdFolder $name
+            $manifest = [IO.File]::ReadAllText($script:OrdBundles.Manifest) | ConvertFrom-PraJson
+            if (-not $SidecarOnly) { $manifest.$Field = [string]$manifest.$Field + $Suffix }
+            [IO.File]::WriteAllText($path, ($manifest | ConvertTo-Json -Depth 20))
+            [IO.File]::WriteAllText(($path + '.sha256'), ((Get-PraHash $path) + $(if ($SidecarOnly) { $Suffix } else { '' })))
+            $path
+        }
+    }
+    It 'refuses -<Parameter> typed as "<Value>" plus <Name> although ValidateSet accepts it' -ForEach @(
+        @{Parameter='Action';Value='Check';Name='U+0001';Char=[string][char]1}
+        @{Parameter='Action';Value='Check';Name='U+200B';Char=[string][char]0x200B}
+        @{Parameter='Mode';Value='Apply';Name='U+0001';Char=[string][char]1}
+        @{Parameter='Mode';Value='Preview';Name='U+200B';Char=[string][char]0x200B}
+        @{Parameter='Scope';Value='All';Name='U+00AD';Char=[string][char]0xAD}
+        @{Parameter='Expect';Value='Retained';Name='U+200B';Char=[string][char]0x200B}
+    ) {
+        $arguments = @{Action='Check'; Mode='Preview'; Identity='user1@gate.invalid'; ConfigPath=$script:OrdRuntime.ConfigPath}
+        $arguments[$Parameter] = $Value + $Char
+        $run = Invoke-GateProcess $script:OrdRuntime $arguments
+        $run.ExitCode | Should -Not -Be 0
+        $run.Error | Should -Match 'accepted values|not belong to the set|does not belong'
+        @(Get-GateWrites $script:OrdRuntime).Count | Should -Be $script:OrdWrites
+    }
+    It 'accepts the untouched Finalize package past the manifest checks (control)' {
+        $run = Invoke-GateProcess $script:OrdRuntime @{Action='Finalize'; Mode='Preview'; ConfigPath=$script:OrdRuntime.ConfigPath; Batch=$script:OrdBundles.Manifest}
+        (@($run.MainResult.Issues | ForEach-Object { [string]$_.Message }) -join ' ') | Should -Not -Match 'another version or Environment|SHA-256 mismatch|do not match|points outside'
+    }
+    It 'refuses a Finalize package whose <Field> carries <Name>' -ForEach @(
+        @{Field='manifest .sha256 file';Name='U+200B';Char=[string][char]0x200B;Property='';Match='SHA-256 mismatch';Sidecar=$true}
+        @{Field='manifest .sha256 file';Name='U+0001';Char=[string][char]1;Property='';Match='SHA-256 mismatch';Sidecar=$true}
+        @{Field='Environment';Name='U+200B';Char=[string][char]0x200B;Property='Environment';Match='another version or Environment';Sidecar=$false}
+        @{Field='Environment';Name='U+0001';Char=[string][char]1;Property='Environment';Match='another version or Environment';Sidecar=$false}
+        @{Field='Operation';Name='U+200B';Char=[string][char]0x200B;Property='Operation';Match='another version or Environment';Sidecar=$false}
+        @{Field='SourceBackupHash';Name='U+200B';Char=[string][char]0x200B;Property='SourceBackupHash';Match='manifest and proofs do not match';Sidecar=$false}
+        @{Field='StateHash';Name='U+0001';Char=[string][char]1;Property='StateHash';Match='manifest and proofs do not match';Sidecar=$false}
+        @{Field='SourceBackupFile (file name)';Name='U+200B';Char=[string][char]0x200B;Property='SourceBackupFile';Match='Stopped at step ''Loading the Finalize package''';Sidecar=$false}
+        @{Field='StateFile (file name)';Name='U+200B';Char=[string][char]0x200B;Property='StateFile';Match='Stopped at step ''Loading the Finalize package''';Sidecar=$false}
+        @{Field='SourceBackupFile (path separator)';Name='a parent-folder suffix';Char='\..\x';Property='SourceBackupFile';Match='a file path points outside the package';Sidecar=$false}
+        @{Field='StateFile (path separator)';Name='a parent-folder suffix';Char='\..\x';Property='StateFile';Match='a file path points outside the package';Sidecar=$false}
+    ) {
+        $mutant = if ($Sidecar) { & $script:OrdMutant '' $Char -SidecarOnly } else { & $script:OrdMutant $Property $Char }
+        $run = Invoke-GateProcess $script:OrdRuntime @{Action='Finalize'; Mode='Apply'; Force=$true; ConfigPath=$script:OrdRuntime.ConfigPath; Batch=$mutant}
+        $run.ExitCode | Should -Be 1
+        ($run.MainResult.Issues.Message -join ' ') | Should -Match $Match
+        @(Get-GateWrites $script:OrdRuntime).Count | Should -Be $script:OrdWrites
+    }
+}
+
+Describe 'Release 3.0.0 - transfer package: verification, extraction and refusals (pure functions, synthetic folders)' -Tag 'TransferPackage' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+        Add-Type -AssemblyName System.IO.Compression
+        $script:TpRoot = Join-Path $global:PraGate.Root 'transfer-pure'
+        $null = New-Item -ItemType Directory -Path $script:TpRoot -Force
+        $script:TpCounter = 0
+        function script:New-TpWork {
+            $script:TpCounter++
+            $work = Join-Path $script:TpRoot ('w' + $script:TpCounter)
+            $null = New-Item -ItemType Directory -Path (Join-Path $work 'src'), (Join-Path $work 'Backups') -Force
+            [pscustomobject]@{ Root = $work; Source = (Join-Path $work 'src'); Backups = (Join-Path $work 'Backups'); Outbox = (Join-Path $work 'Backups\Outbox') }
+        }
+        function script:New-TpFolder([string]$Parent, [string]$Name, [hashtable]$Files) {
+            $folder = Join-Path $Parent $Name
+            $null = New-Item -ItemType Directory -Path $folder -Force
+            foreach ($key in $Files.Keys) { [IO.File]::WriteAllBytes((Join-Path $folder $key), [byte[]]$Files[$key]) }
+            $folder
+        }
+        function script:Get-TpBytes([string]$Text) { (New-Object Text.UTF8Encoding($false)).GetBytes($Text) }
+        function script:Get-TpSha([byte[]]$Bytes) { $sha = [Security.Cryptography.SHA256]::Create(); try { ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant() } finally { $sha.Dispose() } }
+        # A hand-made package: entries (name -> bytes) and a manifest built from them unless overridden. The sidecar is valid unless said otherwise.
+        function script:New-TpZip {
+            param([string]$Path, [System.Collections.Specialized.OrderedDictionary]$Entries, $Manifest = $null, [switch]$NoManifest, [switch]$NoSidecar, [string]$Environment = 'LAB', [string]$Kind = 'Convert', [string]$BatchId = 'aaaaaaaa11111111aaaaaaaa11111111',
+                [string[]]$ExtraEntryNames = @(), [string]$RawManifestText = '')
+            if ($null -eq $Manifest) {
+                $Manifest = [ordered]@{ SchemaVersion = 1; Kind = $Kind; Environment = $Environment; CreatedUtc = '2026-11-04T00:00:00.0000000Z'; ToolVersion = '3.0.0'; BatchId = $BatchId
+                    Entries = @($Entries.Keys | ForEach-Object { [ordered]@{ Name = $_; Size = ([byte[]]$Entries[$_]).Length; Sha256 = (Get-TpSha ([byte[]]$Entries[$_])) } }); NextCommand = '.\x.ps1' }
+            }
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::CreateNew)
+            $zip = New-Object IO.Compression.ZipArchive($stream, [IO.Compression.ZipArchiveMode]::Create)
+            try {
+                if (-not $NoManifest) {
+                    $entry = $zip.CreateEntry('transfer.json'); $s = $entry.Open()
+                    $text = if ($RawManifestText) { $RawManifestText } else { $Manifest | ConvertTo-Json -Depth 6 }
+                    $b = Get-TpBytes $text; $s.Write($b, 0, $b.Length); $s.Dispose()
+                }
+                foreach ($key in $Entries.Keys) { $entry = $zip.CreateEntry($key); $s = $entry.Open(); $b = [byte[]]$Entries[$key]; $s.Write($b, 0, $b.Length); $s.Dispose() }
+            } finally { $zip.Dispose(); $stream.Dispose() }
+            if (-not $NoSidecar) { [IO.File]::WriteAllText($Path + '.sha256', (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()) }
+        }
+        function script:Get-TpChildren([string]$Folder) { @(Get-ChildItem -LiteralPath $Folder -Force -ErrorAction SilentlyContinue).Count }
+    }
+
+    It 'names the package after its purpose' {
+        Get-PraTransferPackageName -Kind Convert -Environment PROD -BatchId 8547AB040273474BA2C720ADE6240FC5 | Should -BeExactly 'PRA-PROD-Convert-8547ab04-for-Cloud.zip'
+        Get-PraTransferPackageName -Kind Recover -Environment LAB_1 -BatchId 8547ab04 | Should -BeExactly 'PRA-LAB_1-Recover-8547ab04-for-Cloud.zip'
+        Get-PraTransferPackageName -Kind Finalize -Environment PROD -BatchId 8547ab040273474ba2c720ade6240fc5 | Should -BeExactly 'PRA-PROD-Finalize-8547ab04-for-AD.zip'
+        { Get-PraTransferPackageName -Kind Other -Environment PROD -BatchId 8547ab04 } | Should -Throw
+        { Get-PraTransferPackageName -Kind Convert -Environment 'A B' -BatchId 8547ab04 } | Should -Throw
+        { Get-PraTransferPackageName -Kind Convert -Environment PROD -BatchId 'xyz' } | Should -Throw
+    }
+    It 'round-trips a <Kind> package: written once in the private Outbox, verified, imported to private folders with the original names' -ForEach @(
+        @{ Kind = 'Convert'; Folders = @('Batch-8547ab040273474ba2c720ade6240fc5'); Suffix = 'for-Cloud'; Direction = 'ToCloud' }
+        @{ Kind = 'Recover'; Folders = @('Batch-8547ab040273474ba2c720ade6240fc5', 'Batch-11112222333344445555666677778888'); Suffix = 'for-Cloud'; Direction = 'ToCloud' }
+        @{ Kind = 'Finalize'; Folders = @('Finalize-8547ab040273474ba2c720ade6240fc5'); Suffix = 'for-AD'; Direction = 'ToAD' }
+    ) {
+        $w = New-TpWork
+        $payload = [byte[]](1..40000 | ForEach-Object { [byte]($_ % 253) })
+        $paths = @(foreach ($name in $Folders) {
+            New-TpFolder $w.Source $name @{ ($name.Substring(0, 5) + '-X.json') = (Get-TpBytes "{`"n`":`"$name`"}"); ($name.Substring(0, 5) + '-X.json.sha256') = (Get-TpBytes 'abc'); 'raw.clixml' = $payload }
+        })
+        $made = New-PraTransferPackage -Kind $Kind -Environment LAB -BatchId '8547ab040273474ba2c720ade6240fc5' -Folders $paths -OutboxFolder $w.Outbox -NextCommand '.\Invoke-PraRemoteMailbox.ps1 -Batch ''x.zip''' -ToolVersion '3.0.0'
+        $made.Name | Should -BeExactly "PRA-LAB-$Kind-8547ab04-$Suffix.zip"
+        $made.Path | Should -BeExactly (Join-Path $w.Outbox $made.Name)
+        $made.Verified | Should -BeTrue
+        ([IO.File]::ReadAllText($made.Path + '.sha256')) | Should -BeExactly (Get-FileHash -LiteralPath $made.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        ([IO.FileSystemAclExtensions]::GetAccessControl((New-Object IO.DirectoryInfo $w.Outbox))).AreAccessRulesProtected | Should -BeTrue
+        # Deterministic entry order: the manifest first, then the names in ordinal order.
+        $zip = [IO.Compression.ZipFile]::OpenRead($made.Path)
+        try {
+            $names = @($zip.Entries.FullName)
+            $names[0] | Should -BeExactly 'transfer.json'
+            (@($names[1..($names.Count - 1)]) -join '|') | Should -BeExactly ((@($names[1..($names.Count - 1)]) | Sort-PraOrdinal) -join '|')
+            @($zip.Entries.LastWriteTime | ForEach-Object { $_.Year } | Get-PraOrdinalUnique) | Should -Be @('2000')
+        } finally { $zip.Dispose() }
+        $info = Get-PraTransferPackage -Path $made.Path -Environment LAB
+        $info.Valid | Should -BeTrue -Because $info.Error
+        $info.Kind | Should -BeExactly $Kind
+        $info.Direction | Should -BeExactly $Direction
+        $info.Environment | Should -BeExactly 'LAB'
+        $info.BatchId | Should -BeExactly '8547ab040273474ba2c720ade6240fc5'
+        $info.EntryCount | Should -Be (3 * $Folders.Count)
+        $info.ToolVersion | Should -BeExactly '3.0.0'
+        $info.NextCommand | Should -Match '-Batch'
+        @($info.Folders | Sort-PraOrdinal) -join '|' | Should -BeExactly ((@($Folders) | Sort-PraOrdinal) -join '|')
+        $info.SizeBytes | Should -Be ((Get-Item -LiteralPath $made.Path).Length)
+        $imported = Import-PraTransferPackage -Path $made.Path -BackupFolder $w.Backups -Environment LAB
+        $imported.Kind | Should -BeExactly $Kind
+        $imported.Created.Count | Should -Be $Folders.Count
+        $imported.Existing.Count | Should -Be 0
+        foreach ($name in $Folders) {
+            $target = Join-Path $w.Backups $name
+            $imported.Folders | Should -Contain $target
+            ([IO.FileSystemAclExtensions]::GetAccessControl((New-Object IO.DirectoryInfo $target))).AreAccessRulesProtected | Should -BeTrue
+            foreach ($file in Get-ChildItem -LiteralPath (Join-Path $w.Source $name) -File) {
+                (Get-FileHash -LiteralPath (Join-Path $target $file.Name)).Hash | Should -BeExactly (Get-FileHash -LiteralPath $file.FullName).Hash
+            }
+        }
+        # The second import finds identical folders: accepted, nothing written.
+        $again = Import-PraTransferPackage -Path $made.Path -BackupFolder $w.Backups -Environment LAB
+        $again.Created.Count | Should -Be 0
+        $again.Existing.Count | Should -Be $Folders.Count
+    }
+    It 'does not overwrite an existing package of the same name' {
+        $w = New-TpWork
+        $folder = New-TpFolder $w.Source 'Batch-8547ab040273474ba2c720ade6240fc5' @{ 'a.json' = (Get-TpBytes '{}') }
+        $null = New-PraTransferPackage -Kind Convert -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders $folder -OutboxFolder $w.Outbox
+        { New-PraTransferPackage -Kind Convert -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders $folder -OutboxFolder $w.Outbox } | Should -Throw '*already exists*'
+        @(Get-ChildItem -LiteralPath $w.Outbox -Filter '*.tmp').Count | Should -Be 0
+    }
+    It 'refuses to pack a folder with a sub-folder or a file name outside the whitelist, and leaves no partial package' {
+        $w = New-TpWork
+        $folder = New-TpFolder $w.Source 'Batch-8547ab040273474ba2c720ade6240fc5' @{ 'a.json' = (Get-TpBytes '{}') }
+        $null = New-Item -ItemType Directory -Path (Join-Path $folder 'sub')
+        { New-PraTransferPackage -Kind Convert -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders $folder -OutboxFolder $w.Outbox } | Should -Throw '*sub-folder*'
+        Remove-Item -LiteralPath (Join-Path $folder 'sub')
+        [IO.File]::WriteAllText((Join-Path $folder 'bad name.txt'), 'x')
+        { New-PraTransferPackage -Kind Convert -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders $folder -OutboxFolder $w.Outbox } | Should -Throw '*cannot be packed*'
+        @(Get-ChildItem -LiteralPath $w.Outbox -ErrorAction SilentlyContinue).Count | Should -Be 0
+    }
+    It 'refuses a bad package (<Name>) with a reason, never throws from Get-PraTransferPackage, and writes nothing on import' -ForEach @(
+        @{ Name = 'tampered entry'; Match = 'does not match its SHA-256' }
+        @{ Name = 'extra entry'; Match = 'unexpected entry' }
+        @{ Name = 'missing entry'; Match = 'missing from the package' }
+        @{ Name = 'duplicate entry'; Match = 'duplicate entry' }
+        @{ Name = 'path traversal'; Match = 'refused entry' }
+        @{ Name = 'traversal in the middle'; Match = 'refused entry' }
+        @{ Name = 'absolute path'; Match = 'refused entry' }
+        @{ Name = 'backslash'; Match = 'refused entry' }
+        @{ Name = 'drive'; Match = 'refused entry' }
+        @{ Name = 'two separators'; Match = 'refused entry' }
+        @{ Name = 'reserved device name'; Match = 'refused entry' }
+        @{ Name = 'control character'; Match = 'refused entry' }
+        @{ Name = 'trailing dot'; Match = 'refused entry' }
+        @{ Name = 'wrong folder prefix'; Match = 'refused entry' }
+        @{ Name = 'declared size differs'; Match = 'size of' }
+        @{ Name = 'wrong Environment'; Match = "Environment 'OTHER'" }
+        @{ Name = 'sidecar missing'; Match = '.sha256 file next to the package is missing' }
+        @{ Name = 'sidecar mismatch'; Match = 'does not match its .sha256' }
+        @{ Name = 'manifest missing'; Match = 'transfer.json is missing' }
+        @{ Name = 'manifest not JSON'; Match = 'transfer.json is not valid' }
+        @{ Name = 'manifest schema 2'; Match = 'SchemaVersion' }
+        @{ Name = 'unknown kind'; Match = 'unknown package kind' }
+        @{ Name = 'kind and folder prefix disagree'; Match = 'folders only' }
+        @{ Name = 'batch folder not in package'; Match = 'folder of the batch' }
+        @{ Name = 'manifest lists transfer.json'; Match = 'refused name' }
+        @{ Name = 'not a zip'; Match = 'not a readable ZIP' }
+    ) {
+        $w = New-TpWork
+        $good = [Collections.Specialized.OrderedDictionary]::new()
+        $good['Batch-aaaaaaaa11111111aaaaaaaa11111111/Convert-X.json'] = (Get-TpBytes '{"ok":1}')
+        $good['Batch-aaaaaaaa11111111aaaaaaaa11111111/raw.bin'] = [byte[]](1..3000 | ForEach-Object { [byte]($_ % 200) })
+        $zipPath = Join-Path $w.Root 'bad.zip'
+        $args1 = @{ Path = $zipPath; Entries = $good }
+        switch ($Name) {
+            'tampered entry' { $bad = [Collections.Specialized.OrderedDictionary]::new(); foreach ($k in $good.Keys) { $bad[$k] = $good[$k] }; $manifest = [ordered]@{ SchemaVersion = 1; Kind = 'Convert'; Environment = 'LAB'; CreatedUtc = 'x'; ToolVersion = '3'; BatchId = 'aaaaaaaa11111111aaaaaaaa11111111'; NextCommand = ''
+                    Entries = @($good.Keys | ForEach-Object { [ordered]@{ Name = $_; Size = $good[$_].Length; Sha256 = (Get-TpSha (Get-TpBytes 'other')) } }) }
+                $args1 = @{ Path = $zipPath; Entries = $good; Manifest = $manifest } }
+            'extra entry' { $more = [Collections.Specialized.OrderedDictionary]::new(); foreach ($k in $good.Keys) { $more[$k] = $good[$k] }; $manifest = [ordered]@{ SchemaVersion = 1; Kind = 'Convert'; Environment = 'LAB'; CreatedUtc = 'x'; ToolVersion = '3'; BatchId = 'aaaaaaaa11111111aaaaaaaa11111111'; NextCommand = ''
+                    Entries = @($good.Keys | ForEach-Object { [ordered]@{ Name = $_; Size = $good[$_].Length; Sha256 = (Get-TpSha $good[$_]) } }) }
+                $more['Batch-aaaaaaaa11111111aaaaaaaa11111111/extra.txt'] = (Get-TpBytes 'evil'); $args1 = @{ Path = $zipPath; Entries = $more; Manifest = $manifest } }
+            'missing entry' { $few = [Collections.Specialized.OrderedDictionary]::new(); $first = @($good.Keys)[0]; $few[$first] = $good[$first]
+                $manifest = [ordered]@{ SchemaVersion = 1; Kind = 'Convert'; Environment = 'LAB'; CreatedUtc = 'x'; ToolVersion = '3'; BatchId = 'aaaaaaaa11111111aaaaaaaa11111111'; NextCommand = ''
+                    Entries = @($good.Keys | ForEach-Object { [ordered]@{ Name = $_; Size = $good[$_].Length; Sha256 = (Get-TpSha $good[$_]) } }) }
+                $args1 = @{ Path = $zipPath; Entries = $few; Manifest = $manifest } }
+            'duplicate entry' { $stream = [IO.File]::Open($zipPath, [IO.FileMode]::CreateNew); $zip = New-Object IO.Compression.ZipArchive($stream, 'Create')
+                $manifest = [ordered]@{ SchemaVersion = 1; Kind = 'Convert'; Environment = 'LAB'; CreatedUtc = 'x'; ToolVersion = '3'; BatchId = 'aaaaaaaa11111111aaaaaaaa11111111'; NextCommand = ''
+                    Entries = @([ordered]@{ Name = 'Batch-aaaaaaaa11111111aaaaaaaa11111111/a.json'; Size = 2; Sha256 = (Get-TpSha (Get-TpBytes '{}')) }) }
+                foreach ($n in 'transfer.json', 'Batch-aaaaaaaa11111111aaaaaaaa11111111/a.json', 'Batch-aaaaaaaa11111111aaaaaaaa11111111/A.JSON') {
+                    $s = $zip.CreateEntry($n).Open(); $b = Get-TpBytes $(if ($n -eq 'transfer.json') { $manifest | ConvertTo-Json -Depth 6 } else { '{}' }); $s.Write($b, 0, $b.Length); $s.Dispose() }
+                $zip.Dispose(); $stream.Dispose(); [IO.File]::WriteAllText($zipPath + '.sha256', (Get-FileHash -LiteralPath $zipPath).Hash.ToLowerInvariant()); $args1 = $null }
+            'path traversal' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['../evil.txt'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'traversal in the middle' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['Batch-aaaaaaaa11111111aaaaaaaa11111111/../evil.txt'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'absolute path' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['/Windows/evil.txt'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'backslash' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['Batch-aaaaaaaa11111111aaaaaaaa11111111\evil.txt'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'drive' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['C:/evil.txt'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'two separators' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['Batch-aaaaaaaa11111111aaaaaaaa11111111/sub/evil.txt'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'reserved device name' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['Batch-aaaaaaaa11111111aaaaaaaa11111111/CON.json'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'control character' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e["Batch-aaaaaaaa11111111aaaaaaaa11111111/a$([char]1)b.json"] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'trailing dot' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['Batch-aaaaaaaa11111111aaaaaaaa11111111/evil.'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'wrong folder prefix' { $e = [Collections.Specialized.OrderedDictionary]::new(); $e['Other-aaaaaaaa11111111aaaaaaaa11111111/a.json'] = (Get-TpBytes 'x'); $args1 = @{ Path = $zipPath; Entries = $e } }
+            'declared size differs' { $manifest = [ordered]@{ SchemaVersion = 1; Kind = 'Convert'; Environment = 'LAB'; CreatedUtc = 'x'; ToolVersion = '3'; BatchId = 'aaaaaaaa11111111aaaaaaaa11111111'; NextCommand = ''
+                    Entries = @($good.Keys | ForEach-Object { [ordered]@{ Name = $_; Size = 5; Sha256 = (Get-TpSha $good[$_]) } }) }
+                $args1 = @{ Path = $zipPath; Entries = $good; Manifest = $manifest } }
+            'wrong Environment' { $args1 = @{ Path = $zipPath; Entries = $good; Environment = 'OTHER' } }
+            'sidecar missing' { $args1 = @{ Path = $zipPath; Entries = $good; NoSidecar = $true } }
+            'sidecar mismatch' { $args1 = $null }
+            'manifest missing' { $args1 = @{ Path = $zipPath; Entries = $good; NoManifest = $true } }
+            'manifest not JSON' { $args1 = @{ Path = $zipPath; Entries = $good; RawManifestText = '{ not json' } }
+            'manifest schema 2' { $manifest = [ordered]@{ SchemaVersion = 2; Kind = 'Convert'; Environment = 'LAB'; CreatedUtc = 'x'; ToolVersion = '3'; BatchId = 'aaaaaaaa11111111aaaaaaaa11111111'; NextCommand = ''
+                    Entries = @($good.Keys | ForEach-Object { [ordered]@{ Name = $_; Size = $good[$_].Length; Sha256 = (Get-TpSha $good[$_]) } }) }
+                $args1 = @{ Path = $zipPath; Entries = $good; Manifest = $manifest } }
+            'unknown kind' { $args1 = @{ Path = $zipPath; Entries = $good; Kind = 'Purge' } }
+            'kind and folder prefix disagree' { $args1 = @{ Path = $zipPath; Entries = $good; Kind = 'Finalize' } }
+            'batch folder not in package' { $args1 = @{ Path = $zipPath; Entries = $good; BatchId = 'bbbbbbbb22222222bbbbbbbb22222222' } }
+            'manifest lists transfer.json' { $manifest = [ordered]@{ SchemaVersion = 1; Kind = 'Convert'; Environment = 'LAB'; CreatedUtc = 'x'; ToolVersion = '3'; BatchId = 'aaaaaaaa11111111aaaaaaaa11111111'; NextCommand = ''
+                    Entries = @([ordered]@{ Name = 'transfer.json'; Size = 1; Sha256 = (Get-TpSha (Get-TpBytes 'x')) }) }
+                $args1 = @{ Path = $zipPath; Entries = $good; Manifest = $manifest } }
+            'not a zip' { [IO.File]::WriteAllBytes($zipPath, [byte[]](1..500 | ForEach-Object { [byte]($_ % 251) })); [IO.File]::WriteAllText($zipPath + '.sha256', (Get-FileHash -LiteralPath $zipPath).Hash.ToLowerInvariant()); $args1 = $null }
+        }
+        if ($null -ne $args1) { New-TpZip @args1 }
+        if ($Name -eq 'sidecar mismatch') { New-TpZip -Path $zipPath -Entries $good; [IO.File]::WriteAllText($zipPath + '.sha256', ('0' * 64)) }
+        $environment = if ($Name -eq 'wrong Environment') { 'LAB_X' } else { 'LAB' }
+        if ($Name -eq 'wrong Environment') { $environment = 'LAB' }
+        $info = Get-PraTransferPackage -Path $zipPath -Environment $environment
+        $info.Valid | Should -BeFalse
+        $info.Error | Should -Match ([regex]::Escape($Match)) -Because $info.Error
+        { Import-PraTransferPackage -Path $zipPath -BackupFolder $w.Backups -Environment $environment } | Should -Throw
+        (Get-TpChildren $w.Backups) | Should -Be 0 -Because 'verification precedes any write'
+    }
+    It 'refuses an entry above the per-entry size limit from its declared length, before reading it' {
+        $w = New-TpWork
+        $zipPath = Join-Path $w.Root 'bomb.zip'
+        $stream = [IO.File]::Open($zipPath, [IO.FileMode]::CreateNew)
+        $zip = New-Object IO.Compression.ZipArchive($stream, 'Create')
+        $entry = $zip.CreateEntry('Batch-aaaaaaaa11111111aaaaaaaa11111111/zeros.bin', [IO.Compression.CompressionLevel]::Fastest); $s = $entry.Open()
+        $chunk = New-Object byte[] 1048576; for ($i = 0; $i -lt 257; $i++) { $s.Write($chunk, 0, $chunk.Length) }
+        $s.Dispose(); $zip.Dispose(); $stream.Dispose()
+        [IO.File]::WriteAllText($zipPath + '.sha256', (Get-FileHash -LiteralPath $zipPath).Hash.ToLowerInvariant())
+        (Get-Item -LiteralPath $zipPath).Length | Should -BeLessThan 5MB
+        $info = Get-PraTransferPackage -Path $zipPath -Environment LAB
+        $info.Valid | Should -BeFalse
+        $info.Error | Should -Match 'too large'
+        (Get-TpChildren $w.Backups) | Should -Be 0
+    }
+    It 'refuses a package whose entries together exceed the total size limit' {
+        $w = New-TpWork
+        $zipPath = Join-Path $w.Root 'total.zip'
+        $stream = [IO.File]::Open($zipPath, [IO.FileMode]::CreateNew)
+        $zip = New-Object IO.Compression.ZipArchive($stream, 'Create')
+        $chunk = New-Object byte[] 1048576
+        foreach ($n in 1..3) {
+            $entry = $zip.CreateEntry("Batch-aaaaaaaa11111111aaaaaaaa11111111/z$n.bin", [IO.Compression.CompressionLevel]::Fastest); $s = $entry.Open()
+            for ($i = 0; $i -lt 200; $i++) { $s.Write($chunk, 0, $chunk.Length) }
+            $s.Dispose()
+        }
+        $zip.Dispose(); $stream.Dispose()
+        [IO.File]::WriteAllText($zipPath + '.sha256', (Get-FileHash -LiteralPath $zipPath).Hash.ToLowerInvariant())
+        $info = Get-PraTransferPackage -Path $zipPath -Environment LAB
+        $info.Valid | Should -BeFalse
+        $info.Error | Should -Match 'too large|zip bomb'
+    }
+    It 'accepts an upper-case sidecar and surrounding spaces, and refuses a sidecar that is not a SHA-256' {
+        $w = New-TpWork
+        $folder = New-TpFolder $w.Source 'Batch-8547ab040273474ba2c720ade6240fc5' @{ 'a.json' = (Get-TpBytes '{}') }
+        $made = New-PraTransferPackage -Kind Convert -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders $folder -OutboxFolder $w.Outbox
+        [IO.File]::WriteAllText($made.Sidecar, "  $((Get-FileHash -LiteralPath $made.Path).Hash.ToUpperInvariant())`r`n")
+        (Get-PraTransferPackage -Path $made.Path -Environment LAB).Valid | Should -BeTrue
+        [IO.File]::WriteAllText($made.Sidecar, 'not a hash')
+        (Get-PraTransferPackage -Path $made.Path -Environment LAB).Valid | Should -BeFalse
+    }
+    It 'detects a byte flipped inside the package through the sidecar' {
+        $w = New-TpWork
+        $folder = New-TpFolder $w.Source 'Batch-8547ab040273474ba2c720ade6240fc5' @{ 'a.json' = (Get-TpBytes '{"a":"b"}'); 'raw.bin' = [byte[]](1..2000 | ForEach-Object { [byte]($_ % 251) }) }
+        $made = New-PraTransferPackage -Kind Convert -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders $folder -OutboxFolder $w.Outbox
+        $bytes = [IO.File]::ReadAllBytes($made.Path); $bytes[$bytes.Length - 60] = [byte]($bytes[$bytes.Length - 60] -bxor 0xFF); [IO.File]::WriteAllBytes($made.Path, $bytes)
+        $info = Get-PraTransferPackage -Path $made.Path -Environment LAB
+        $info.Valid | Should -BeFalse
+        $info.Error | Should -Match 'does not match its .sha256'
+    }
+    It 'accepts an identical existing folder and refuses a different one (changed, extra and missing file) without creating the other folders' {
+        $w = New-TpWork
+        $a = New-TpFolder $w.Source 'Batch-8547ab040273474ba2c720ade6240fc5' @{ 'a.json' = (Get-TpBytes '{"a":1}'); 'b.bin' = [byte[]](1..100) }
+        $b = New-TpFolder $w.Source 'Batch-11112222333344445555666677778888' @{ 'c.json' = (Get-TpBytes '{"c":1}') }
+        $made = New-PraTransferPackage -Kind Recover -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders @($a, $b) -OutboxFolder $w.Outbox
+        # Only the first folder exists, identical: accepted, the second is created.
+        Copy-Item -LiteralPath $a -Destination $w.Backups -Recurse
+        $result = Import-PraTransferPackage -Path $made.Path -BackupFolder $w.Backups -Environment LAB
+        $result.Existing.Count | Should -Be 1
+        $result.Created.Count | Should -Be 1
+        Remove-Item -LiteralPath (Join-Path $w.Backups 'Batch-11112222333344445555666677778888') -Recurse -Force
+        foreach ($case in @('changed', 'extra', 'missing')) {
+            $target = Join-Path $w.Backups 'Batch-8547ab040273474ba2c720ade6240fc5'
+            Remove-Item -LiteralPath $target -Recurse -Force; Copy-Item -LiteralPath $a -Destination $w.Backups -Recurse
+            switch ($case) {
+                'changed' { [IO.File]::WriteAllText((Join-Path $target 'a.json'), '{"a":2}') }
+                'extra' { [IO.File]::WriteAllText((Join-Path $target 'extra.txt'), 'x') }
+                'missing' { Remove-Item -LiteralPath (Join-Path $target 'b.bin') }
+            }
+            { Import-PraTransferPackage -Path $made.Path -BackupFolder $w.Backups -Environment LAB } | Should -Throw '*already exists and is different*'
+            Test-Path -LiteralPath (Join-Path $w.Backups 'Batch-11112222333344445555666677778888') | Should -BeFalse -Because "${case}: nothing is created when one folder is refused"
+        }
+    }
+    It 'removes the folders it created when a later folder cannot be extracted' {
+        $w = New-TpWork
+        $a = New-TpFolder $w.Source 'Batch-8547ab040273474ba2c720ade6240fc5' @{ 'a.json' = (Get-TpBytes '{"a":1}') }
+        $b = New-TpFolder $w.Source 'Batch-11112222333344445555666677778888' @{ 'c.json' = (Get-TpBytes '{"c":1}') }
+        $made = New-PraTransferPackage -Kind Recover -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders @($a, $b) -OutboxFolder $w.Outbox
+        $script:TpCalls = 0
+        Mock -ModuleName PRA.Common New-PraPrivateDirectorySecurity {
+            $global:TpCalls++
+            if ($global:TpCalls -ge 2) { throw 'simulated failure on the second folder' }
+            $acl = New-Object Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true, $false)
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule([Security.Principal.WindowsIdentity]::GetCurrent().User, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))); $acl
+        }
+        $global:TpCalls = 0
+        { Import-PraTransferPackage -Path $made.Path -BackupFolder $w.Backups -Environment LAB } | Should -Throw '*simulated failure*'
+        $global:TpCalls | Should -BeGreaterOrEqual 2
+        @(Get-ChildItem -LiteralPath $w.Backups -Directory | Where-Object { $_.Name.StartsWith('Batch-', [StringComparison]::Ordinal) }).Count | Should -Be 0 -Because 'the first folder created by the failed import is removed'
+    }
+    It 'checks the expected kind before reading the content' {
+        $w = New-TpWork
+        $a = New-TpFolder $w.Source 'Batch-8547ab040273474ba2c720ade6240fc5' @{ 'a.json' = (Get-TpBytes '{"a":1}') }
+        $made = New-PraTransferPackage -Kind Convert -Environment LAB -BatchId 8547ab040273474ba2c720ade6240fc5 -Folders $a -OutboxFolder $w.Outbox
+        { Import-PraTransferPackage -Path $made.Path -BackupFolder $w.Backups -Environment LAB -ExpectedKind Recover } | Should -Throw '*Convert package*'
+        (Import-PraTransferPackage -Path $made.Path -BackupFolder $w.Backups -Environment LAB -ExpectedKind Convert).Kind | Should -BeExactly 'Convert'
+    }
+}
+
+Describe 'Release 3.0.0 - engine events for the progress view (plan, step, item, progress, result)' -Tag 'EngineEvents' {
+    BeforeEach {
+        $oldEventPath = $env:PRA_EVENT_FILE
+        $runtime = New-GateRuntime -Name 'engine-events'
+        $env:PRA_EVENT_FILE = Join-Path $runtime.Root 'engine.events.jsonl'
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+    }
+    AfterEach { $env:PRA_EVENT_FILE = $oldEventPath }
+
+    It 'writes a progress event with every field, and nothing without PRA_EVENT_FILE' {
+        $context = @{ StepIndex = 3; StepTotal = 5; Issues = (New-Object 'Collections.Generic.List[object]'); Warnings = 0; LogFile = '' }
+        Write-PraProgress -Context $context -Text 'Waiting for the mailbox' -Current 30 -Total 3600 -Attempt 2 -MaxAttempts 61 -NextInSeconds 60
+        $event = [IO.File]::ReadAllText($env:PRA_EVENT_FILE) | ConvertFrom-Json -DateKind String
+        $event.kind | Should -BeExactly 'progress'
+        $event.stepId | Should -BeExactly 's3'
+        ($event.current, $event.total, $event.attempt, $event.maxAttempts, $event.nextInSeconds) -join ',' | Should -BeExactly '30,3600,2,61,60'
+        $event.text | Should -BeExactly 'Waiting for the mailbox'
+        $env:PRA_EVENT_FILE = ''
+        @(Write-PraProgress -Context $context -Text 'x').Count | Should -Be 0
+    }
+    It 'closes each step with ok, warn or fail and announces a skipped step at once' {
+        $context = @{ StepIndex = 0; StepTotal = 4; Issues = (New-Object 'Collections.Generic.List[object]'); Warnings = 0; LogFile = ''; Action = 'Convert'; CurrentPhase = '' }
+        Write-PraStep -Context $context -Title 'One' | Out-Null
+        Write-PraItem -Context $context -Status Ok -Text 'fine' -Detail 'more'
+        Write-PraStep -Context $context -Title 'Two' | Out-Null
+        Write-PraItem -Context $context -Status Warn -Text 'careful'
+        Write-PraStep -Context $context -Title 'Three' | Out-Null
+        Add-PraIssue $context 'broken'
+        Write-PraStep -Context $context -Title 'Four' -Skipped | Out-Null
+        InModuleScope PRA.Common -Parameters @{ Ctx = $context } { Close-PraStepEvent -Context $Ctx }
+        $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        $steps = @($events | Where-Object kind -eq 'step')
+        ($steps | ForEach-Object { '{0}:{1}' -f $_.id, $_.state }) -join ',' | Should -BeExactly 's1:running,s1:ok,s2:running,s2:warn,s3:running,s3:fail,s4:skipped'
+        $steps[0].endedUtc | Should -BeNullOrEmpty
+        $steps[1].startedUtc | Should -Be $steps[0].startedUtc
+        $steps[1].endedUtc | Should -Not -BeNullOrEmpty
+        $steps[6].startedUtc | Should -Be $steps[6].endedUtc
+        $steps[0].index | Should -Be 1
+        $steps[0].total | Should -Be 4
+        $steps[0].title | Should -BeExactly 'One'
+        $items = @($events | Where-Object kind -eq 'item')
+        $items[0].stepId | Should -BeExactly 's1'
+        $items[0].detail | Should -BeExactly 'more'
+        $items[1].stepId | Should -BeExactly 's2'
+        $items[1].detail | Should -BeExactly ''
+    }
+    It 'announces the plan before the first step and closes every step of a Convert AD Preview, the transfer package step being skipped' {
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        $kinds = @($events.kind)
+        $plans = @($events | Where-Object kind -eq 'plan')
+        $plans.Count | Should -Be 1
+        [array]::IndexOf($kinds, 'plan') | Should -BeLessThan ([array]::IndexOf($kinds, 'step'))
+        $plan = $plans[0]
+        @($plan.steps | ForEach-Object id) -join ',' | Should -BeExactly 's1,s2,s3,s4,s5'
+        @($plan.steps | ForEach-Object label) | Should -Contain 'Creating the transfer package'
+        $plan.steps[-1].label | Should -BeExactly 'Creating the transfer package'
+        $plan.steps[0].PSObject.Properties.Name | Should -Contain 'count'
+        $final = @{}
+        foreach ($step in @($events | Where-Object kind -eq 'step')) { $final[$step.id] = $step }
+        $final.Keys.Count | Should -Be 5
+        foreach ($step in $final.Values) { $step.state | Should -BeIn @('ok', 'warn', 'skipped'); $step.endedUtc | Should -Not -BeNullOrEmpty }
+        $final['s5'].state | Should -BeExactly 'skipped'
+        $final['s5'].title | Should -BeExactly 'Creating the transfer package'
+        foreach ($item in @($events | Where-Object kind -eq 'item')) { $item.PSObject.Properties.Name | Should -Contain 'stepId'; $item.PSObject.Properties.Name | Should -Contain 'detail' }
+        $result = @($events | Where-Object kind -eq 'result')[0]
+        $result.transferPackage | Should -BeExactly ''
+        $result.transferPackageKind | Should -BeExactly ''
+        @($result.configOverrides).Count | Should -Be 0
+        $run.Output | Should -Match 'Creating the transfer package'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'reports a failed run with its last step failed' {
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Phase='AD';Mode='Preview';Batch='deadbeef';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 1
+        $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        $running = @($events | Where-Object { $_.kind -eq 'step' -and $_.state -eq 'running' })
+        $closing = @($events | Where-Object { $_.kind -eq 'step' -and $_.state -eq 'fail' })
+        $closing.Count | Should -Be 1
+        $closing[0].id | Should -BeExactly $running[-1].id
+    }
+}
+
+Describe 'Release 3.0.0 - transfer package through the real main (hand-off and import)' -Tag 'TransferPackageMain' {
+    BeforeEach {
+        $oldEventPath = $env:PRA_EVENT_FILE
+        $runtime = New-GateRuntime -Name 'tp-main-ad'
+        $env:PRA_EVENT_FILE = Join-Path $runtime.Root 'engine.events.jsonl'
+        $script:Cloud = $null
+        function script:Get-TpEvents($Path) { @(Get-Content -LiteralPath $Path -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String }) }
+        function script:New-TpCloudRuntime([string]$Name) {
+            $cloudRuntime = New-GateRuntime -Name $Name
+            $cloudRuntime
+        }
+    }
+    AfterEach { $env:PRA_EVENT_FILE = $oldEventPath }
+
+    It 'Convert -Phase AD -Mode Apply writes one verified package in the private Outbox, and the cloud server runs from it (<Spelling>)' -ForEach @(
+        @{ Spelling = 'official'; Action = 'Convert'; Mode = 'Apply'; Phase = 'Cloud'; ByName = $false }
+        @{ Spelling = 'lower case, by file name from the Inbox'; Action = 'convert'; Mode = 'apply'; Phase = 'cloud'; ByName = $true }
+        @{ Spelling = 'upper case'; Action = 'CONVERT'; Mode = 'APPLY'; Phase = 'CLOUD'; ByName = $false }
+    ) {
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -BeIn @(0, 2)
+        $events = Get-TpEvents $env:PRA_EVENT_FILE
+        $result = @($events | Where-Object kind -eq 'result')[0]
+        $result.transferPackageKind | Should -BeExactly 'Convert'
+        $zip = $result.transferPackage
+        $zip | Should -Match 'PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip$'
+        Test-Path -LiteralPath $zip -PathType Leaf | Should -BeTrue
+        Split-Path $zip -Parent | Should -BeExactly (Join-Path $runtime.State.BackupFolder 'Outbox')
+        Test-Path -LiteralPath ($zip + '.sha256') | Should -BeTrue
+        $run.MainResult.TransferPackage | Should -BeExactly $zip
+        ($run.MainResult.NextSteps -join "`n") | Should -Match 'Copy .*PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip to the cloud server'
+        ($run.MainResult.NextSteps -join "`n") | Should -Match "-Batch 'PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip'"
+        ($run.MainResult.NextSteps -join "`n") | Should -Not -Match 'Copy the folder'
+        $steps = @($events | Where-Object { $_.kind -eq 'step' -and $_.title -eq 'Creating the transfer package' })
+        ($steps.state -join ',') | Should -BeExactly 'running,ok'
+        @($events | Where-Object { $_.kind -eq 'item' -and $_.text -like 'Transfer package * written (* checksums verified)' }).Count | Should -Be 1
+        $info = Get-PraTransferPackage -Path $zip -Environment SYNTHETIC_GATE
+        $info.Valid | Should -BeTrue -Because $info.Error
+        $info.Kind | Should -BeExactly 'Convert'
+        $info.Folders.Count | Should -Be 1
+        # The cloud server: another machine, nothing but the package.
+        $cloud = New-GateRuntime -Name 'tp-main-cloud'
+        $target = $zip
+        if ($ByName) {
+            $inbox = Join-Path $cloud.State.BackupFolder 'Inbox'; $null = New-Item -ItemType Directory -Path $inbox
+            Copy-Item -LiteralPath $zip -Destination $inbox; Copy-Item -LiteralPath ($zip + '.sha256') -Destination $inbox
+            $target = [IO.Path]::GetFileName($zip)
+        } else {
+            $drop = Join-Path $cloud.Root 'dropped'; $null = New-Item -ItemType Directory -Path $drop
+            Copy-Item -LiteralPath $zip -Destination $drop; Copy-Item -LiteralPath ($zip + '.sha256') -Destination $drop
+            $target = Join-Path $drop ([IO.Path]::GetFileName($zip))
+        }
+        Remove-Item -LiteralPath $env:PRA_EVENT_FILE -Force
+        $env:PRA_EVENT_FILE = Join-Path $cloud.Root 'engine.events.jsonl'
+        $second = Invoke-GateProcess $cloud @{Action=$Action;Mode=$Mode;Phase=$Phase;Force=$true;ConfigPath=$cloud.ConfigPath;Batch=$target} -TimeoutSeconds 120
+        (@($second.MainResult.Issues | ForEach-Object { [string]$_.Message }) -join ' ') | Should -Not -Match 'Transfer package|does not match|AD proof'
+        $second.ExitCode | Should -BeIn @(0, 2)
+        @($second.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 1
+        $folder = Join-Path $cloud.State.BackupFolder ('Batch-' + $info.BatchId)
+        Test-Path -LiteralPath $folder -PathType Container | Should -BeTrue
+        ([IO.FileSystemAclExtensions]::GetAccessControl((New-Object IO.DirectoryInfo $folder))).AreAccessRulesProtected | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $folder -File | Where-Object Name -like 'State-*.json').Count | Should -Be 1
+        $second.Output | Should -Match 'Transfer package .* verified'
+        @(Get-GateWrites $cloud).Count | Should -Be 0
+    }
+    It 'refuses a Convert package for a Recover cloud phase, a tampered package and a package of another Environment, writing nothing' {
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $zip = @(Get-TpEvents $env:PRA_EVENT_FILE | Where-Object kind -eq 'result')[0].transferPackage
+        $cloud = New-GateRuntime -Name 'tp-main-refused'
+        $before = @(Get-ChildItem -LiteralPath $cloud.State.BackupFolder -Recurse -Force).Count
+        $wrongKind = Invoke-GateProcess $cloud @{Action='Recover';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$cloud.ConfigPath;Batch=$zip}
+        $wrongKind.ExitCode | Should -Be 1
+        ($wrongKind.MainResult.Issues.Message -join ' ') | Should -Match 'this is a Convert package, a Recover package is needed'
+        # Tampered: flip a byte, the sidecar no longer matches.
+        $bad = Join-Path $cloud.Root 'bad.zip'
+        $bytes = [IO.File]::ReadAllBytes($zip); $bytes[$bytes.Length - 70] = [byte]($bytes[$bytes.Length - 70] -bxor 0x55); [IO.File]::WriteAllBytes($bad, $bytes)
+        Copy-Item -LiteralPath ($zip + '.sha256') -Destination ($bad + '.sha256')
+        $tampered = Invoke-GateProcess $cloud @{Action='Convert';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$cloud.ConfigPath;Batch=$bad}
+        $tampered.ExitCode | Should -Be 1
+        ($tampered.MainResult.Issues.Message -join ' ') | Should -Match 'does not match its .sha256'
+        # Another Environment.
+        Set-GateConfigText $cloud { param($t) $t.Replace("Environment='SYNTHETIC_GATE'", "Environment='OTHER_ENV'") }
+        $other = Invoke-GateProcess $cloud @{Action='Convert';Mode='Preview';Phase='Cloud';ConfigPath=$cloud.ConfigPath;Batch=$zip}
+        $other.ExitCode | Should -Be 1
+        ($other.MainResult.Issues.Message -join ' ') | Should -Match "Environment 'SYNTHETIC_GATE'"
+        @(Get-ChildItem -LiteralPath $cloud.State.BackupFolder -Recurse -Force | Where-Object { $_.FullName -notlike '*\Outbox*' }).Count | Should -Be $before
+        @(Get-GateWrites $cloud).Count | Should -Be 0
+    }
+    It 'Recover -Phase AD -Mode Apply packs the new Recover batch and the original Convert batch; the cloud server runs from the package' {
+        $env:PRA_GATE_STATE = $runtime.StatePath
+        $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+        Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        $fresh = New-GateContext $runtime
+        $plans = @(New-PraPlan $fresh 'user1' 'Convert'; New-PraPlan $fresh 'user2' 'Convert')
+        $source = Invoke-PraAdBatch $fresh $plans 'Convert'
+        [IO.File]::WriteAllText($runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($global:PraGateAd, 35))
+        Remove-Item -LiteralPath $runtime.EventPath -Force -ErrorAction SilentlyContinue
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$source.Path} -TimeoutSeconds 120
+        $run.ExitCode | Should -BeIn @(0, 2) -Because ($run.Output + $run.Error)
+        $result = @(Get-TpEvents $env:PRA_EVENT_FILE | Where-Object kind -eq 'result')[0]
+        $result.transferPackageKind | Should -BeExactly 'Recover'
+        $zip = $result.transferPackage
+        $zip | Should -Match 'PRA-SYNTHETIC_GATE-Recover-[0-9a-f]{8}-for-Cloud\.zip$'
+        $info = Get-PraTransferPackage -Path $zip -Environment SYNTHETIC_GATE
+        $info.Valid | Should -BeTrue -Because $info.Error
+        $info.Folders.Count | Should -Be 2
+        $info.Folders | Should -Contain (Split-Path (Split-Path $source.Path -Parent) -Leaf)
+        $cloud = New-GateRuntime -Name 'tp-main-recover-cloud'
+        $drop = Join-Path $cloud.Root 'dropped'; $null = New-Item -ItemType Directory -Path $drop
+        Copy-Item -LiteralPath $zip, ($zip + '.sha256') -Destination $drop
+        $second = Invoke-GateProcess $cloud @{Action='Recover';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$cloud.ConfigPath;Batch=(Join-Path $drop ([IO.Path]::GetFileName($zip)))} -TimeoutSeconds 120
+        $messages = ($second.MainResult.Issues.Message -join ' ')
+        # The proof and the original Convert source were found in the extracted folders (the synthetic cloud then confirms nothing).
+        $messages | Should -Match 'Cloud deprovisioning or AD proof not confirmed'
+        $messages | Should -Not -Match 'Transfer package|ORIGINAL Convert|not in'
+        foreach ($folder in $info.Folders) { Test-Path -LiteralPath (Join-Path $cloud.State.BackupFolder $folder) -PathType Container | Should -BeTrue }
+        @(Get-GateWrites $cloud).Count | Should -Be 0
+    }
+    It 'Preview of a Convert cloud phase from a package verifies it and reads it from a private temporary folder: nothing is written to the backup folder' {
+        $null = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $zip = @(Get-TpEvents $env:PRA_EVENT_FILE | Where-Object kind -eq 'result')[0].transferPackage
+        $cloud = New-GateRuntime -Name 'tp-main-preview'
+        $env:PRA_EVENT_FILE = Join-Path $cloud.Root 'engine.events.jsonl'
+        $second = Invoke-GateProcess $cloud @{Action='Convert';Mode='Preview';Phase='Cloud';ConfigPath=$cloud.ConfigPath;Batch=$zip}
+        $second.ExitCode | Should -BeIn @(0, 2)
+        $second.Output | Should -Match 'read from a private temporary folder, deleted at the end'
+        $second.Output | Should -Match 'Nothing was written to the backup folder'
+        $second.Output | Should -Match '1 folder\(s\) extracted'
+        @(Get-ChildItem -LiteralPath $cloud.State.BackupFolder -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'Batch-*' -or $_.Name -like '.importing-*' }).Count | Should -Be 0 -Because 'a Preview leaves no batch folder behind'
+        @(Get-ChildItem -LiteralPath (Join-Path $cloud.Root 'logs') -Directory -Filter 'preview-*' -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'the temporary Preview folder is deleted'
+        # Run twice: the same result, still nothing written.
+        $third = Invoke-GateProcess $cloud @{Action='Convert';Mode='Preview';Phase='Cloud';ConfigPath=$cloud.ConfigPath;Batch=$zip}
+        $third.ExitCode | Should -BeIn @(0, 2)
+        $third.Output | Should -Match '1 folder\(s\) extracted'
+        @(Get-ChildItem -LiteralPath $cloud.State.BackupFolder -Directory -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'Batch-*' }).Count | Should -Be 0
+    }
+}
+
+Describe 'Release 3.0.0 - Recover cloud phase writes the Finalize transfer package' -Tag 'TransferPackageMain' {
+    It 'packs the Finalize folder in one ZIP for the AD server and the AD server can import it' {
+        $oldEventPath = $env:PRA_EVENT_FILE
+        try {
+            $runtime = New-GateRuntime -Name 'tp-finalize' -Shared13 -Case CloudConfirmed13
+            $env:PRA_GATE_STATE = $runtime.StatePath; $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+            Import-Module ActiveDirectory -Force -Global
+            $context = New-GateContext $runtime
+            $plans = @(1..13 | ForEach-Object { New-PraPlan $context ('user' + $_) 'Convert' })
+            $source = Invoke-PraAdBatch $context $plans 'Convert'
+            [IO.File]::WriteAllText($runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($global:PraGateAd, 35))
+            $recover = Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$source.Path} -TimeoutSeconds 120
+            $recover.ExitCode | Should -Be 2
+            $recoverPath = @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Recover-*.json')[0].FullName
+            $env:PRA_EVENT_FILE = Join-Path $runtime.Root 'finalize-events.jsonl'
+            $cloud = Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$recoverPath} -TimeoutSeconds 120
+            $cloud.ExitCode | Should -Be 2
+            $result = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String } | Where-Object kind -eq 'result')[0]
+            $result.transferPackageKind | Should -BeExactly 'Finalize'
+            $result.transferPackage | Should -Match 'PRA-SYNTHETIC_GATE-Finalize-[0-9a-f]{8}-for-AD\.zip$'
+            ($cloud.MainResult.NextSteps -join "`n") | Should -Match 'to the AD server \(anywhere\)'
+            ($cloud.MainResult.NextSteps -join "`n") | Should -Match "-Action Finalize .*-Batch 'PRA-SYNTHETIC_GATE-Finalize-[0-9a-f]{8}-for-AD\.zip'"
+            $info = Get-PraTransferPackage -Path $result.transferPackage -Environment SYNTHETIC_GATE
+            $info.Valid | Should -BeTrue -Because $info.Error
+            $info.Kind | Should -BeExactly 'Finalize'
+            $info.Direction | Should -BeExactly 'ToAD'
+            $info.Folders.Count | Should -Be 1
+            $fresh = Join-Path $runtime.Root 'ad-server-backups'
+            $imported = Import-PraTransferPackage -Path $result.transferPackage -BackupFolder $fresh -Environment SYNTHETIC_GATE -ExpectedKind Finalize
+            $imported.Created.Count | Should -Be 1
+            $manifestFile = @(Get-ChildItem -LiteralPath $imported.Folders[0] -File -Filter 'Finalize-*.json' | Where-Object { -not $_.Name.EndsWith('.sha256', [StringComparison]::Ordinal) })[0]
+            ([IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -DateKind String).Operation | Should -BeExactly 'RecoverFinalize'
+        } finally { $env:PRA_EVENT_FILE = $oldEventPath }
+    }
+}
+
+Describe 'Release 3.0.0 - effective run configuration' -Tag 'EffectiveConfig' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+    }
+    BeforeEach {
+        $runtime = New-GateRuntime -Name 'effective-config'
+        $run = Join-Path $runtime.Root 'runfolder'
+        Initialize-PraPrivateFolder $run
+        $baseHash = (Get-FileHash -LiteralPath $runtime.ConfigPath).Hash
+    }
+
+    It 'writes base + overrides as a new private file that Import-PraConfiguration accepts, and never touches the base file' {
+        $dest = Join-Path $run 'effective.psd1'
+        $made = New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Environment = 'LAB_RUN'; DomainController = 'dc02.gate.invalid'; Cloud = @{ TenantId = '20000000-0000-0000-0000-000000000002'; Organization = 'gate.onmicrosoft.com' }; Scope = @{ IncludeShared = $true } } -Destination $dest
+        $made.Path | Should -BeExactly $dest
+        $made.Hash | Should -BeExactly (Get-FileHash -LiteralPath $dest).Hash.ToLowerInvariant()
+        @($made.Keys | Sort-PraOrdinal) -join ',' | Should -BeExactly 'Cloud.Organization,Cloud.TenantId,DomainController,Environment,Scope.IncludeShared'
+        (Get-FileHash -LiteralPath $runtime.ConfigPath).Hash | Should -BeExactly $baseHash
+        $base = Import-PraConfiguration -Path $runtime.ConfigPath -Root $global:PraGate.Package
+        $effective = Import-PraConfiguration -Path $dest -Root $global:PraGate.Package
+        $effective.Environment | Should -BeExactly 'LAB_RUN'
+        $effective.DomainController | Should -BeExactly 'dc02.gate.invalid'
+        $effective.Cloud.TenantId | Should -BeExactly '20000000-0000-0000-0000-000000000002'
+        $effective.Scope.IncludeShared | Should -BeTrue
+        $differences = @(Get-PraConfigurationDifference -Base $base -Effective $effective)
+        @($differences.Key | Sort-PraOrdinal) -join ',' | Should -BeExactly 'Cloud.Organization,Cloud.TenantId,DomainController,Environment,Scope.IncludeShared'
+        ($differences | Where-Object Key -eq 'Environment').Text | Should -BeExactly 'Environment: SYNTHETIC_GATE -> LAB_RUN'
+        # Everything that is not overridden is identical to the base (the difference lists exactly the overridden keys, asserted above).
+        [IO.File]::ReadAllText($dest) | Should -Match 'never edit - the base file is unchanged'
+    }
+    It 'makes the file private to the current account, SYSTEM and Administrators' {
+        $dest = Join-Path $run 'effective.psd1'
+        $null = New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Environment = 'LAB_RUN' } -Destination $dest
+        $acl = [IO.FileSystemAclExtensions]::GetAccessControl((New-Object IO.FileInfo $dest))
+        $acl.AreAccessRulesProtected | Should -BeTrue
+        $sids = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Get-PraOrdinalUnique -IgnoreCase | Sort-PraOrdinal)
+        $expected = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544' | Get-PraOrdinalUnique -IgnoreCase | Sort-PraOrdinal)
+        $sids -join ',' | Should -BeExactly ($expected -join ',')
+    }
+    It 'refuses an unknown key, a wrong type, a section mismatch, an existing destination and an invalid value, leaving no file' {
+        $dest = Join-Path $run 'bad.psd1'
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Nonsense = 'x' } -Destination $dest } | Should -Throw '*unknown setting*'
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Cloud = @{ Nonsense = 'x' } } -Destination $dest } | Should -Throw '*unknown setting Cloud.Nonsense*'
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Environment = 5 } -Destination $dest } | Should -Throw '*must be text*'
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Scope = @{ IncludeShared = 'yes' } } -Destination $dest } | Should -Throw '*must be*'
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Cloud = 'x' } -Destination $dest } | Should -Throw '*section*'
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Environment = 'bad env!' } -Destination $dest } | Should -Throw '*Environment*'
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Cloud = @{ AppId = 'a1' } } -Destination $dest } | Should -Throw '*Cloud.AppId*'
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Cloud = @{ UserPrincipalName = "a`nb" } } -Destination $dest } | Should -Throw '*control character*'
+        Test-Path -LiteralPath $dest | Should -BeFalse
+        $good = Join-Path $run 'good.psd1'
+        $null = New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Environment = 'LAB_RUN' } -Destination $good
+        { New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Environment = 'LAB_RUN' } -Destination $good } | Should -Throw '*already exists*'
+        { New-PraEffectiveConfiguration -BasePath (Join-Path $run 'missing.psd1') -Root $global:PraGate.Package -Overrides @{} -Destination (Join-Path $run 'x.psd1') } | Should -Throw '*not found*'
+        (Get-FileHash -LiteralPath $runtime.ConfigPath).Hash | Should -BeExactly $baseHash
+    }
+    It 'keeps a value with quotes, typographic quotes, semicolons and code-like text as data' {
+        $dest = Join-Path $run 'quotes.psd1'
+        $marker = Join-Path $runtime.Root 'must-not-exist.txt'
+        $value = "x'; New-Item -Path '$marker' -ItemType File; '" + [char]0x2018 + [char]0x2019 + '"$(Get-Date)`n'
+        $null = New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Cloud = @{ UserPrincipalName = $value }; Scope = @{ ExcludeSamAccountNames = @("o'neil", 'a;b', '$(x)') } } -Destination $dest
+        $effective = Import-PraConfiguration -Path $dest -Root $global:PraGate.Package
+        $effective.Cloud.UserPrincipalName | Should -BeExactly $value
+        @($effective.Scope.ExcludeSamAccountNames) -join '|' | Should -BeExactly "o'neil|a;b|`$(x)"
+        Test-Path -LiteralPath $marker | Should -BeFalse
+    }
+    It 'runs the main on the effective configuration and lists what differs from the file, in the log, the events and the result' {
+        $oldEventPath = $env:PRA_EVENT_FILE
+        try {
+            $dest = Join-Path $run 'effective.psd1'
+            $null = New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $runtime.Package -Overrides @{ Polling = @{ TimeoutMinutes = 30 }; Cloud = @{ Organization = 'gate.onmicrosoft.com' } } -Destination $dest
+            $env:PRA_EVENT_FILE = Join-Path $runtime.Root 'engine.events.jsonl'
+            $run1 = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$dest;BaseConfigPath=$runtime.ConfigPath}
+            $run1.ExitCode | Should -Be 0 -Because ($run1.Output + $run1.Error)
+            $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+            $result = @($events | Where-Object kind -eq 'result')[0]
+            @($result.configOverrides | Sort-PraOrdinal) -join '|' | Should -BeExactly 'Cloud.Organization: (empty) -> gate.onmicrosoft.com|Polling.TimeoutMinutes: 60 -> 30'
+            $texts = @($events | Where-Object { $_.kind -eq 'item' -and $_.text -like 'Run setting:*' })
+            $texts.Count | Should -Be 2
+            ($texts | ForEach-Object status | Get-PraOrdinalUnique) | Should -BeExactly 'Info'
+            ($texts.text -join '|') | Should -Match 'Run setting: Polling.TimeoutMinutes 30 \(configuration file: 60\)'
+            $run1.Output | Should -Match 'Run setting: Cloud.Organization gate.onmicrosoft.com'
+            Get-Content -LiteralPath $run1.MainResult.LogFile -Raw | Should -Match 'Run setting: Polling.TimeoutMinutes'
+            (Get-FileHash -LiteralPath $runtime.ConfigPath).Hash | Should -BeExactly $baseHash
+            # Without -BaseConfigPath nothing is listed.
+            Remove-Item -LiteralPath $env:PRA_EVENT_FILE -Force
+            $run2 = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$dest}
+            $result2 = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String } | Where-Object kind -eq 'result')[0]
+            @($result2.configOverrides).Count | Should -Be 0
+            $run2.Output | Should -Not -Match 'Run setting:'
+        } finally { $env:PRA_EVENT_FILE = $oldEventPath }
+    }
+}
+
+Describe 'Release 3.0.0 - native process binding: SetLastError on every import, handle-list launch API' -Tag 'NativeBinding' {
+    BeforeAll { Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global }
+
+    It 'returns the existing tables and the new STARTUPINFOEXW with the methods of a handle-list launch' {
+        $native = Get-PraNativeProcessApi
+        (@($native.Keys) | Sort-PraOrdinal) -join ',' | Should -BeExactly 'Api,ProcessInformation,StartupInfo,StartupInfoEx'
+        foreach ($name in 'CreateProcessW', 'CreateProcessEx', 'InitializeProcThreadAttributeList', 'UpdateProcThreadAttribute', 'DeleteProcThreadAttributeList', 'GetExitCodeProcess', 'CloseHandle') {
+            $native.Api.GetMethod($name) | Should -Not -BeNullOrEmpty -Because $name
+        }
+        $native.StartupInfoEx.GetField('StartupInfo').FieldType | Should -Be $native.StartupInfo
+        $native.StartupInfoEx.GetField('lpAttributeList').FieldType | Should -Be ([IntPtr])
+        [Runtime.InteropServices.Marshal]::SizeOf([Activator]::CreateInstance($native.StartupInfoEx)) | Should -Be ([Runtime.InteropServices.Marshal]::SizeOf([Activator]::CreateInstance($native.StartupInfo)) + [IntPtr]::Size)
+        $native.Api.GetMethod('CreateProcessW').GetParameters()[8].ParameterType | Should -Be $native.StartupInfo.MakeByRefType()
+        $native.Api.GetMethod('CreateProcessEx').GetParameters()[8].ParameterType | Should -Be $native.StartupInfoEx.MakeByRefType()
+        $native.Api.GetMethod('InitializeProcThreadAttributeList').GetParameters()[3].ParameterType | Should -Be ([IntPtr].MakeByRefType())
+        $native.Api.GetMethod('GetExitCodeProcess').GetParameters()[1].ParameterType | Should -Be ([uint32].MakeByRefType())
+        (Get-PraNativeProcessApi).Api | Should -Be $native.Api
+    }
+    It 'emits every DllImport of the process and path bindings with SetLastError = true' {
+        $apis = @((Get-PraNativeProcessApi).Api, (InModuleScope PRA.Common { Get-PraNativePathApi }))
+        foreach ($api in $apis) {
+            $methods = @($api.GetMethods([Reflection.BindingFlags]'Public,Static,DeclaredOnly'))
+            $methods.Count | Should -BeGreaterThan 1
+            foreach ($method in $methods) {
+                $import = @($method.GetCustomAttributes($false) | Where-Object { $_ -is [Runtime.InteropServices.DllImportAttribute] })
+                $import.Count | Should -Be 1 -Because $method.Name
+                $import[0].SetLastError | Should -BeTrue -Because $method.Name
+                $import[0].Value | Should -BeExactly 'kernel32.dll'
+            }
+        }
+        (Get-PraNativeProcessApi).Api.GetMethod('CreateProcessEx').GetCustomAttributes($false).Where({ $_ -is [Runtime.InteropServices.DllImportAttribute] })[0].EntryPoint | Should -BeExactly 'CreateProcessW'
+    }
+    It 'keeps the Win32 error of a failed call (CloseHandle on an invalid handle is error 6) and spells it with Get-PraWin32ErrorText' {
+        $native = Get-PraNativeProcessApi
+        $result = $native.Api.GetMethod('CloseHandle').Invoke($null, [object[]]@([IntPtr]0x12345678)); $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $result | Should -BeFalse
+        $lastError | Should -Be 6
+        Get-PraWin32ErrorText -Code 6 | Should -Match '^6: .+'
+        Get-PraWin32ErrorText -Code 6 | Should -BeExactly ('6: ' + (New-Object ComponentModel.Win32Exception(6)).Message)
+        Get-PraWin32ErrorText -Code 5 | Should -Match '^5: .+'
+    }
+    It 'sizes a process attribute list (the first call of a handle-list launch reports ERROR_INSUFFICIENT_BUFFER)' {
+        $native = Get-PraNativeProcessApi
+        $arguments = [object[]]@([IntPtr]::Zero, 1, 0, [IntPtr]::Zero)
+        $result = $native.Api.GetMethod('InitializeProcThreadAttributeList').Invoke($null, $arguments); $lastError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        $result | Should -BeFalse
+        $lastError | Should -Be 122
+        ([IntPtr]$arguments[3]).ToInt64() | Should -BeGreaterThan 0
+    }
+}
+
+Describe 'Release 3.0.0 lot 2b - phase data and the global report across the two servers' -Tag 'GlobalReport' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+        $script:GrRoot = Join-Path $global:PraGate.Root ('lot2b-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $null = New-Item -ItemType Directory -Path $script:GrRoot -Force
+        $script:Dot = [string][char]0x00B7
+        function global:New-GrRow {
+            param([string]$Sam, [bool]$Shared, [string]$Status, [string]$Cloud, [string]$Guid, [string]$Warnings = '')
+            [pscustomobject]@{ ObjectGuid = $Guid; SamAccountName = $Sam; UserPrincipalName = "$Sam@contoso.com"; Action = 'Convert'; IsShared = $Shared; ADApplied = $true; ADVerified = $true
+                BackupPath = 'D:\PRA\Backups\Batch-x\Convert.json'; CloudStatus = $Cloud; CloudDetail = ''; FinalStatus = $Status; Detail = 'detail'; Warnings = $Warnings; LastOperation = ''; GroupAction = ''
+                CloudMailbox = $null; CloudLicense = $null; PreserveCloudMailbox = $false; PreserveLicense = $false; DeprovisionConfirmed = $false; PermDetail = ''; PermMissing = @() }
+        }
+        function global:New-GrContext {
+            param([string]$Action, [string]$Phase, [object[]]$Rows, [string[]]$PhaseFolders = @(), [int]$Minutes = 0, [string[]]$Overrides = @(), [string]$Name = 'run')
+            $reports = Join-Path $script:GrRoot ('reports-' + $Name)
+            $context = @{ Root = $global:PraGate.Package; Version = '3.0.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = (Get-Date).AddMinutes($Minutes); Action = $Action; Mode = 'Apply'; Phase = $Phase
+                CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
+                Server = 'dc01.contoso.com'; Config = @{ Environment = 'GATE'; Cloud = @{ Organization = 'contoso.onmicrosoft.com' } }; AllowMutation = $true; ReportFolder = $reports; NoReport = $false; BatchId = 'abcd1234'
+                LogFile = ''; NextSteps = @(); ExitCode = 0; CloudConnectFailed = $false; ResultStatus = ''; PhaseFolders = $PhaseFolders; ConfigOverrides = $Overrides }
+            foreach ($row in $Rows) { $context.Rows.Add($row) }
+            $context
+        }
+        function global:New-GrFolder { param([string]$Name) $path = Join-Path $script:GrRoot $Name; $null = New-Item -ItemType Directory -Path $path -Force; $path }
+        $script:GuidA = [guid]::NewGuid().ToString(); $script:GuidB = [guid]::NewGuid().ToString(); $script:GuidC = [guid]::NewGuid().ToString()
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\New-GrRow', 'Function:\New-GrContext', 'Function:\New-GrFolder' -ErrorAction SilentlyContinue }
+
+    It 'Convert AD -> Cloud: the cloud server writes ONE report with both sides, for a user and a shared mailbox, with the journey of each object' {
+        $folder = New-GrFolder 'Batch-abcd1234ef'
+        $ad = New-GrContext Convert AD @((New-GrRow 'alice' $false 'Pending' 'N/A' $script:GuidA), (New-GrRow 'bob.shared' $true 'Pending' 'N/A' $script:GuidB)) -Name 'c1ad' -Overrides @('Polling.TimeoutMinutes: 60 -> 30')
+        Register-PraObjectName $ad $script:GuidA 'alice@contoso.com'
+        $ad.CurrentIdentity = $script:GuidA
+        Write-PraStep -Context $ad -Title 'Backup and Active Directory changes' | Out-Null
+        Write-PraItem -Context $ad -Status Ok -Text 'backup written on the AD side'
+        $file = Save-PraPhaseData -Context $ad -Folder $folder -HandOff 'Convert'
+        Test-Path -LiteralPath $file | Should -BeTrue
+        Test-Path -LiteralPath ($file + '.sha256') | Should -BeTrue
+        [IO.Path]::GetFileName($file) | Should -Match '^PhaseData-\d{14}-AD-[0-9a-f]{8}\.json$'
+        $cloud = New-GrContext Convert Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA), (New-GrRow 'bob.shared' $true 'Success' 'Success' $script:GuidB)) -PhaseFolders @($folder) -Minutes 5 -Name 'c1cloud'
+        $report = Write-PraGlobalReport -Context $cloud
+        Test-Path -LiteralPath $report.Html | Should -BeTrue
+        Test-Path -LiteralPath $report.Csv | Should -BeTrue
+        $model = $cloud.GlobalModel
+        @($model.Phases | ForEach-Object Label) -join '|' | Should -BeExactly "Convert $script:Dot AD|Convert $script:Dot Cloud"
+        $model.Objects.Count | Should -Be 2
+        @($model.Objects | ForEach-Object Verdict | Get-PraOrdinalUnique) -join ',' | Should -BeExactly 'done'
+        $html = [IO.File]::ReadAllText($report.Html)
+        # (the report is HTML: the middle dot is written as an entity)
+        foreach ($text in "Convert $script:Dot AD", "Convert $script:Dot Cloud", 'alice@contoso.com', 'bob.shared@contoso.com', 'Shared mailbox', 'User mailbox', 'backup written on the AD side', 'Polling.TimeoutMinutes: 60 -> 30') { $html | Should -Match ([regex]::Escape([Net.WebUtility]::HtmlEncode($text))) }
+        $rows = @(Import-Csv -LiteralPath $report.Csv -Delimiter ';')
+        $rows.Count | Should -Be 2
+        ($rows | Where-Object Name -eq 'alice@contoso.com').Sides | Should -Match 'Convert . AD: Handed over \| Convert . Cloud: Success'
+        $rows[0].RunSettings | Should -Match 'Polling.TimeoutMinutes'
+    }
+
+    It 'Recover Cloud -> AD (Finalize): one report with Recover AD, Recover Cloud and Finalize, the original Convert shown as history' {
+        $convertFolder = New-GrFolder 'Batch-c0ffee0100'
+        $recoverFolder = New-GrFolder 'Batch-feed000200'
+        $finalizeFolder = New-GrFolder 'Finalize-aaaa000300'
+        $convert = New-GrContext Convert Both @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA), (New-GrRow 'bob.shared' $true 'Success' 'Success' $script:GuidB)) -Minutes -60 -Name 'c2convert'
+        $null = Save-PraPhaseData -Context $convert -Folder $convertFolder
+        $recoverAd = New-GrContext Recover AD @((New-GrRow 'alice' $false 'Success' 'N/A' $script:GuidA), (New-GrRow 'bob.shared' $true 'Pending' 'N/A' $script:GuidB)) -PhaseFolders @($convertFolder) -Minutes 0 -Name 'c2ad'
+        $null = Save-PraPhaseData -Context $recoverAd -Folder $recoverFolder -HandOff 'Recover'
+        $recoverCloud = New-GrContext Recover Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA), (New-GrRow 'bob.shared' $true 'Pending' 'Success' $script:GuidB)) -PhaseFolders @($recoverFolder, $convertFolder) -Minutes 10 -Name 'c2cloud'
+        (Copy-PraPhaseData -SourceFolder @($recoverFolder, $convertFolder) -Destination $finalizeFolder) | Should -Be 2
+        $null = Save-PraPhaseData -Context $recoverCloud -Folder $finalizeFolder -HandOff 'Finalize'
+        $finalize = New-GrContext Finalize Finalize @((New-GrRow 'bob.shared' $true 'Success' 'N/A' $script:GuidB)) -PhaseFolders @($finalizeFolder) -Minutes 20 -Name 'c2final'
+        $report = Write-PraGlobalReport -Context $finalize
+        $model = $finalize.GlobalModel
+        @($model.Phases | ForEach-Object Label) -join '|' | Should -BeExactly "Convert $script:Dot AD + Cloud|Recover $script:Dot AD|Recover $script:Dot Cloud|Finalize $script:Dot AD"
+        @($model.Phases | Where-Object Role -eq 'History').Count | Should -Be 1
+        $model.Missing.Count | Should -Be 0
+        $model.Objects.Count | Should -Be 2
+        ($model.Objects | Where-Object Name -eq 'bob.shared@contoso.com').Verdict | Should -BeExactly 'done'
+        ($model.Objects | Where-Object Name -eq 'bob.shared@contoso.com').Stages.Count | Should -Be 3
+        ($model.Objects | Where-Object Name -eq 'alice@contoso.com').Verdict | Should -BeExactly 'done' -Because 'a user mailbox needs no Finalize: its last stage is its verdict'
+        [IO.File]::ReadAllText($report.Html) | Should -Match 'earlier operation'
+    }
+
+    It 'refuses a PhaseData file that was changed (checksum) and says plainly that the side is not available' {
+        $folder = New-GrFolder 'Batch-badbad0001'
+        $ad = New-GrContext Convert AD @((New-GrRow 'alice' $false 'Pending' 'N/A' $script:GuidA)) -Name 'c3ad'
+        $file = Save-PraPhaseData -Context $ad -Folder $folder -HandOff 'Convert'
+        [IO.File]::AppendAllText($file, ' ')
+        $read = Read-PraPhaseData -Folder @($folder) -Environment 'GATE'
+        $read.Phases.Count | Should -Be 0
+        ($read.Problems -join ' ') | Should -Match 'the checksum does not match'
+        $cloud = New-GrContext Convert Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA)) -PhaseFolders @($folder) -Minutes 5 -Name 'c3cloud'
+        $report = Write-PraGlobalReport -Context $cloud
+        $cloud.GlobalModel.Missing | Should -Contain "Convert $script:Dot AD"
+        $html = [IO.File]::ReadAllText($report.Html)
+        $html | Should -Match 'not available \(folder from an older version or copied manually\)'
+        $html | Should -Match 'the checksum does not match'
+        # Another Environment is refused too.
+        $other = New-GrFolder 'Batch-badbad0002'
+        $null = Save-PraPhaseData -Context (New-GrContext Convert AD @((New-GrRow 'alice' $false 'Pending' 'N/A' $script:GuidA)) -Name 'c3other') -Folder $other
+        (Read-PraPhaseData -Folder @($other) -Environment 'ANOTHER').Phases.Count | Should -Be 0
+        (Read-PraPhaseData -Folder @($other) -Environment 'GATE').Phases.Count | Should -Be 1
+    }
+
+    It 'still writes the global report when the folder carries no phase data (older version, manual copy) and marks the previous side not available' {
+        $cloud = New-GrContext Convert Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA)) -PhaseFolders @((New-GrFolder 'Batch-nodata0001')) -Name 'c4'
+        $report = Write-PraGlobalReport -Context $cloud
+        Test-Path -LiteralPath $report.Html | Should -BeTrue
+        $cloud.GlobalModel.Missing.Count | Should -Be 1
+        $cloud.GlobalModel.Objects[0].Verdict | Should -BeExactly 'done'
+        [IO.File]::ReadAllText($report.Html) | Should -Match 'Side not available'
+    }
+
+    It 'Phase Both: the same global layout, one phase, nothing missing' {
+        $both = New-GrContext Convert Both @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA), (New-GrRow 'carol' $false 'Success' 'Success' $script:GuidC -Warnings 'Forwarding kept')) -Name 'c5'
+        $report = Write-PraGlobalReport -Context $both
+        $both.GlobalModel.Phases.Count | Should -Be 1
+        $both.GlobalModel.Phases[0].Label | Should -BeExactly "Convert $script:Dot AD + Cloud"
+        $both.GlobalModel.Missing.Count | Should -Be 0
+        ($both.GlobalModel.Objects | Where-Object Name -eq 'carol@contoso.com').Verdict | Should -BeExactly 'done with warnings'
+        [IO.File]::ReadAllText($report.Html) | Should -Match 'Objects, end to end'
+    }
+
+    It 'an object that is not in the results of the cloud side is listed as pending with the reason (filtered out there)' {
+        $folder = New-GrFolder 'Batch-filter0001'
+        $ad = New-GrContext Convert AD @((New-GrRow 'alice' $false 'Pending' 'N/A' $script:GuidA), (New-GrRow 'carol' $false 'Pending' 'N/A' $script:GuidC)) -Name 'c6ad'
+        $null = Save-PraPhaseData -Context $ad -Folder $folder -HandOff 'Convert'
+        $cloud = New-GrContext Convert Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA)) -PhaseFolders @($folder) -Minutes 5 -Name 'c6cloud'
+        $null = Write-PraGlobalReport -Context $cloud
+        $carol = $cloud.GlobalModel.Objects | Where-Object Name -eq 'carol@contoso.com'
+        $carol.Verdict | Should -BeExactly 'pending'
+        $carol.Note | Should -Match 'Not in the results of Convert . Cloud'
+        $cloud.GlobalModel.Counts.Pending | Should -Be 1
+        $cloud.GlobalModel.Counts.Done | Should -Be 1
+    }
+
+    It 'Convert AD -> Cloud: the AD phase and its stages read "Handed over" (display only), the raw status stays in the journey and the verdicts do not change' {
+        $folder = New-GrFolder 'Batch-handed0001'
+        $ad = New-GrContext Convert AD @((New-GrRow 'alice' $false 'Pending' 'N/A' $script:GuidA), (New-GrRow 'bob.shared' $true 'Pending' 'N/A' $script:GuidB)) -Name 'h1ad'
+        $null = Save-PraPhaseData -Context $ad -Folder $folder -HandOff 'Convert'
+        $cloud = New-GrContext Convert Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA), (New-GrRow 'bob.shared' $true 'Success' 'Success' $script:GuidB)) -PhaseFolders @($folder) -Minutes 5 -Name 'h1cloud'
+        $report = Write-PraGlobalReport -Context $cloud
+        $model = $cloud.GlobalModel
+        [string](Get-PraValue $model.Phases[0].Header 'Status' '') | Should -BeExactly 'Pending' -Because 'the phase itself is recorded as Pending: only the display changes'
+        $model.Phases[0].StatusDisplay | Should -BeExactly 'Handed over'
+        $model.Phases[0].HandedOverTo | Should -BeExactly "Convert $script:Dot Cloud"
+        $model.Phases[1].StatusDisplay | Should -BeExactly 'Success'
+        foreach ($entry in $model.Objects) {
+            $entry.Stages[0].Status | Should -BeExactly 'Pending'
+            $entry.Stages[0].StatusDisplay | Should -BeExactly 'Handed over'
+            $entry.Stages[1].StatusDisplay | Should -BeExactly 'Success'
+            $entry.Verdict | Should -BeExactly 'done'
+        }
+        $model.Counts.Pending | Should -Be 0
+        $html = [IO.File]::ReadAllText($report.Html)
+        $html | Should -Match '<span class="pill ok" title="Pending \(handed over to [^"]*\)">Handed over</span>'
+        $html | Should -Match '<span class="pill ok">Handed over</span>'
+        $html | Should -Not -Match '<span class="pill warn">Pending</span>'
+        $html | Should -Match ([regex]::Escape([Net.WebUtility]::HtmlEncode("Pending (handed over to Convert $script:Dot Cloud)")))
+        $rows = @(Import-Csv -LiteralPath $report.Csv -Delimiter ';')
+        ($rows | Where-Object Name -eq 'alice@contoso.com').Sides | Should -Match 'Convert . AD: Handed over \| Convert . Cloud: Success'
+        ($rows | Where-Object Name -eq 'alice@contoso.com').Journey | Should -Match 'result: Pending \(handed over to Convert . Cloud\)'
+    }
+
+    It 'Recover AD -> Cloud -> Finalize: both intermediate phases and their Pending stages read "Handed over"; the last phase keeps its own status' {
+        $recoverFolder = New-GrFolder 'Batch-handed0200'
+        $finalizeFolder = New-GrFolder 'Finalize-handed0300'
+        $recoverAd = New-GrContext Recover AD @((New-GrRow 'alice' $false 'Success' 'N/A' $script:GuidA), (New-GrRow 'bob.shared' $true 'Pending' 'N/A' $script:GuidB)) -Minutes 0 -Name 'h2ad'
+        $null = Save-PraPhaseData -Context $recoverAd -Folder $recoverFolder -HandOff 'Recover'
+        $recoverCloud = New-GrContext Recover Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA), (New-GrRow 'bob.shared' $true 'Pending' 'Success' $script:GuidB)) -PhaseFolders @($recoverFolder) -Minutes 10 -Name 'h2cloud'
+        $null = Copy-PraPhaseData -SourceFolder @($recoverFolder) -Destination $finalizeFolder
+        $null = Save-PraPhaseData -Context $recoverCloud -Folder $finalizeFolder -HandOff 'Finalize'
+        $finalize = New-GrContext Finalize Finalize @((New-GrRow 'bob.shared' $true 'Success' 'N/A' $script:GuidB)) -PhaseFolders @($finalizeFolder) -Minutes 20 -Name 'h2final'
+        $report = Write-PraGlobalReport -Context $finalize
+        $model = $finalize.GlobalModel
+        @($model.Phases | ForEach-Object StatusDisplay) -join '|' | Should -BeExactly 'Handed over|Handed over|Success'
+        $model.Phases[0].HandedOverTo | Should -BeExactly "Recover $script:Dot Cloud"
+        $model.Phases[1].HandedOverTo | Should -BeExactly "Finalize $script:Dot AD"
+        $bob = $model.Objects | Where-Object Name -eq 'bob.shared@contoso.com'
+        @($bob.Stages | ForEach-Object StatusDisplay) -join '|' | Should -BeExactly 'Handed over|Handed over|Success'
+        $bob.Verdict | Should -BeExactly 'done'
+        $html = [IO.File]::ReadAllText($report.Html)
+        $html | Should -Not -Match '<span class="pill warn">Pending</span>'
+        (@(Import-Csv -LiteralPath $report.Csv -Delimiter ';') | Where-Object Name -eq 'bob.shared@contoso.com').Sides | Should -Match 'Handed over \| Recover . Cloud: Handed over \| Finalize . AD: Success'
+    }
+
+    It 'an object that only the AD side lists stays Pending (warn) while the AD phase itself reads "Handed over"; a last phase that is Pending stays Pending' {
+        $folder = New-GrFolder 'Batch-handed0400'
+        $ad = New-GrContext Convert AD @((New-GrRow 'alice' $false 'Pending' 'N/A' $script:GuidA), (New-GrRow 'carol' $false 'Pending' 'N/A' $script:GuidC)) -Name 'h3ad'
+        $null = Save-PraPhaseData -Context $ad -Folder $folder -HandOff 'Convert'
+        $cloud = New-GrContext Convert Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA)) -PhaseFolders @($folder) -Minutes 5 -Name 'h3cloud'
+        $report = Write-PraGlobalReport -Context $cloud
+        $model = $cloud.GlobalModel
+        $model.Phases[0].StatusDisplay | Should -BeExactly 'Handed over'
+        $carol = $model.Objects | Where-Object Name -eq 'carol@contoso.com'
+        $carol.Stages[0].StatusDisplay | Should -BeExactly 'Pending'
+        $carol.Stages[0].HandedOverTo | Should -BeExactly ''
+        $carol.Verdict | Should -BeExactly 'pending'
+        $html = [IO.File]::ReadAllText($report.Html)
+        $html | Should -Match '<span class="pill warn">Pending</span>'
+        (@(Import-Csv -LiteralPath $report.Csv -Delimiter ';') | Where-Object Name -eq 'carol@contoso.com').Sides | Should -Match 'Convert . AD: Pending \| Convert . Cloud: -'
+        # The last phase: Pending with no later phase stays Pending.
+        $folder2 = New-GrFolder 'Batch-handed0500'
+        $ad2 = New-GrContext Convert AD @((New-GrRow 'dave' $false 'Pending' 'N/A' $script:GuidA)) -Name 'h3bad'
+        $null = Save-PraPhaseData -Context $ad2 -Folder $folder2 -HandOff 'Convert'
+        $cloud2 = New-GrContext Convert Cloud @((New-GrRow 'dave' $false 'Pending' 'Success' $script:GuidA)) -PhaseFolders @($folder2) -Minutes 5 -Name 'h3bcloud'
+        $report2 = Write-PraGlobalReport -Context $cloud2
+        $m2 = $cloud2.GlobalModel
+        @($m2.Phases | ForEach-Object StatusDisplay) -join '|' | Should -BeExactly 'Handed over|Pending'
+        @($m2.Objects[0].Stages | ForEach-Object StatusDisplay) -join '|' | Should -BeExactly 'Handed over|Pending'
+        $m2.Objects[0].Verdict | Should -BeExactly 'pending'
+        (@(Import-Csv -LiteralPath $report2.Csv -Delimiter ';'))[0].Sides | Should -Match 'Convert . AD: Handed over \| Convert . Cloud: Pending'
+        # One phase alone, still Pending: nothing took it over.
+        $single = New-GrContext Convert Both @((New-GrRow 'erin' $false 'Pending' 'N/A' $script:GuidC)) -Name 'h3c'
+        $null = Write-PraGlobalReport -Context $single
+        $single.GlobalModel.Phases[0].StatusDisplay | Should -BeExactly 'Pending'
+        $single.GlobalModel.Objects[0].Stages[0].StatusDisplay | Should -BeExactly 'Pending'
+    }
+
+    It 'HTML-encodes every value and neutralises spreadsheet formulas in the CSV' {
+        $evil = '<script>alert(1)</script>'
+        $ad = New-GrContext Convert Both @((New-GrRow $evil $false 'Success' 'Success' $script:GuidA -Warnings 'a "quoted" <b>warning</b> & more'), (New-GrRow '=cmd' $false 'Error' 'Error' $script:GuidB)) -Name 'c7' -Overrides @('Cloud.Organization: <x> -> "y"')
+        $ad.Issues.Add([pscustomobject]@{ Timestamp = 't'; Phase = 'p<'; Operation = 'o'; Identity = 'i'; Source = 's'; Message = 'boom <img src=x onerror=alert(1)>' })
+        $report = Write-PraGlobalReport -Context $ad
+        $html = [IO.File]::ReadAllText($report.Html)
+        $html | Should -Not -Match '<script>alert'
+        $html | Should -Not -Match '<img src=x'
+        $html | Should -Match '&lt;script&gt;alert\(1\)&lt;/script&gt;'
+        $html | Should -Match 'boom &lt;img'
+        $html | Should -Match 'Cloud.Organization: &lt;x&gt; -&gt; &quot;y&quot;'
+        (@(Import-Csv -LiteralPath $report.Csv -Delimiter ';') | Where-Object { $_.Name -like "'=*" }).Count | Should -Be 1
+        ($ad.GlobalModel.Objects | Where-Object Name -eq '=cmd@contoso.com').Verdict | Should -BeExactly 'failed'
+    }
+
+    It 'wants a global report only from the run that ends the chain (Apply, nothing handed over)' {
+        $both = New-GrContext Convert Both @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA)) -Name 'c8'
+        Test-PraGlobalReportWanted -Context $both | Should -BeTrue
+        $both.HandOff = 'Convert'
+        Test-PraGlobalReportWanted -Context $both | Should -BeFalse
+        $both.HandOff = ''; $both.AllowMutation = $false
+        Test-PraGlobalReportWanted -Context $both | Should -BeFalse
+        $check = New-GrContext Check Cloud @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA)) -Name 'c8b'
+        Test-PraGlobalReportWanted -Context $check | Should -BeFalse
+    }
+
+    It 'carries the phase data in the transfer package, listed with its SHA-256, and refuses a package whose phase data was changed' {
+        $folder = New-GrFolder 'Batch-abcd9999aa'
+        $ad = New-GrContext Convert AD @((New-GrRow 'alice' $false 'Pending' 'N/A' $script:GuidA)) -Name 'c9'
+        $null = Save-PraPhaseData -Context $ad -Folder $folder -HandOff 'Convert'
+        [IO.File]::WriteAllText((Join-Path $folder 'Convert-x.json'), '{}')
+        $package = New-PraTransferPackage -Kind Convert -Environment GATE -BatchId 'abcd9999aa' -Folders @($folder) -OutboxFolder (Join-Path $script:GrRoot 'outbox')
+        $info = Get-PraTransferPackage -Path $package.Path -Environment GATE
+        $info.Valid | Should -BeTrue -Because $info.Error
+        $info.EntryCount | Should -Be 3 -Because 'the batch JSON, the phase data and its checksum'
+        $tampered = Join-Path $script:GrRoot 'tampered.zip'
+        Copy-Item -LiteralPath $package.Path -Destination $tampered
+        $zip = [IO.Compression.ZipFile]::Open($tampered, [IO.Compression.ZipArchiveMode]::Update)
+        try {
+            $entry = @($zip.Entries | Where-Object { $_.Name -like 'PhaseData-*.json' -and $_.Name -notlike '*.sha256' })[0]
+            $reader = New-Object IO.StreamReader($entry.Open()); $text = $reader.ReadToEnd(); $reader.Dispose(); $name = $entry.FullName; $entry.Delete()
+            $replacement = $zip.CreateEntry($name); $writer = New-Object IO.StreamWriter($replacement.Open())
+            $writer.Write($text.Replace('"Success"', '"Succes5"').Replace('alice', 'alicf')); $writer.Dispose()
+        } finally { $zip.Dispose() }
+        [IO.File]::WriteAllText($tampered + '.sha256', (Get-FileHash -LiteralPath $tampered -Algorithm SHA256).Hash.ToLowerInvariant())
+        $bad = Get-PraTransferPackage -Path $tampered -Environment GATE
+        $bad.Valid | Should -BeFalse
+        $bad.Error | Should -Match 'does not match its SHA-256|larger|shorter|differs from transfer.json'
+    }
+
+    It 'lists the run settings changed in the per-phase HTML report too' {
+        $ctx = New-GrContext Convert Both @((New-GrRow 'alice' $false 'Success' 'Success' $script:GuidA)) -Name 'c10' -Overrides @('Polling.TimeoutMinutes: 60 -> 30', 'Directory.ForceReplication: False -> True')
+        $html = InModuleScope PRA.Common -Parameters @{ Ctx = $ctx } { Get-PraReportHtml -Context $Ctx -Outcome (Get-PraOutcome $Ctx) }
+        $html | Should -Match 'Run settings changed'
+        $html | Should -Match 'Polling.TimeoutMinutes: 60 -&gt; 30; Directory.ForceReplication: False -&gt; True'
+    }
+
+    It 'item events carry the backup path of the object, else the one of the batch, else nothing; the journey keeps only known objects' {
+        $old = $env:PRA_EVENT_FILE
+        try {
+            $env:PRA_EVENT_FILE = Join-Path $script:GrRoot 'events-backup.jsonl'
+            $ctx = New-GrContext Convert AD @() -Name 'c11'
+            Register-PraObjectName $ctx $script:GuidA 'alice@contoso.com'
+            Register-PraObjectBackup -Context $ctx -Identity @($script:GuidA, 'alice@contoso.com') -Path 'D:\PRA\Backups\Batch-1\a.json'
+            $ctx.CurrentIdentity = $script:GuidA; Write-PraItem -Context $ctx -Status Ok -Text 'one'
+            $ctx.CurrentIdentity = $script:GuidB; Write-PraItem -Context $ctx -Status Ok -Text 'two'
+            Register-PraObjectBackup -Context $ctx -Path 'D:\PRA\Backups\Batch-1'
+            $ctx.CurrentIdentity = ''; Write-PraItem -Context $ctx -Status Ok -Text 'three'
+            $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+            @($events | ForEach-Object backup) -join '|' | Should -BeExactly 'D:\PRA\Backups\Batch-1\a.json||D:\PRA\Backups\Batch-1' -Because 'the second object has no backup yet and the batch folder is not known yet'
+            $ctx.Journey.Count | Should -Be 1 -Because 'only the named object has a journey'
+            $ctx.Journey[0].Name | Should -BeExactly 'alice@contoso.com'
+        } finally { $env:PRA_EVENT_FILE = $old }
+    }
+}
+
+Describe 'Release 3.0.0 lot 2b - optional forced Active Directory replication (Directory.ForceReplication)' -Tag 'AdReplication' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+        $script:RepRuntime = New-GateRuntime -Name 'replication'
+        $env:PRA_GATE_STATE = $script:RepRuntime.StatePath
+        $env:PSModulePath = $script:RepRuntime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Import-Module ActiveDirectory -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        function global:Invoke-RepScenario {
+            param([bool]$Enabled = $true, [string[]]$Targets = @(), [hashtable]$Fail = @{}, [hashtable]$Values = @{}, [string]$Mode = 'Apply', [bool]$Approve = $true)
+            $old = $env:PRA_EVENT_FILE
+            $events = Join-Path $script:RepRuntime.Root ('rep-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+            $env:PRA_EVENT_FILE = $events; $global:LastRepEvents = $events
+            try {
+                InModuleScope PRA.Directory -Parameters @{ Enabled = $Enabled; Targets = $Targets; Fail = $Fail; Values = $Values; Mode = $Mode; Approve = $Approve } {
+                    $script:RepCalls = New-Object 'Collections.Generic.List[string]'; $script:RepFail = $Fail; $script:RepValues = $Values
+                    function script:Sync-ADObject { param($Object, $Source, $Destination, $ErrorAction) $script:RepCalls.Add("sync|$Source|$Destination|$Object"); if ($script:RepFail.ContainsKey($Destination)) { throw $script:RepFail[$Destination] } }
+                    function script:Get-ADDomainController { param($Filter, $Server, $Identity, $ErrorAction) $script:RepCalls.Add('list'); @([pscustomobject]@{ HostName = 'dc1.gate.invalid'; IsReadOnly = $false }, [pscustomobject]@{ HostName = 'dc2.gate.invalid'; IsReadOnly = $false },
+                            [pscustomobject]@{ HostName = 'dc3.gate.invalid'; IsReadOnly = $false }, [pscustomobject]@{ HostName = 'rodc.gate.invalid'; IsReadOnly = $true }) }
+                    function script:Get-ADUser { param($Identity, $Properties, $Server, $ErrorAction) $script:RepCalls.Add("read|$Server"); [pscustomobject]@{ ObjectGUID = $Identity; description = $(if ($script:RepValues.ContainsKey($Server)) { $script:RepValues[$Server] } else { 'x' }) } }
+                    $approve = $Approve
+                    $ctx = @{ Config = @{ Directory = @{ ForceReplication = $Enabled; ReplicationTargets = $Targets; ReplicationVerifyAttempts = 2; ReplicationVerifyDelaySeconds = 1 } }; Server = 'dc1.gate.invalid'; AllowMutation = ($Mode -eq 'Apply'); Mode = $Mode
+                        Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); LogFile = ''; CurrentPhase = 'Replication'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Version = 'gate'
+                        Approval = { param($t, $o) $true }.GetNewClosure(); Rows = (New-Object 'Collections.Generic.List[object]'); Action = 'Convert' }
+                    if (-not $approve) { $ctx.Approval = { param($t, $o) $false } }
+                    $plans = @(1..2 | ForEach-Object { [pscustomobject]@{ Record = [pscustomobject]@{ ObjectGuid = [guid]::NewGuid().ToString(); DistinguishedName = "CN=u$_,DC=gate,DC=invalid" }
+                                Row = [pscustomobject]@{ ADApplied = $true; UserPrincipalName = "u$_@gate.invalid"; SamAccountName = "u$_" }; Kinds = @{ description = 'String' }
+                                Desired = @{ description = [ordered]@{ Present = $true; Kind = 'String'; Value = 'x' } } } })
+                    Invoke-PraAdReplication -Context $ctx -Plans $plans
+                    [pscustomobject]@{ Calls = @($script:RepCalls); Context = $ctx; EventFile = $null }
+                }
+            } finally { $env:PRA_EVENT_FILE = $old }
+        }
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\Invoke-RepScenario' -ErrorAction SilentlyContinue; Remove-Variable LastRepEvents -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'option off: no step to run and no call at all' {
+        $run = Invoke-RepScenario -Enabled $false
+        $run.Calls.Count | Should -Be 0
+    }
+    It 'Preview never replicates, even with the option on' {
+        $run = Invoke-RepScenario -Mode 'Preview'
+        $run.Calls.Count | Should -Be 0
+    }
+    It 'option on: Sync-ADObject once per object per other writable domain controller (no read-only one), then a read back on each, with progress and item events' {
+        $run = Invoke-RepScenario
+        @($run.Calls | Where-Object { $_ -like 'sync|*' }).Count | Should -Be 4
+        @($run.Calls | Where-Object { $_ -like 'sync|dc1.gate.invalid|dc2.gate.invalid|*' }).Count | Should -Be 2
+        @($run.Calls | Where-Object { $_ -like 'sync|dc1.gate.invalid|dc3.gate.invalid|*' }).Count | Should -Be 2
+        @($run.Calls | Where-Object { $_ -like '*rodc*' }).Count | Should -Be 0
+        @($run.Calls | Where-Object { $_ -like 'read|*' }).Count | Should -BeGreaterOrEqual 4
+        @(Get-PraList $run.Context 'ReplicationUnconfirmed').Count | Should -Be 0
+        $run.Context.Warnings | Should -Be 0
+    }
+    It 'emits one progress event per attempt and one item event per object and domain controller' {
+        $run = Invoke-RepScenario
+        $events = @(Get-Content -LiteralPath $global:LastRepEvents -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        @($events | Where-Object { $_.kind -eq 'progress' -and $_.text -like 'Active Directory replication to *' }).Count | Should -BeGreaterOrEqual 2
+        ($events | Where-Object { $_.kind -eq 'progress' } | Select-Object -First 1).maxAttempts | Should -Be 2
+        @($events | Where-Object { $_.kind -eq 'item' -and $_.text -like 'Replicated to dc*' }).Count | Should -Be 4
+    }
+    It 'a domain controller that does not converge is a warning that names it, and the Next steps data keeps it' {
+        $run = Invoke-RepScenario -Values @{ 'dc3.gate.invalid' = 'other' }
+        @(Get-PraList $run.Context 'ReplicationUnconfirmed') -join ',' | Should -BeExactly 'dc3.gate.invalid'
+        $run.Context.Warnings | Should -BeGreaterThan 0
+        (@(Get-PraList $run.Context 'WarningList') | ForEach-Object Message) -join ' ' | Should -Match 'dc3.gate.invalid'
+    }
+    It 'an unreachable domain controller is a warning that names it' {
+        $run = Invoke-RepScenario -Fail @{ 'dc2.gate.invalid' = 'The server is not operational.' }
+        @(Get-PraList $run.Context 'ReplicationUnconfirmed') -join ',' | Should -BeExactly 'dc2.gate.invalid'
+        (@(Get-PraList $run.Context 'WarningList') | ForEach-Object Message) -join ' ' | Should -Match 'dc2.gate.invalid.*not operational'
+    }
+    It 'an access denied says which right is needed' {
+        $run = Invoke-RepScenario -Fail @{ 'dc2.gate.invalid' = 'Access is denied.' }
+        (@(Get-PraList $run.Context 'WarningList') | ForEach-Object Message) -join ' ' | Should -Match 'access denied: the account needs the right to replicate a single object'
+        (@(Get-PraList $run.Context 'WarningList') | ForEach-Object Message) -join ' ' | Should -Match 'Replication Synchronization'
+    }
+    It 'a destination that is not approved is not written to, and is reported' {
+        $run = Invoke-RepScenario -Approve $false
+        @($run.Calls | Where-Object { $_ -like 'sync|*' }).Count | Should -Be 0
+        @(Get-PraList $run.Context 'ReplicationUnconfirmed').Count | Should -Be 2
+    }
+    It 'Directory.ReplicationTargets restricts the destinations and skips the discovery' {
+        $run = Invoke-RepScenario -Targets @('dc3.gate.invalid')
+        @($run.Calls | Where-Object { $_ -like 'sync|*' } | ForEach-Object { ($_ -split '\|')[2] } | Get-PraOrdinalUnique) -join ',' | Should -BeExactly 'dc3.gate.invalid'
+        @($run.Calls | Where-Object { $_ -eq 'list' }).Count | Should -Be 0
+    }
+    It 'validates the options, is off by default and is in the shipped file; the entry script has the switch' {
+        $runtime = New-GateRuntime -Name 'replication-config'
+        $config = Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package
+        $config.Directory.ForceReplication | Should -BeFalse
+        $config.Directory.ReplicationVerifyAttempts | Should -Be 6
+        Set-GateConfigText $runtime { param($t) $t.Replace("Execution=@{Phase='Both'}", "Execution=@{Phase='Both'}`r`n Directory=@{ReplicationVerifyAttempts=0}") }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*Directory.ReplicationVerifyAttempts*'
+        Set-GateConfigText $runtime { param($t) $t.Replace('Directory=@{ReplicationVerifyAttempts=0}', "Directory=@{ReplicationTargets=@('bad name!')}") }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*Directory.ReplicationTargets*'
+        (Get-Command (Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1')).Parameters.Keys | Should -Contain 'ForceAdReplication'
+    }
+}
+
+Describe 'Release 3.0.0 lot 2b - plan counts and the replication step through the real main' -Tag 'Lot2bMain' {
+    BeforeEach {
+        $oldEventPath = $env:PRA_EVENT_FILE
+        $runtime = New-GateRuntime -Name 'lot2b-main'
+        $env:PRA_EVENT_FILE = Join-Path $runtime.Root 'engine.events.jsonl'
+    }
+    AfterEach { $env:PRA_EVENT_FILE = $oldEventPath }
+    It 'announces how many objects the steps work on (a count event after targeting), and adds the replication step only with the option' {
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        $counts = @($events | Where-Object kind -eq 'count')
+        $counts.Count | Should -Be 1
+        $counts[0].count | Should -BeGreaterThan 0
+        @($counts[0].stepIds) -join ',' | Should -BeExactly 's2,s3'
+        @($events | Where-Object kind -eq 'plan')[0].steps.Count | Should -Be 5
+        @(@($events | Where-Object kind -eq 'plan')[0].steps | ForEach-Object label) | Should -Not -Contain 'Active Directory replication'
+        Remove-Item -LiteralPath $env:PRA_EVENT_FILE -Force
+        $replicated = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath;ForceAdReplication=$true}
+        $replicated.ExitCode | Should -Be 0 -Because ($replicated.Output + $replicated.Error)
+        $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        $labels = @(@($events | Where-Object kind -eq 'plan')[0].steps | ForEach-Object label)
+        $labels.Count | Should -Be 6
+        $labels[2] | Should -BeExactly 'Backup and Active Directory changes'
+        $labels[3] | Should -BeExactly 'Active Directory replication'
+        $labels[4] | Should -BeExactly 'Entra Connect synchronisation' -Because 'the replication step sits just before the synchronisation'
+        @($events | Where-Object { $_.kind -eq 'step' -and $_.title -eq 'Active Directory replication' } | ForEach-Object state) | Should -Contain 'skipped'
+        @(@($events | Where-Object kind -eq 'result')[0].configOverrides) -join '|' | Should -Match 'Directory.ForceReplication'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+}
+
+Describe 'Release 3.0.0 lot 2c - review fixes: licence group replication, staging extraction, phase order, Next steps, Preview folder' -Tag 'Lot2c' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+        $script:C2Root = Join-Path $global:PraGate.Root ('lot2c-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $null = New-Item -ItemType Directory -Path $script:C2Root -Force
+    }
+
+    It 'replicates and verifies the licence GROUP change too (member added), and names a domain controller whose group does not show the member' {
+        $runtime = New-GateRuntime -Name 'replication-group'
+        $env:PRA_GATE_STATE = $runtime.StatePath
+        $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Import-Module ActiveDirectory -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        foreach ($case in @(@{ Stale = ''; Expected = 0 }, @{ Stale = 'dc3.gate.invalid'; Expected = 1 })) {
+            $run = InModuleScope PRA.Directory -Parameters @{ Stale = $case.Stale } {
+                $script:Calls = New-Object 'Collections.Generic.List[string]'; $script:StaleDc = $Stale
+                function script:Sync-ADObject { param($Object, $Source, $Destination, $ErrorAction) $script:Calls.Add("sync|$Destination|$Object") }
+                function script:Get-ADDomainController { param($Filter, $Server, $Identity, $ErrorAction) @([pscustomobject]@{ HostName = 'dc1.gate.invalid'; IsReadOnly = $false }, [pscustomobject]@{ HostName = 'dc2.gate.invalid'; IsReadOnly = $false }, [pscustomobject]@{ HostName = 'dc3.gate.invalid'; IsReadOnly = $false }) }
+                function script:Get-ADUser { param($Identity, $Properties, $Server, $ErrorAction) [pscustomobject]@{ ObjectGUID = $Identity; description = 'x' } }
+                function script:Get-ADGroup { param($Identity, $Properties, $Server, $ErrorAction) $script:Calls.Add("group|$Server"); [pscustomobject]@{ member = $(if ($Server -ceq $script:StaleDc) { @() } else { @('CN=u1,DC=gate,DC=invalid') }) } }
+                $ctx = @{ Config = @{ Directory = @{ ForceReplication = $true; ReplicationTargets = @(); ReplicationVerifyAttempts = 1; ReplicationVerifyDelaySeconds = 1 } }; Server = 'dc1.gate.invalid'; AllowMutation = $true; Mode = 'Apply'
+                    Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); LogFile = ''; CurrentPhase = 'Replication'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Version = 'gate'
+                    Approval = { param($t, $o) $true }; Rows = (New-Object 'Collections.Generic.List[object]'); Action = 'Convert' }
+                $plan = [pscustomobject]@{ Record = [pscustomobject]@{ ObjectGuid = [guid]::NewGuid().ToString(); DistinguishedName = 'CN=u1,DC=gate,DC=invalid'; Licensing = [pscustomobject]@{ GroupDN = 'CN=Lic,DC=gate,DC=invalid'; GroupGuid = [guid]::NewGuid().ToString(); DesiredMember = $true } }
+                    Row = [pscustomobject]@{ ADApplied = $true; GroupAction = 'Added'; UserPrincipalName = 'u1@gate.invalid'; SamAccountName = 'u1' }; Kinds = @{ description = 'String' }
+                    Desired = @{ description = [ordered]@{ Present = $true; Kind = 'String'; Value = 'x' } } }
+                Invoke-PraAdReplication -Context $ctx -Plans @($plan)
+                [pscustomobject]@{ Calls = @($script:Calls); Context = $ctx }
+            }
+            @($run.Calls | Where-Object { $_ -like 'sync|*|CN=Lic,*' }).Count | Should -Be 2 -Because 'the group object is pushed to each other domain controller'
+            @($run.Calls | Where-Object { $_ -like 'group|*' }).Count | Should -BeGreaterOrEqual 2
+            @(Get-PraList $run.Context 'ReplicationUnconfirmed').Count | Should -Be $case.Expected
+            if ($case.Stale) { (@(Get-PraList $run.Context 'ReplicationUnconfirmed') -join ',') | Should -BeExactly $case.Stale }
+        }
+    }
+
+    It 'extracts through a staging folder: no staging folder is left, a stale one is swept, and the folders come out private' {
+        $backup = Join-Path $script:C2Root 'backups-stage'
+        $null = New-Item -ItemType Directory -Path $backup -Force
+        $stale = Join-Path $backup '.importing-deadbeef'; $null = New-Item -ItemType Directory -Path $stale; (Get-Item $stale).CreationTimeUtc = [datetime]::UtcNow.AddHours(-2)
+        $source = Join-Path $script:C2Root 'Batch-5ca1ab1e01'; $null = New-Item -ItemType Directory -Path $source
+        [IO.File]::WriteAllText((Join-Path $source 'Convert-x.json'), '{}')
+        $package = New-PraTransferPackage -Kind Convert -Environment GATE -BatchId '5ca1ab1e01' -Folders @($source) -OutboxFolder (Join-Path $script:C2Root 'outbox-stage')
+        $imported = Import-PraTransferPackage -Path $package.Path -BackupFolder $backup -Environment GATE -ExpectedKind Convert
+        $imported.Created.Count | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $backup 'Batch-5ca1ab1e01\Convert-x.json') | Should -BeTrue
+        @(Get-ChildItem -LiteralPath $backup -Directory -Force | Where-Object { $_.Name -like '.importing-*' }).Count | Should -Be 0 -Because 'the staging folder is removed, and the stale one swept'
+        ([IO.FileSystemAclExtensions]::GetAccessControl((New-Object IO.DirectoryInfo (Join-Path $backup 'Batch-5ca1ab1e01')))).AreAccessRulesProtected | Should -BeTrue
+        # A second import of the same package: identical, accepted, nothing written.
+        $again = Import-PraTransferPackage -Path $package.Path -BackupFolder $backup -Environment GATE -ExpectedKind Convert
+        $again.Created.Count | Should -Be 0
+        $again.Existing.Count | Should -Be 1
+    }
+
+    It 'sweeps a stale temporary package of the Outbox and keeps a distinct temporary name per attempt' {
+        $outbox = Join-Path $script:C2Root 'outbox-tmp'
+        $null = New-Item -ItemType Directory -Path $outbox
+        $old = Join-Path $outbox 'PRA-GATE-Convert-aaaaaaaa-for-Cloud.zip.0123abcd.tmp'; [IO.File]::WriteAllText($old, 'x'); (Get-Item $old).LastWriteTimeUtc = [datetime]::UtcNow.AddDays(-3)
+        $source = Join-Path $script:C2Root 'Batch-5ca1ab1e02'; $null = New-Item -ItemType Directory -Path $source; [IO.File]::WriteAllText((Join-Path $source 'Convert-x.json'), '{}')
+        $null = New-PraTransferPackage -Kind Convert -Environment GATE -BatchId '5ca1ab1e02' -Folders @($source) -OutboxFolder $outbox
+        Test-Path -LiteralPath $old | Should -BeFalse
+        @(Get-ChildItem -LiteralPath $outbox -Filter '*.tmp').Count | Should -Be 0
+    }
+
+    It 'orders the phases of the chain by their side, not by clock: a cloud server whose clock is behind still reports the objects as done' {
+        function Row($sam, $guid, $status, $cloud) { [pscustomobject]@{ ObjectGuid = $guid; SamAccountName = $sam; UserPrincipalName = "$sam@contoso.com"; Action = 'Convert'; IsShared = $false; ADApplied = $true; ADVerified = $true; BackupPath = ''; CloudStatus = $cloud; CloudDetail = ''; FinalStatus = $status; Detail = ''; Warnings = ''; LastOperation = ''; GroupAction = ''; CloudMailbox = $null; CloudLicense = $null; PreserveCloudMailbox = $false; PreserveLicense = $false; DeprovisionConfirmed = $false; PermDetail = ''; PermMissing = @() } }
+        function Ctx($phase, $rows, $minutes, $folders) {
+            $c = @{ Root = $global:PraGate.Package; Version = '3.0.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = (Get-Date).AddMinutes($minutes); Action = 'Convert'; Mode = 'Apply'; Phase = $phase
+                CurrentPhase = ''; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]'); Server = ''
+                Config = @{ Environment = 'GATE' }; AllowMutation = $true; ReportFolder = (Join-Path $script:C2Root 'reports-skew'); NoReport = $false; BatchId = 'abcd1234'; LogFile = ''; NextSteps = @(); ExitCode = 0; CloudConnectFailed = $false; ResultStatus = ''; PhaseFolders = $folders; ConfigOverrides = @() }
+            foreach ($r in $rows) { $c.Rows.Add($r) }; $c
+        }
+        $guid = [guid]::NewGuid().ToString()
+        $folder = Join-Path $script:C2Root 'Batch-5ca1ab1e03'; $null = New-Item -ItemType Directory -Path $folder
+        $null = Save-PraPhaseData -Context (Ctx 'AD' @((Row 'alice' $guid 'Pending' 'N/A')) 0 @()) -Folder $folder -HandOff 'Convert'
+        $cloud = Ctx 'Cloud' @((Row 'alice' $guid 'Success' 'Success')) -30 @($folder)
+        $null = Write-PraGlobalReport -Context $cloud
+        @($cloud.GlobalModel.Phases | ForEach-Object { $_.Header.Phase }) -join ',' | Should -BeExactly 'AD,Cloud'
+        $cloud.GlobalModel.Objects[0].Verdict | Should -BeExactly 'done'
+    }
+
+    It 'keeps the replication warning in the Next steps of a run that failed afterwards (the synchronisation threw)' {
+        $ctx = @{ Root = $global:PraGate.Package; Version = '3.0.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
+            CurrentPhase = 'Entra Connect synchronisation'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
+            Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $true; ReportFolder = (Join-Path $script:C2Root 'reports-next'); NoReport = $true; BatchId = 'abcd1234'; LogFile = ''; TranscriptStarted = $false; NextSteps = @()
+            ExitCode = 1; CloudConnectFailed = $false; ResultStatus = ''; ReplicationUnconfirmed = @('dc3.gate.invalid') }
+        $ctx.Issues.Add([pscustomobject]@{ Timestamp = 't'; Phase = 'p'; Operation = 'Start-ADSyncSyncCycle'; Identity = ''; Source = 'Execution'; Message = 'Timeout: the synchronisation cycle did not end in time' })
+        $result = Complete-PraRun -Context $ctx
+        $result.ExitCode | Should -Be 1
+        ($result.NextSteps -join ' ') | Should -Match 'replication was NOT confirmed on: dc3.gate.invalid'
+        ($result.NextSteps -join ' ') | Should -Match 'Start-ADSyncSyncCycle'
+    }
+}
+
+Describe 'Release 3.0.0 lot 2c - the window switch -ForceAdReplication and -BaseConfigPath together' -Tag 'Lot2cMain' {
+    It 'lists both the switch and the differences with the configuration file' {
+        $old = $env:PRA_EVENT_FILE
+        try {
+            $runtime = New-GateRuntime -Name 'lot2c-main'
+            $env:PRA_EVENT_FILE = Join-Path $runtime.Root 'engine.events.jsonl'
+            $dest = Join-Path $runtime.Root 'effective.psd1'
+            $null = New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $runtime.Package -Overrides @{ Polling = @{ TimeoutMinutes = 30 } } -Destination $dest
+            $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$dest;BaseConfigPath=$runtime.ConfigPath;ForceAdReplication=$true}
+            $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+            $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+            $overrides = @(@($events | Where-Object kind -eq 'result')[0].configOverrides) -join '|'
+            $overrides | Should -Match 'Polling.TimeoutMinutes'
+            $overrides | Should -Match 'Directory.ForceReplication'
+        } finally { $env:PRA_EVENT_FILE = $old }
+    }
+}
+
 AfterAll {
     $env:PSModulePath=$global:PraGate.OriginalModulePath
     $env:PRA_GATE_NONET=$global:PraGate.OriginalNonet

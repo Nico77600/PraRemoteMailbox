@@ -1,0 +1,13 @@
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:42.0190389Z","Target":"*","Operation":"Backup","Status":"Verified","Detail":"C:\\PraFx\\ad2479\\backups\\Batch-501c35a4807142b0af0b10ce98252607\\Convert-SYNTHETIC_GATE-20261104_034340-501c35a4.json"}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:42.3619150Z","Target":"00000000-0000-0000-0000-000000000001","Operation":"Set-ADUser","Status":"Started","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:42.8895087Z","Target":"00000000-0000-0000-0000-000000000001","Operation":"Set-ADUser","Status":"Applied","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:42.9049481Z","Target":"00000000-0000-0000-0000-000000000001","Operation":"Set-ADUser","Status":"Verified","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.0519618Z","Target":"00000000-0000-0000-0000-000000000001","Operation":"Add-ADGroupMember","Status":"Started","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.1038058Z","Target":"00000000-0000-0000-0000-000000000001","Operation":"Add-ADGroupMember","Status":"Applied","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.1380257Z","Target":"00000000-0000-0000-0000-000000000001","Operation":"Convert","Status":"Verified","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.3581333Z","Target":"00000000-0000-0000-0000-000000000002","Operation":"Set-ADUser","Status":"Started","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.3721848Z","Target":"00000000-0000-0000-0000-000000000002","Operation":"Set-ADUser","Status":"Applied","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.3877611Z","Target":"00000000-0000-0000-0000-000000000002","Operation":"Set-ADUser","Status":"Verified","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.5394595Z","Target":"00000000-0000-0000-0000-000000000002","Operation":"Add-ADGroupMember","Status":"Started","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.5565199Z","Target":"00000000-0000-0000-0000-000000000002","Operation":"Add-ADGroupMember","Status":"Applied","Detail":""}
+{"RunId":"3cdb23504e7e4de19cd76eb81f247582","Utc":"2026-11-04T02:43:43.5745155Z","Target":"00000000-0000-0000-0000-000000000002","Operation":"Convert","Status":"Verified","Detail":""}

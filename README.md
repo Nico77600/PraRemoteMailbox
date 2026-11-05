@@ -6,13 +6,14 @@
 </p>
 
 <p align="center">
+  <a href="#get-started"><b>Get started</b></a> &nbsp;&middot;&nbsp;
   <a href="#how-it-works"><b>How it works</b></a> &nbsp;&middot;&nbsp;
   <a href="#convert-and-recover"><b>Convert and Recover</b></a> &nbsp;&middot;&nbsp;
-  <a href="#shared-mailbox-permissions"><b>Shared mailboxes</b></a> &nbsp;&middot;&nbsp;
-  <a href="#wpf-window"><b>WPF window</b></a> &nbsp;&middot;&nbsp;
+  <a href="#console"><b>Console</b></a> &nbsp;&middot;&nbsp;
   <a href="#reports"><b>Reports</b></a> &nbsp;&middot;&nbsp;
-  <a href="#quick-start"><b>Quick start</b></a> &nbsp;&middot;&nbsp;
-  <a href="package/docs/PraRemoteMailbox-Guide.md"><b>Administrator guide</b></a>
+  <a href="#requirements"><b>Requirements</b></a> &nbsp;&middot;&nbsp;
+  <a href="package/docs/PraRemoteMailbox-UserGuide.md"><b>User guide</b></a> &nbsp;&middot;&nbsp;
+  <a href="package/docs/PraRemoteMailbox-Guide.md"><b>Reference guide</b></a>
 </p>
 
 > [!IMPORTANT]
@@ -26,24 +27,119 @@
 >
 > The `Install-Module` commands in this documentation use `-Force`, so they also update or reinstall a module that is already installed. If an older version still conflicts, close every PowerShell window, open a new one (as administrator for `-Scope AllUsers`), run `Uninstall-Module <ModuleName> -AllVersions -Force`, then run the `Install-Module` command again.
 
+> [!IMPORTANT]
+> **3.0.0 requires PowerShell 7.5 or later (`pwsh.exe`).** Windows PowerShell 5.1 is refused before any code runs. The **2.2.x releases remain the Windows PowerShell 5.1 version** for servers that cannot have PowerShell 7. Backups, proofs and Finalize packages written by 2.x restore unchanged with 3.0.0 (the formats did not change, [reference guide](package/docs/PraRemoteMailbox-Guide.md) annex D).
+
 ## Why
 
 In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for Exchange Online. If the on-premises Exchange servers are lost (ransomware, site loss, corrupted databases), these users have no mailbox at all — and a normal migration is impossible, because moving a mailbox needs the on-premises servers. As long as **Active Directory and Entra Connect** still work, the fastest way back to e-mail is to give each user a **new, empty mailbox in Exchange Online** and to recreate the access to the shared mailboxes. *PRA* stands for *Plan de Reprise d'Activité*, the disaster recovery plan. When Active Directory and Entra Connect are lost too (scenario 2), use [PRA Cloud Mailbox](https://github.com/Nico77600/PraCloudMailbox) instead: it gives the users and shared mailboxes an Exchange Online mailbox on their existing identity, from the cloud only, and rolls everything back once the infrastructure is rebuilt.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-why-dark.png">
+  <img alt="Three ideas: the mail servers of the company are lost; the tool gives each person a new, empty mailbox in the cloud; when the old servers work again, the tool puts everything back as the backup says" src="package/docs/images/readme-why-light.png">
+</picture>
+
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
-**Author:** Nicolas Fabert · **Version:** 2.2.0, unreleased source ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 3.0.0, unreleased source ([changelog](CHANGELOG.md)).
+
+> [!CAUTION]
+> Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (reference guide, chapter 6).
+
+## Get started
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-principles-dark.png">
-  <img alt="Design principles: backup before any write, preview first, stop at the first error, reversible" src="package/docs/images/readme-principles-light.png">
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-path-dark.png">
+  <img alt="The guided path. Set up once: 1 get your rights, 2 put the tool on the server, 3 fill in the settings file, 4 open the console. Then branch A, move mailboxes to the cloud: 5 try one mailbox, 6 move everyone, 7 read the report. Or branch B, go back: 5 roll back, 6 complete the rollback on two servers, 7 read the report" src="package/docs/images/readme-path-light.png">
 </picture>
+
+One path for everyone. Set the tool up once (**1 to 4**), then take branch **A** to move the mailboxes to the cloud, branch **B** to go back, or both. **Always try one mailbox first** (step 5). The commands use one example — the AD server `DC01`, the domain `contoso.com`, the tool in `D:\PRA\PraRemoteMailbox`, a test user `alice.vance@contoso.com`. Change only these names to yours. The [user guide](package/docs/PraRemoteMailbox-UserGuide.md) explains each step with a picture, what you should see and what to do if not, in plain words.
+
+### Set up once · 1 to 4
+
+```powershell
+# 1 · Get your rights. Give the table "Requirements" below to your administrator (minimum rights, derived from the code).
+
+# 2 · On the server, in PowerShell 7.5+ as administrator: put the tool in its folder and unblock it.
+#     Use the zip of the latest release, or copy the repository package folder to D:\PRA\PraRemoteMailbox
+Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File
+Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -Force
+Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllUsers -Force
+
+# 3 · Fill in the settings: scope, licence group, routing domain, Entra Connect server, tenant
+notepad D:\PRA\PraRemoteMailbox\config\PraRemoteMailbox.config.psd1
+
+# 4 · Open the console: five lights on the first page, all green or grey
+pwsh -STA -File D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1 -Gui
+```
+
+<details>
+<summary><b>What you see</b> · the Setup page: one light per prerequisite; a red light says what is missing</summary>
+<br>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/console-setup-dark.png">
+  <img alt="The Setup page of the console: the environment, what this server can run, and five prerequisite lights, all green" src="package/docs/images/console-setup-light.png">
+</picture>
+</details>
+
+### A · Move mailboxes to the cloud · 5 to 7
+
+```powershell
+# 5 · Try ONE mailbox first. Preview (nothing is written), then Apply.
+cd D:\PRA\PraRemoteMailbox
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Identity alice.vance@contoso.com
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Identity alice.vance@contoso.com -Mode Apply
+
+# 6 · Move everyone: the scope of the settings file, on one server
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert                  # preview
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Mode Apply      # backup, AD, sync, Exchange Online
+#     Two servers (the AD server cannot reach the cloud): on the AD server, then copy ONE zip file to the cloud server
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Batch 'PRA-PROD-Convert-490cc62e-for-Cloud.zip' -Mode Apply   # on the cloud server
+
+# 7 · Read the report: the Next steps page (or the summary) gives its path. Note the batch ID.
+```
+
+In the console, the same path is five pages: **Setup**, **Task** (*Move mailboxes to Exchange Online*, *Single identity (test)*), **Verify** (**Preview**, type the confirmation word, **Convert the mailboxes**), **Run** and **Next steps**.
+
+<details>
+<summary><b>What you see</b> · Task, Verify, Run, Next steps for one test mailbox</summary>
+<br>
+<table>
+  <tr>
+    <td width="50%" valign="top"><a href="package/docs/images/console-task-light.png"><img alt="The Task page: the card Move mailboxes to Exchange Online, the object source Single identity (test)" src="package/docs/images/console-task-light.png"></a><br><sub><b>Task</b> &middot; what to do, and on what: one test identity first</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/console-verify-light.png"><img alt="The Verify page: one mailbox will be converted, nothing blocking; the confirmation word typed" src="package/docs/images/console-verify-light.png"></a><br><sub><b>Verify</b> &middot; the preview in plain words, then the confirmation word</sub></td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top"><a href="package/docs/images/console-run-finished-light.png"><img alt="The Run page when the conversion is done: six green steps and the journey of the mailbox" src="package/docs/images/console-run-finished-light.png"></a><br><sub><b>Run</b> &middot; the steps, their waits and warnings, the journey of each mailbox</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/console-next-light.png"><img alt="The Next steps page: the result, the batch, the buttons Open report and Open log" src="package/docs/images/console-next-light.png"></a><br><sub><b>Next steps</b> &middot; the result, the report, the next command</sub></td>
+  </tr>
+</table>
+</details>
+
+### B · Go back · 5 to 7
+
+```powershell
+# 5 · Roll back, when the old servers work again. Preview, then Apply, with the batch ID of the Convert.
+.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 490cc62e
+.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 490cc62e -Mode Apply
+
+# 6 · Two servers only: Recover on the AD server, then on the cloud server (it writes a Finalize package), then Finalize on the AD server
+.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Phase AD -Batch 490cc62e -Mode Apply
+.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Phase Cloud -Batch 'PRA-PROD-Recover-490cc62e-for-Cloud.zip' -Mode Apply
+.\Invoke-PraRemoteMailbox.ps1 -Action Finalize -Batch 'PRA-PROD-Finalize-490cc62e-for-AD.zip' -Mode Apply
+
+# 7 · Read the report; check a mailbox at any time
+.\Invoke-PraRemoteMailbox.ps1 -Action Check -Identity alice.vance@contoso.com
+```
+
+Keep the `Backups` folder on a durable, protected volume: the backups are the only way back. The environment values of the configuration are empty in this repository. The zip of each [release](https://github.com/Nico77600/PraRemoteMailbox/releases) contains only the files needed to run; `.\tools\New-PraPackage.ps1` builds the same package from the repository.
 
 ## How it works
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-how-dark.png">
-  <img alt="The configuration is read by Invoke-PraRemoteMailbox.ps1, which backs up then writes Active Directory, runs an Entra Connect delta cycle and checks Exchange Online, then writes the batch and the reports; four actions: Convert, Recover, Finalize and Check" src="package/docs/images/readme-how-light.png">
+  <img alt="The settings file is read by Invoke-PraRemoteMailbox.ps1, which backs up then writes Active Directory, runs an Entra Connect cycle and checks Exchange Online, then writes the batch and the reports; four actions: Convert, Recover, Finalize and Check" src="package/docs/images/readme-how-light.png">
 </picture>
 
 - **Signed package.** The runtime lives in `package\` (same layout as the extracted release ZIP). Every runtime file authenticates the owner-signed manifest before it runs; a changed, missing or unexpected stable file stops the tool before any import or operation. The configuration and your CSV lists are data, outside that check. There is no unsigned mode. The tool refuses to run from any tree whose files are not signed by the owner: use a signed release package. Backup, log and report folders inside the package are limited to the canonical `Backups`, `logs` and `reports`. See [package/README.md](package/README.md).
@@ -52,28 +148,19 @@ Done by hand, this means rewriting about ten Exchange attributes per object in A
 - **One batch ID** links the steps: every Apply prints it with the exact next command, and `-Action Recover -Batch <id>` rolls the batch back.
 - **One or two servers**: everything from one server, or the AD part on-premises and the cloud part on an isolated server.
 
-## WPF window
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-principles-dark.png">
+  <img alt="Design principles: backup before any write, preview first, stop at the first error, reversible" src="package/docs/images/readme-principles-light.png">
+</picture>
 
-Open the window with `pwsh -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui` for native Fluent on
-PowerShell 7.5+, or `powershell.exe -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui` for compatible
-WPF controls. It starts no operation automatically; each operation runs the existing engine in a
-separate **Windows PowerShell 5.1** process.
+### Two servers, one file
 
-Choose Convert, Recover, Finalize or Check, with explicit **AD + cloud**, **AD only** or **Cloud only**
-execution. Preview is mandatory before Apply, which requires typing the action name. The window
-shows progress, results, logs/reports and the next-server commands. Changed inputs invalidate Preview.
+Between two servers, an Apply writes **one transfer package** (`Backups\Outbox\PRA-<Env>-<Kind>-<id8>-for-<Cloud|AD>.zip` with its checksum file). Copy that single file to the other server and use **Import package...** (or `-Batch <package.zip>`): the package is verified completely, including every entry hash, before anything is written. The last server writes **one global report** that follows each object from the first server to the last.
 
-For **Convert AD/Both**, select the configured scope, an **OU** (typed DN or read-only directory
-picker), or an **Identity CSV** (comma/semicolon). The choice applies only to this run and never
-rewrites the configuration. Users and shared mailboxes are supported: use **All** for a mixed CSV,
-or UsersOnly/SharedOnly for a list containing only the corresponding type.
-
-For split Recover, **AD** takes the original Convert batch; **Cloud** takes the new Recover batch
-and produces a Finalize package if AD restoration remains; **Finalize** runs on the AD server.
-Cloud-only never restores AD, even with RSAT installed. Copy complete batch folders between servers;
-the window does not transfer them. See the administrator guide, chapter 8.
-
-![WPF Fluent window - synthetic preview, no live operation](package/docs/images/gui-fluent.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-transfer-dark.png">
+  <img alt="Two servers, one file. Move the mailboxes: the AD server writes one zip file, you carry it, the cloud server finishes and writes the global report. Go back: the AD server, then the cloud server, then the AD server again, with a Recover package and a Finalize package" src="package/docs/images/readme-transfer-light.png">
+</picture>
 
 ## Convert and Recover
 
@@ -94,89 +181,90 @@ What a Convert changes in Active Directory (a Recover puts the saved values back
 | retention tag (`extensionAttribute1` by default) | → `Converted` | → `Converted` |
 | licence group | **added** | never |
 
-> [!CAUTION]
-> Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (guide, chapter 6).
-
-## Shared mailbox permissions
+### Shared mailbox permissions
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-permissions-dark.png">
-  <img alt="Shared mailbox permissions: read the 3 attributes in AD, groups expanded to users, saved in the batch, every holder checked in Exchange Online, each right granted once then re-read; FullAccess from msExchMailboxSecurityDescriptor, SendAs from the Send As right, SendOnBehalf from publicDelegates" src="package/docs/images/readme-permissions-light.png">
+  <img alt="Shared mailbox access: read in Active Directory, saved in the batch, every holder found in Exchange Online, each right granted once then read again; FullAccess from msExchMailboxSecurityDescriptor, SendAs from the Send As right, SendOnBehalf from publicDelegates" src="package/docs/images/readme-permissions-light.png">
 </picture>
 
 Exchange on-premises is down, so the tool reads the permissions where Exchange keeps a copy: on the account of the shared mailbox in Active Directory. The preview lists who will get each right; the log has the complete lists. A permission already present in Exchange Online is only verified, never added twice.
 
+## Console
+
+Open the console with `pwsh -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui` (native Fluent theme, PowerShell 7.5+, English). It starts no operation by itself; every operation runs the existing engine in a separate **PowerShell 7.5+** process (the same `pwsh.exe`).
+
+The console is a guided path of five pages: **Setup** (the environment, what this server can run, the prerequisite lights from real detection, one line of run settings), **Task** (move mailboxes, roll back, complete a rollback, check a mailbox, on what: one identity to test first, the configured scope, an OU or a CSV, or a batch or package to continue), **Verify** (the Preview in plain words, then the confirmation word in any letter case), **Run** (the steps announced by the engine, with their waits and warnings in plain words; click a step or an object) and **Next steps**. Run settings changed in the window apply to that run only, through a guarded effective copy of the configuration: the file is never rewritten. See the [reference guide](package/docs/PraRemoteMailbox-Guide.md), chapter 8.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/console-run-finished-dark.png">
+  <img alt="The Run page of a finished conversion: six green steps, the objects of the selected step, and the journey and backup of one mailbox" src="package/docs/images/console-run-finished-light.png">
+</picture>
+
 ## Reports
+
+Every run writes a log, a PowerShell transcript, a CSV and an HTML report. Exit codes: 0 = done, 1 = failed, 2 = done, next step required.
 
 <table>
   <tr>
-    <td width="50%" valign="top"><a href="package/docs/images/console-preview.png"><img alt="Preview of a Convert" src="package/docs/images/console-preview.png"></a><br><sub><b>Preview</b> &middot; the plan of each object: only the attributes that change, the holders of each permission; nothing is written</sub></td>
-    <td width="50%" valign="top"><a href="package/docs/images/console-apply.png"><img alt="Convert Apply" src="package/docs/images/console-apply.png"></a><br><sub><b>Apply</b> &middot; pre-check, backup, AD writes, Entra Connect, Exchange Online; summary card with the batch ID and the next command</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/report-phase-light.png"><img alt="The HTML report of one run: the word Success, the counters, and one line per person" src="package/docs/images/report-phase-light.png"></a><br><sub><b>HTML report</b> &middot; counters, next step, then virtualized, filterable rows (tested to 100,000 rows, at most 200 rows in the page) with a filtered CSV export; needs current desktop Edge or Chrome</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/report-phase-warning-light.png"><img alt="The HTML report of a run with a warning on a shared mailbox, and the list of warnings below the table" src="package/docs/images/report-phase-warning-light.png"></a><br><sub><b>Warnings</b> &middot; something was left aside on purpose: shown in the console, the log, the CSV and the report</sub></td>
   </tr>
   <tr>
-    <td width="50%" valign="top"><a href="package/docs/images/report.png"><img alt="HTML report" src="package/docs/images/report.png"></a><br><sub><b>HTML report</b> &middot; counters, next step, then virtualized, filterable rows (tested to 100,000 rows, at most 200 rows in the page) with a filtered CSV export; needs current desktop Edge or Chrome</sub></td>
-    <td width="50%" valign="top"><a href="package/docs/images/report-warning.png"><img alt="HTML report with a warning" src="package/docs/images/report-warning.png"></a><br><sub><b>Warnings</b> &middot; a permission of a deleted account is ignored and shown in the console, the log, the CSV and the report</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/report-global-light.png"><img alt="The global report of a Convert across two servers: the times of the AD server and of the cloud server, then every person from end to end" src="package/docs/images/report-global-light.png"></a><br><sub><b>Global report</b> &middot; on two servers, the last server writes one report that follows each object from the first server to the last</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/report-global-recover-light.png"><img alt="The global report of a rollback across three phases: Recover on the AD server, Recover on the cloud server, Finalize" src="package/docs/images/report-global-recover-light.png"></a><br><sub><b>Rollback</b> &middot; Recover on the AD server, Recover on the cloud server, then Finalize, in one report</sub></td>
   </tr>
 </table>
-
-Every run also writes a log, a PowerShell transcript and a CSV. Exit codes: 0 = done, 1 = failed, 2 = done, next step required.
 
 ## Requirements
 
 | Item | Requirement |
 |---|---|
 | Scenario | Hybrid Exchange organisation (Exchange Server + Exchange Online) synchronised by **Entra Connect**. Exchange on-premises is not needed (it is down); Active Directory and Entra Connect must work (both lost: [PRA Cloud Mailbox](https://github.com/Nico77600/PraCloudMailbox)) |
-| PowerShell | Operations: **Windows PowerShell 5.1** (`powershell.exe`). Window: PowerShell 7.5+ for native Fluent, or Windows PowerShell 5.1 for compatible WPF controls |
-| Modules | RSAT `ActiveDirectory`, `ExchangeOnlineManagement` 3.10 or later, `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users` |
-| Permissions | Active Directory: write the Exchange attributes of the objects in scope and the members of the licence group. Entra Connect: `ADSyncOperators` (or local administrator), WinRM when remote. Exchange Online: **Exchange Recipient Administrator**. Microsoft Graph: `User.Read.All`. Unattended runs: an application with a certificate (guide, annex C) |
+| PowerShell | **PowerShell 7.5 or later** (`pwsh.exe`) for the operations and the window. Windows PowerShell 5.1 is refused (use the 2.2.x release there) |
+| Modules | RSAT `ActiveDirectory` (native in PowerShell 7 on Windows 10 1809+ / Windows Server 2019+), `ExchangeOnlineManagement` 3.10 or later and `Microsoft.Graph.Authentication` / `Microsoft.Graph.Users`, installed **for PowerShell 7**; `ADSync` on the Entra Connect server (loaded through the Windows PowerShell compatibility layer when used locally) |
 | Licences | A licence group that gives Exchange Online to the users (shared mailboxes need no licence) |
 | Console | Windows Terminal for emoji and colours; the classic console shows symbols |
 
-## Quick start
+### Minimum permissions
 
-```powershell
-git clone https://github.com/Nico77600/PraRemoteMailbox.git
-cd PraRemoteMailbox
-notepad .\package\config\PraRemoteMailbox.config.psd1      # scope, licence group, routing domain, Entra Connect, tenant
+Derived from the code, not from habit: no Domain Admin, no Global Administrator. The exact table, with the place in the code that justifies each line and the commands to delegate, is in the [reference guide, chapter 4](package/docs/PraRemoteMailbox-Guide.md#permissions).
 
-# Optional window; actual operations still run in Windows PowerShell 5.1.
-pwsh -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-rights-dark.png">
+  <img alt="The rights to ask for: Active Directory, the Entra Connect server, Microsoft 365 Graph, Exchange Online" src="package/docs/images/readme-rights-light.png">
+</picture>
 
-# Command line: run these commands in Windows PowerShell 5.1.
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Identity jdupont@contoso.com   # preview for one user: nothing is written
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert                                 # preview of the configured scope (e.g. an OU)
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -SearchBase "OU=Mailboxes,DC=contoso,DC=com"
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Both -CsvPath .\package\config\Targets.sample.csv
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Mode Apply                     # backup, AD, sync, Exchange Online
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Convert -Scope SharedOnly -Mode Apply   # only the shared mailboxes of the scope
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 1d5ac20b                 # preview of the roll-back of that batch
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 1d5ac20b -Mode Apply     # roll the batch back
-.\package\Invoke-PraRemoteMailbox.ps1 -Action Check -Identity jdupont@contoso.com     # provisioned or not in Exchange Online
-```
+| Where | Minimum |
+|---|---|
+| Active Directory | **Write property** on 10 Exchange attributes (`homeMDB`, `homeMTA`, `msExchHomeServerName`, `msExchMailboxGuid`, `mDBUseDefaults`, `msExchRecipientDisplayType`, `msExchRecipientTypeDetails`, `msExchRemoteRecipientType`, `targetAddress`, `proxyAddresses`) and one `extensionAttribute` (retention tag) of the objects in scope; **write** `member` of the licence group; **read** of the objects and their security descriptors. Optional forced replication: *Replication synchronization* on the domain |
+| Entra Connect server | **ADSyncOperators** (or local administrator); WinRM access when remote |
+| Microsoft Graph, interactive | Delegated `User.Read.All` (consent once), and a role that can read users (for example Global Reader) |
+| Microsoft Graph, certificate | Application permission `User.Read.All` (admin consent) |
+| Exchange Online, interactive | **Exchange Recipient Administrator** (or the role group Recipient Management) |
+| Exchange Online, certificate | Application permission `Exchange.ManageAsApp` (admin consent) and the Entra role **Exchange Recipient Administrator** for the application; a CSP certificate in `CurrentUser\My` (reference guide, annex C) |
 
-Keep the `Backups` folder on a durable, protected volume: the backups are the only way back. The environment values of the configuration are empty in this repository. The zip of each [release](https://github.com/Nico77600/PraRemoteMailbox/releases) contains only the files needed to run; `.\tools\New-PraPackage.ps1` builds the same package from the repository.
+A few points depend on Microsoft services and are flagged for a lab check in the reference guide (*What the code cannot tell you*).
 
 ## Documentation
 
-The **administrator guide** covers the disaster scenario, what changes in Active Directory, the shared mailbox permissions, installation, configuration, unattended execution with a certificate, ready-to-use recipes (one user, an OU, shared mailboxes only, a list, the roll-back, two servers), the reports, troubleshooting, the internals and the lab test campaign:
+The `package` folder of this repository holds exactly the files needed to run PRA Remote Mailbox, with both guides. The zip of each [release](https://github.com/Nico77600/PraRemoteMailbox/releases) contains the same run-time files with the HTML guides; `.\tools\New-PraPackage.ps1` builds that zip content from the repository.
 
-- [package/docs/PraRemoteMailbox-Guide.md](package/docs/PraRemoteMailbox-Guide.md)
-- `package/docs/PraRemoteMailbox-Guide.html` — the same guide as a single HTML file, with a light and a dark theme (download it and open it locally)
+| Guide | Content |
+|---|---|
+| **[User guide](package/docs/PraRemoteMailbox-UserGuide.md)** | **The guided path in plain words**, written for someone who has never used the tool: a checklist before you start, the rights to ask for, set up once (**1 to 4**), then **A · Move mailboxes** (one test mailbox, everyone on one server, everyone on two servers) and **B · Go back** (roll back, complete the rollback). A picture for each step, what you should see and what to do if not, a table of the common messages, and a picture dictionary. |
+| **[Reference guide](package/docs/PraRemoteMailbox-Guide.md)** | Everything else: the disaster scenario, what changes in Active Directory, the shared mailbox permissions, installation, the exact minimum permissions, configuration, unattended execution with a certificate, ready-to-use recipes, the reports, troubleshooting, the internals, how to modify and test the tool, and the lab test campaign. |
+
+Both guides also exist as a single HTML file with a light and a dark theme (`package/docs/PraRemoteMailbox-UserGuide.html`, `package/docs/PraRemoteMailbox-Guide.html`): download them and open them locally, or use the copies in the release zip. The pictures are generated from synthetic data by `tools\New-DocumentationImages.ps1`.
 
 ## Tests
 
 ```powershell
-# Windows PowerShell 5.1 (powershell.exe), like the tool; Pester 5+ and PSScriptAnalyzer 1.25.0 installed
-powershell.exe -NoProfile -File .\tests\Invoke-TestGate.ps1     # no directory, no tenant needed
+# PowerShell 7.5+ (pwsh), like the tool; Pester 5+ and PSScriptAnalyzer 1.25.0 installed
+pwsh -NoProfile -File .\tests\Invoke-TestGate.ps1     # no directory, no tenant needed
 ```
 
-The gate runs the real entry script against a synthetic Active Directory, Entra Connect and Exchange Online:
-no write before the complete backup, stop at the first error, no write in Preview, no Apply without
-confirmation, memory bounds, proofs and Finalize packages. It also exercises WPF selection,
-Preview/Apply guards and OU/CSV targeting. Earlier versions were validated on a real Active Directory,
-Entra Connect and Microsoft 365 tenant (guide, annex B); **2.2.0 (unreleased source) has offline validation only, not a new
-live-tenant campaign**. `tools\Build-Documentation.ps1`, which rebuilds the HTML guide on a workstation,
-needs PowerShell 7.4+.
+The gate runs the real entry script against a synthetic Active Directory, Entra Connect and Exchange Online: no write before the complete backup, stop at the first error, no write in Preview, no Apply without confirmation, memory bounds, proofs and Finalize packages. It also exercises WPF selection, Preview/Apply guards and OU/CSV targeting, and checks the documentation (pictures, names, the Graph scope documented against the one of the code). Earlier versions were validated on a real Active Directory, Entra Connect and Microsoft 365 tenant (reference guide, annex B); **3.0.0 (unreleased source) has offline validation only, not a new live-tenant campaign** (the lab list for the PowerShell 7 engine is in the guide, annex B). Files written by the real 2.2.0 under Windows PowerShell 5.1 are replayed by the gate (`tests\PraLegacyFixtures.Tests.ps1`, fixtures frozen in `testsixtures\ps51-2.2.0`). `tools\Build-Documentation.ps1` and `tools\New-DocumentationImages.ps1`, which rebuild the HTML guides and the pictures on a workstation, need PowerShell 7.5+ (and Microsoft Edge for the pictures).
 
 ## License
 

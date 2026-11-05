@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+﻿#Requires -Version 7.5
 <#
 .SYNOPSIS
     Copies the files needed to run PRA Remote Mailbox into a separate folder, ready to be zipped.
@@ -10,7 +10,7 @@
     plus the guide:
         Invoke-PraRemoteMailbox.ps1, PackageIntegrity.psd1, README.md, LICENSE, CHANGELOG.md (copied from the
         repository root), module\ (modules, GUI, verifier and XAML), templates\, config\ (configuration and
-        CSV samples), docs\PraRemoteMailbox-Guide.html and .md (with images)
+        CSV samples), docs\PraRemoteMailbox-Guide.html and .md, docs\PraRemoteMailbox-UserGuide.html and .md (with images)
     It never copies Backups\, logs\, reports\, tests\ or tools\: backups hold AD values of real objects.
 
     The package source and the finished package must pass the owner-signed integrity check
@@ -32,11 +32,11 @@
 
 .EXAMPLE
     .\tools\New-PraPackage.ps1
-    Creates ..\package\PraRemoteMailbox-2.2.0.
+    Creates ..\package\PraRemoteMailbox-3.0.0.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.2.0
+    Version : 3.0.0
 #>
 [CmdletBinding()]
 param(
@@ -47,9 +47,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $packageRoot = Join-Path $root 'package'
-$entry = Join-Path $packageRoot 'Invoke-PraRemoteMailbox.ps1'
-$version = ([regex]::Match([IO.File]::ReadAllText($entry), "Version = '([0-9.]+)'")).Groups[1].Value
-if (-not $version) { throw 'Version not found in package\Invoke-PraRemoteMailbox.ps1.' }
+# The version has one source: $script:ToolVersion of the common module (read as text, nothing is executed).
+$versionSource = Join-Path $packageRoot 'module\PRA.Common.psm1'
+$version = ([regex]::Match([IO.File]::ReadAllText($versionSource), '(?m)^\$script:ToolVersion\s*=\s*''([0-9]+\.[0-9]+\.[0-9]+)''')).Groups[1].Value
+if (-not $version) { throw 'Version not found in package\module\PRA.Common.psm1 ($script:ToolVersion).' }
 
 function Assert-AuthenticatedPackage([string]$Path, [switch]$Distribution) {
     $verifier = Join-Path $Path 'module\Test-PackageIntegrity.ps1'
@@ -60,8 +61,8 @@ function Assert-AuthenticatedPackage([string]$Path, [switch]$Distribution) {
         $cursor = [IO.Path]::GetDirectoryName($cursor)
     }
     $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $verifier -ErrorAction Stop
-    if ([string]$signature.Status -cne 'Valid' -or $null -eq $signature.SignerCertificate -or
-        $signature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
+    if (-not [string]::Equals([string]$signature.Status, 'Valid', [StringComparison]::Ordinal) -or $null -eq $signature.SignerCertificate -or
+        -not [string]::Equals([string]$signature.SignerCertificate.Thumbprint, '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6', [StringComparison]::Ordinal) -or
         $null -eq $signature.TimeStamperCertificate) {
         throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
     }
@@ -87,15 +88,23 @@ if (Test-Path -LiteralPath $Destination) {
 
 # ---- Files needed at run time (paths relative to package\, the same as in the extracted ZIP) ----------------
 $files = New-Object 'Collections.Generic.List[string]'
-foreach ($f in 'Invoke-PraRemoteMailbox.ps1', 'PackageIntegrity.psd1', 'README.md', 'LICENSE', 'CHANGELOG.md', 'templates\Report.template.html',
-    'config\Targets.sample.csv', 'config\SharedPermissions.sample.csv', 'docs\PraRemoteMailbox-Guide.html', 'docs\PraRemoteMailbox-Guide.md') { $files.Add($f) }
+foreach ($f in 'Invoke-PraRemoteMailbox.ps1', 'PraRemoteMailbox.psd1', 'PraRemoteMailbox.psm1', 'PackageIntegrity.psd1', 'README.md', 'LICENSE', 'CHANGELOG.md', 'templates\Report.template.html',
+    'config\Targets.sample.csv', 'config\SharedPermissions.sample.csv', 'docs\PraRemoteMailbox-Guide.html', 'docs\PraRemoteMailbox-Guide.md',
+    'docs\PraRemoteMailbox-UserGuide.html', 'docs\PraRemoteMailbox-UserGuide.md') { $files.Add($f) }
 foreach ($m in 'PRA.Common.psm1', 'PRA.Directory.psm1', 'PRA.Backup.psm1', 'PRA.Cloud.psm1', 'PRA.Gui.psm1', 'PRA.Gui.xaml', 'PRA.Gui.Directory.ps1', 'Test-PackageIntegrity.ps1') { $files.Add("module\$m") }
 Get-ChildItem -LiteralPath (Join-Path $packageRoot 'docs\images') -File -ErrorAction SilentlyContinue | ForEach-Object { $files.Add('docs\images\' + $_.Name) }
-if (@($files | Select-Object -Unique).Count -ne $files.Count) { throw 'Package integrity: duplicate distribution file path.' }
+# Ordinal comparisons throughout: on .NET with ICU the culture comparison (-eq, -in, Select-Object -Unique) ignores zero-weight characters.
+function Test-OrdinalIn([string]$Value, [string[]]$Set, [switch]$IgnoreCase) {
+    $comparison = if ($IgnoreCase) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    foreach ($item in $Set) { if ([string]::Equals($Value, $item, $comparison)) { return $true } }
+    return $false
+}
+function New-OrdinalSet([string[]]$Items) { $set = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::Ordinal); foreach ($item in $Items) { [void]$set.Add($item) }; ,$set }
+if ((New-OrdinalSet $files.ToArray()).Count -ne $files.Count) { throw 'Package integrity: duplicate distribution file path.' }
 
 foreach ($f in $files) {
     # CHANGELOG.md is the only file copied from the repository root; it is hashed by the manifest.
-    $source = if ($f -eq 'CHANGELOG.md') { Join-Path $root $f } else { Join-Path $packageRoot $f }
+    $source = if ([string]::Equals($f, 'CHANGELOG.md', [StringComparison]::Ordinal)) { Join-Path $root $f } else { Join-Path $packageRoot $f }
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing file in the tool folder: $f" }
     $target = Join-Path $Destination $f
     [void][IO.Directory]::CreateDirectory((Split-Path $target -Parent))
@@ -130,10 +139,10 @@ $problems = New-Object 'Collections.Generic.List[string]'
 foreach ($name in 'Backups', 'reports', 'logs', 'tests', 'tools') {
     if (Test-Path -LiteralPath (Join-Path $Destination $name)) { $problems.Add("Folder $name\ must not be in the package.") }
 }
-# -Include is ignored with -LiteralPath in Windows PowerShell 5.1: filter on the extension instead.
-Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { $_.Extension -in '.clixml', '.jsonl', '.sha256' } | ForEach-Object { $problems.Add("Backup file in the package: $($_.Name)") }
-$textFiles = Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1', '.psd1', '.csv', '.xaml' }
-foreach ($value in ($emptied | Select-Object -Unique)) {
+# Filter on the extension (-Include is ignored with -LiteralPath in Windows PowerShell 5.1, the former host of this script).
+Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { Test-OrdinalIn $_.Extension @('.clixml', '.jsonl', '.sha256') -IgnoreCase } | ForEach-Object { $problems.Add("Backup file in the package: $($_.Name)") }
+$textFiles = Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { Test-OrdinalIn $_.Extension @('.ps1', '.psm1', '.psd1', '.csv', '.xaml') -IgnoreCase }
+foreach ($value in (New-OrdinalSet $emptied.ToArray())) {
     foreach ($file in $textFiles) {
         if ([IO.File]::ReadAllText($file.FullName).IndexOf($value, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
             $problems.Add("An environment value of the configuration ($value) appears in $($file.FullName.Substring($Destination.Length + 1)).")
@@ -143,8 +152,8 @@ foreach ($value in ($emptied | Select-Object -Unique)) {
 $check = Import-PowerShellDataFile -LiteralPath $configTarget
 if ($check.Cloud.TenantId -or $check.Cloud.AppId) { $problems.Add('Tenant values are still in the packaged configuration.') }
 $delivered = @(Get-ChildItem -LiteralPath $Destination -Recurse -File | ForEach-Object { $_.FullName.Substring($Destination.Length + 1) })
-foreach ($extra in @($delivered | Where-Object { $_ -notin $files })) { $problems.Add("Unexpected file in the package: $extra") }
-foreach ($missing in @($files | Where-Object { $_ -notin $delivered })) { $problems.Add("Expected file missing from the package: $missing") }
+foreach ($extra in @($delivered | Where-Object { -not (Test-OrdinalIn $_ $files.ToArray()) })) { $problems.Add("Unexpected file in the package: $extra") }
+foreach ($missing in @($files | Where-Object { -not (Test-OrdinalIn $_ $delivered) })) { $problems.Add("Expected file missing from the package: $missing") }
 if ($problems.Count) { throw ("Package not valid ($Destination):`n - " + ($problems -join "`n - ")) }
 try { Assert-AuthenticatedPackage $Destination -Distribution }
 catch { Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction SilentlyContinue; throw }
@@ -155,6 +164,6 @@ Write-Host "  PRA Remote Mailbox $version - package ready" -ForegroundColor Gree
 Write-Host "  Folder   : $Destination"
 Write-Host ("  Content  : {0} files, {1:N1} MB" -f $all.Count, (($all | Measure-Object Length -Sum).Sum / 1MB))
 Write-Host "  Integrity: owner signatures and SHA256 inventory verified"
-Write-Host "  Config   : environment values emptied ($(@($emptied | Select-Object -Unique).Count)) - fill in the configuration (guide, chapter 6)"
+Write-Host "  Config   : environment values emptied ($((New-OrdinalSet $emptied.ToArray()).Count)) - fill in the configuration (guide, chapter 6)"
 Write-Host ''
 $all | Sort-Object FullName | ForEach-Object { '    {0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($Destination.Length + 1) }

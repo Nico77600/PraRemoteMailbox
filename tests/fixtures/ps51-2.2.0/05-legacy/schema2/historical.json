@@ -1,0 +1,327 @@
+{
+    "SchemaVersion":  2,
+    "Operation":  "Convert",
+    "Environment":  "SYNTHETIC_GATE",
+    "Records":  [
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000001",
+                        "DistinguishedName":  "CN=User1,OU=Tests,DC=contoso,DC=com",
+                        "SamAccountName":  "user1",
+                        "UserPrincipalName":  "user1@contoso.com",
+                        "DisplayName":  "Synthetic User 1",
+                        "CapturedUtc":  "2026-11-04T02:43:39.0554806Z",
+                        "CapturedUsnChanged":  "100",
+                        "IsShared":  false,
+                        "RequestedOperation":  "Convert",
+                        "Attributes":  {
+                                           "homeMDB":  {
+                                                           "Present":  true,
+                                                           "Kind":  "String",
+                                                           "Value":  "CN=Database1,CN=Databases,DC=contoso,DC=com"
+                                                       },
+                                           "homeMTA":  {
+                                                           "Present":  true,
+                                                           "Kind":  "String",
+                                                           "Value":  "CN=OriginalMTA,DC=contoso,DC=com"
+                                                       },
+                                           "msExchHomeServerName":  {
+                                                                        "Present":  true,
+                                                                        "Kind":  "String",
+                                                                        "Value":  "/o=Synthetic/ou=Gate/cn=Servers/cn=Original"
+                                                                    },
+                                           "msExchMailboxGuid":  {
+                                                                     "Present":  true,
+                                                                     "Kind":  "Bytes",
+                                                                     "Value":  "AAECf4D+/wE="
+                                                                 },
+                                           "mDBUseDefaults":  {
+                                                                  "Present":  true,
+                                                                  "Kind":  "Bool",
+                                                                  "Value":  false
+                                                              },
+                                           "msExchRecipientDisplayType":  {
+                                                                              "Present":  true,
+                                                                              "Kind":  "Int",
+                                                                              "Value":  "0"
+                                                                          },
+                                           "msExchRecipientTypeDetails":  {
+                                                                              "Present":  true,
+                                                                              "Kind":  "Long",
+                                                                              "Value":  "1"
+                                                                          },
+                                           "msExchRemoteRecipientType":  {
+                                                                             "Present":  false,
+                                                                             "Kind":  "Long",
+                                                                             "Value":  null
+                                                                         },
+                                           "targetAddress":  {
+                                                                 "Present":  false,
+                                                                 "Kind":  "String",
+                                                                 "Value":  null
+                                                             },
+                                           "proxyAddresses":  {
+                                                                  "Present":  true,
+                                                                  "Kind":  "MultiString",
+                                                                  "Value":  [
+                                                                                "smtp:alias1@contoso.com",
+                                                                                "SMTP:user1@contoso.com",
+                                                                                "X500:/o=Synthetic/ou=Gate/cn=User"
+                                                                            ]
+                                                              },
+                                           "extensionAttribute1":  {
+                                                                       "Present":  true,
+                                                                       "Kind":  "String",
+                                                                       "Value":  "OriginalTag-1"
+                                                                   }
+                                       },
+                        "PlannedAttributes":  {
+                                                  "homeMDB":  {
+                                                                  "Kind":  "String",
+                                                                  "Value":  null,
+                                                                  "Present":  false
+                                                              },
+                                                  "homeMTA":  {
+                                                                  "Kind":  "String",
+                                                                  "Value":  null,
+                                                                  "Present":  false
+                                                              },
+                                                  "msExchHomeServerName":  {
+                                                                               "Kind":  "String",
+                                                                               "Value":  null,
+                                                                               "Present":  false
+                                                                           },
+                                                  "msExchMailboxGuid":  {
+                                                                            "Kind":  "Bytes",
+                                                                            "Value":  null,
+                                                                            "Present":  false
+                                                                        },
+                                                  "mDBUseDefaults":  {
+                                                                         "Kind":  "Bool",
+                                                                         "Value":  null,
+                                                                         "Present":  false
+                                                                     },
+                                                  "msExchRecipientDisplayType":  {
+                                                                                     "Kind":  "Int",
+                                                                                     "Value":  "-2147483642",
+                                                                                     "Present":  true
+                                                                                 },
+                                                  "msExchRecipientTypeDetails":  {
+                                                                                     "Kind":  "Long",
+                                                                                     "Value":  "2147483648",
+                                                                                     "Present":  true
+                                                                                 },
+                                                  "msExchRemoteRecipientType":  {
+                                                                                    "Kind":  "Long",
+                                                                                    "Value":  "1",
+                                                                                    "Present":  true
+                                                                                },
+                                                  "targetAddress":  {
+                                                                        "Kind":  "String",
+                                                                        "Value":  "SMTP:user1@contoso.mail.onmicrosoft.com",
+                                                                        "Present":  true
+                                                                    },
+                                                  "proxyAddresses":  {
+                                                                         "Kind":  "MultiString",
+                                                                         "Value":  [
+                                                                                       "SMTP:user1@contoso.com",
+                                                                                       "smtp:alias1@contoso.com",
+                                                                                       "X500:/o=Synthetic/ou=Gate/cn=User",
+                                                                                       "smtp:user1@contoso.mail.onmicrosoft.com"
+                                                                                   ],
+                                                                         "Present":  true
+                                                                     },
+                                                  "extensionAttribute1":  {
+                                                                              "Kind":  "String",
+                                                                              "Value":  "Converted",
+                                                                              "Present":  true
+                                                                          }
+                                              },
+                        "Licensing":  {
+                                          "Enabled":  true,
+                                          "GroupGuid":  "10000000-0000-0000-0000-000000000001",
+                                          "GroupDN":  "CN=License,OU=Tests,DC=contoso,DC=com",
+                                          "WasMember":  false,
+                                          "DesiredMember":  true
+                                      },
+                        "Retention":  {
+                                          "Enabled":  true,
+                                          "Attribute":  "extensionAttribute1",
+                                          "Value":  "Converted"
+                                      },
+                        "SharedPermissions":  {
+                                                  "SendOnBehalf":  [
+
+                                                                   ],
+                                                  "SendAs":  [
+
+                                                             ],
+                                                  "FullAccess":  [
+
+                                                                 ]
+                                              },
+                        "PreserveCloudMailbox":  false,
+                        "PreserveLicense":  false
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000002",
+                        "DistinguishedName":  "CN=User2,OU=Tests,DC=contoso,DC=com",
+                        "SamAccountName":  "user2",
+                        "UserPrincipalName":  "user2@contoso.com",
+                        "DisplayName":  "Synthetic User 2",
+                        "CapturedUtc":  "2026-11-04T02:43:39.3712261Z",
+                        "CapturedUsnChanged":  "100",
+                        "IsShared":  false,
+                        "RequestedOperation":  "Convert",
+                        "Attributes":  {
+                                           "homeMDB":  {
+                                                           "Present":  true,
+                                                           "Kind":  "String",
+                                                           "Value":  "CN=Database2,CN=Databases,DC=contoso,DC=com"
+                                                       },
+                                           "homeMTA":  {
+                                                           "Present":  true,
+                                                           "Kind":  "String",
+                                                           "Value":  "CN=OriginalMTA,DC=contoso,DC=com"
+                                                       },
+                                           "msExchHomeServerName":  {
+                                                                        "Present":  true,
+                                                                        "Kind":  "String",
+                                                                        "Value":  "/o=Synthetic/ou=Gate/cn=Servers/cn=Original"
+                                                                    },
+                                           "msExchMailboxGuid":  {
+                                                                     "Present":  true,
+                                                                     "Kind":  "Bytes",
+                                                                     "Value":  "AAECf4D+/wI="
+                                                                 },
+                                           "mDBUseDefaults":  {
+                                                                  "Present":  true,
+                                                                  "Kind":  "Bool",
+                                                                  "Value":  false
+                                                              },
+                                           "msExchRecipientDisplayType":  {
+                                                                              "Present":  true,
+                                                                              "Kind":  "Int",
+                                                                              "Value":  "0"
+                                                                          },
+                                           "msExchRecipientTypeDetails":  {
+                                                                              "Present":  true,
+                                                                              "Kind":  "Long",
+                                                                              "Value":  "1"
+                                                                          },
+                                           "msExchRemoteRecipientType":  {
+                                                                             "Present":  false,
+                                                                             "Kind":  "Long",
+                                                                             "Value":  null
+                                                                         },
+                                           "targetAddress":  {
+                                                                 "Present":  false,
+                                                                 "Kind":  "String",
+                                                                 "Value":  null
+                                                             },
+                                           "proxyAddresses":  {
+                                                                  "Present":  true,
+                                                                  "Kind":  "MultiString",
+                                                                  "Value":  [
+                                                                                "smtp:alias2@contoso.com",
+                                                                                "SMTP:user2@contoso.com",
+                                                                                "X500:/o=Synthetic/ou=Gate/cn=User"
+                                                                            ]
+                                                              },
+                                           "extensionAttribute1":  {
+                                                                       "Present":  true,
+                                                                       "Kind":  "String",
+                                                                       "Value":  "OriginalTag-2"
+                                                                   }
+                                       },
+                        "PlannedAttributes":  {
+                                                  "homeMDB":  {
+                                                                  "Kind":  "String",
+                                                                  "Value":  null,
+                                                                  "Present":  false
+                                                              },
+                                                  "homeMTA":  {
+                                                                  "Kind":  "String",
+                                                                  "Value":  null,
+                                                                  "Present":  false
+                                                              },
+                                                  "msExchHomeServerName":  {
+                                                                               "Kind":  "String",
+                                                                               "Value":  null,
+                                                                               "Present":  false
+                                                                           },
+                                                  "msExchMailboxGuid":  {
+                                                                            "Kind":  "Bytes",
+                                                                            "Value":  null,
+                                                                            "Present":  false
+                                                                        },
+                                                  "mDBUseDefaults":  {
+                                                                         "Kind":  "Bool",
+                                                                         "Value":  null,
+                                                                         "Present":  false
+                                                                     },
+                                                  "msExchRecipientDisplayType":  {
+                                                                                     "Kind":  "Int",
+                                                                                     "Value":  "-2147483642",
+                                                                                     "Present":  true
+                                                                                 },
+                                                  "msExchRecipientTypeDetails":  {
+                                                                                     "Kind":  "Long",
+                                                                                     "Value":  "2147483648",
+                                                                                     "Present":  true
+                                                                                 },
+                                                  "msExchRemoteRecipientType":  {
+                                                                                    "Kind":  "Long",
+                                                                                    "Value":  "1",
+                                                                                    "Present":  true
+                                                                                },
+                                                  "targetAddress":  {
+                                                                        "Kind":  "String",
+                                                                        "Value":  "SMTP:user2@contoso.mail.onmicrosoft.com",
+                                                                        "Present":  true
+                                                                    },
+                                                  "proxyAddresses":  {
+                                                                         "Kind":  "MultiString",
+                                                                         "Value":  [
+                                                                                       "SMTP:user2@contoso.com",
+                                                                                       "smtp:alias2@contoso.com",
+                                                                                       "X500:/o=Synthetic/ou=Gate/cn=User",
+                                                                                       "smtp:user2@contoso.mail.onmicrosoft.com"
+                                                                                   ],
+                                                                         "Present":  true
+                                                                     },
+                                                  "extensionAttribute1":  {
+                                                                              "Kind":  "String",
+                                                                              "Value":  "Converted",
+                                                                              "Present":  true
+                                                                          }
+                                              },
+                        "Licensing":  {
+                                          "Enabled":  true,
+                                          "GroupGuid":  "10000000-0000-0000-0000-000000000001",
+                                          "GroupDN":  "CN=License,OU=Tests,DC=contoso,DC=com",
+                                          "WasMember":  false,
+                                          "DesiredMember":  true
+                                      },
+                        "Retention":  {
+                                          "Enabled":  true,
+                                          "Attribute":  "extensionAttribute1",
+                                          "Value":  "Converted"
+                                      },
+                        "SharedPermissions":  {
+                                                  "SendOnBehalf":  [
+
+                                                                   ],
+                                                  "SendAs":  [
+
+                                                             ],
+                                                  "FullAccess":  [
+
+                                                                 ]
+                                              },
+                        "PreserveCloudMailbox":  false,
+                        "PreserveLicense":  false
+                    }
+                ],
+    "RawFile":  "historical.clixml",
+    "RawHash":  "9c72d626194ef134bd71ae9fb7c5151bbaa8edae380be06179dcea9018416efb"
+}

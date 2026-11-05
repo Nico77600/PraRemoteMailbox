@@ -1,0 +1,25 @@
+{
+    "SchemaVersion":  2,
+    "Operation":  "Convert",
+    "Kind":  "ADVerified",
+    "Environment":  "SYNTHETIC_GATE",
+    "RunId":  "3cdb23504e7e4de19cd76eb81f247582",
+    "BackupFile":  "Convert-SYNTHETIC_GATE-20261104_034340-501c35a4.json",
+    "BackupHash":  "b54a66fcc6a5185cb31ed54b494e561441251622fedba282523129e4a9681553",
+    "SourceBackupHash":  "",
+    "CreatedUtc":  "2026-11-04T02:43:43.6204499Z",
+    "Records":  [
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000001",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000002",
+                        "Operation":  "Convert",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "101"
+                    }
+                ]
+}

@@ -1,5 +1,4 @@
-﻿#Requires -Version 5.1
-#Requires -PSEdition Desktop
+﻿#Requires -Version 7.5
 <#
 .SYNOPSIS
     PRA Remote Mailbox - data-only CLIXML codec of the AD captures (backup part 2 of 2).
@@ -21,7 +20,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.2.0 (format PraDataOnlyClixml-v1, unchanged since 1.3.3)
+    Version : 3.0.0 (format PraDataOnlyClixml-v1, unchanged since 1.3.3)
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -37,8 +36,8 @@ $ErrorActionPreference = 'Stop'
         $cursor = [IO.Path]::GetDirectoryName($cursor)
     }
     $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $verifier -ErrorAction Stop
-    if ([string]$signature.Status -cne 'Valid' -or $null -eq $signature.SignerCertificate -or
-        $signature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
+    if (-not [string]::Equals([string]$signature.Status, 'Valid', [StringComparison]::Ordinal) -or $null -eq $signature.SignerCertificate -or
+        -not [string]::Equals([string]$signature.SignerCertificate.Thumbprint, '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6', [StringComparison]::Ordinal) -or
         $null -eq $signature.TimeStamperCertificate) {
         throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
     }
@@ -59,6 +58,27 @@ $script:PraRawNodes = 1000000
 $script:PraRawCulture = [Globalization.CultureInfo]::InvariantCulture
 $script:PraRawEscape = [regex]'[_\x00-\x1f\x7f-\x9f\uD800-\uDFFF￾￿]'
 $script:PraRawUnescape = [regex]'_x([0-9a-fA-F]{4})_'
+# Closed vocabularies of the codec. On .NET with ICU every culture-sensitive comparison (the PowerShell comparison operators, switch, ...) ignores
+# zero-weight characters, so "Binary<U+0001>" would equal "Binary". Wire and JSON values are therefore compared with explicit ORDINAL comparers only:
+# [string]::Equals(a, b, [StringComparison]::Ordinal) or the ordinal sets below. A value accepted by a set IS one of the literals, byte for byte.
+$script:PraRawCollectionTypes = [Collections.Generic.HashSet[string]]::new([string[]]@('System.Collections.ArrayList',
+    'System.Collections.Specialized.StringCollection','Microsoft.ActiveDirectory.Management.ADPropertyValueCollection'), [StringComparer]::Ordinal)
+$script:PraRawClrTypes = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+foreach ($pair in @('System.String=String','System.Boolean=Boolean','System.Char=Char','System.SByte=Integer','System.Byte=Integer','System.Int16=Integer',
+    'System.UInt16=Integer','System.Int32=Integer','System.UInt32=Integer','System.Int64=Integer','System.UInt64=Integer','System.Single=Float',
+    'System.Double=Float','System.Decimal=Decimal','System.DateTime=DateTime','System.DateTimeOffset=DateTimeOffset','System.TimeSpan=TimeSpan',
+    'System.Guid=Guid','System.Security.Principal.SecurityIdentifier=Sid','System.Byte[]=Bytes')) {
+    $script:PraRawClrTypes.Add($pair.Substring(0, $pair.IndexOf('=', [StringComparison]::Ordinal)), $pair.Substring($pair.IndexOf('=', [StringComparison]::Ordinal) + 1))
+}
+$script:PraRawBinaryScalarTypes = [Collections.Generic.HashSet[string]]::new([string[]]@('Single','Double','SID'), [StringComparer]::Ordinal)
+$script:PraRawScalarTypes = [Collections.Generic.HashSet[string]]::new([string[]]@('String','Boolean','Char','SByte','Byte','Int16','UInt16','Int32','UInt32',
+    'Int64','UInt64','Guid','TimeSpan','DateTime','DateTimeOffset','Decimal'), [StringComparer]::Ordinal)
+$script:PraRawIntegerTypes = [Collections.Generic.HashSet[string]]::new([string[]]@('SByte','Byte','Int16','UInt16','Int32','UInt32','Int64','UInt64','String'), [StringComparer]::Ordinal)
+$script:PraRawRestoreKinds = [Collections.Generic.HashSet[string]]::new([string[]]@('Bytes','String','Bool','Int','Long'), [StringComparer]::Ordinal)
+$script:PraLegacyElementNames = [Collections.Generic.HashSet[string]]::new([string[]]@('Obj','Ref','TN','TNRef','T','ToString','Props','MS','LST','IE','QUE','STK','DCT','En',
+    'Nil','S','C','B','SB','By','I16','U16','I32','U32','I64','U64','Sg','Db','D','DT','TS','G','URI','Version','BA','SS','XD','SBK'), [StringComparer]::Ordinal)
+$script:PraLegacySkipNames = [Collections.Generic.HashSet[string]]::new([string[]]@('TN','TNRef','ToString'), [StringComparer]::Ordinal)
+$script:PraLegacyMemberNames = [Collections.Generic.HashSet[string]]::new([string[]]@('Props','MS'), [StringComparer]::Ordinal)
 
 function Get-PraRawMember {
     param([AllowNull()]$Object,[string]$Name)
@@ -74,9 +94,8 @@ function Get-PraRawMember {
 
 function Test-PraRawCollectionType {
     param([string]$Name)
-    return ($Name -cmatch '^System\.[A-Za-z0-9_.+`\[\], =-]+\[\]$' -or
-        $Name -cin @('System.Collections.ArrayList','System.Collections.Specialized.StringCollection',
-            'Microsoft.ActiveDirectory.Management.ADPropertyValueCollection') -or
+    return ($Name -cmatch '^System\.[A-Za-z0-9_.+`\[\], =-]+\[\]\z' -or
+        $script:PraRawCollectionTypes.Contains($Name) -or
         $Name -cmatch '^System\.Collections\.(Generic\.List|ObjectModel\.(ReadOnlyCollection|Collection))`1\[\[')
 }
 
@@ -90,36 +109,38 @@ function ConvertTo-PraRawDescriptor {
     if ($null -eq $Value) { return ,$result }
     $type = $Value.GetType(); $name = $type.FullName
     $result.Kind = 'Scalar'; $result.Type = $type.Name
-    switch -CaseSensitive ($name) {
-        'System.String' { $result.Value = $Value; return ,$result }
-        'System.Boolean' { $result.Value = if ($Value) { 'true' } else { 'false' }; return ,$result }
-        'System.Char' { $result.Value = ([uint16][char]$Value).ToString($script:PraRawCulture); return ,$result }
-        { $_ -cin @('System.SByte','System.Byte','System.Int16','System.UInt16','System.Int32',
-                'System.UInt32','System.Int64','System.UInt64') } {
+    # The CLR full name is mapped to a closed token through an ordinal dictionary; the switch only ever sees our own tokens.
+    $clrToken = $null
+    $null = $script:PraRawClrTypes.TryGetValue([string]$name, [ref]$clrToken)
+    switch -CaseSensitive ($clrToken) {
+        'String' { $result.Value = $Value; return ,$result }
+        'Boolean' { $result.Value = if ($Value) { 'true' } else { 'false' }; return ,$result }
+        'Char' { $result.Value = ([uint16][char]$Value).ToString($script:PraRawCulture); return ,$result }
+        'Integer' {
             $result.Value = $Value.ToString($script:PraRawCulture); return ,$result
         }
-        { $_ -cin @('System.Single','System.Double') } {
+        'Float' {
             $bytes = [BitConverter]::GetBytes($Value)
             if (-not [BitConverter]::IsLittleEndian) { [array]::Reverse($bytes) }
             $result.Value = [Convert]::ToBase64String($bytes); return ,$result
         }
-        'System.Decimal' {
+        'Decimal' {
             $parts = [Collections.Generic.List[string]]::new()
             foreach ($part in [decimal]::GetBits($Value)) { $parts.Add($part.ToString($script:PraRawCulture)) }
             $result.Value = $parts -join '|'; return ,$result
         }
-        'System.DateTime' { $result.Value = $Value.ToBinary().ToString($script:PraRawCulture); return ,$result }
-        'System.DateTimeOffset' {
+        'DateTime' { $result.Value = $Value.ToBinary().ToString($script:PraRawCulture); return ,$result }
+        'DateTimeOffset' {
             $result.Value = $Value.Ticks.ToString($script:PraRawCulture) + '|' + $Value.Offset.Ticks.ToString($script:PraRawCulture)
             return ,$result
         }
-        'System.TimeSpan' { $result.Value = $Value.Ticks.ToString($script:PraRawCulture); return ,$result }
-        'System.Guid' { $result.Value = $Value.ToString('D'); return ,$result }
-        'System.Security.Principal.SecurityIdentifier' {
+        'TimeSpan' { $result.Value = $Value.Ticks.ToString($script:PraRawCulture); return ,$result }
+        'Guid' { $result.Value = $Value.ToString('D'); return ,$result }
+        'Sid' {
             $bytes = [byte[]]::new($Value.BinaryLength); $Value.GetBinaryForm($bytes,0)
             $result.Type = 'SID'; $result.Value = [Convert]::ToBase64String($bytes); return ,$result
         }
-        'System.Byte[]' {
+        'Bytes' {
             $result.Kind = 'Binary'; $result.Type = 'Byte[]'
             $result.Value = [Convert]::ToBase64String($Value); return ,$result
         }
@@ -138,8 +159,9 @@ function ConvertTo-PraRawDescriptor {
     $collection = $false
     if ($type.IsArray) {
         $collection = $Value.Rank -eq 1 -and $Value.GetLowerBound(0) -eq 0
-    } elseif ((Test-PraRawCollectionType $name) -and
-        $type.Assembly.GetName().Name -cin @('mscorlib','System','Microsoft.ActiveDirectory.Management')) {
+    } elseif (Test-PraRawCollectionType $name) {
+        # The closed list of full type names is the filter. There is no assembly list on purpose: the same type lives in
+        # mscorlib / System under Windows PowerShell 5.1 and in System.Private.CoreLib / System.Collections.* under .NET.
         $collection = $true
     }
     if (-not $collection) { throw "Raw capture: unsupported attribute=$Attribute type=$name GUID=$ObjectGuid; no fallback."
@@ -169,7 +191,7 @@ function ConvertTo-PraRawSnapshot {
     # Native ADUser exposes CLR tracking metadata alongside its returned directory properties.
     # Its property bag is authoritative; ordinary objects/dictionaries retain every member.
     $names = if ($dictionary) { $User.Keys }
-        elseif ($User.GetType().FullName -ceq 'Microsoft.ActiveDirectory.Management.ADUser') { $User.PropertyNames }
+        elseif ([string]::Equals($User.GetType().FullName, 'Microsoft.ActiveDirectory.Management.ADUser', [StringComparison]::Ordinal)) { $User.PropertyNames }
         else { $User.PSObject.Properties.Name }
     foreach ($name in $names) {
         if ($name -isnot [string] -or [string]::IsNullOrEmpty($name) -or $attributes.Contains($name)) {
@@ -178,7 +200,7 @@ function ConvertTo-PraRawSnapshot {
         $value = $null
         try {
             # Direct assignment preserves null/empty/nested arrays and reads each getter once.
-            if ($name -ieq 'ObjectGUID') { $value = $identity }
+            if ([string]::Equals($name, 'ObjectGUID', [StringComparison]::OrdinalIgnoreCase)) { $value = $identity }
             elseif ($dictionary) { $value = $User[$name] }
             else {
                 $property = $User.PSObject.Properties[$name]
@@ -193,7 +215,7 @@ function ConvertTo-PraRawSnapshot {
         }
     }
     $dn = $attributes['DistinguishedName']
-    if ($null -eq $dn -or $dn.Kind -cne 'Scalar' -or $dn.Type -cne 'String') {
+    if ($null -eq $dn -or -not [string]::Equals($dn.Kind, 'Scalar', [StringComparison]::Ordinal) -or -not [string]::Equals($dn.Type, 'String', [StringComparison]::Ordinal)) {
         throw "Raw capture: DistinguishedName must be a captured string, GUID=$key."
     }
     $snapshot = [pscustomobject][ordered]@{ ObjectGUID=$key; DistinguishedName=$dn.Value; CapturedUtc=$CapturedUtc; Attributes=$attributes }
@@ -203,42 +225,44 @@ function ConvertTo-PraRawSnapshot {
 
 function Assert-PraRawScalar {
     param([string]$Kind,[string]$Type,[AllowNull()]$Value)
-    if ($Kind -ceq 'Null') {
-        if ($Type -cne '' -or $null -ne $Value) { throw 'Raw: invalid null descriptor.' }
+    if ([string]::Equals($Kind, 'Null', [StringComparison]::Ordinal)) {
+        if (-not [string]::Equals($Type, '', [StringComparison]::Ordinal) -or $null -ne $Value) { throw 'Raw: invalid null descriptor.' }
         return
     }
-    if ($Kind -ceq 'Collection') {
+    if ([string]::Equals($Kind, 'Collection', [StringComparison]::Ordinal)) {
         if ($null -ne $Value -or -not (Test-PraRawCollectionType $Type)) { throw 'Raw: invalid collection descriptor.' }
         return
     }
     if ($Value -isnot [string]) { throw 'Raw: descriptor Value must be a string.' }
-    if ($Kind -ceq 'Binary' -or $Kind -ceq 'SecurityDescriptor' -or
-        ($Kind -ceq 'Scalar' -and $Type -cin @('Single','Double','SID'))) {
+    if ([string]::Equals($Kind, 'Binary', [StringComparison]::Ordinal) -or [string]::Equals($Kind, 'SecurityDescriptor', [StringComparison]::Ordinal) -or
+        ([string]::Equals($Kind, 'Scalar', [StringComparison]::Ordinal) -and $script:PraRawBinaryScalarTypes.Contains($Type))) {
         $bytes = [Convert]::FromBase64String($Value)
-        if ([Convert]::ToBase64String($bytes) -cne $Value) { throw 'Raw: noncanonical Base64.' }
-        if ($Kind -ceq 'Binary') {
-            if ($Type -cne 'Byte[]') { throw 'Raw: invalid binary type.' }
-        } elseif ($Kind -ceq 'SecurityDescriptor') {
-            if ($Type -notmatch '^System\.(Security\.AccessControl|DirectoryServices)\.[A-Za-z]+(Security|SecurityDescriptor)$') {
+        if (-not [string]::Equals([Convert]::ToBase64String($bytes), $Value, [StringComparison]::Ordinal)) { throw 'Raw: noncanonical Base64.' }
+        if ([string]::Equals($Kind, 'Binary', [StringComparison]::Ordinal)) {
+            if (-not [string]::Equals($Type, 'Byte[]', [StringComparison]::Ordinal)) { throw 'Raw: invalid binary type.' }
+        } elseif ([string]::Equals($Kind, 'SecurityDescriptor', [StringComparison]::Ordinal)) {
+            if ($Type -notmatch '^System\.(Security\.AccessControl|DirectoryServices)\.[A-Za-z]+(Security|SecurityDescriptor)\z') {
                 throw 'Raw: invalid security descriptor type.'
             }
             $security = [Security.AccessControl.RawSecurityDescriptor]::new($bytes,0)
             $copy = [byte[]]::new($security.BinaryLength); $security.GetBinaryForm($copy,0)
-            if ([Convert]::ToBase64String($copy) -cne $Value) { throw 'Raw: security descriptor binary mismatch.' }
-        } elseif ($Type -ceq 'SID') {
+            if (-not [string]::Equals([Convert]::ToBase64String($copy), $Value, [StringComparison]::Ordinal)) { throw 'Raw: security descriptor binary mismatch.' }
+        } elseif ([string]::Equals($Type, 'SID', [StringComparison]::Ordinal)) {
             $sid = [Security.Principal.SecurityIdentifier]::new($bytes,0)
             $copy = [byte[]]::new($sid.BinaryLength); $sid.GetBinaryForm($copy,0)
-            if ([Convert]::ToBase64String($copy) -cne $Value) { throw 'Raw: SID binary mismatch.' }
-        } elseif (($Type -ceq 'Single' -and $bytes.Length -ne 4) -or ($Type -ceq 'Double' -and $bytes.Length -ne 8)) {
+            if (-not [string]::Equals([Convert]::ToBase64String($copy), $Value, [StringComparison]::Ordinal)) { throw 'Raw: SID binary mismatch.' }
+        } elseif (([string]::Equals($Type, 'Single', [StringComparison]::Ordinal) -and $bytes.Length -ne 4) -or ([string]::Equals($Type, 'Double', [StringComparison]::Ordinal) -and $bytes.Length -ne 8)) {
             throw 'Raw: invalid IEEE754 width.'
         }
         return
     }
-    if ($Kind -cne 'Scalar') { throw 'Raw: unknown descriptor kind.' }
+    if (-not [string]::Equals($Kind, 'Scalar', [StringComparison]::Ordinal)) { throw 'Raw: unknown descriptor kind.' }
     $canonical = $Value
+    # Ordinal membership first: after it, $Type is exactly one of the literals below, so the switch cannot match a look-alike.
+    if (-not $script:PraRawScalarTypes.Contains($Type)) { throw "Raw: unknown scalar type '$Type'." }
     switch -CaseSensitive ($Type) {
         'String' { return }
-        'Boolean' { if ($Value -cnotin @('true','false')) { throw 'Raw: invalid Boolean.' }; return }
+        'Boolean' { if (-not ([string]::Equals($Value, 'true', [StringComparison]::Ordinal) -or [string]::Equals($Value, 'false', [StringComparison]::Ordinal))) { throw 'Raw: invalid Boolean.' }; return }
         'Char' { $canonical = ([uint16]::Parse($Value,$script:PraRawCulture)).ToString($script:PraRawCulture) }
         'SByte' { $canonical = ([sbyte]::Parse($Value,$script:PraRawCulture)).ToString($script:PraRawCulture) }
         'Byte' { $canonical = ([byte]::Parse($Value,$script:PraRawCulture)).ToString($script:PraRawCulture) }
@@ -271,7 +295,7 @@ function Assert-PraRawScalar {
         }
         default { throw "Raw: unknown scalar type '$Type'." }
     }
-    if ($canonical -cne $Value) { throw "Raw: noncanonical $Type value." }
+    if (-not [string]::Equals($canonical, $Value, [StringComparison]::Ordinal)) { throw "Raw: noncanonical $Type value." }
 }
 
 function Assert-PraRawDescriptor {
@@ -286,7 +310,7 @@ function Assert-PraRawDescriptor {
         throw 'Raw: invalid descriptor field type.'
     }
     Assert-PraRawScalar $Descriptor.Kind $Descriptor.Type $Descriptor.Value
-    if ($Descriptor.Kind -cne 'Collection' -and $Descriptor.Items.Count -ne 0) { throw 'Raw: scalar has children.' }
+    if (-not [string]::Equals($Descriptor.Kind, 'Collection', [StringComparison]::Ordinal) -and $Descriptor.Items.Count -ne 0) { throw 'Raw: scalar has children.' }
     foreach ($item in $Descriptor.Items) { Assert-PraRawDescriptor $item ($Depth+1) $Budget }
 }
 
@@ -297,7 +321,7 @@ function Assert-PraRawSnapshot {
         if ((Get-PraRawMember $Snapshot $field) -isnot [string]) { throw "Raw: invalid snapshot $field." }
     }
     $guid = [guid]::Parse($Snapshot.ObjectGUID)
-    if ($guid -eq [guid]::Empty -or $guid.ToString('D') -cne $Snapshot.ObjectGUID) { throw 'Raw: invalid snapshot GUID.' }
+    if ($guid -eq [guid]::Empty -or -not [string]::Equals($guid.ToString('D'), $Snapshot.ObjectGUID, [StringComparison]::Ordinal)) { throw 'Raw: invalid snapshot GUID.' }
     if ([string]::IsNullOrWhiteSpace($Snapshot.CapturedUtc)) { throw 'Raw: empty CapturedUtc.' }
     $null = [datetimeoffset]::Parse($Snapshot.CapturedUtc,$script:PraRawCulture)
     if ($Snapshot.Attributes -isnot [Collections.Specialized.OrderedDictionary]) { throw 'Raw: Attributes must be an ordered dictionary.' }
@@ -307,9 +331,11 @@ function Assert-PraRawSnapshot {
         catch { throw "Raw: attribute=$name GUID=$($Snapshot.ObjectGUID). $($_.Exception.Message)" }
     }
     $id = $Snapshot.Attributes['ObjectGUID']; $dn = $Snapshot.Attributes['DistinguishedName']
-    if ($null -eq $id -or $id.Kind -cne 'Scalar' -or $id.Type -cnotin @('Guid','String') -or
-        ([guid]::Parse($id.Value)).ToString('D') -cne $Snapshot.ObjectGUID) { throw 'Raw: metadata/attribute ObjectGUID mismatch.' }
-    if ($null -eq $dn -or $dn.Kind -cne 'Scalar' -or $dn.Type -cne 'String' -or $dn.Value -cne $Snapshot.DistinguishedName) {
+    if ($null -eq $id -or -not [string]::Equals($id.Kind, 'Scalar', [StringComparison]::Ordinal) -or
+        -not ([string]::Equals($id.Type, 'Guid', [StringComparison]::Ordinal) -or [string]::Equals($id.Type, 'String', [StringComparison]::Ordinal)) -or
+        -not [string]::Equals(([guid]::Parse($id.Value)).ToString('D'), $Snapshot.ObjectGUID, [StringComparison]::Ordinal)) { throw 'Raw: metadata/attribute ObjectGUID mismatch.' }
+    if ($null -eq $dn -or -not [string]::Equals($dn.Kind, 'Scalar', [StringComparison]::Ordinal) -or -not [string]::Equals($dn.Type, 'String', [StringComparison]::Ordinal) -or
+        -not [string]::Equals($dn.Value, $Snapshot.DistinguishedName, [StringComparison]::Ordinal)) {
         throw 'Raw: metadata/attribute DistinguishedName mismatch.'
     }
 }
@@ -334,7 +360,7 @@ function Write-PraRawElement {
     param([hashtable]$State,[string]$Tag,[AllowEmptyString()][string]$Name,[AllowNull()]$Value)
     $State.Writer.WriteStartElement($Tag,$script:PraRawNamespace)
     if ($Name) { $State.Writer.WriteStartAttribute('N'); Write-PraRawString $State.Writer $Name; $State.Writer.WriteEndAttribute() }
-    if ($Tag -cne 'Nil') { Write-PraRawString $State.Writer $Value }
+    if (-not [string]::Equals($Tag, 'Nil', [StringComparison]::Ordinal)) { Write-PraRawString $State.Writer $Value }
     $State.Writer.WriteEndElement()
 }
 
@@ -363,7 +389,7 @@ function Write-PraRawProgress {
     param($Context,$Snapshot,[int64]$Bytes,[string]$Stage)
     $name = $Snapshot.DistinguishedName
     $sam = $Snapshot.Attributes['SamAccountName']
-    if ($null -ne $sam -and $sam.Kind -ceq 'Scalar' -and $sam.Type -ceq 'String') { $name = $sam.Value }
+    if ($null -ne $sam -and [string]::Equals($sam.Kind, 'Scalar', [StringComparison]::Ordinal) -and [string]::Equals($sam.Type, 'String', [StringComparison]::Ordinal)) { $name = $sam.Value }
     if ($name.Length -gt 128) { $name = $name.Substring(0,128) }
     $name = [regex]::Replace($name,'[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]','?')
     $process = [Diagnostics.Process]::GetCurrentProcess()
@@ -401,7 +427,7 @@ function Write-PraRawCapture {
             Write-PraRawProgress $Context $snapshot $stream.Position 'WRITE BEGIN'
             Write-PraRawObjectStart $state; $writer.WriteStartElement('MS',$script:PraRawNamespace)
             foreach ($field in @('RawFormat','ObjectGUID','DistinguishedName','CapturedUtc')) {
-                $value = if ($field -ceq 'RawFormat') { $script:PraRawFormat } else { $snapshot.$field }
+                $value = if ([string]::Equals($field, 'RawFormat', [StringComparison]::Ordinal)) { $script:PraRawFormat } else { $snapshot.$field }
                 Write-PraRawElement $state 'S' $field $value
             }
             Write-PraRawObjectStart $state 'Attributes'; $writer.WriteStartElement('DCT',$script:PraRawNamespace)
@@ -434,13 +460,15 @@ function ConvertFrom-PraRawString {
 function Assert-PraRawXmlStart {
     param([Xml.XmlReader]$Reader,[string]$Tag,[string[]]$Attributes=@())
     $null = $Reader.MoveToContent()
-    if ($Reader.NodeType -ne [Xml.XmlNodeType]::Element -or $Reader.LocalName -cne $Tag -or $Reader.NamespaceURI -cne $script:PraRawNamespace) {
+    if ($Reader.NodeType -ne [Xml.XmlNodeType]::Element -or -not [string]::Equals($Reader.LocalName, $Tag, [StringComparison]::Ordinal) -or
+        -not [string]::Equals($Reader.NamespaceURI, $script:PraRawNamespace, [StringComparison]::Ordinal)) {
         throw "Raw XML: expected $Tag, found $($Reader.NodeType)/$($Reader.LocalName)."
     }
     if ($Reader.MoveToFirstAttribute()) {
         do {
-            if ($Reader.Name -ceq 'xmlns' -and $Tag -ceq 'Objs' -and $Reader.Value -ceq $script:PraRawNamespace) { continue }
-            if ($Reader.NamespaceURI -cne '' -or $Reader.Name -cnotin $Attributes) { throw "Raw XML: unexpected attribute $($Reader.Name)." }
+            if ([string]::Equals($Reader.Name, 'xmlns', [StringComparison]::Ordinal) -and [string]::Equals($Tag, 'Objs', [StringComparison]::Ordinal) -and
+                [string]::Equals($Reader.Value, $script:PraRawNamespace, [StringComparison]::Ordinal)) { continue }
+            if (-not [string]::Equals($Reader.NamespaceURI, '', [StringComparison]::Ordinal) -or [Array]::IndexOf($Attributes, $Reader.Name) -lt 0) { throw "Raw XML: unexpected attribute $($Reader.Name)." }
         } while ($Reader.MoveToNextAttribute())
         $null = $Reader.MoveToElement()
     }
@@ -456,7 +484,8 @@ function Read-PraRawStart {
 function Read-PraRawEnd {
     param([Xml.XmlReader]$Reader,[string]$Tag)
     $null = $Reader.MoveToContent()
-    if ($Reader.NodeType -ne [Xml.XmlNodeType]::EndElement -or $Reader.LocalName -cne $Tag -or $Reader.NamespaceURI -cne $script:PraRawNamespace) {
+    if ($Reader.NodeType -ne [Xml.XmlNodeType]::EndElement -or -not [string]::Equals($Reader.LocalName, $Tag, [StringComparison]::Ordinal) -or
+        -not [string]::Equals($Reader.NamespaceURI, $script:PraRawNamespace, [StringComparison]::Ordinal)) {
         throw "Raw XML: expected closing $Tag."
     }
     $Reader.ReadEndElement()
@@ -466,8 +495,8 @@ function Read-PraRawObjectStart {
     param([hashtable]$State,[string]$Name='')
     $reader = $State.Reader
     Assert-PraRawXmlStart $reader 'Obj' @('RefId','N')
-    if ($reader.GetAttribute('RefId') -cne $State.RefId.ToString($script:PraRawCulture) -or
-        (ConvertFrom-PraRawString ([string]$reader.GetAttribute('N'))) -cne $Name -or $reader.IsEmptyElement) {
+    if (-not [string]::Equals($reader.GetAttribute('RefId'), $State.RefId.ToString($script:PraRawCulture), [StringComparison]::Ordinal) -or
+        -not [string]::Equals((ConvertFrom-PraRawString ([string]$reader.GetAttribute('N'))), $Name, [StringComparison]::Ordinal) -or $reader.IsEmptyElement) {
         throw 'Raw XML: object identity/name/sequence invalid; shared references are forbidden.'
     }
     $State.RefId++; $reader.ReadStartElement()
@@ -476,16 +505,16 @@ function Read-PraRawObjectStart {
 function Read-PraRawElement {
     param([Xml.XmlReader]$Reader,[string]$Tag,[string]$Name)
     Assert-PraRawXmlStart $Reader $Tag @('N')
-    if ((ConvertFrom-PraRawString ([string]$Reader.GetAttribute('N'))) -cne $Name) { throw "Raw XML: expected member $Name." }
-    if ($Tag -ceq 'Nil') {
-        if ($Reader.ReadElementContentAsString() -cne '') { throw 'Raw XML: nonempty Nil.' }
+    if (-not [string]::Equals((ConvertFrom-PraRawString ([string]$Reader.GetAttribute('N'))), $Name, [StringComparison]::Ordinal)) { throw "Raw XML: expected member $Name." }
+    if ([string]::Equals($Tag, 'Nil', [StringComparison]::Ordinal)) {
+        if (-not [string]::Equals($Reader.ReadElementContentAsString(), '', [StringComparison]::Ordinal)) { throw 'Raw XML: nonempty Nil.' }
         return $null
     }
     # One intrinsic scalar only; never materialize a snapshot XML string or the whole file.
     $value = $Reader.ReadElementContentAsString()
-    if ($Tag -ceq 'S') { return (ConvertFrom-PraRawString $value) }
+    if ([string]::Equals($Tag, 'S', [StringComparison]::Ordinal)) { return (ConvertFrom-PraRawString $value) }
     $number = [int]::Parse($value,$script:PraRawCulture)
-    if ($number.ToString($script:PraRawCulture) -cne $value) { throw 'Raw XML: noncanonical Int32.' }
+    if (-not [string]::Equals($number.ToString($script:PraRawCulture), $value, [StringComparison]::Ordinal)) { throw 'Raw XML: noncanonical Int32.' }
     return $number
 }
 
@@ -495,12 +524,12 @@ function Read-PraRawNode {
     if ($Depth -gt $script:PraRawDepth -or $Budget.Left -lt 0) { throw 'Raw XML: descriptor depth/node limit.' }
     $reader = $State.Reader
     Read-PraRawObjectStart $State; Read-PraRawStart $reader 'MS'
-    if ((Read-PraRawElement $reader 'I32' 'Depth') -ne $Depth) { throw 'Raw XML: invalid descriptor preorder depth.' }
+    if ((-not (Test-PraOrdinalIgnoreCaseEqual (Read-PraRawElement $reader 'I32' 'Depth') $Depth))) { throw 'Raw XML: invalid descriptor preorder depth.' }
     $kind = Read-PraRawElement $reader 'S' 'Kind'; $type = Read-PraRawElement $reader 'S' 'Type'
     $null = $reader.MoveToContent(); $tag = $reader.LocalName
-    if ($tag -cnotin @('S','Nil')) { throw 'Raw XML: invalid descriptor value type.' }
+    if (-not ([string]::Equals($tag, 'S', [StringComparison]::Ordinal) -or [string]::Equals($tag, 'Nil', [StringComparison]::Ordinal))) { throw 'Raw XML: invalid descriptor value type.' }
     $value = Read-PraRawElement $reader $tag 'Value'; $count = Read-PraRawElement $reader 'I32' 'Count'
-    if ($count -lt 0 -or $count -gt $Budget.Left -or ($kind -cne 'Collection' -and $count -ne 0)) { throw 'Raw XML: invalid item cardinality.' }
+    if ($count -lt 0 -or $count -gt $Budget.Left -or (-not [string]::Equals($kind, 'Collection', [StringComparison]::Ordinal) -and $count -ne 0)) { throw 'Raw XML: invalid item cardinality.' }
     Read-PraRawEnd $reader 'MS'; Read-PraRawEnd $reader 'Obj'
     $items = [Collections.Generic.List[object]]::new()
     for ($i=0; $i -lt $count; $i++) { $items.Add((Read-PraRawNode $State ($Depth+1) $Budget)) }
@@ -511,7 +540,7 @@ function Read-PraRawSnapshot {
     param([hashtable]$State)
     $reader = $State.Reader
     Read-PraRawObjectStart $State; Read-PraRawStart $reader 'MS'
-    if ((Read-PraRawElement $reader 'S' 'RawFormat') -cne $script:PraRawFormat) { throw 'Raw XML: format marker mismatch.' }
+    if (-not [string]::Equals((Read-PraRawElement $reader 'S' 'RawFormat'), $script:PraRawFormat, [StringComparison]::Ordinal)) { throw 'Raw XML: format marker mismatch.' }
     $guid = Read-PraRawElement $reader 'S' 'ObjectGUID'; $dn = Read-PraRawElement $reader 'S' 'DistinguishedName'
     $utc = Read-PraRawElement $reader 'S' 'CapturedUtc'
     Read-PraRawObjectStart $State 'Attributes'; Read-PraRawStart $reader 'DCT'
@@ -546,7 +575,7 @@ function Assert-PraRawExpected {
     if ($Actual.Attributes.Count -ne $Expected.Attributes.Count) { throw 'Raw: creation roundtrip attribute count mismatch.' }
     $names = @($Expected.Attributes.Keys); $index = 0
     foreach ($name in $Actual.Attributes.Keys) {
-        if ($name -cne $names[$index]) { throw 'Raw: creation roundtrip attribute name/order mismatch.' }
+        if (-not [string]::Equals($name, $names[$index], [StringComparison]::Ordinal)) { throw 'Raw: creation roundtrip attribute name/order mismatch.' }
         Assert-PraRawDescriptorEqual $Actual.Attributes[$name] $Expected.Attributes[$name] $name
         $index++
     }
@@ -565,25 +594,27 @@ function Assert-PraRawRecord {
         $name = if ($states -is [Collections.IDictionary]) { $entry.Key } else { $entry.Name }
         if (-not $Snapshot.Attributes.Contains($name)) { throw "Raw/JSON: attribute not captured, $name." }
         $state = $entry.Value; $descriptor = $Snapshot.Attributes[$name]
-        $present = $descriptor.Kind -cne 'Null' -and
-            -not ($descriptor.Kind -ceq 'Collection' -and $descriptor.Items.Count -eq 0) -and
-            -not ($descriptor.Kind -ceq 'Binary' -and $descriptor.Value.Length -eq 0) -and
-            -not ($descriptor.Kind -ceq 'Scalar' -and $descriptor.Type -ceq 'String' -and $descriptor.Value.Length -eq 0)
+        $present = -not [string]::Equals($descriptor.Kind, 'Null', [StringComparison]::Ordinal) -and
+            -not ([string]::Equals($descriptor.Kind, 'Collection', [StringComparison]::Ordinal) -and $descriptor.Items.Count -eq 0) -and
+            -not ([string]::Equals($descriptor.Kind, 'Binary', [StringComparison]::Ordinal) -and $descriptor.Value.Length -eq 0) -and
+            -not ([string]::Equals($descriptor.Kind, 'Scalar', [StringComparison]::Ordinal) -and [string]::Equals($descriptor.Type, 'String', [StringComparison]::Ordinal) -and $descriptor.Value.Length -eq 0)
         $storedPresent = Get-PraRawMember $state 'Present'
-        if ($storedPresent -isnot [bool] -or $storedPresent -ne $present) { throw "Raw/JSON: presence mismatch, attribute=$name." }
+        if ($storedPresent -isnot [bool] -or (-not (Test-PraOrdinalIgnoreCaseEqual $storedPresent $present))) { throw "Raw/JSON: presence mismatch, attribute=$name." }
         $stored = Get-PraRawMember $state 'Value'; $kind = Get-PraRawMember $state 'Kind'
         if (-not $present) {
             if ($null -ne $stored) { throw "Raw/JSON: absent value mismatch, attribute=$name." }
             continue
         }
-        if ($kind -ceq 'MultiString') {
+        if ([string]::Equals($kind, 'MultiString', [StringComparison]::Ordinal)) {
             $values = [Collections.Generic.List[string]]::new()
-            $items = if ($descriptor.Kind -ceq 'Collection') { $descriptor.Items } else { ,$descriptor }
+            $items = if ([string]::Equals($descriptor.Kind, 'Collection', [StringComparison]::Ordinal)) { $descriptor.Items } else { ,$descriptor }
             foreach ($item in $items) {
-                if ($item.Kind -cne 'Scalar' -or $item.Type -cne 'String') { throw "Raw/JSON: MultiString type mismatch, $name." }
+                if (-not [string]::Equals($item.Kind, 'Scalar', [StringComparison]::Ordinal) -or -not [string]::Equals($item.Type, 'String', [StringComparison]::Ordinal)) { throw "Raw/JSON: MultiString type mismatch, $name." }
                 $values.Add($item.Value)
             }
-            $actual = @($values | Sort-Object -CaseSensitive); $expected = @($stored | Sort-Object -CaseSensitive)
+            # Ordinal order on both sides (Sort-Object uses the culture collation, which ties look-alike strings in an arbitrary order).
+            $actual = $values.ToArray(); [Array]::Sort($actual, [StringComparer]::Ordinal)
+            $expected = @($stored); $expectedKeys = [string[]]@($expected | ForEach-Object { [string]$_ }); [Array]::Sort([Array]$expectedKeys, [Array]$expected, [Collections.IComparer][StringComparer]::Ordinal)
             if ($actual.Count -ne $expected.Count) { throw "Raw/JSON: MultiString count mismatch, $name." }
             for ($i=0; $i -lt $actual.Count; $i++) {
                 if (-not [object]::Equals($actual[$i],$expected[$i])) { throw "Raw/JSON: MultiString value mismatch, $name." }
@@ -591,16 +622,18 @@ function Assert-PraRawRecord {
             continue
         }
         $scalar = $descriptor
-        if ($scalar.Kind -ceq 'Collection' -and $scalar.Items.Count -eq 1) { $scalar = $scalar.Items[0] }
+        if ([string]::Equals($scalar.Kind, 'Collection', [StringComparison]::Ordinal) -and $scalar.Items.Count -eq 1) { $scalar = $scalar.Items[0] }
         $actual = $null
+        # Ordinal membership first: after it, $kind is exactly one of the literals below, so the switch cannot match a look-alike.
+        if ($null -eq $kind -or -not $script:PraRawRestoreKinds.Contains([string]$kind)) { throw "Raw/JSON: unknown restoration kind, attribute=$name." }
         switch -CaseSensitive ($kind) {
-            'Bytes' { if ($descriptor.Kind -ceq 'Binary') { $actual = $descriptor.Value } }
-            'String' { if ($scalar.Kind -ceq 'Scalar' -and $scalar.Type -ceq 'String') { $actual = $scalar.Value } }
-            'Bool' { if ($scalar.Kind -ceq 'Scalar' -and $scalar.Type -ceq 'Boolean') { $actual = $scalar.Value -ceq 'true' } }
-            { $_ -cin @('Int','Long') } {
-                if ($scalar.Kind -ceq 'Scalar' -and $scalar.Type -cin @('SByte','Byte','Int16','UInt16','Int32','UInt32','Int64','UInt64','String')) {
+            'Bytes' { if ([string]::Equals($descriptor.Kind, 'Binary', [StringComparison]::Ordinal)) { $actual = $descriptor.Value } }
+            'String' { if ([string]::Equals($scalar.Kind, 'Scalar', [StringComparison]::Ordinal) -and [string]::Equals($scalar.Type, 'String', [StringComparison]::Ordinal)) { $actual = $scalar.Value } }
+            'Bool' { if ([string]::Equals($scalar.Kind, 'Scalar', [StringComparison]::Ordinal) -and [string]::Equals($scalar.Type, 'Boolean', [StringComparison]::Ordinal)) { $actual = [string]::Equals($scalar.Value, 'true', [StringComparison]::Ordinal) } }
+            { [string]::Equals($_, 'Int', [StringComparison]::Ordinal) -or [string]::Equals($_, 'Long', [StringComparison]::Ordinal) } {
+                if ([string]::Equals($scalar.Kind, 'Scalar', [StringComparison]::Ordinal) -and $script:PraRawIntegerTypes.Contains($scalar.Type)) {
                     $actual = ([int64]::Parse($scalar.Value,$script:PraRawCulture)).ToString($script:PraRawCulture)
-                    if ($kind -ceq 'Int') { $null = [int32]::Parse($actual,$script:PraRawCulture) }
+                    if ([string]::Equals($kind, 'Int', [StringComparison]::Ordinal)) { $null = [int32]::Parse($actual,$script:PraRawCulture) }
                 }
             }
             default { throw "Raw/JSON: unknown restoration kind, attribute=$name." }
@@ -610,7 +643,7 @@ function Assert-PraRawRecord {
     $usn = Get-PraRawMember $Record 'CapturedUsnChanged'
     if ($null -ne $usn) {
         $descriptor = $Snapshot.Attributes['uSNChanged']
-        if ($null -eq $descriptor -or $descriptor.Kind -cne 'Scalar' -or $descriptor.Value -cne $usn) { throw 'Raw/JSON: uSNChanged mismatch.' }
+        if ($null -eq $descriptor -or -not [string]::Equals($descriptor.Kind, 'Scalar', [StringComparison]::Ordinal) -or -not [string]::Equals($descriptor.Value, $usn, [StringComparison]::Ordinal)) { throw 'Raw/JSON: uSNChanged mismatch.' }
     }
 }
 
@@ -618,13 +651,11 @@ function Skip-PraLegacyValue {
     param([Xml.XmlReader]$Reader)
     $null = $Reader.MoveToContent(); $depth = $Reader.Depth
     if ($Reader.NodeType -ne [Xml.XmlNodeType]::Element) { throw 'Legacy CLIXML: expected value.' }
-    $allowed = @('Obj','Ref','TN','TNRef','T','ToString','Props','MS','LST','IE','QUE','STK','DCT','En',
-        'Nil','S','C','B','SB','By','I16','U16','I32','U32','I64','U64','Sg','Db','D','DT','TS','G','URI','Version','BA','SS','XD','SBK')
     while ($true) {
         if ($Reader.Depth -gt 256) { throw 'Legacy CLIXML: XML depth exceeds 256; no graph inflation fallback.' }
         if ($Reader.NodeType -eq [Xml.XmlNodeType]::Element) {
-            if ($Reader.NamespaceURI -cne $script:PraRawNamespace -or $Reader.LocalName -cnotin $allowed) { throw 'Legacy CLIXML: unsupported XML node.' }
-            if ($Reader.LocalName -ceq 'BA') {
+            if (-not [string]::Equals($Reader.NamespaceURI, $script:PraRawNamespace, [StringComparison]::Ordinal) -or -not $script:PraLegacyElementNames.Contains($Reader.LocalName)) { throw 'Legacy CLIXML: unsupported XML node.' }
+            if ([string]::Equals($Reader.LocalName, 'BA', [StringComparison]::Ordinal)) {
                 $buffer = [byte[]]::new(4096)
                 while ($Reader.ReadElementContentAsBase64($buffer,0,$buffer.Length) -gt 0) { }
                 if ($Reader.Depth -le $depth) { return }
@@ -641,7 +672,7 @@ function Skip-PraLegacyValue {
 function Add-PraRawIdentity {
     param([hashtable]$State,[string]$Guid)
     $key = ([guid]::Parse($Guid)).ToString('D')
-    if ($key -ceq [guid]::Empty.ToString('D') -or -not $State.Records.ContainsKey($key) -or -not $State.Seen.Add($key)) {
+    if ([string]::Equals($key, [guid]::Empty.ToString('D'), [StringComparison]::Ordinal) -or -not $State.Records.ContainsKey($key) -or -not $State.Seen.Add($key)) {
         throw "Raw/JSON: unexpected/duplicate logical user GUID=$key."
     }
     $State.Guids.Add($key)
@@ -665,22 +696,28 @@ function Read-PraLegacyObject {
     $reader = $State.Reader
     Assert-PraRawXmlStart $reader 'Obj' @('RefId','N')
     $refId = $reader.GetAttribute('RefId')
-    if ($null -eq $refId -or $refId -cnotmatch '^(0|[1-9][0-9]*)$' -or $reader.IsEmptyElement) { throw 'Legacy CLIXML: invalid logical object.' }
+    if ($null -eq $refId -or $refId -cnotmatch '^(0|[1-9][0-9]*)\z' -or $reader.IsEmptyElement) { throw 'Legacy CLIXML: invalid logical object.' }
     $reader.ReadStartElement(); $guid = $null; $wrapper = $false; $members = $false
     while ($reader.MoveToContent() -eq [Xml.XmlNodeType]::Element) {
-        switch -CaseSensitive ($reader.LocalName) {
-            { $_ -cin @('TN','TNRef','ToString') } { Skip-PraLegacyValue $reader }
+        # The element name is mapped to a closed token with ordinal comparers; the switch only ever sees our own tokens.
+        $localName = $reader.LocalName
+        $legacyToken = if ($script:PraLegacySkipNames.Contains($localName)) { 'Skip' }
+            elseif ([string]::Equals($localName, 'LST', [StringComparison]::Ordinal)) { 'LST' }
+            elseif ($script:PraLegacyMemberNames.Contains($localName)) { 'Members' }
+            else { '' }
+        switch -CaseSensitive ($legacyToken) {
+            'Skip' { Skip-PraLegacyValue $reader }
             'LST' {
                 if (-not $AllowWrapper -or $wrapper -or $members) { throw 'Legacy CLIXML: ambiguous/nested user wrapper.' }
                 $wrapper = $true; Read-PraRawStart $reader 'LST'
                 while ($reader.MoveToContent() -eq [Xml.XmlNodeType]::Element) {
-                    if ($reader.LocalName -ceq 'Ref') { Add-PraRawIdentity $State (Read-PraLegacyReference $State) }
-                    elseif ($reader.LocalName -ceq 'Obj') { $null = Read-PraLegacyObject $State $false }
+                    if ([string]::Equals($reader.LocalName, 'Ref', [StringComparison]::Ordinal)) { Add-PraRawIdentity $State (Read-PraLegacyReference $State) }
+                    elseif ([string]::Equals($reader.LocalName, 'Obj', [StringComparison]::Ordinal)) { $null = Read-PraLegacyObject $State $false }
                     else { throw 'Legacy CLIXML: non-object logical user in wrapper.' }
                 }
                 Read-PraRawEnd $reader 'LST'
             }
-            { $_ -cin @('Props','MS') } {
+            'Members' {
                 if ($wrapper) { throw 'Legacy CLIXML: wrapper also has user properties.' }
                 $members = $true; $container = $reader.LocalName
                 Assert-PraRawXmlStart $reader $container
@@ -688,12 +725,12 @@ function Read-PraLegacyObject {
                 $reader.ReadStartElement()
                 while ($reader.MoveToContent() -eq [Xml.XmlNodeType]::Element) {
                     $name = ConvertFrom-PraRawString ([string]$reader.GetAttribute('N'))
-                    if ($name -ieq 'ObjectGUID') {
+                    if ([string]::Equals($name, 'ObjectGUID', [StringComparison]::OrdinalIgnoreCase)) {
                         if ($null -ne $guid) { throw 'Legacy CLIXML: duplicate direct ObjectGUID.' }
-                        if ($reader.LocalName -ceq 'G') {
+                        if ([string]::Equals($reader.LocalName, 'G', [StringComparison]::Ordinal)) {
                             Assert-PraRawXmlStart $reader 'G' @('N')
                             $guid = ([guid]::Parse($reader.ReadElementContentAsString())).ToString('D')
-                        } elseif ($reader.LocalName -ceq 'Ref') { $guid = Read-PraLegacyReference $State }
+                        } elseif ([string]::Equals($reader.LocalName, 'Ref', [StringComparison]::Ordinal)) { $guid = Read-PraLegacyReference $State }
                         else { throw 'Legacy CLIXML: identity is not a direct typed GUID or provable reference; rejected.' }
                     } else { Skip-PraLegacyValue $reader }
                 }
@@ -724,17 +761,17 @@ function Test-PraRawCapture {
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records,
         [Parameter(Mandatory)][AllowEmptyString()][string]$RawFormat,
         [AllowEmptyCollection()][object[]]$ExpectedSnapshots)
-    if ($RawFormat -cnotin @('',$script:PraRawFormat)) { throw "Raw: unsupported format '$RawFormat'." }
+    if (-not ([string]::Equals($RawFormat, '', [StringComparison]::Ordinal) -or [string]::Equals($RawFormat, $script:PraRawFormat, [StringComparison]::Ordinal))) { throw "Raw: unsupported format '$RawFormat'." }
     if ($Records.Count -eq 0) { throw 'Raw: empty Records.' }
     $recordMap = @{}; $expectedMap = @{}
     foreach ($record in $Records) {
         $key = ([guid]::Parse([string](Get-PraRawMember $record 'ObjectGUID'))).ToString('D')
-        if ($key -ceq [guid]::Empty.ToString('D') -or $recordMap.ContainsKey($key)) { throw 'Raw: invalid/duplicate JSON GUID.' }
+        if ([string]::Equals($key, [guid]::Empty.ToString('D'), [StringComparison]::Ordinal) -or $recordMap.ContainsKey($key)) { throw 'Raw: invalid/duplicate JSON GUID.' }
         $recordMap[$key] = $record
     }
     $compare = $PSBoundParameters.ContainsKey('ExpectedSnapshots')
     if ($compare) {
-        if ($RawFormat -ceq '' -or $ExpectedSnapshots.Count -ne $Records.Count) { throw 'Raw: ExpectedSnapshots format/cardinality mismatch.' }
+        if ([string]::Equals($RawFormat, '', [StringComparison]::Ordinal) -or $ExpectedSnapshots.Count -ne $Records.Count) { throw 'Raw: ExpectedSnapshots format/cardinality mismatch.' }
         foreach ($snapshot in $ExpectedSnapshots) {
             Assert-PraRawSnapshot $snapshot
             if ($expectedMap.ContainsKey($snapshot.ObjectGUID) -or -not $recordMap.ContainsKey($snapshot.ObjectGUID)) { throw 'Raw: duplicate/unexpected expected GUID.' }
@@ -750,13 +787,13 @@ function Test-PraRawCapture {
         $settings.CheckCharacters = $true; $settings.ConformanceLevel = [Xml.ConformanceLevel]::Document
         $reader = [Xml.XmlReader]::Create($stream,$settings)
         Assert-PraRawXmlStart $reader 'Objs' @('Version')
-        if ($reader.GetAttribute('Version') -cne '1.1.0.1' -or $reader.IsEmptyElement) { throw 'Raw: invalid/empty CLIXML root.' }
+        if (-not [string]::Equals($reader.GetAttribute('Version'), '1.1.0.1', [StringComparison]::Ordinal) -or $reader.IsEmptyElement) { throw 'Raw: invalid/empty CLIXML root.' }
         $reader.ReadStartElement()
         $state = @{Reader=$reader; RefId=[int64]0; Records=$recordMap; Guids=[Collections.Generic.List[string]]::new();
             Seen=[Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal); Identities=@{}}
         $wrapper = $false; $topCount = 0
         while ($reader.MoveToContent() -eq [Xml.XmlNodeType]::Element) {
-            if ($RawFormat -ceq $script:PraRawFormat) {
+            if ([string]::Equals($RawFormat, $script:PraRawFormat, [StringComparison]::Ordinal)) {
                 $snapshot = Read-PraRawSnapshot $state
                 Add-PraRawIdentity $state $snapshot.ObjectGUID
                 Assert-PraRawRecord $snapshot $recordMap[$snapshot.ObjectGUID]
@@ -765,7 +802,7 @@ function Test-PraRawCapture {
                 $snapshot = $null
             } else {
                 if ($wrapper) { throw 'Legacy CLIXML: wrapper mixed with root sequence.' }
-                if ($reader.LocalName -ceq 'Ref') { Add-PraRawIdentity $state (Read-PraLegacyReference $state) }
+                if ([string]::Equals($reader.LocalName, 'Ref', [StringComparison]::Ordinal)) { Add-PraRawIdentity $state (Read-PraLegacyReference $state) }
                 else { $wrapper = Read-PraLegacyObject $state ($topCount -eq 0) }
                 $topCount++
             }
@@ -785,10 +822,10 @@ function Test-PraRawCapture {
 Export-ModuleMember -Function ConvertTo-PraRawSnapshot,Write-PraRawCapture,Test-PraRawCapture
 
 # SIG # Begin signature block
-# MIIghgYJKoZIhvcNAQcCoIIgdzCCIHMCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBg1436t7I8BK3A
-# vBE8oE2z5dhzZURSP3+b7zd6V08y2aCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDTUxk8Cpm8HkVu
+# CPDFXIwDYsdvIcdATPo5PdQzqIG7J6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -860,103 +897,133 @@ Export-ModuleMember -Function ConvertTo-PraRawSnapshot,Write-PraRawCapture,Test-
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYISbTCCEmkCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDn8w1u79fq
-# RgZi1oiwfplz2kor7AtDtBHZ2zP3pbER/zANBgkqhkiG9w0BAQEFAASCAgBgwv89
-# GD4VCS8ngAMZOlOkYtovjrsYhITiZFYpYUpfnII2o2yzpP5ZPUpJxavDko/mOkLP
-# iwJG1NpmjZO7kTZCfmB1XHIjXupebHPV83ZPoL4O8CW6Zres5Sy9XwsQ56KQgiyl
-# 5v8sCtLuCTyXYW5sTguorRIB1JsYR9S4gqrXNnls4W+WF+lj77PB7YNUZN81BPky
-# FoSbDSdjGF+nQaDOviHHKLBb79Eul3Yjbsh85NMxvTlfy1BWpYJlZKsVd9A03gNW
-# XULGy1WwxFlCNA8+kx0LgJygayqL8m1lhmZgK/kaVpT0nGPw3MbyqLJG9kfnl8RR
-# 2mxdZ/uRS2CvuHAdKXiPw8/GbRXcC+G3sbQCTLPRoXs6C2C0N8jQvIPN/J56ltt2
-# Id/QTrcGFCP+XMon0OT1YlxwcJAA3ajplZv8IOT/BNKq5y/fpPSGGAVgV10dHdFU
-# btQIHQI4xHpFzKSX9jchQbPo+H0mBdy02rKNyvlMSyGaZymRrguNpfaEv8rcAD38
-# VL/TgVY085eNayM5/cEWrrW5X8nCGn3aWavkQE5QGSQ8A/CT3X+kH9tJ/i1exPRq
-# /fIOhzpPABFLe3IsuZTz6YaZetIpenhJ42nzVEX8hhBpUv9yGF7zi5KRYdIoucXx
-# MiQlxVSap0m6POUjADCTj+tpQVhc1xk3yH4HC6GCDyowgg8mBgorBgEEAYI3AwMB
-# MYIPFjCCDxIGCSqGSIb3DQEHAqCCDwMwgg7/AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBThsyEUa6X
+# 8YMR0DhEJDEF8XuQQ+TKWkSibutxwgCv2TANBgkqhkiG9w0BAQEFAASCAgAWqPAo
+# rQToc1F1gIMkowo8iAbVtK2jqyWNHU0Ixl7OmyjQMasiGX2xtDEj/ZCUFGEEssTB
+# wuXbjzz3i6KLUa58sz71Ku9qdBC5uKaf82YhtJrUnOmtNhHxeDvqdmbt5s4MZCow
+# 01nwp6YoY+ieEOLcNpHs/AgieGpdSkl/LpsBAwk2Y6St/zFovXUM7CN3/XxJI/Eo
+# XG+Kf/tOvApKjLS8asCGxrD8LHoIzGiSSJYGVBlnSfSdsGYrcX4H13+FlaiqwQ2d
+# RqzJZychUYW709zfd9Q88c4d/+dGOa0W0g9SVzTXPR0C6WwqJkBWTC9Z+UxurPnZ
+# YaK4DCwA8U+1NvbQzKW4o728g1sL8cwKZQG/ZprTWs0DwMvMccoKXI/qUHVHVQ8n
+# soSblfYMVti8sKCAq1y7L3ZHs2dVn3Fb4X/gZGcJ1chztd2XN6d2CXrZoq9IorqT
+# +BYzoA/4cRiyfJoSyeechLZw9P7mJkS0HIUj4PmbnqCkwJkfmYkjKNK8uwQP4FWa
+# dO03IpCz2VFssK9lrbNscAfbSnJX+t5TMsWQ0sE5pQiCgOEHH8H82TXI/BayqCS3
+# 25l0ktPrnoyuGP629Qr6UfyC1ufifnHLjE/JWppMmidk70+WjeIJ/Z2kB5Fc4nOv
+# aUsu3yVl4GkTYerlG+XVwWy7pYlgDTm5VToh6qGCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIES79wxrMjSBsHfQ/Y9w9eP+GSDg0LfGcDTzl+p7I7PBAggfOMFh4A1M
-# VxgPMjAyNjEwMTUyMTIzMDZaMAMCAQECEAcp0UEVAQcEdy9EUxkP4HSgggwAMIIE
-# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
+# BAIBBQAEIBrGN+m7AxLiaTfGj8hTFYAM0g0PouuhV9bENtHhb6y2AghRiNUJzMDP
+# FBgPMjAyNjExMDUwODA3MzBaMAMCAQECEA+IDxknEt8sWg32QCJT9iCgghGnMIIE
+# 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
-# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
-# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
-# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
-# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
-# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
-# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
-# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
-# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
-# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
-# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
-# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
-# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
-# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
-# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
-# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
-# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
-# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
-# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
-# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
-# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
-# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
-# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
-# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
-# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
-# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
-# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
-# VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
-# cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
-# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
-# A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
-# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
-# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
-# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
-# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
-# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
-# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
-# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
-# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
-# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
-# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
-# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
-# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
-# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
-# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
-# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
-# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
-# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
+# BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSAyMB4XDTI2MDYxMjE3MjI0NloXDTM2MDYwOTE3MjI0NVow
+# bjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9u
+# MREwDwYDVQQKDAhTU0wgQ29ycDEqMCgGA1UEAwwhU1NMLmNvbSBUaW1lc3RhbXBp
+# bmcgVW5pdCAyMDI2IEUxMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE6CWLuGYT
+# LkiSOPMLNskOBthXsIhRSA46feOQwvSLcDaNh6vxUzBKEx1KdFBRFs7OHrnH/K0V
+# A6MbDQIFpUg0PaOCAVIwggFOMB8GA1UdIwQYMBaAFHCaZcFDgKP86bFkiW7xMJwJ
+# Icl8ME0GCCsGAQUFBwEBBEEwPzA9BggrBgEFBQcwAoYxaHR0cDovL2NlcnQuc3Ns
+# LmNvbS9TU0wuY29tLXRpbWVTdGFtcGluZy1JLVIyLmNlcjBRBgNVHSAESjBIMDwG
+# DCsGAQQBgqkwAQMGATAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29t
+# L3JlcG9zaXRvcnkwCAYGZ4EMAQQCMBYGA1UdJQEB/wQMMAoGCCsGAQUFBwMIMEIG
+# A1UdHwQ7MDkwN6A1oDOGMWh0dHA6Ly9jcmxzLnNzbC5jb20vU1NMLmNvbS10aW1l
+# U3RhbXBpbmctSS1SMi5jcmwwHQYDVR0OBBYEFCesA1a6KGq6FzuDPUB/eagk7MM8
+# MA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAT3ZuzvwDnsIZTXBn
+# +hjmuBXgzB12fbYxT9uYe6ZvhvpbZWKcyDQgacETkPw8k6yeqnYCYyFZ063lMPEq
+# AhAD2nMG614Zh7PtHW9DWqfsgivxbPYBeN+t7UxgkYT3expbWMdPEqBtWVyHOvLc
+# KvMxgJWfJjANwVkwVDfky/j7cf28+iimN8PKc7S/u8/LenRRnV2W2YfncRnkz9Cf
+# s5nRDzaZguiHrrp2GxwgnNQSH4GBjHOl3PzLsnVbGoZKi4ZEjgXups4mGGOK7+GB
+# 2HAlQn+OS944cHqlkH0gElt2WezoCNRpELph9qaxuBnjSEqXWWfgE6yGBwO0uxKN
+# qpWVTHmAwr6SvBPofxubXIuEn9ivR4CLOuAxUSrJ41ZBg/qqG0oJjF6GkRKbxq7c
+# yWSkEZYJhmKCg2Hg5fXHagOxiwbmn5JPZ1vhWCrbk3v/dTx2gvTK5+erC5H9/rTc
+# ljUI776yd2rfhjfkpvyAsbtXs4D7nrnw8i9wor5+fdtRSJBVxqzLmykFftoL0Up2
+# Q++tyKCUdribdcnrB4HKS3s+t3AjdcbA06DCL8GifQi9fL0yRBRNlA4o6BP+Sr75
+# 5MaCNjURYZDvDyxJHBBT7cqjZIwsiR8s+6860noFbBBtdge2Iw7CPC/1Q31I27hV
+# olS7B0yao3v8X2MtWy3msZlXTcEwggXdMIIDxaADAgECAgh7LJvTFoAymTANBgkq
+# hkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNV
+# BAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8GA1UEAwwo
+# U1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAeFw0xNjAy
+# MTIxNzM5MzlaFw00MTAyMTIxNzM5MzlaMHwxCzAJBgNVBAYTAlVTMQ4wDAYDVQQI
+# DAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBvcmF0
+# aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRob3Jp
+# dHkgUlNBMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA+Q/doyt9y9Aq
+# /uxnhabnLhu6d+Hj9a+k7PpKXZHEV0drGHdrdvL9k+Q9D8IWngtmw1aUnheDhc5W
+# 7/IW/QBi9SIJVOhlF05BueBPRpeqG8i4bmJeabFf2yoCfvxsyvNB2O3Q6Pw/YUjt
+# sAMUHRAOSxngu07shmX/NvNeZwILnYZVYf16OO3+4hkAt2+hUGJ1dDyg+sglkrRu
+# eiLH+B6h47LdkTGrKx0E/6VKBDfphaQzK/3i1lU0fBmkSmjHsqjTt8qhk4jrwZe8
+# jPkd2SKEJHTHBD1qqSmTzOu4W+H+XyWqNFjIwSNUnRuYEcM4nH49hmylD0CGfAL0
+# XAJPKMuucZ8POsgz/hElNer8usVgPdl8GNWyqdN1eANyIso6wx/vLOUuqfqeLLZR
+# Rv2vA9bqYGjqhRY2a4XpHsCz3cQk3IAqgUFtlD7I4MmBQQCeXr9/xQiYohgsQkCz
+# +W84J0tOgPQ9gUfgiHzqHM61dVxRLhwrfxpyKOcAtdF0xtfkn60Hk7ZTNTX8N+TD
+# 9l0WviFz3pIK+KBjaryWkmo++LxlVZve9Q2JJgT8JRqmJWnLwm3KfOJZX5es6+8u
+# yLzXG1k8K8zyGciTaydjGc/86Sb4ynGbf5P+NGeETpnr/LN4CTNwumamdu0bc+sa
+# pQ3EIhMglFYKTixsTrH9z5wJuqIz7YcCAwEAAaNjMGEwHQYDVR0OBBYEFN0ECQei
+# 9Xp9UlMSkpXuOIAlDaZZMA8GA1UdEwEB/wQFMAMBAf8wHwYDVR0jBBgwFoAU3QQJ
+# B6L1en1SUxKSle44gCUNplkwDgYDVR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBCwUA
+# A4ICAQAgGBGUKfsmnRweHnBh8ZVyk3EkrWiTWI4yrxuzcAP8JSt0hZA9eGr0uYul
+# lzu1GJG7Hqf5QFuR+VWZrx4R0Fwdp2bjsZQHDDI5puobsHnYHZxwROOK3cT5lR+K
+# OEM/AYWlR6c9RrK85SJo93uc2Cw+CiHILTOsv8WBmTF0wXVxxb6x8CNF9J1r/Blj
+# naO8BMYYCyW7U4kPs4BQ3kXuRH+rlHhkmNP2KN2H2HBldPsOuRPrpw9hqTKWzN67
+# 7WNMGLupQPegVG4giHF1GOp6tDRy4CMnd1y2kOqGJUCr7zMPy5+CvqIg+/a1LRrm
+# woWxdA/7yGUCpFIBR91JIsG/2OtrrH7e7GMzFbcjCI/GD41BWt2OxbmP5UU/eNu6
+# 0htAsf5xTT/ggaK6XrTsFeCT3QgffuFVmQsh3pOeCvvmo0m9NjD+53eyoHWXtS2B
+# iBdlIPfakACfyVLMMso1fPU9D9gr1/UmbMkGNJYW6nBZGjJ5eQu2iH8PUkg9v2zY
+# okQu0U63cljTiROV/kSr+NeLG26cvCygW9VqAK9fN+HV+hALmJyG5yaPzvDsbopX
+# C4DjTrLAoGNhkLpVaDd0araS25+hhiK2ZScO7LafQmDkZ8K12kELxNOLYRu8+h+R
+# K9dEB166KazZxenvU0ha64DxKFghzbAGVfsnP1OQcKkEHlcnuTCCBsswggSzoAMC
+# AQICEFKdu8K4iYf1g4DgsOuiBjYwDQYJKoZIhvcNAQELBQAwfDELMAkGA1UEBhMC
+# VVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQKDA9T
+# U0wgQ29ycG9yYXRpb24xMTAvBgNVBAMMKFNTTC5jb20gUm9vdCBDZXJ0aWZpY2F0
+# aW9uIEF1dGhvcml0eSBSU0EwHhcNMjYwNjEyMTY0MjE1WhcNNDEwMjEyMTczOTM5
+# WjByMQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0
+# b24xETAPBgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFt
+# cGluZyBJc3N1aW5nIFJTQSBDQSAyMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
+# CgKCAgEAny+r5nNNkLwxRps2B3laUGNU9y7vWiJ5013yf0iXz65bQdwa9bjj8l/S
+# keXqHGqfSh2Foae+80E8mDEf93oIwjsy2CX2cXmKxqtF8HJGYB4f6yRhKED50wkb
+# OysL02IXf+/EZna44jffhhVz4OU/k52xQ/PnIg/uFhc2Wk+Sc/CHqAr+lYVkPz7L
+# y5RqB9f1RKGr9JC37W1LgVdHC50dNIdsa3QXPhltYZubR3npE4Bbfi0joUW5n5O0
+# ayweN45R/YVLxA0YGlp1OHVfVnsqXq8bhnw1Lc4kjJ6XOgXlOlw/a8ze57TvbduZ
+# l3ehewTmvO0Aky/nqOWDS9IPPxdxdG6vprBbSuHlxNANBAbHTiFgkfZmf0dZYlT/
+# AnZIoFxAq0HILPolf4OgWgET76SiWSlm2XYRIXwVjpeqG0plvXwRIQBzSiEJj7Qe
+# QFnCvHx4gQMINvN3+yG/1rxhEbajGve0tTP3lX4PPOHVAE0QJp4ZzPI1YYJkhVRr
+# iVVxVRU4Fsg4BPwP6I+YLmHb1tZ4RLwOFNLh/gJYDgPlChCoxOogFxXgwPZZrDyE
+# RYB0aeOexW0OKacN4RRu9cqF2KKu/Ab5AL7eYDLVGUPrEEyYbIMApVKqpebc0/jD
+# QniC+3rkauRAjgVc8m1ip/CQgG1Dw4Z9ulVRAY9VR6Za26LsTbUCAwEAAaOCAVEw
+# ggFNMBIGA1UdEwEB/wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAU3QQJB6L1en1SUxKS
+# le44gCUNplkwTQYIKwYBBQUHAQEEQTA/MD0GCCsGAQUFBzAChjFodHRwOi8vY2Vy
+# dC5zc2wuY29tL1NTTGNvbS1Sb290Q0EtUlNBLTQwOTYtUjEuY2VyMD8GA1UdIAQ4
 # MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
-# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
-# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
-# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
-# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
-# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
-# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
-# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
-# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
-# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
-# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
-# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
-# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
-# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
-# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
-# WTCCAlUCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
-# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
-# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
-# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
-# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNTIxMjMwNlowKAYJKoZIhvcNAQk0MRswGTAL
-# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIASkEtuiPSNp
-# S1AAsyiPgJftMQq3TruDMaxlM7le+xbxMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
-# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
-# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
-# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
-# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
-# BEgwRgIhAO0b3IeoiG2PfDI5ICIV+rQ2N318gQVC6y1kUL9GY4iAAiEA04f2VzCx
-# URKtCd9/ddG7j7YEeEmyQJBWD+xvw2XO9Zw=
+# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwQgYDVR0fBDswOTA3oDWgM4Yx
+# aHR0cDovL2NybHMuc3NsLmNvbS9TU0xjb20tUm9vdENBLVJTQS00MDk2LVIxLmNy
+# bDAdBgNVHQ4EFgQUcJplwUOAo/zpsWSJbvEwnAkhyXwwDgYDVR0PAQH/BAQDAgGG
+# MA0GCSqGSIb3DQEBCwUAA4ICAQBlFFvNMemA6iBiBYo56IKQjWhWuQaYKuo4qpf0
+# KJNERAt1gz+HsA2SL3xA/V+EA8SRPNP9SvX0is+5mDsppYvpKyYGqYP36YFW0mbF
+# 1F0ZtXxumCUUO/ZV5mBNKDf5Q4PY7Qb0eWAepUc0rNJr/Mvn5ZiXfJPxDb2xmcg8
+# aRD652/nr+Ork2UBP0E43iJdI4LF7Vs29R3SGRLYZOxM15DI4QebsKRl0KDlf4Om
+# YGCKc7umTxibkZtN1C1KWgnf9jadU/JwnySaYEBgx6/v+FVC6SGONziY7TcvI9MV
+# +qYxHUPlOm6AaQP2dS4bjWXnm86ldCbUkxtOACumSfT97077JNiVa7PZ1IBkd/2P
+# E1AC8gs7U+/Yk1BN9XRPIi15k/uA1xF9oeee5KGjyiGKkqIT7W8QkgUT5zeCinFK
+# kcKafZMcROSVYpXtmtQqGGR2g4uPYqJ0K1hms6gJXrHt/34p8M9PrV8oNWe0Zl1E
+# rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
+# fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
+# 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
+# JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
+# AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNTA4MDczMFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIPIv
+# +9EOarrSmV6GEch8+4Lb7fT2jXT1KozNCR3viJ11MIHIBgsqhkiG9w0BCRACLzGB
+# uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
+# dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
+# c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
+# YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
+# zj0EAwIERzBFAiEA6YdYDTpIhY0PO9MKcVvVBhfJmdGa9KfDg2mpBWxHwGgCIE37
+# ESj863KGq3f5PRV1+v3dMYGjoJJo2tv31VfwBSi9
 # SIG # End signature block

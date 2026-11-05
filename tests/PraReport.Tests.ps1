@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    High-volume HTML report tests for PRA Remote Mailbox 2.2.0 (offline; synthetic data only: no AD, Exchange, Graph or network).
+    High-volume HTML report tests for PRA Remote Mailbox 3.0.0 (offline; synthetic data only: no AD, Exchange, Graph or network).
 .DESCRIPTION
     Report-only evidence: the real Write-PraReport / Write-PraReportHtml of a fixture copy of the package write the
     reports of synthetic runs (up to 100,000 rows), and the compressed data is decoded exactly like the page does and
@@ -9,9 +9,9 @@
     measured generation times (they are measurements, not gates).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.2.0
+    Version : 3.0.0
 #>
-#Requires -Version 5.1
+#Requires -Version 7.5
 
 BeforeAll {
     . (Join-Path $PSScriptRoot 'IntegrityFixture.ps1')
