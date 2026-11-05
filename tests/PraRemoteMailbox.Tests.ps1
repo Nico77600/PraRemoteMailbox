@@ -5259,7 +5259,7 @@ Describe 'Release 3.0.0 - transfer package: verification, extraction and refusal
         $info.Environment | Should -BeExactly 'LAB'
         $info.BatchId | Should -BeExactly '8547ab040273474ba2c720ade6240fc5'
         $info.EntryCount | Should -Be (3 * $Folders.Count)
-        $info.ToolVersion | Should -BeExactly '3.1.0'
+        $info.ToolVersion | Should -BeExactly '3.0.0'
         $info.NextCommand | Should -Match '-Batch'
         @($info.Folders | Sort-PraOrdinal) -join '|' | Should -BeExactly ((@($Folders) | Sort-PraOrdinal) -join '|')
         $info.SizeBytes | Should -Be ((Get-Item -LiteralPath $made.Path).Length)
@@ -6432,13 +6432,16 @@ Describe 'Release 3.1.0 - X500 control: Active Directory side (expected addresse
         $global:PraGate.Runtime=New-GateRuntime -Name 'x500-ad'
         $env:PRA_GATE_STATE=$global:PraGate.Runtime.StatePath
         $env:PSModulePath=$global:PraGate.Runtime.Modules+';'+(Join-Path $PSHOME 'Modules')
-        Import-Module ActiveDirectory -Force -Global
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module (Join-Path $global:PraGate.Runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
         $global:PraGate.Context=New-GateContext $global:PraGate.Runtime
         $global:PraGate.Context.LogFile=Join-Path $global:PraGate.Runtime.Root 'logs\x500-ad.log'
         $global:PraGate.Legacy1='X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user1'
         $global:PraGate.Older='X500:/o=Synthetic/ou=Gate/cn=User'
     }
-    It 'reads legacyExchangeDN with the other attributes and records X500:<legacyExchangeDN> first, then the on-premises X500 proxies; nothing else is managed' {
+    It 'reads legacyExchangeDN with the other attributes and records the X500 of the legacyExchangeDN first, then the on-premises X500 proxies; nothing else is managed' {
         $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
         @($plan.Record.ExpectedX500) | Should -BeExactly @($global:PraGate.Legacy1,$global:PraGate.Older)
         $plan.Record.ExpectedX500 | Should -BeOfType ([string])
@@ -6550,6 +6553,7 @@ function Get-ConnectionInformation { [CmdletBinding()]param() [pscustomobject]@{
 Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgUserLicenseDetail,Get-ConnectionInformation,Get-MgContext
 '@
         [IO.File]::WriteAllText($global:PraGate.X500NetworkPath,$networkSource,(New-Object Text.UTF8Encoding($true)))
+        Get-Module PRA.Cloud -All | Remove-Module -Force -ErrorAction SilentlyContinue
         Import-Module $global:PraGate.X500NetworkPath -Global -Force
         Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
         $global:PraGate.X500Legacy='X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user1'
