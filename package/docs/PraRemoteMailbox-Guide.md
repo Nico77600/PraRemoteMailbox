@@ -46,14 +46,14 @@ Keep the batch ID | The summary prints it (e.g. `efb9d60a`) with the next comman
 > **Preview is the default.** Without `-Mode Apply` (or with `-WhatIf`) the tool only reads. With `-Mode Apply` it asks **one** confirmation after showing the plan; `-Force` skips it for unattended runs. No option ever skips a safety check.
 
 > [!TIP]
-> **Ready-to-use commands** — one user, a whole OU, only the shared mailboxes, a list, the roll-back: chapter 8, recipes 1 to 6.
+> **Ready-to-use commands** — one user, a whole OU, only the shared mailboxes, a list, the roll-back: [chapter 8](#8-everyday-use), recipes 1 to 6.
 
 The **window** opens with `pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui` (native Fluent theme).
 It starts no operation automatically. Version **3.0.0** has offline validation only; no new
-live-tenant campaign has been performed for this version (the list to replay is in annex B).
+live-tenant campaign has been performed for this version (the list to replay is in [annex B](#annex-b--lab-test-campaign-2026-09-30)).
 
 > [!IMPORTANT]
-> **Breaking in 3.0.0: PowerShell 7.5 or later is required.** Windows PowerShell 5.1 (`powershell.exe`) is refused by `#Requires` before any code runs, and so is PowerShell 7.4 (the tool reads JSON dates as text with `ConvertFrom-Json -DateKind`, new in 7.5). The **2.2.x releases remain the Windows PowerShell 5.1 version**: keep them for a server that cannot have PowerShell 7. **Backups, proofs and Finalize packages written by 2.x restore unchanged with 3.0.0** (same formats, annex D), and the files written by 3.0.0 stay readable by 2.2.x.
+> **Breaking in 3.0.0: PowerShell 7.5 or later is required.** Windows PowerShell 5.1 (`powershell.exe`) is refused by `#Requires` before any code runs, and so is PowerShell 7.4 (the tool reads JSON dates as text with `ConvertFrom-Json -DateKind`, new in 7.5). The **2.2.x releases remain the Windows PowerShell 5.1 version**: keep them for a server that cannot have PowerShell 7. **Backups, proofs and Finalize packages written by 2.x restore unchanged with 3.0.0** (same formats, [annex D](#annex-d--file-formats)), and the files written by 3.0.0 stay readable by 2.2.x.
 
 # Part I · Understand
 
@@ -137,7 +137,7 @@ The tool **proves** this, per object, and never writes a cloud address:
 3. **Check.** `-Action Check -Batch <id>` (or `-Identity <sAMAccountName>`, which reads AD) shows the same comparison, read only. An identity given as a UPN has no Active Directory read: the line says so and skips the control.
 4. **Old batches.** A batch written before 3.1.0 has no `ExpectedX500`: the control is skipped with the information line *expected addresses not available (batch from 3.0.0 or older)*, never a failure. The field is validated like `KeptX500` when the batch is read (only strings starting with `X500:`, at most 2,000 values of at most 2,048 characters); a changed or invalid field makes the batch refused.
 
-The control runs only when the mailbox check runs (`Cloud.CheckMailbox`). Recover is unchanged: it keeps the cloud X500 address written back on premises (chapter 3).
+The control runs only when the mailbox check runs (`Cloud.CheckMailbox`). Recover is unchanged: it keeps the cloud X500 address written back on premises ([chapter 3](#3-things-to-know)).
 
 ### Shared mailbox permissions — where they come from
 
@@ -216,7 +216,7 @@ check | Done | on-premises again
 > **The backups are the only way back.** A Recover restores what the Convert batch saved — nothing else. Keep the `Backups` folder on a durable, protected volume and copy it outside the server after each Apply. Never edit a backup: every file is checked by SHA-256 and a changed file is refused.
 
 > [!CAUTION]
-> **Convert creates new, empty mailboxes** in Exchange Online (`msExchMailboxGuid` is cleared). The content of the on-premises mailboxes is not moved. A Recover **deprovisions** the cloud mailboxes: mail received in the cloud during the disaster must be exported first if it has to be kept (or protected by a retention policy, see `Retention` in chapter 6).
+> **Convert creates new, empty mailboxes** in Exchange Online (`msExchMailboxGuid` is cleared). The content of the on-premises mailboxes is not moved. A Recover **deprovisions** the cloud mailboxes: mail received in the cloud during the disaster must be exported first if it has to be kept (or protected by a retention policy, see `Retention` in [chapter 6](#6-configuration)).
 >
 > What the lab showed after a deprovisioning: Exchange Online keeps the cloud mailbox **disconnected** (it is not listed as a soft-deleted mailbox), and a new Convert a few minutes later **reattached it with the same `ExchangeGuid`**. How long Exchange Online keeps it is not known, so **saving its content before a rollback stays the advice**. In Exchange Online, the synchronised mail user can have its object id as its `Name`: search by UPN, alias or address, never by `Name`.
 >
@@ -226,7 +226,7 @@ check | Done | on-premises again
 > **Nothing is automatic after an error.** The first error stops the batch: no next object, no sync, no cloud write, and no automatic rollback. The journal of the batch (`Journal-<id>.jsonl`) says exactly which write was started, applied and verified. Read the summary, fix the cause, run the same command again: objects already done are detected (`AlreadyDone`).
 
 > [!TIP]
-> **Two servers are supported.** If the cloud server has no access to AD (isolated network), run the AD part with `-Phase AD`, copy the **one transfer package** it writes (`Backups\Outbox\*.zip`, chapter 10), and run `-Phase Cloud -Batch <package.zip>` on the other server. The summary of each step prints the command of the next one.
+> **Two servers are supported.** If no single server reaches both Active Directory and Microsoft 365 (for example an AD server on an isolated network), run the AD part with `-Phase AD` on the AD server, copy the **one transfer package** it writes (`Backups\Outbox\*.zip`, [chapter 10](#10-files-batches-proofs-and-packages)), and run `-Phase Cloud -Batch <package.zip>` on the **cloud server**. That is not a server hosted in the cloud: it is any Windows machine of the organisation that reaches Microsoft 365 through the Internet (server room or administrator workstation), with no access to AD. The summary of each step prints the command of the next one.
 
 # Part II · Set up
 
@@ -245,6 +245,8 @@ check | Done | on-premises again
 | `ExchangeOnlineManagement` **3.10** or later, installed for PowerShell 7 | phase Both | required |
 | `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users`, installed for PowerShell 7 | phase Both | required |
 | Durable disk for `Backups` | required | required (copies of the batches) |
+
+The **cloud server** is not a machine hosted in the cloud: it is any Windows machine of the organisation that can reach Microsoft 365 (Exchange Online and Microsoft Graph) through the Internet, in your own server room or an administrator workstation. It needs no access to Active Directory, no RSAT and no Entra Connect. It needs the rows of the *Cloud server* column, the same signed package folder, and a configuration file with the same `Environment`.
 
 ```powershell
 # PowerShell 7.5+ (pwsh), as administrator. winget install Microsoft.PowerShell installs PowerShell 7 if needed.
@@ -343,7 +345,7 @@ There is **no** `Remove-*`, `New-*`, `Enable-*` or recovery cmdlet: a Recover ne
 |---|---|---|
 | **Role** | **Exchange Recipient Administrator** (Microsoft Entra role), or the Exchange Online role group **Recipient Management**. Read-only checks (`Check`) only: *View-Only Recipients* is enough | The application needs the **application permission** `Office 365 Exchange Online › Exchange.ManageAsApp` (admin consent) **and** the Entra role **Exchange Recipient Administrator** assigned to its service principal (a role that Microsoft lists as supported for app-only sign-in) |
 | **Why this role** | it contains the *Mail Recipients* management role that carries `Add-MailboxPermission`, `Set-Mailbox` and the recipient reads | same roles; the access token carries the directory role |
-| **Certificate** | none | in the **CurrentUser\My** store of the account that runs the tool (Microsoft: `-CertificateThumbprint` reads the user store), with its **private key**, **not expired** (the console's *Sign-in: Certificate* light checks the thumbprint, the expiry and the private key), created with a **CSP** key provider (a CNG key is refused by Exchange Online): annex C |
+| **Certificate** | none | in the **CurrentUser\My** store of the account that runs the tool (Microsoft: `-CertificateThumbprint` reads the user store), with its **private key**, **not expired** (the console's *Sign-in: Certificate* light checks the thumbprint, the expiry and the private key), created with a **CSP** key provider (a CNG key is refused by Exchange Online): [annex C](#annex-c--certificate-sign-in-application) |
 
 #### What the code cannot tell you (have it confirmed in a lab)
 
@@ -351,25 +353,25 @@ These points depend on Microsoft services or on your directory, not on the code.
 
 1. **The Entra role of the person for the Graph reads.** The code asks for `User.Read.All` (delegated). Which role the signed-in admin needs to read `assignedLicenses`, `assignedPlans` and `licenseDetails` of *other* users is decided by Microsoft Graph, not by this code. **Global Reader** is known to be sufficient and is the one to give; whether the *Exchange Recipient Administrator* role alone is enough must be tested: sign in with only that role and run **Check** on one user; an *Authorization_RequestDenied* means a reader role is missing.
 2. **Which right replicates a single object.** The tool says *Replication Synchronization* in its *access denied* message (`PRA.Directory.psm1:1675`). Microsoft's protocol document for the `replicateSingleObject` operation ([MS-ADTS 3.1.1.3.3.18](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adts/d3d19d15-8427-4d4d-8256-d5fb11333292)) names the same control access right, **DS-Replication-Synchronize** (*Replication synchronization*, `1131f6ab-9c07-11d1-f79f-00c04fc2dcd2`), on the root of the naming context. The delegation above grants it. This has not been run with a delegated account yet. If *access denied* persists on a destination domain controller, add *Replicating Directory Changes* in the same way and report it.
-3. **That an attribute-level *Write property* ACE is enough for every `msExch*` attribute** with `Set-ADUser` from a non-Exchange account. It is how Active Directory works, but it was validated in the lab with an administrator account only (annex B).
+3. **That an attribute-level *Write property* ACE is enough for every `msExch*` attribute** with `Set-ADUser` from a non-Exchange account. It is how Active Directory works, but it was validated in the lab with an administrator account only ([annex B](#annex-b--lab-test-campaign-2026-09-30)).
 4. **The exact Exchange role of each cmdlet.** Check it in your tenant: `Get-ManagementRoleEntry "*\Add-MailboxPermission","*\Add-RecipientPermission","*\Set-Mailbox","*\Get-EXOMailbox"` lists the roles that carry each cmdlet; a custom role group with exactly those roles is a narrower alternative to *Exchange Recipient Administrator* (Microsoft, *Option 2: custom role groups* of the app-only authentication article).
 5. **`ADSyncOperators` as the only membership** for `Get-ADSyncScheduler` / `Start-ADSyncSyncCycle`, and **Remote Management Users** for the remote session: Microsoft documentation, not exercised by the tests.
 6. **How Exchange Online and Entra expose the X500 addresses.** The X500 control reads `EmailAddresses` (`Get-EXOMailbox -Properties EmailAddresses`) or, through Graph, `proxyAddresses`, and assumes that Entra Connect writes the on-premises `legacyExchangeDN` as an X500 address of the cloud object (the normal hybrid result). The lag (how many minutes a value takes to appear) and the property behaviour of your tenant are marked for lab validation; if the property is not returned, the control warns *could not be verified* instead of failing.
 7. **The certificate store.** The console light looks in `CurrentUser\My` only, the store that Exchange Online (`Connect-ExchangeOnline -CertificateThumbprint`) reads: a thumbprint that exists only in `LocalMachine\My` shows a red light. A green light still does not prove that Exchange Online accepts the certificate (CSP key, application permission): the sign-in is proven by a **Check** on one mailbox.
 
-Certificate sign-in for unattended runs: annex C.
+Certificate sign-in for unattended runs: [annex C](#annex-c--certificate-sign-in-application).
 
 <!-- icon: download -->
 ## 5. Installation
 
 > **In short:** Copy the signed package to the server, unblock it, and put Backups on a safe disk. The package checks itself at every start.
 
-1. Install PowerShell 7.5 or later on the server (`winget install Microsoft.PowerShell`, or the MSI of the PowerShell release page), then the modules for PowerShell 7 (chapter 4). Copy the package folder (`PraRemoteMailbox-3.0.0`, the signed package built by `tools\New-PraPackage.ps1`, or the extracted release ZIP) to the server, for example `D:\PRA\PraRemoteMailbox`.
+1. Install PowerShell 7.5 or later on the server (`winget install Microsoft.PowerShell`, or the MSI of the PowerShell release page), then the modules for PowerShell 7 ([chapter 4](#4-prerequisites)). Copy the package folder (`PraRemoteMailbox-3.0.0`, the signed package built by `tools\New-PraPackage.ps1`, or the extracted release ZIP) to the server, for example `D:\PRA\PraRemoteMailbox`.
 2. Unblock the files if they were downloaded: `Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File`.
 3. Put `Backups` on a durable volume (default: `.\Backups` in the tool folder; see `Storage.BackupFolder`).
-4. Fill in the configuration (chapter 6), then run a **Preview**: it checks the configuration, AD access and the scope without writing anything.
+4. Fill in the configuration ([chapter 6](#6-configuration)), then run a **Preview**: it checks the configuration, AD access and the scope without writing anything.
 
-**Two servers**: install the same version on both, with a configuration of the **same `Environment`** (a batch is refused by a configuration of another `Environment`). The cloud server needs only the cloud sections; the AD server needs the AD sections.
+**Two servers**: install the same version on both, with a configuration of the **same `Environment`** (a batch is refused by a configuration of another `Environment`). The cloud server (any Windows machine that reaches Microsoft 365, see [chapter 4](#4-prerequisites)) needs only the cloud sections; the AD server needs the AD sections.
 
 | Folder | Content |
 |---|---|
@@ -430,7 +432,7 @@ Everything is set in `config\PraRemoteMailbox.config.psd1` — the command line 
 |---|---|
 | `SharedMailbox.Enabled` | `$true` (default): shared mailboxes are converted with their permissions (when `Scope.IncludeShared = $true`). `$false`: no permission is captured or granted. |
 | `SharedMailbox.RemoteRecipientType` | 97 (first provisioning of a shared mailbox), 99 with archive. |
-| `SharedMailbox.PermissionSource` | Where FullAccess / SendAs holders are read, without Exchange: `AD` (default: the copy Exchange keeps on the account), `Csv` (`Shared,Group`), `CustomAttribute` (a group tagged with the name of the mailbox), `None`. Groups are expanded to their users. Details: chapter 2, *Shared mailbox permissions*. |
+| `SharedMailbox.PermissionSource` | Where FullAccess / SendAs holders are read, without Exchange: `AD` (default: the copy Exchange keeps on the account), `Csv` (`Shared,Group`), `CustomAttribute` (a group tagged with the name of the mailbox), `None`. Groups are expanded to their users. Details: [chapter 2](#2-how-it-works), *Shared mailbox permissions*. |
 | `CaptureSendOnBehalf` | SendOnBehalf holders from `publicDelegates`. |
 | `GrantFullAccess`, `GrantSendAs`, `GrantSendOnBehalf`, `AutoMapping` | What is granted in Exchange Online. |
 | `ExcludeTrusteeSamAccountNames` | Accounts never reproduced (e.g. service or admin accounts found in the ACLs). |
@@ -466,10 +468,10 @@ converge is a **warning that names it**; the synchronisation still runs, and the
 | Setting | Meaning |
 |---|---|
 | `Cloud.TenantId`, `Cloud.Organization` | Tenant GUID and initial domain (`tenant.onmicrosoft.com`). Every session is checked against them. **When `Cloud.AppId` is set, both are required** (the tenant must be a GUID): the configuration is refused at load otherwise. |
-| `Cloud.AppId` + `Cloud.CertificateThumbprint` | Certificate sign-in (unattended, annex C). Both empty = interactive sign-in (`Cloud.UserPrincipalName` = expected account). |
+| `Cloud.AppId` + `Cloud.CertificateThumbprint` | Certificate sign-in (unattended, [annex C](#annex-c--certificate-sign-in-application)). Both empty = interactive sign-in (`Cloud.UserPrincipalName` = expected account). |
 | `Cloud.CheckMailbox`, `CheckLicense`, `MailboxCheckVia`, `RequiredSkuPartNumber` | What "ready" means for a user: mailbox (Exchange Online type, or Graph provisioning) and licence. `MailboxCheckVia` is `Exo` by default (mailbox type in Exchange Online) or `Graph` (provisioning). |
 | `Exo.MinModuleVersion` | Oldest `ExchangeOnlineManagement` accepted in the console process (default `3.10.0`); an older module is only used through the child process (certificate sign-in). |
-| `Exo.DisableWAM` | `$false` (default): interactive sign-in through the Windows broker (WAM). `$true`: browser sign-in instead. See chapter 8, *Cloud sign-in from the window*. |
+| `Exo.DisableWAM` | `$false` (default): interactive sign-in through the Windows broker (WAM). `$true`: browser sign-in instead. See [chapter 8](#8-everyday-use), *Cloud sign-in from the window*. |
 | `Exo.GrantVerifyAttempts`, `GrantVerifyDelaySeconds` | After **one** grant, re-read up to N times (never granted twice). |
 | `Exo.UseSubprocess` | Run every Exchange Online call in a child PowerShell 7 process (certificate only; automatic with a module older than `MinModuleVersion`). |
 | `Polling.IntervalMinutes`, `TimeoutMinutes` | How often (default 1 minute) and how long (default 60) the cloud part waits (15 to 60 minutes is common after a sync). |
@@ -503,8 +505,8 @@ For a run without a person at the keyboard (scheduled task, orchestrator):
 
 0. Start PowerShell 7, never `powershell.exe`: the action of the scheduled task is `"C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -NonInteractive -File "D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1" -Action Convert -Mode Apply -Force` (adapt the path of `pwsh.exe`).
 
-1. Certificate sign-in: create the application once (annex C) and set `Cloud.AppId` + `Cloud.CertificateThumbprint`. The certificate must be in the **CurrentUser\My** store of the account that runs the tool.
-2. Run with `-Mode Apply -Force` under a domain account that has the AD rights of chapter 4. `-Confirm:$false` is accepted as an equivalent for the single confirmation (an explicit `-Confirm`, with either value, skips it); use it only after a reviewed Preview.
+1. Certificate sign-in: create the application once ([annex C](#annex-c--certificate-sign-in-application)) and set `Cloud.AppId` + `Cloud.CertificateThumbprint`. The certificate must be in the **CurrentUser\My** store of the account that runs the tool.
+2. Run with `-Mode Apply -Force` under a domain account that has the AD rights of [chapter 4](#4-prerequisites). `-Confirm:$false` is accepted as an equivalent for the single confirmation (an explicit `-Confirm`, with either value, skips it); use it only after a reviewed Preview.
 3. Read the exit code: **0** done, **1** failed, **2** done but a next step is required (Pending objects). With `-PassThru`, the tool also returns the result object: `Status`, `ExitCode`, `BatchId`, `NextSteps`, the counters and the paths of the log and the reports (without `-PassThru`, nothing is written to the pipeline).
 
 ```powershell
@@ -527,7 +529,7 @@ Everything else comes from the configuration file; the command line only says **
 | `-Action` | `Convert`, `Recover`, `Finalize`, `Check` | required for command-line operations; mutually exclusive with `-Gui`. The value is **case-insensitive** for `-Action`, `-Mode`, `-Phase`, `-Scope` and `-Expect` (`convert`, `CLOUD`, `apply`): the script rewrites them to their official spelling before anything else, and the strict comparisons of the proofs and batches stay case-sensitive |
 | `-Mode` | `Preview` (default), `Apply` | `Apply` writes, after one confirmation |
 | `-Phase` | `Both`, `AD`, `Cloud` | Convert / Recover on two servers; default `Execution.Phase` |
-| `-Batch` | batch ID (8 characters), path of the batch JSON, or **a transfer package `.zip`** (path, or the name of a file in `Backups\Inbox`, `Backups\Outbox` or the current folder) | Recover, `-Phase Cloud`, Finalize; optional for Check. A package is verified, then extracted (chapter 10) |
+| `-Batch` | batch ID (8 characters), path of the batch JSON, or **a transfer package `.zip`** (path, or the name of a file in `Backups\Inbox`, `Backups\Outbox` or the current folder) | Recover, `-Phase Cloud`, Finalize; optional for Check. A package is verified, then extracted ([chapter 10](#10-files-batches-proofs-and-packages)) |
 | `-Identity` | UPN, sAMAccountName, DN or GUID | one object only |
 | `-SearchBase` | OU distinguished name | Convert AD/Both only; run-specific OU + child OUs, without changing configuration |
 | `-CsvPath` | path of an Identity CSV | Convert AD/Both only; run-specific comma/semicolon list, without changing configuration |
@@ -538,7 +540,7 @@ Everything else comes from the configuration file; the command line only says **
 | `-BaseConfigPath` | path | set by the console when run settings were changed: `-ConfigPath` is then the effective copy and this is the file it was made from. The log, the result and the report list the settings that differ. Not needed on the command line |
 | `-Force` | switch | Apply without the confirmation (unattended). An explicit `-Confirm` (with either value) also skips the single confirmation: `-Confirm:$false` behaves like `-Force`, a plain `-Confirm` replaces it with a PowerShell prompt for every write. Never skips a safety check. |
 | `-Once` | switch | cloud checks: one pass, no wait |
-| `-PassThru` | switch | also returns the result object (chapter 7) |
+| `-PassThru` | switch | also returns the result object ([chapter 7](#7-unattended-execution)) |
 | `-Gui` | switch | opens the window; may be combined with `-ConfigPath`, not with an operation |
 | `-WhatIf` / `-Verbose` | switches | `-WhatIf` = Preview; `-Verbose` shows the debug lines of the log |
 
@@ -605,7 +607,7 @@ voids the previous Preview. The list is revalidated and hashed before Run. AD st
 | Check a mailbox | | `Cloud`, read only | one UPN |
 
 **Continue a batch** lists the batches found in `Storage.BackupFolder` (of every environment) and the transfer packages waiting in
-`<Storage.BackupFolder>\Inbox`, with their state. **Import package...** takes a `.zip` from anywhere: the console verifies it (all checks before any write, chapter 10),
+`<Storage.BackupFolder>\Inbox`, with their state. **Import package...** takes a `.zip` from anywhere: the console verifies it (all checks before any write, [chapter 10](#10-files-batches-proofs-and-packages)),
 extracts it into `Storage.BackupFolder` and selects its batch. A package picked in the list is imported when you continue to the verification page.
 
 **Safety is unchanged.** Run is locked until a successful Preview of **exactly** the same request, files and configuration; the engine independently rereads the
@@ -640,7 +642,7 @@ choices matter for the interactive Microsoft 365 sign-in (`Connect-ExchangeOnlin
   window at all.
 
 What to do: **leave the new console window open** (it can be minimised) while a cloud operation runs and accept the
-Microsoft sign-in dialog. If the sign-in dialog cannot open, use the certificate sign-in (annex C) or set
+Microsoft sign-in dialog. If the sign-in dialog cannot open, use the certificate sign-in ([annex C](#annex-c--certificate-sign-in-application)) or set
 `Exo.DisableWAM = $true` (browser sign-in). The activity log shows the engine's own console lines as they arrive
 (sign-in messages, waits, warnings), without repeating the events it already displays; the complete output is kept
 in `logs\gui\<id>.stdout.txt` and `.stderr.txt` (the raw bytes of the child, in the console code page of the
@@ -756,7 +758,7 @@ Users get their original attributes back and leave the licence group. Shared mai
 .\Invoke-PraRemoteMailbox.ps1 -Action Check -Batch 1d5ac20b -Expect Deprovisioned     # after a Recover
 ```
 
-Read only. Check waits for the expected state (up to `Polling.TimeoutMinutes`); add `-Once` for a single pass. It also shows whether the mailbox carries the X500 addresses recorded by the Convert (section *X500 addresses*, chapter 2).
+Read only. Check waits for the expected state (up to `Polling.TimeoutMinutes`); add `-Once` for a single pass. It also shows whether the mailbox carries the X500 addresses recorded by the Convert (section *X500 addresses*, [chapter 2](#2-how-it-works)).
 
 ### Scenario C — Convert on two servers
 
@@ -845,7 +847,7 @@ for Convert (AD, then Cloud) as for Recover (AD, Cloud, then Finalize), whatever
 
 ### Warnings
 
-A warning never stops the run and never changes the exit code; it says that something was **left aside on purpose** and should be read. Today: the permission entries of a shared mailbox that point to an account no longer in AD (chapter 2), and an X500 address missing in Exchange Online (chapter 2, *X500 addresses*). It is shown in four places: a yellow `▲` line in the console under the object, `[WARN]` in the log, the `Warnings` column of the CSV, and in the HTML report (*Warnings* tile, *Warnings* card, yellow mark on the row). The summary card of the console turns yellow and shows the last warnings.
+A warning never stops the run and never changes the exit code; it says that something was **left aside on purpose** and should be read. Today: the permission entries of a shared mailbox that point to an account no longer in AD ([chapter 2](#2-how-it-works)), and an X500 address missing in Exchange Online ([chapter 2](#2-how-it-works), *X500 addresses*). It is shown in four places: a yellow `▲` line in the console under the object, `[WARN]` in the log, the `Warnings` column of the CSV, and in the HTML report (*Warnings* tile, *Warnings* card, yellow mark on the row). The summary card of the console turns yellow and shows the last warnings.
 
 ![Report of a run with a warning on a shared mailbox (synthetic example data)](images/report-phase-warning-light.png)
 
@@ -957,7 +959,7 @@ The run state is one hashtable, the **context** (`$context`), created by the ent
 5. **Proofs**: the State file lists the objects verified; the cloud phase, Finalize and the sync refuse a batch without a valid proof, and Finalize refuses an object changed since the proof. One change is accepted: the writeback of Entra Connect, when the `X500:` addresses of `proxyAddresses` are the only difference from the list of the proof and every other managed attribute is as the proof left it (the list of kept addresses is then computed again).
 6. **A cloud error is never "absent"**: deprovisioning is confirmed only when Exchange Online returns no mailbox **and** a MailUser recipient. Only then are the shared mailboxes restored on-premises.
 7. **Preview and Check never write** (AD, Entra Connect, Exchange Online); they still write their log, transcript and report.
-8. **Strings are compared ordinally.** On PowerShell 7 (.NET, ICU) the usual comparison operators ignore zero-width and control characters (`"a" -ceq "a<U+0001>"` is true). Every comparison that guards integrity, identity or authorisation (hashes, GUIDs, `Environment`, `Operation`, file names, the `RawFormat` marker, codec type and XML names, trustees, the typed confirmation) is ordinal; a character that does not belong refuses the object instead of matching it. See the pitfalls table (chapter 12) and the limitations note below.
+8. **Strings are compared ordinally.** On PowerShell 7 (.NET, ICU) the usual comparison operators ignore zero-width and control characters (`"a" -ceq "a<U+0001>"` is true). Every comparison that guards integrity, identity or authorisation (hashes, GUIDs, `Environment`, `Operation`, file names, the `RawFormat` marker, codec type and XML names, trustees, the typed confirmation) is ordinal; a character that does not belong refuses the object instead of matching it. See the pitfalls table ([chapter 12](#12-modifying-the-tool)) and the limitations note below.
 
 **Limitations of the ordinal comparison.** The ordinal rule applies to the runtime files of the package; the tests, the tools and the display-only sorts (lists shown in the window, the OU picker) keep the usual operators. `ValidateSet` still uses the culture comparison: the entry script and the window request refuse a value that has no ordinal match. Lists that the tool writes in a canonical order (permission holders, multi-valued attributes, batch order) are now sorted ordinally (upper-case before lower-case, by UTF-16 code unit), which can differ from the order written by 2.x under Windows PowerShell 5.1; the comparison of two states sorts both sides, so old backups still compare equal. Regular expressions are anchored with `\z` (not `$`, which also accepts a trailing line feed).
 
@@ -996,7 +998,7 @@ The rule: **change the plan, never the guards.** The backup, the re-reads and th
 1. Add it to `$script:AttributeKinds` in `PRA.Directory.psm1` with its type (`String`, `MultiString`, `Bytes`, `Bool`, `Int`, `Long`).
 2. Set its target value in `New-PraPlan` (branch `Convert`, and `Deprovision` if needed). Recover restores it automatically from the backup.
 3. Old batches do not contain it: `Assert-PraStoredRecord` refuses them for Recover. Decide explicitly (new backup schema, or keep old batches on the previous version).
-4. Add a gate test (chapter 13) with a synthetic user having and not having the attribute.
+4. Add a gate test ([chapter 13](#13-testing-a-change)) with a synthetic user having and not having the attribute.
 
 ### Change the routing address or the recipient types
 
@@ -1063,18 +1065,18 @@ No picture is drawn by hand. `tools\New-DocumentationImages.ps1` rebuilds them a
 
 ### The lab campaign
 
-After a change of the engine, repeat the campaign of annex B on the lab: Preview, Convert Apply (users + shared), Check, Recover on two servers (AD, Cloud with Finalize package, Finalize), plus a Recover of a batch written by the previous version.
+After a change of the engine, repeat the campaign of [annex B](#annex-b--lab-test-campaign-2026-09-30) on the lab: Preview, Convert Apply (users + shared), Check, Recover on two servers (AD, Cloud with Finalize package, Finalize), plus a Recover of a batch written by the previous version.
 
 # Annexes
 
 <!-- icon: lifebuoy -->
 ## Annex A — Troubleshooting
 
-> **In short:** The message you see, its cause, and what to do. The user guide has the same in plainer words (chapter 7).
+> **In short:** The message you see, its cause, and what to do. The [user guide, chapter 7](PraRemoteMailbox-UserGuide.md#7-when-something-goes-wrong) (file `PraRemoteMailbox-UserGuide.html`) has the same in plainer words.
 
 | Message | Cause | What to do |
 |---|---|---|
-| `Configuration: unknown setting X` | typing mistake or setting of another version | compare with chapter 6 |
+| `Configuration: unknown setting X` | typing mistake or setting of another version | compare with [chapter 6](#6-configuration) |
 | `Batch <id> not found under ...` | the batch folder is not in `Storage.BackupFolder` | copy the whole `Batch-...` / `Finalize-...` folder there, or give the path of the JSON file |
 | `The Convert batch used by this Recover is not in ...` | cloud phase of a Recover without the original Convert batch | copy the `Batch-<convert id>` folder too |
 | `Batch ... is a Convert batch: the cloud phase of a Recover needs the batch printed by its AD phase` | wrong ID | use the ID printed by `Recover -Phase AD` |
@@ -1123,7 +1125,7 @@ All runs were made with the **real** script on `VMLLM` (Windows PowerShell 5.1),
 | T10 | `-Action Recover -Batch 79f5a1e1 -Mode Apply -Force` (phase Both, one server) | AD restore, sync, cloud phase and on-premises restore inline, **12 min 29 s** | PASS |
 | T11 | `-Mode Apply` without `-Force` in a non-interactive process | stops **before the backup** with "Apply needs a confirmation", exit code 1, nothing written | PASS |
 | T12 | `-Action Check -Expect Deprovisioned` | the objects are back on-premises | PASS |
-| T13 | `-Action Convert` (Preview) | final plan of the 4 objects (run again on 2026-10-01 for the screenshot of chapter 8) | PASS |
+| T13 | `-Action Convert` (Preview) | final plan of the 4 objects (run again on 2026-10-01 for the screenshot of [chapter 8](#8-everyday-use)) | PASS |
 | T14 | `-Action Convert -Scope SharedOnly` (Preview, 2026-10-01) | only the 2 shared mailboxes; FullAccess / SendAs holders listed under each one, complete lists in the log | PASS |
 | T15 | `-Action Convert -Identity pra-shared02` (Preview, 2026-10-01) after giving FullAccess + SendAs to a temporary account, then deleting it | the 2 entries of the deleted account are ignored: yellow line and yellow summary card, `[WARN]` in the log, CSV column `Warnings`, *Warnings* tile and card in the report; exit code 0; the permissions of `pra-shared02` were restored after the test | PASS |
 | T16 | `-Action Convert -Identity pra-shared03` (Preview, then `-Mode Apply -Force`, 2026-10-01) after adding on `pra-shared03`: FullAccess for the group `PRA-Shared03-Team` (`pra-user01` + a nested group with `pra-user02`), SendOnBehalf for `pra-user01`, and removing its SendAs in Exchange Online | 9 permissions: the group becomes its 2 users (nested group included) and never gets a right itself; FullAccess **granted** and verified for 5 users, SendAs **granted** and verified for 3; SendOnBehalf already brought by Entra Connect, verified; an independent read of Exchange Online shows the same; **0 `TerminatingError` line** in the transcript. Batch `662e8b6d`, **8 min 48 s** | PASS |
@@ -1138,14 +1140,14 @@ Measured durations: delta sync on the Entra Connect server (remote) about **5 mi
 Defects found by the campaign and fixed in 2.0.0 (all now covered by the gate):
 
 1. With `-Force`, the approval callback of the AD engine still called `ShouldProcess` with `ConfirmImpact High` → "Windows PowerShell is in NonInteractive mode" in the scheduled task, **before any write** (fail-closed). Fix: the single confirmation of the run sets `ConfirmPreference = None` for the callbacks.
-2. The session guard compared the organisation domain of a certificate session with `Cloud.TenantId` and refused it (finding 1 of annex F). Fix: the guard accepts `Cloud.Organization` and checks the `AppId`.
+2. The session guard compared the organisation domain of a certificate session with `Cloud.TenantId` and refused it (finding 1 of [annex F](#annex-f--code-review-2026-09-30)). Fix: the guard accepts `Cloud.Organization` and checks the `AppId`.
 3. (T17) `Get-EXORecipient -UserPrincipalName` answers an absent object with HTTP 404 `ManagementObjectNotFoundException`. During the Recover cloud check, while the mailbox turns into a MailUser, this answer stopped the run (fail-closed). Fix: this exact answer, for this exact UPN, means "not there yet": the check waits and reads again; any other error still stops.
-4. (T18) A run that needs Microsoft Graph after a run that used Exchange Online in the same console failed with an obscure `GetTokenAsync` error. Fix: a clear message asks for a new Windows PowerShell window (annex A).
+4. (T18) A run that needs Microsoft Graph after a run that used Exchange Online in the same console failed with an obscure `GetTokenAsync` error. Fix: a clear message asks for a new Windows PowerShell window ([annex A](#annex-a--troubleshooting)).
 5. (transcripts of T3 and T9) Before each FullAccess grant, the normal "No permissions were found" answer appeared as a `TerminatingError` line in the transcript. Fix: read through `-ErrorVariable`; T16 and T17c: 0 such line.
 
 The lab was left as before the tests: T16 test material removed (groups deleted, `msExchMailboxSecurityDescriptor` identical to its copy taken before the test, `publicDelegates` empty), `pra-shared03` back on-premises.
 
-Lab fixes made before the campaign (outside the tool): domain controller `DC2` had not replicated from `DC1` since 2026-09-18 (Kerberos `0x80090322`, stale KDC ticket); fixed by purging the tickets of the computer account and forcing the replication. Account `LAB\pra-operator` and the lab application (annex C) were created for the campaign.
+Lab fixes made before the campaign (outside the tool): domain controller `DC2` had not replicated from `DC1` since 2026-09-18 (Kerberos `0x80090322`, stale KDC ticket); fixed by purging the tickets of the computer account and forcing the replication. Account `LAB\pra-operator` and the lab application ([annex C](#annex-c--certificate-sign-in-application)) were created for the campaign.
 
 <!-- icon: key -->
 ### Lab revalidation of the PowerShell 7 engine (3.0.0)
@@ -1161,13 +1163,13 @@ Lab fixes made before the campaign (outside the tool): domain controller `DC2` h
 7. **Window:** Preview, Apply, OU browser, opening of the reports; interactive cloud sign-in from the window (console of the child).
 8. **Reports:** the CSV opened in Excel (accents), the HTML report with a large volume.
 9. Manual check of a capture written by 3.0.0: `Import-Clixml` for audit, and a Recover that reads it.
-10. **Minimum permissions (chapter 4, *What the code cannot tell you*):** with an account that is **not** a Domain Admin and holds only the `dsacls` delegation of chapter 4, run a Preview and an Apply on one user and one shared mailbox, then a Recover (if an attribute is refused, note which). With `Directory.ForceReplication` on, check that *Replication synchronization* alone is enough on every destination domain controller. Sign in to Graph with only the Entra role *Exchange Recipient Administrator* and run **Check** (a refusal of the licence read means a reader role such as *Global Reader* is needed). For each cmdlet of the Exchange Online table, `Get-ManagementRoleEntry "*\<cmdlet>"` and confirm the role. Certificate sign-in with a certificate created by the Annex C command (CSP provider) in `CurrentUser\My`.
+10. **Minimum permissions ([chapter 4](#4-prerequisites), *What the code cannot tell you*):** with an account that is **not** a Domain Admin and holds only the `dsacls` delegation of [chapter 4](#4-prerequisites), run a Preview and an Apply on one user and one shared mailbox, then a Recover (if an attribute is refused, note which). With `Directory.ForceReplication` on, check that *Replication synchronization* alone is enough on every destination domain controller. Sign in to Graph with only the Entra role *Exchange Recipient Administrator* and run **Check** (a refusal of the licence read means a reader role such as *Global Reader* is needed). For each cmdlet of the Exchange Online table, `Get-ManagementRoleEntry "*\<cmdlet>"` and confirm the role. Certificate sign-in with a certificate created by the [Annex C](#annex-c--certificate-sign-in-application) command (CSP provider) in `CurrentUser\My`.
 
 ## Annex C — Certificate sign-in (application)
 
 > **In short:** How to sign in without a person: one application, one certificate, two permissions, one role.
 
-Least privilege for unattended runs: one application, one certificate, two application permissions (`User.Read.All` for Microsoft Graph, `Exchange.ManageAsApp` for Exchange Online, both with admin consent) and one Entra role (Exchange Recipient Administrator) for its service principal. These are exactly the rows of the *Certificate sign-in* column of chapter 4, *Permissions*. The tool reads and grants nothing else through the application.
+Least privilege for unattended runs: one application, one certificate, two application permissions (`User.Read.All` for Microsoft Graph, `Exchange.ManageAsApp` for Exchange Online, both with admin consent) and one Entra role (Exchange Recipient Administrator) for its service principal. These are exactly the rows of the *Certificate sign-in* column of [chapter 4](#4-prerequisites), *Permissions*. The tool reads and grants nothing else through the application.
 
 **What the certificate must be** (the console light *Sign-in: Certificate* checks the first three; Microsoft requires the last two for Exchange Online):
 
@@ -1206,7 +1208,7 @@ $app                                               # -> Cloud.AppId
 > With certificate sign-in, Exchange Online identifies the session by the **organisation domain** and the **AppId**: `Cloud.Organization` must be the initial domain (`tenant.onmicrosoft.com`) and `Cloud.AppId` the application ID. To revoke: delete the certificate credential of the application (or the application).
 
 > [!WARNING]
-> **To validate in the lab.** The `-Provider` parameter (CSP key, not CNG) follows Microsoft's requirement for app-only sign-in in Exchange Online; it was added to this command in 3.0.0 and has not been replayed on a tenant. The command of the earlier versions used the default provider. If `Connect-ExchangeOnline` refuses the certificate, recreate it with the provider named above. Whether the Entra role *Exchange Recipient Administrator* alone covers every cmdlet of chapter 4 is also a point to confirm once (chapter 4, *What the code cannot tell you*).
+> **To validate in the lab.** The `-Provider` parameter (CSP key, not CNG) follows Microsoft's requirement for app-only sign-in in Exchange Online; it was added to this command in 3.0.0 and has not been replayed on a tenant. The command of the earlier versions used the default provider. If `Connect-ExchangeOnline` refuses the certificate, recreate it with the provider named above. Whether the Entra role *Exchange Recipient Administrator* alone covers every cmdlet of [chapter 4](#4-prerequisites) is also a point to confirm once ([chapter 4](#4-prerequisites), *What the code cannot tell you*).
 
 <!-- icon: file -->
 ## Annex D — File formats
@@ -1232,7 +1234,7 @@ Every JSON has a `.sha256` file; a mismatch is refused. **Version 2.0.0 reads th
 
 > **In short:** What changed between versions and how to upgrade.
 
-**From 2.x to 3.0.0.** Install PowerShell 7.5+ and the AD, Exchange Online and Graph modules for PowerShell 7 (chapter 4); replace the package folder; keep `Backups\` and the configuration file (same format; nothing to change); run the commands with `pwsh` (and change the action of scheduled tasks from `powershell.exe` to `pwsh.exe`, chapter 7). Windows PowerShell 5.1 and PowerShell 7.4 are refused before any code runs. The 2.2.x package remains the Windows PowerShell 5.1 version and is the fallback on a server that cannot have PowerShell 7; both versions read the backups of the other.
+**From 2.x to 3.0.0.** Install PowerShell 7.5+ and the AD, Exchange Online and Graph modules for PowerShell 7 ([chapter 4](#4-prerequisites)); replace the package folder; keep `Backups\` and the configuration file (same format; nothing to change); run the commands with `pwsh` (and change the action of scheduled tasks from `powershell.exe` to `pwsh.exe`, [chapter 7](#7-unattended-execution)). Windows PowerShell 5.1 and PowerShell 7.4 are refused before any code runs. The 2.2.x package remains the Windows PowerShell 5.1 version and is the fallback on a server that cannot have PowerShell 7; both versions read the backups of the other.
 
 - **One source**: `$script:ToolVersion` in `module\PRA.Common.psm1`, exported as `Get-PraToolVersion`. The entry script (run context, report, audit, log), the window (title) and the package builder (`tools\New-PraPackage.ps1`, which reads that line as text) take the version from it. Nothing else in the code carries a version literal.
 - **Literals that cannot be computed** (the signature and the manifest hash the exact bytes, so a comment cannot be generated at run time). Change them together with the source, in the same commit; `tests\PraRemoteMailbox.Tests.ps1` fails if one differs:
@@ -1242,7 +1244,7 @@ Every JSON has a `.sha256` file; a mismatch is refused. **Version 2.0.0 reads th
   - `version:` in the front matter of this guide, and the generated `docs\PraRemoteMailbox-Guide.html` (rebuild it);
   - `README.md` (package and repository) and the `CHANGELOG.md` heading;
   - the repository-only headers `Version` of `tools\New-PraPackage.ps1`, `tools\Build-Documentation.ps1`, `tests\Invoke-TestGate.ps1`, `tests\IntegrityFixture.ps1`, `tests\PackageIntegrity.Tests.ps1`, `tests\PraRemoteMailbox.Tests.ps1`, `tests\PraReport.Tests.ps1`.
-- Release checklist: gate PASS · lab campaign (annex B) · `pwsh tools\New-DocumentationImages.ps1` (PowerShell 7.5+, Microsoft Edge, documentation only: every picture of the README and the guides, then the two HTML guides) · **owner signature and manifest (below)** · `tools\New-PraPackage.ps1` · git tag `vX.Y.Z`.
+- Release checklist: gate PASS · lab campaign ([annex B](#annex-b--lab-test-campaign-2026-09-30)) · `pwsh tools\New-DocumentationImages.ps1` (PowerShell 7.5+, Microsoft Edge, documentation only: every picture of the README and the guides, then the two HTML guides) · **owner signature and manifest (below)** · `tools\New-PraPackage.ps1` · git tag `vX.Y.Z`.
 - **Signature and manifest after a change.** Editing a signed or hashed file invalidates its signature or hash, and the package then refuses to start (by design). The owner (1) signs, with the timestamp, every PowerShell file of the inventory (`Invoke-PraRemoteMailbox.ps1`, `PraRemoteMailbox.psd1`, `PraRemoteMailbox.psm1`, `module\PRA.Common.psm1`, `PRA.Directory.psm1`, `PRA.Backup.psm1`, `PRA.Cloud.psm1`, `PRA.Gui.psm1`, `PRA.Gui.Directory.ps1`, `Test-PackageIntegrity.ps1`); (2) regenerates `PackageIntegrity.psd1` with the SHA256 of **every** inventory file taken from the final signed bytes (the hash of a signed script includes its signature block, so it cannot be computed before signing), then signs the manifest; (3) runs the gate and `tools\New-PraPackage.ps1`. The gate and the Pester suites also pass on an unsigned working tree (the native-state tests accept the fail-closed state); `tools\New-PraPackage.ps1` and the CI *Package* stage refuse an unsigned or changed source.
 
 **From 1.3.6**: keep the old `Backups` folders; copy the values of `DRP-Config.psd1` into the new file (same sections; `ADConnect` → `EntraConnect`; `BackupFolder/LogFolder/ReportFolder` → `Storage/Logging/Report`; `Safety` → `Storage.ForbiddenBackupRoots`); keep the same `Environment` to use the old batches. Command mapping: see `CHANGELOG.md` (table "Changed").
@@ -1256,7 +1258,7 @@ Review of version 1.3.6 (script 513 lines, four modules 3,386 lines, gate 325 te
 
 | # | Finding | Impact | 2.0.0 |
 |---|---|---|---|
-| 1 | Certificate sign-in to Exchange Online always refused by the session guard (TenantID of an app-only session = organisation domain) | cloud phase impossible unattended; explains the "UnAuthorized" blocker of the 1.3.4 pilot | **fixed** (annex C) |
+| 1 | Certificate sign-in to Exchange Online always refused by the session guard (TenantID of an app-only session = organisation domain) | cloud phase impossible unattended; explains the "UnAuthorized" blocker of the 1.3.4 pilot | **fixed** ([annex C](#annex-c--certificate-sign-in-application)) |
 | 2 | Missing ADSync detected **after** the AD writes | batch half done (AD written, no sync, no cloud) — seen in the E2E pilot | checked before the first write; remote sync added |
 | 3 | One ShouldProcess prompt per AD write and per grant (ConfirmImpact High) | dozens of prompts for a batch; operators used `-Force` blindly | one confirmation after the plan |
 | 4 | `-BackupFile` / `-StateFile` long paths, implicit choice of "the most recent backup" | copy/paste errors (a line break in a path stopped a Recover on 09-09) | short batch IDs, explicit, proof and source found automatically |

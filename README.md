@@ -93,7 +93,7 @@ cd D:\PRA\PraRemoteMailbox
 # 6 · Move everyone: the scope of the settings file, on one server
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert                  # preview
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Mode Apply      # backup, AD, sync, Exchange Online
-#     Two servers (the AD server cannot reach the cloud): on the AD server, then copy ONE zip file to the cloud server
+#     Two servers (no single server reaches both Active Directory and Microsoft 365): on the AD server, then copy ONE zip file to the cloud server
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Batch 'PRA-PROD-Convert-490cc62e-for-Cloud.zip' -Mode Apply   # on the cloud server
 
@@ -147,7 +147,7 @@ Keep the `Backups` folder on a durable, protected volume: the backups are the on
 - **Preview by default.** Without `-Mode Apply` the tool only reads. With `-Mode Apply` it shows the plan and asks **one** confirmation (`-Force` for unattended runs).
 - **X500 control.** The batch records the X500 addresses (`legacyExchangeDN` and older X500) that the cloud mailbox must carry; the cloud phase proves them and warns if one is missing, because replies to old messages would otherwise bounce.
 - **One batch ID** links the steps: every Apply prints it with the exact next command, and `-Action Recover -Batch <id>` rolls the batch back.
-- **One or two servers**: everything from one server, or the AD part on-premises and the cloud part on an isolated server.
+- **One or two servers**: everything from one server that reaches both Active Directory and Microsoft 365, or the AD part on the AD server and the cloud part on a **cloud server**. The cloud server is not a server hosted in the cloud: it is any Windows machine of your organisation that reaches Microsoft 365 through the Internet, with no access to Active Directory.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-principles-dark.png">
@@ -195,7 +195,7 @@ Exchange on-premises is down, so the tool reads the permissions where Exchange k
 
 Open the console with `pwsh -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui` (native Fluent theme, PowerShell 7.5+, English). It starts no operation by itself; every operation runs the existing engine in a separate **PowerShell 7.5+** process (the same `pwsh.exe`).
 
-The console is a guided path of five pages: **Setup** (the environment, what this server can run, the prerequisite lights from real detection, one line of run settings), **Task** (move mailboxes, roll back, complete a rollback, check a mailbox, on what: one identity to test first, the configured scope, an OU or a CSV, or a batch or package to continue), **Verify** (the Preview in plain words, then the confirmation word in any letter case), **Run** (the steps announced by the engine, with their waits and warnings in plain words; click a step or an object) and **Next steps**. Run settings changed in the window apply to that run only, through a guarded effective copy of the configuration: the file is never rewritten. See the [reference guide](package/docs/PraRemoteMailbox-Guide.md), chapter 8.
+The console is a guided path of five pages: **Setup** (the environment, what this server can run, the prerequisite lights from real detection, one line of run settings), **Task** (move mailboxes, roll back, complete a rollback, check a mailbox, on what: one identity to test first, the configured scope, an OU or a CSV, or a batch or package to continue), **Verify** (the Preview in plain words, then the confirmation word in any letter case), **Run** (the steps announced by the engine, with their waits and warnings in plain words; click a step or an object) and **Next steps**. Run settings changed in the window apply to that run only, through a guarded effective copy of the configuration: the file is never rewritten. See the [reference guide, chapter 8](package/docs/PraRemoteMailbox-Guide.md#8-everyday-use).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/console-run-finished-dark.png">

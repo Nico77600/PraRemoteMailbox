@@ -19,6 +19,8 @@ a PATCH version fixes a defect. The backup formats have their own version (see t
 ### Changed
 - A batch written before 3.1.0 has no expected list: the control is skipped with an information line, never a failure.
   The backup schema is unchanged (one more optional field per record).
+- User guide clarified: which path is yours, what the cloud server is (a company machine, not a server in the cloud), where the
+  phase shows on screen, working links.
 
 ## 3.0.0 — 2026-11-05
 
