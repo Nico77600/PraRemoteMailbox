@@ -250,7 +250,7 @@
 
     <!-- Prerequisite light -->
     <DataTemplate x:Key="LightT">
-      <Border x:Name="Bd" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" Background="{DynamicResource LayerFillColorDefaultBrush}" Padding="12,10" Margin="0,0,10,0">
+      <Border x:Name="Bd" CornerRadius="8" BorderThickness="1" BorderBrush="{DynamicResource CardStrokeColorDefaultBrush}" Background="{DynamicResource LayerFillColorDefaultBrush}" Padding="12,10" Margin="0,0,10,10">
         <StackPanel>
           <StackPanel Orientation="Horizontal">
             <ContentControl Content="{Binding}" ContentTemplate="{StaticResource GlyphT}"/>
@@ -376,7 +376,7 @@
                 </StackPanel>
               </Grid>
               <ItemsControl x:Name="Lights" ItemTemplate="{StaticResource LightT}">
-                <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Rows="1"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                <ItemsControl.ItemsPanel><ItemsPanelTemplate><UniformGrid Columns="3"/></ItemsPanelTemplate></ItemsControl.ItemsPanel>
               </ItemsControl>
             </StackPanel>
           </Border>

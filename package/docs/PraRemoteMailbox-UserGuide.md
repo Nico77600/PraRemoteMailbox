@@ -197,11 +197,11 @@ pwsh -STA -File D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1 -Gui
 
 **You should see:** the console opens. It starts on the **Setup** page. Look at the **lights**. A light is a small box with a mark. A **green check** means "this is ready". A **red cross** means "this is missing".
 
-![The Setup page. Five lights: all five are green or grey. Number 1 marks the lights](images/console-setup-light.png)
+![The Setup page. Six lights: all six are green or grey. Number 1 marks the lights](images/console-setup-light.png)
 
 Here is what each light checks.
 
-![The five lights, one by one, in green](images/console-setup-lights-light.png)
+![The six lights, one by one, in green](images/console-setup-lights-light.png)
 
 | Light | In plain words |
 |---|---|
@@ -210,13 +210,14 @@ Here is what each light checks.
 | **Microsoft.Graph** | The program that reads people in Microsoft 365. |
 | **Entra Connect sync** | The way to send the changes to the cloud. Grey means "not used". |
 | **Sign-in** | How the tool signs in to Microsoft 365. |
+| **Microsoft 365 reachable** | Can this server reach Microsoft 365 through the Internet? The console tries for 3 seconds. This light shows only when the cloud programs are installed. |
 
 **If a light is red:** read the red text inside it. It says what is missing. Ask your administrator to fix it. Then press **Check again**.
 
 ![A Setup page where two lights are red because the cloud programs are not installed on this server](images/console-setup-red-light.png)
 
 > [!NOTE]
-> A red light is **not always a problem**. In the middle box, **This server can run**, a big word says what *this* server can do. **AD + Cloud** means everything. **AD** means the directory part only. **Cloud** means the cloud part only. **Nothing yet** means a light must be fixed first. The word comes from the programs installed here. It does not test the network. On the directory server, the cloud lights stay red. On the cloud server, the **RSAT ActiveDirectory** light stays red. That is normal. You do the other part on the other server.
+> A red light is **not always a problem**. In the middle box, **This server can run**, a big word says what *this* server can do. **AD + Cloud** means everything. **AD** means the directory part only. **Cloud** means the cloud part only. **Nothing yet** means a light must be fixed first. The word comes from the programs installed here and from a short test of the Internet. If Microsoft 365 cannot be reached, the word is **AD**, even when every program is installed. The cloud part must then run on another machine that reaches the Internet (two servers). On the directory server, the cloud lights stay red. On the cloud server, the **RSAT ActiveDirectory** light stays red. That is normal. You do the other part on the other server.
 
 <!-- icon: cloud -->
 ## 4. A · Move mailboxes to the cloud
@@ -255,7 +256,7 @@ This is the safest start. One person is moved. Everybody else is left alone.
 
 ![The Task page. Number 1: the box with the e-mail address. Number 2: the button Check. Number 3: the pill Phase: Both. Number 4: the button Continue to verification](images/console-task-identity-light.png)
 
-**You should see:** a green line under the box with the name of the person, for example *Alice Vance · alice.vance@contoso.com · User mailbox*. At the bottom of the page, the card **What will happen on this server** has a pink pill on its left. The pill says **Phase: Both** (number 3 in the picture). It means that this server does everything alone. On a directory server of a two-server move, it says **Phase: AD**: see Path 3.
+**You should see:** a green line under the box with the name of the person, for example *Alice Vance · alice.vance@contoso.com · User mailbox*. At the bottom of the page, the card **What will happen on this server** has a pink pill on its left. The pill says **Phase: Both** (number 3 in the picture). It means that this server does everything alone. On a directory server of a two-server move, it says **Phase: AD**: see Path 3. A server that cannot reach Microsoft 365 also says **Phase: AD**.
 
 **If not:** a red line says the person was not found. Check the spelling of the e-mail address. If two people match, type the exact e-mail address. If it still fails, stop and ask.
 

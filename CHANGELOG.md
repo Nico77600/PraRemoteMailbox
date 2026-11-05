@@ -19,8 +19,10 @@ a PATCH version fixes a defect. The backup formats have their own version (see t
 ### Changed
 - A batch written before 3.1.0 has no expected list: the control is skipped with an information line, never a failure.
   The backup schema is unchanged (one more optional field per record).
+- Phase detection tests the network: *AD + Cloud* is proposed only if Microsoft 365 answers from this server (HTTPS to the
+  sign-in and Exchange Online endpoints, in the background); otherwise *AD*, with a new Setup light that says why.
 - User guide clarified: which path is yours, what the cloud server is (a company machine, not a server in the cloud), where the
-  phase shows on screen, working links.
+  phase shows on screen, the Complete a rollback screens, working links.
 
 ## 3.0.0 — 2026-11-05
 

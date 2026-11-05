@@ -69,7 +69,7 @@ Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllU
 # 3 · Fill in the settings: scope, licence group, routing domain, Entra Connect server, tenant
 notepad D:\PRA\PraRemoteMailbox\config\PraRemoteMailbox.config.psd1
 
-# 4 · Open the console: five lights on the first page, all green or grey
+# 4 · Open the console: the lights on the first page, all green or grey
 pwsh -STA -File D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1 -Gui
 ```
 
@@ -78,7 +78,7 @@ pwsh -STA -File D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1 -Gui
 <br>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/console-setup-dark.png">
-  <img alt="The Setup page of the console: the environment, what this server can run, and five prerequisite lights, all green" src="package/docs/images/console-setup-light.png">
+  <img alt="The Setup page of the console: the environment, what this server can run, and the prerequisite lights, all green" src="package/docs/images/console-setup-light.png">
 </picture>
 </details>
 

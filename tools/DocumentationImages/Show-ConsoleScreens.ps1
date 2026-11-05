@@ -96,10 +96,11 @@ try {
         J (Join-Path $ffolder 'RecoverFinalize-fixture.json') @{SchemaVersion = 2; Operation = 'RecoverFinalize'; Environment = 'LAB'; BatchId = $id; SourceBackupHash = ''; Records = @($item); Items = @($item) }
     }
 
+    # The probes stand in for the whole detection, the Microsoft 365 test included: a server with the programs of its side also shows the light *Microsoft 365 reachable*.
     $bothProbe = { param($r) [pscustomobject]@{ Lights = @(
                 [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Ok'; Detail = 'Installed, version 1.0.1.0.' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Ok'; Detail = 'Installed, version 3.10.0.' },
                 [ordered]@{Name = 'Microsoft.Graph'; Status = 'Ok'; Detail = 'Installed, version 2.25.0.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01 (reachability is checked when the run starts).' },
-                [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }); AD = $true; Cloud = $true; Role = 'Both' } }
+                [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }, [ordered]@{Name = 'Microsoft 365 reachable'; Status = 'Ok'; Detail = 'Reachable from this server (login.microsoftonline.com and outlook.office365.com).' }); AD = $true; Cloud = $true; Role = 'Both' } }
     $adProbe = { param($r) [pscustomobject]@{ Lights = @(
                 [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Ok'; Detail = 'Installed, version 1.0.1.0.' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Fail'; Detail = 'Not installed (version 3.10.0 or later needed): Install-Module ExchangeOnlineManagement.' },
                 [ordered]@{Name = 'Microsoft.Graph'; Status = 'Fail'; Detail = 'Not installed (Authentication and Users): the cloud parts and Check cannot run on this server.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01 (reachability is checked when the run starts).' },
@@ -107,7 +108,7 @@ try {
     $cloudProbe = { param($r) [pscustomobject]@{ Lights = @(
                 [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Fail'; Detail = 'Not installed: the Active Directory parts cannot run on this server (install the RSAT feature Active Directory module).' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Ok'; Detail = 'Installed, version 3.10.0.' },
                 [ordered]@{Name = 'Microsoft.Graph'; Status = 'Ok'; Detail = 'Installed, version 2.25.0.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'NA'; Detail = 'Not used: this server does not change Active Directory.' },
-                [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }); AD = $false; Cloud = $true; Role = 'Cloud' } }
+                [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }, [ordered]@{Name = 'Microsoft 365 reachable'; Status = 'Ok'; Detail = 'Reachable from this server (login.microsoftonline.com and outlook.office365.com).' }); AD = $false; Cloud = $true; Role = 'Cloud' } }
     $probe = switch ($Scenario) { 'twoserver' { $adProbe } 'finalize' { $adProbe } 'cloud' { $cloudProbe } default { $bothProbe } }
     $identityProbe = { param($identity) [pscustomobject]@{ Success = $true; Found = $true; Count = 1; DisplayName = 'Alice Vance'; UserPrincipalName = 'alice.vance@contoso.com'; SamAccountName = 'alice.vance'; MailboxType = 'User mailbox' } }
     $toolVersion = [regex]::Match([IO.File]::ReadAllText((Join-Path $repo 'package\Invoke-PraRemoteMailbox.ps1')), '(?m)^\s*Version\s*:\s*(\d+\.\d+\.\d+)\s*$').Groups[1].Value
