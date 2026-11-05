@@ -837,8 +837,8 @@ function Get-PraExpectedX500 {
     $list = New-Object 'Collections.Generic.List[string]'
     if (-not [string]::IsNullOrWhiteSpace($LegacyExchangeDN)) { $value = 'X500:' + $LegacyExchangeDN; if ($seen.Add($value)) { $list.Add($value) } }
     foreach ($address in @($ProxyAddresses)) { if (Test-PraX500Address $address) { if ($seen.Add([string]$address)) { $list.Add([string]$address) } } }
-    if ($list.Count -gt $script:MaxExpectedX500) { throw "Too many X500 addresses to verify ($($list.Count), limit $($script:MaxExpectedX500)): conversion refused before any change." }
-    foreach ($value in $list) { if ($value.Length -gt $script:MaxExpectedX500Length) { throw "X500 address too long to verify ($($value.Length) characters, limit $($script:MaxExpectedX500Length)): conversion refused before any change." } }
+    if ($list.Count -gt $script:MaxExpectedX500) { throw "Too many X500 addresses to verify ($($list.Count), limit $($script:MaxExpectedX500))." }
+    foreach ($value in $list) { if ($value.Length -gt $script:MaxExpectedX500Length) { throw "X500 address too long to verify ($($value.Length) characters, limit $($script:MaxExpectedX500Length))." } }
     return [string[]]$list.ToArray()
 }
 #endregion

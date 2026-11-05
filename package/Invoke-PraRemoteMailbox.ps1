@@ -925,11 +925,12 @@ try {
         $stepTitle = switch ($Action) { 'Check' { 'Objects to check' } 'Recover' { 'Loading the Recover batch' } default { 'Loading the batch of the AD phase' } }
         Write-PraStep -Context $context -Title $stepTitle -Icon Batch
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and $Identity -and -not $Batch) {
-            if ($Identity -match '@') { $record = [pscustomobject]@{ ObjectGuid = ''; SamAccountName = $Identity; UserPrincipalName = $Identity; IsShared = ((Test-PraOrdinalIgnoreCaseEqual $Scope 'SharedOnly')) } }
+            if ($Identity -match '@') { $record = [pscustomobject]@{ ObjectGuid = ''; SamAccountName = $Identity; UserPrincipalName = $Identity; IsShared = ((Test-PraOrdinalIgnoreCaseEqual $Scope 'SharedOnly')); ExpectedX500Note = 'identity given as a UPN, no Active Directory read: give the sAMAccountName or -Batch' } }
             else {
                 Initialize-PraDirectory $context
                 $user = Get-PraUser $context $Identity
-                $record = [pscustomobject]@{ ObjectGuid = ([guid]$user.ObjectGUID).ToString(); SamAccountName = $user.SamAccountName; UserPrincipalName = $user.UserPrincipalName; IsShared = ((Test-PraOrdinalIn $user.msExchRecipientTypeDetails @(4, 34359738368) -IgnoreCase)) }
+                $record = [pscustomobject]@{ ObjectGuid = ([guid]$user.ObjectGUID).ToString(); SamAccountName = $user.SamAccountName; UserPrincipalName = $user.UserPrincipalName; IsShared = ((Test-PraOrdinalIn $user.msExchRecipientTypeDetails @(4, 34359738368) -IgnoreCase))
+                    ExpectedX500 = [string[]]@(Get-PraExpectedX500 -LegacyExchangeDN ([string](Get-PraValue $user 'legacyExchangeDN' '')) -ProxyAddresses @($user.proxyAddresses)) }
             }
             $context.Rows.Add((New-PraRow $context $record))
             Write-PraItem -Context $context -Status Ok -Text ("{0} ({1})" -f $record.UserPrincipalName, $(if ($record.IsShared) { 'shared mailbox' } else { 'user mailbox' }))
@@ -1056,6 +1057,13 @@ try {
 
     if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIn $effectivePhase @('Both','Cloud') -IgnoreCase) -and $context.BatchId -and -not $context.Issues.Count) {
         $context.NextSteps = @($(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { 'To roll back this batch later, on the AD server: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId -OtherServer) } else { 'To roll back this batch later: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId) }))
+    }
+
+    # X500 addresses missing in Exchange Online (warning of the cloud phase): synchronise, then check again.
+    $x500Missing = @(Get-PraList $context 'X500Missing')
+    if ($x500Missing.Count) {
+        $checkCommand = Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $context.BatchId -KeepFilters
+        $context.NextSteps = @(@(Get-PraList $context 'NextSteps') + ('X500 missing in Exchange Online for {0} object(s) (replies to old messages can bounce): run an Entra Connect synchronisation, then check again: {1}' -f $x500Missing.Count, $checkCommand))
     }
 }
 catch {

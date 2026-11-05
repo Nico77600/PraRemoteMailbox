@@ -296,7 +296,15 @@ function Invoke-PraCloudPhase {
     param([hashtable]$Context,[object[]]$Rows,[string]$Act)
     $state=[Management.Automation.PSSerializer]::Deserialize([IO.File]::ReadAllText($env:PRA_GATE_STATE))
     [IO.File]::AppendAllText($state.EventPath,('{"Operation":"CloudPhase-SyntheticBarrier","Synthetic":true}'+"`r`n"))
-    if ($state.Case -eq 'CloudConcurrentChange') {
+    $seen=@(foreach ($row in $Rows) { [ordered]@{ Upn=[string]$row.UserPrincipalName; ExpectedX500=@(Get-PraList $row.BackupRec 'ExpectedX500'); Note=[string](Get-PraValue $row.BackupRec 'ExpectedX500Note' '') } })
+    [IO.File]::AppendAllText($state.EventPath,((@{Operation='CloudRows-SyntheticBarrier';Synthetic=$true;Rows=$seen} | ConvertTo-Json -Depth 8 -Compress)+"`r`n"))
+    if ($state.Case -eq 'CloudX500Missing') {
+        # What the real cloud phase does for an object whose X500 address is not in Exchange Online: a warning item, the object listed for the Next steps, the conversion done.
+        foreach ($row in $Rows) { $row.CloudStatus='Success'; $row.CloudMailbox=$true; $row.CloudLicense=$true; $row.FinalStatus='Success'; $row.CloudDetail='SYNTHETIC: mailbox ready.' }
+        $Context.CurrentIdentity=[string]$Rows[0].ObjectGuid
+        Write-PraItem -Context $Context -Status Warn -Text ($Rows[0].UserPrincipalName+': X500 missing in Exchange Online: X500:/o=Synthetic/cn=old. Replies to old messages and meeting updates to this mailbox can bounce (IMCEAEX NDR).')
+        $Context['X500Missing']=New-Object 'Collections.Generic.List[string]'; [void]$Context['X500Missing'].Add([string]$Rows[0].UserPrincipalName)
+    } elseif ($state.Case -eq 'CloudConcurrentChange') {
         # Model a third-party edit during polling, not a cmdlet call by the product.
         $global:PraGateAd.Users[0].homeMDB='CN=ThirdParty,DC=gate,DC=invalid'
         $global:PraGateAd.Users[0].uSNChanged=[long]$global:PraGateAd.Users[0].uSNChanged+1
@@ -340,7 +348,7 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
             ObjectGUID=[guid]('00000000-0000-0000-0000-{0:000000000000}' -f $Index)
             DistinguishedName="CN=User$Index,OU=Tests,DC=gate,DC=invalid"; SamAccountName="user$Index"
             UserPrincipalName="user$Index@gate.invalid"; DisplayName="Synthetic User $Index"; Name="User$Index"; objectClass='user'
-            mail="user$Index@gate.invalid"; mailNickname="user$Index"; uSNChanged=[long]100; memberOf=@(); publicDelegates=@()
+            mail="user$Index@gate.invalid"; mailNickname="user$Index"; legacyExchangeDN="/o=Synthetic/ou=Gate/cn=Recipients/cn=user$Index"; uSNChanged=[long]100; memberOf=@(); publicDelegates=@()
             nTSecurityDescriptor=$null; msExchMailboxSecurityDescriptor=$null; msExchArchiveGUID=$null
             homeMDB="CN=Database$Index,CN=Databases,DC=gate,DC=invalid"; homeMTA='CN=OriginalMTA,DC=gate,DC=invalid'
             msExchHomeServerName='/o=Synthetic/ou=Gate/cn=Servers/cn=Original'; msExchMailboxGuid=[byte[]](0,1,2,127,128,254,255,$Index)
@@ -6416,6 +6424,436 @@ Describe 'Release 3.0.0 lot 2c - the window switch -ForceAdReplication and -Base
             $overrides | Should -Match 'Polling.TimeoutMinutes'
             $overrides | Should -Match 'Directory.ForceReplication'
         } finally { $env:PRA_EVENT_FILE = $old }
+    }
+}
+
+Describe 'Release 3.1.0 - X500 control: Active Directory side (expected addresses recorded in the batch, read only)' -Tag 'Lot6' {
+    BeforeEach {
+        $global:PraGate.Runtime=New-GateRuntime -Name 'x500-ad'
+        $env:PRA_GATE_STATE=$global:PraGate.Runtime.StatePath
+        $env:PSModulePath=$global:PraGate.Runtime.Modules+';'+(Join-Path $PSHOME 'Modules')
+        Import-Module ActiveDirectory -Force -Global
+        $global:PraGate.Context=New-GateContext $global:PraGate.Runtime
+        $global:PraGate.Context.LogFile=Join-Path $global:PraGate.Runtime.Root 'logs\x500-ad.log'
+        $global:PraGate.Legacy1='X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user1'
+        $global:PraGate.Older='X500:/o=Synthetic/ou=Gate/cn=User'
+    }
+    It 'reads legacyExchangeDN with the other attributes and records X500:<legacyExchangeDN> first, then the on-premises X500 proxies; nothing else is managed' {
+        $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
+        @($plan.Record.ExpectedX500) | Should -BeExactly @($global:PraGate.Legacy1,$global:PraGate.Older)
+        $plan.Record.ExpectedX500 | Should -BeOfType ([string])
+        $plan.Kinds.Keys | Should -Not -Contain 'legacyExchangeDN'
+        $plan.Record.Attributes.Keys | Should -Not -Contain 'legacyExchangeDN'
+        $plan.Record.PlannedAttributes.Keys | Should -Not -Contain 'legacyExchangeDN'
+        $read=@(Get-GateEvents $global:PraGate.Runtime | Where-Object Operation -eq 'Get-ADUser')[0]
+        @($read.Detail.Properties) | Should -Contain 'legacyExchangeDN'
+        @(Get-GateWrites $global:PraGate.Runtime).Count | Should -Be 0
+    }
+    It 'removes duplicates (ordinal, ignoring case, whole value), keeps the first spelling byte for byte and ignores non-X500 proxies' {
+        $user=$global:PraGateAd.Users[0]
+        $user.proxyAddresses=[string[]]@($user.proxyAddresses)+'x500:/O=SYNTHETIC/OU=GATE/CN=RECIPIENTS/CN=USER1'+'x500:/o=synthetic/ou=gate/cn=user'+'X500:/o=Old/cn=A B '+'X500:/o=Old/cn=A B '+'smtp:x500:not.x500@gate.invalid'
+        $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
+        @($plan.Record.ExpectedX500) | Should -BeExactly @($global:PraGate.Legacy1,$global:PraGate.Older,'X500:/o=Old/cn=A B ')
+        # a value that differs by one character is another address
+        $user.proxyAddresses=[string[]]@($user.proxyAddresses)+'X500:/o=Old/cn=A B'
+        @((New-PraPlan $global:PraGate.Context 'user1' 'Convert').Record.ExpectedX500).Count | Should -Be 4
+    }
+    It 'keeps only the X500 proxies when legacyExchangeDN is empty or absent' -ForEach @(@{Shape='empty'},@{Shape='absent'}) {
+        $user=$global:PraGateAd.Users[0]
+        if ($Shape -eq 'empty') { $user.legacyExchangeDN='' } else { $user.PSObject.Properties.Remove('legacyExchangeDN') }
+        $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
+        @($plan.Record.ExpectedX500) | Should -BeExactly @($global:PraGate.Older)
+        $user.proxyAddresses=[string[]]@($user.proxyAddresses | Where-Object { $_ -cne $global:PraGate.Older })
+        @((New-PraPlan $global:PraGate.Context 'user1' 'Convert').Record.ExpectedX500).Count | Should -Be 0
+    }
+    It 'writes the field in the batch JSON, re-reads it, and never writes, restores or clears legacyExchangeDN' {
+        $context=$global:PraGate.Context
+        $plans=@(New-PraPlan $context 'user1' 'Convert';New-PraPlan $context 'user2' 'Convert')
+        $receipt=Invoke-PraAdBatch $context $plans 'Convert'
+        $saved=Import-PraBackup $context $receipt.Path
+        @($saved.Data.Records[0].ExpectedX500) | Should -BeExactly @($global:PraGate.Legacy1,$global:PraGate.Older)
+        @($saved.Data.Records[1].ExpectedX500) | Should -BeExactly @('X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user2',$global:PraGate.Older)
+        $global:PraGateAd.Users[0].legacyExchangeDN | Should -BeExactly '/o=Synthetic/ou=Gate/cn=Recipients/cn=user1'
+        $writes=@(Get-GateEvents $global:PraGate.Runtime | Where-Object Operation -eq 'Set-ADUser')
+        $writes.Count | Should -BeGreaterThan 0
+        ($writes | ConvertTo-Json -Depth 10) | Should -Not -Match 'legacyExchangeDN'
+        # Recover: the field is empty (nothing to verify after a rollback) and legacyExchangeDN is still untouched.
+        $context.Action='Recover'; $context.Source=$receipt; $context.SourceBackupHash=$receipt.Hash
+        $recover=@(foreach ($record in $receipt.Data.Records) { New-PraPlan $context $record.ObjectGuid 'Recover' $record })
+        @($recover[0].Record.ExpectedX500).Count | Should -Be 0
+        $null=Invoke-PraAdBatch $context $recover 'Recover'
+        $global:PraGateAd.Users[0].legacyExchangeDN | Should -BeExactly '/o=Synthetic/ou=Gate/cn=Recipients/cn=user1'
+        (Get-GateEvents $global:PraGate.Runtime | Where-Object Operation -eq 'Set-ADUser' | ConvertTo-Json -Depth 10) | Should -Not -Match 'legacyExchangeDN'
+    }
+    It 'shows "X500 to verify after the conversion: N" per object in the plan (information, nothing changes)' {
+        $context=$global:PraGate.Context
+        $context.Mode='Preview'; $context.AllowMutation=$false
+        $plans=@(New-PraPlan $context 'user1' 'Convert';New-PraPlan $context 'user2' 'Convert')
+        Invoke-PraAdPreview $context $plans
+        $log=[IO.File]::ReadAllText($context.LogFile)
+        $log | Should -Match 'user1: X500 to verify after the conversion: 2'
+        $log | Should -Match 'user2: X500 to verify after the conversion: 2'
+        $log | Should -Match ([regex]::Escape('X500 to verify in Exchange Online : '+$global:PraGate.Legacy1))
+        $context.Warnings | Should -Be 0
+        @(Get-GateWrites $global:PraGate.Runtime).Count | Should -Be 0
+        $global:PraGateAd.Users[0].PSObject.Properties.Remove('legacyExchangeDN')
+        $global:PraGateAd.Users[0].proxyAddresses=[string[]]@($global:PraGateAd.Users[0].proxyAddresses | Where-Object { $_ -cne $global:PraGate.Older })
+        Invoke-PraAdPreview $context @(New-PraPlan $context 'user1' 'Convert')
+        [IO.File]::ReadAllText($context.LogFile) | Should -Match 'user1: X500 to verify after the conversion: 0 \(no legacyExchangeDN and no X500 address on premises\)'
+    }
+    It 'reads a record written before 3.1.0 (no ExpectedX500) and refuses an invalid field like KeptX500' {
+        InModuleScope PRA.Directory {
+            $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
+            $record=($plan.Record | ConvertTo-Json -Depth 20 | ConvertFrom-Json -DateKind String)
+            { Assert-PraStoredRecord $record } | Should -Not -Throw
+            $record.PSObject.Properties.Remove('ExpectedX500')
+            { Assert-PraStoredRecord $record } | Should -Not -Throw
+            $bad=@{
+                NotX500=@('smtp:not.x500@gate.invalid'); NullEntry=@('X500:/o=a',$null); Number=@(7); Nested=@(@('X500:/o=a'))
+                TooLong=@('X500:'+('a' * 2100)); TooMany=@(1..2001 | ForEach-Object { 'X500:/o=Synthetic/cn=' + $_ }); Object=([pscustomobject]@{Value='X500:/o=a'})
+            }
+            foreach ($name in $bad.Keys) {
+                $record | Add-Member -NotePropertyName ExpectedX500 -NotePropertyValue $bad[$name] -Force
+                { Assert-PraStoredRecord $record } | Should -Throw '*expected X500*' -Because $name
+            }
+            $record | Add-Member -NotePropertyName ExpectedX500 -NotePropertyValue @('X500:/o=a','x500:/o=B') -Force
+            { Assert-PraStoredRecord $record } | Should -Not -Throw
+        }
+    }
+    It 'refuses a re-read batch whose expected X500 list differs from the plan, and refuses an object with too many X500 addresses before any change' {
+        InModuleScope PRA.Directory {
+            $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
+            $stored=($plan.Record | ConvertTo-Json -Depth 20 | ConvertFrom-Json -DateKind String)
+            { Assert-PraRecordMatchesPlan -Stored $stored -Expected $plan.Record } | Should -Not -Throw
+            $stored.ExpectedX500=@($stored.ExpectedX500[0])
+            { Assert-PraRecordMatchesPlan -Stored $stored -Expected $plan.Record } | Should -Throw '*expected X500 addresses not preserved*'
+            $stored.ExpectedX500=@($stored.ExpectedX500[0],($plan.Record.ExpectedX500[1].ToLowerInvariant()))
+            { Assert-PraRecordMatchesPlan -Stored $stored -Expected $plan.Record } | Should -Throw '*expected X500 addresses not preserved*'
+            $global:PraGateAd.Users[0].proxyAddresses=[string[]]@(1..2001 | ForEach-Object { 'X500:/o=Synthetic/cn=' + $_ })
+            { New-PraPlan $global:PraGate.Context 'user1' 'Convert' } | Should -Throw '*Too many X500 addresses*'
+        }
+        @(Get-GateWrites $global:PraGate.Runtime).Count | Should -Be 0
+    }
+}
+
+Describe 'Release 3.1.0 - X500 control: Exchange Online side (production Cloud module, mocked boundaries, no network)' -Tag 'Lot6' {
+    BeforeAll {
+        $global:PraGate.X500NetworkPath=Join-Path $global:PraGate.Root 'PraGateX500Network.psm1'
+        $networkSource=@'
+if ($env:PRA_GATE_NONET -cne 'SYNTHETIC-NO-NETWORK') { throw 'Synthetic interlock absent.' }
+function Get-EXOMailbox { [CmdletBinding()]param($Filter,$Properties,$ResultSize,[switch]$InactiveMailboxOnly) throw 'SYNTHETIC BLOCK: EXO mailbox' }
+function Get-EXORecipient { [CmdletBinding()]param($UserPrincipalName,$Filter,$Properties,$ResultSize) throw 'SYNTHETIC BLOCK: EXO recipient' }
+function Get-MgUser { [CmdletBinding()]param($UserId,$Property) throw 'SYNTHETIC BLOCK: Graph user' }
+function Get-MgUserLicenseDetail { [CmdletBinding()]param($UserId,[switch]$All) throw 'SYNTHETIC BLOCK: Graph license' }
+function Get-MgContext { [CmdletBinding()]param() [pscustomobject]@{TenantId='20000000-0000-0000-0000-000000000002';ContextScope='Process'} }
+function Get-ConnectionInformation { [CmdletBinding()]param() [pscustomobject]@{TenantID='20000000-0000-0000-0000-000000000002';State='Connected';TokenStatus='Active';ConnectionId='30000000-0000-0000-0000-000000000003';ModuleName=$global:PraGate.X500NetworkPath} }
+Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgUserLicenseDetail,Get-ConnectionInformation,Get-MgContext
+'@
+        [IO.File]::WriteAllText($global:PraGate.X500NetworkPath,$networkSource,(New-Object Text.UTF8Encoding($true)))
+        Import-Module $global:PraGate.X500NetworkPath -Global -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+        $global:PraGate.X500Legacy='X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user1'
+        $global:PraGate.X500Older='X500:/o=Synthetic/ou=Gate/cn=User'
+        $global:PraGate.X500Oldest='X500:/o=Contoso/ou=First Administrative Group/cn=Recipients/cn=user1'
+        function global:New-X500Row {
+            param([string]$Upn='user1@gate.invalid',[string]$Guid='00000000-0000-0000-0000-000000000001',[string[]]$Expected,[switch]$NoField,[string]$Note='')
+            $record=[ordered]@{ObjectGuid=$Guid;UserPrincipalName=$Upn;IsShared=$false}
+            if (-not $NoField) { $record.ExpectedX500=[string[]]$Expected }
+            if ($Note) { $record.ExpectedX500Note=$Note }
+            New-PraRow $global:PraGate.CloudContext ([pscustomobject]$record)
+        }
+        function global:Get-X500Log { [IO.File]::ReadAllText($global:PraGate.CloudContext.LogFile) }
+    }
+    BeforeEach {
+        $global:PraGate.Runtime=New-GateRuntime -Name 'x500-cloud'
+        $context=New-GateContext $global:PraGate.Runtime -Mode Apply -Action Convert
+        $context.Phase='Cloud'; $context.Once=$false; $context.CheckScope='Both'; $context.IntervalMinutes=0; $context.TimeoutMinutes=5
+        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';TenantId='20000000-0000-0000-0000-000000000002'}
+        $context.Config.SharedMailbox.GrantFullAccess=$false
+        $context.LogFile=Join-Path $global:PraGate.Runtime.Root 'logs\x500-cloud.log'
+        $global:PraGate.CloudContext=$context
+        $global:PraGate.X500Calls=0; $global:PraGate.X500Reply=$null
+        $global:PraGate.X500Binding=@{TenantId='20000000-0000-0000-0000-000000000002';ConnectionId='30000000-0000-0000-0000-000000000003';ModuleLocation=$global:PraGate.X500NetworkPath;ModulePath=$global:PraGate.X500NetworkPath}
+    }
+    AfterAll {
+        Remove-Item -LiteralPath 'Function:\New-X500Row','Function:\Get-X500Log' -ErrorAction SilentlyContinue
+        Remove-Module PRA.Cloud,PraGateX500Network -Force -ErrorAction SilentlyContinue
+    }
+    It 'every expected address present (case of the type prefix may differ): an Ok line, no warning, one read' {
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Older,$global:PraGate.X500Oldest)
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid','smtp:user1@synthetic.mail.onmicrosoft.com',$global:PraGate.X500Legacy.Replace('X500:','x500:'),$global:PraGate.X500Older,$global:PraGate.X500Oldest)}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $row=$global:PraGate.CloudRow
+        $row.CloudStatus | Should -BeExactly 'Success'
+        $row.FinalStatus | Should -BeExactly 'Success'
+        $row.Warnings | Should -BeNullOrEmpty
+        $row.CloudDetail | Should -Match 'X500:present=3/3'
+        $global:PraGate.CloudContext.Warnings | Should -Be 0
+        $global:PraGate.CloudContext.Issues.Count | Should -Be 0
+        @(Get-PraList $global:PraGate.CloudContext 'X500Missing').Count | Should -Be 0
+        Get-X500Log | Should -Match ([regex]::Escape('user1@gate.invalid: X500: 3 of 3 present (legacyExchangeDN + older X500)'))
+        $global:PraGate.X500Calls | Should -Be 1
+    }
+    It 'one address missing after the bounded re-reads: ONE warning listing it (not an error), counted everywhere, the conversion stays done' {
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Older,$global:PraGate.X500Oldest)
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid',$global:PraGate.X500Legacy,$global:PraGate.X500Older)}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $row=$global:PraGate.CloudRow; $context=$global:PraGate.CloudContext
+        $global:PraGate.X500Calls | Should -Be 3 -Because 'the first read and two re-reads, never a long new wait'
+        $row.CloudStatus | Should -BeExactly 'Success'
+        $row.FinalStatus | Should -BeExactly 'Success'
+        $context.Issues.Count | Should -Be 0
+        $context.Warnings | Should -Be 1
+        $warnings=@(Get-PraList $context 'WarningList')
+        $warnings.Count | Should -Be 1
+        $warnings[0].Message | Should -BeExactly ('user1@gate.invalid: X500 missing in Exchange Online: '+$global:PraGate.X500Oldest+'. Replies to old messages and meeting updates to this mailbox can bounce (IMCEAEX NDR). Check that Entra Connect syncs proxyAddresses and legacyExchangeDN for this object, run a sync, then run -Action Check.')
+        $row.Warnings | Should -Match ([regex]::Escape($global:PraGate.X500Oldest))
+        $row.CloudDetail | Should -Match 'X500:missing=1/3'
+        @(Get-PraList $context 'X500Missing') | Should -BeExactly @('user1@gate.invalid')
+        @(Get-PraList $context 'Journey' | Where-Object { $_.Status -eq 'Warn' -and $_.Text -match 'X500 missing' }).Count | Should -Be 1
+        Get-X500Log | Should -Match '\[WARN  \] user1@gate.invalid: X500 missing in Exchange Online'
+        Get-X500Log | Should -Match ([regex]::Escape('user1@gate.invalid | X500 missing in Exchange Online : '+$global:PraGate.X500Oldest))
+    }
+    It 'a value that lags one synchronisation: missing at the first read, present at the second: Ok after the re-read, progress events sent' {
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Older)
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid',$global:PraGate.X500Legacy)}
+        $eventFile=Join-Path $global:PraGate.Runtime.Root 'x500.events.jsonl'; $oldEvent=$env:PRA_EVENT_FILE; $env:PRA_EVENT_FILE=$eventFile
+        try {
+            InModuleScope PRA.Cloud {
+                Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+                Mock Close-PraCloudSession { }
+                Mock Start-Sleep { }
+                Mock Get-EXOMailbox {
+                    $global:PraGate.X500Calls++
+                    if ($global:PraGate.X500Calls -ge 2) { $global:PraGate.X500Reply.EmailAddresses=[string[]]@('SMTP:user1@gate.invalid',$global:PraGate.X500Legacy,$global:PraGate.X500Older) }
+                    $global:PraGate.X500Reply
+                }
+                Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+            }
+        } finally { $env:PRA_EVENT_FILE=$oldEvent }
+        $row=$global:PraGate.CloudRow; $context=$global:PraGate.CloudContext
+        $global:PraGate.X500Calls | Should -Be 2
+        $row.CloudStatus | Should -BeExactly 'Success'
+        $context.Warnings | Should -Be 0
+        $context.Issues.Count | Should -Be 0
+        @(Get-PraList $context 'X500Missing').Count | Should -Be 0
+        Get-X500Log | Should -Match ([regex]::Escape('user1@gate.invalid: X500: 2 of 2 present (legacyExchangeDN + older X500)'))
+        $progress=@(Get-Content -LiteralPath $eventFile -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String } | Where-Object kind -eq 'progress')
+        $progress.Count | Should -BeGreaterThan 0
+        ($progress.text -join ' ') | Should -Match 'Waiting for the X500 addresses to appear in Exchange Online'
+    }
+    It 'a batch without the field (3.0.0 or older) is skipped with an explicit information line, never a warning or a failure' {
+        $global:PraGate.CloudRow=New-X500Row -NoField
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid')}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Success'
+        $global:PraGate.CloudContext.Warnings | Should -Be 0
+        $global:PraGate.CloudContext.Issues.Count | Should -Be 0
+        $global:PraGate.X500Calls | Should -Be 1
+        Get-X500Log | Should -Match ([regex]::Escape('user1@gate.invalid: X500 control skipped, expected addresses not available (batch from 3.0.0 or older)'))
+    }
+    It 'an empty list (no legacyExchangeDN, no X500) says there is nothing to verify' {
+        $global:PraGate.CloudRow=New-X500Row -Expected @()
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid')}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Success'
+        $global:PraGate.CloudContext.Warnings | Should -Be 0
+        Get-X500Log | Should -Match 'X500 control skipped, nothing to verify'
+    }
+    It 'EmailAddresses not returned by Exchange Online: a warning (cannot be proven), not an error, and the request asks for the property' {
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy)
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox'}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { param($Filter,$Properties,$ResultSize) $global:PraGate.X500Calls++; $global:PraGate.X500Props=@($Properties); $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.X500Props | Should -Contain 'EmailAddresses'
+        $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Success'
+        $global:PraGate.CloudContext.Issues.Count | Should -Be 0
+        $global:PraGate.CloudContext.Warnings | Should -Be 1
+        $global:PraGate.CloudRow.Warnings | Should -Match 'X500 could not be verified in Exchange Online \(EmailAddresses not returned by Exchange Online\)'
+    }
+    It 'a single look (preview or -Once) reads once, never waits, and warns about what is missing' {
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Older)
+        $global:PraGate.CloudContext.Mode='Preview'; $global:PraGate.CloudContext.AllowMutation=$false; $global:PraGate.CloudContext.Once=$true
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@($global:PraGate.X500Legacy)}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { throw 'A single look must not wait.' }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.X500Calls | Should -Be 1
+        $global:PraGate.CloudContext.Warnings | Should -Be 1
+        $global:PraGate.CloudContext.Issues.Count | Should -Be 0
+        $global:PraGate.CloudRow.Warnings | Should -Match ([regex]::Escape($global:PraGate.X500Older))
+    }
+    It 'two objects: the one that is complete is Ok, the other one warns, and the next-step list counts only the second' {
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy)
+        $second=New-X500Row -Upn 'user2@gate.invalid' -Guid '00000000-0000-0000-0000-000000000002' -Expected @('X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user2')
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@($global:PraGate.X500Legacy)}
+        $global:PraGate.X500Second=$second
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow,$global:PraGate.X500Second) 'Convert'
+        }
+        $global:PraGate.CloudRow.Warnings | Should -BeNullOrEmpty
+        $global:PraGate.X500Second.Warnings | Should -Match 'user2@gate.invalid: X500 missing in Exchange Online: X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user2'
+        @(Get-PraList $global:PraGate.CloudContext 'X500Missing') | Should -BeExactly @('user2@gate.invalid')
+        $global:PraGate.CloudContext.Warnings | Should -Be 1
+        $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Success'
+        $global:PraGate.X500Second.CloudStatus | Should -BeExactly 'Success'
+    }
+    It 'Microsoft Graph mailbox check: the Entra proxyAddresses are compared, so no Exchange Online session is needed' {
+        $global:PraGate.CloudContext.Config.Cloud.MailboxCheckVia='Graph'
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Older)
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$true;Exo=$false;Subprocess=$false;GraphContext=@{TenantId='20000000-0000-0000-0000-000000000002';ContextScope='Process'}} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { throw 'The Graph path must not call Exchange Online.' }
+            Mock Get-MgUser {
+                $global:PraGate.X500Calls++
+                [pscustomobject]@{assignedPlans=@([pscustomobject]@{Service='exchange';CapabilityStatus='Enabled'});provisionedPlans=@([pscustomobject]@{Service='exchange';ProvisioningStatus='Success'})
+                    proxyAddresses=[string[]]@('SMTP:user1@gate.invalid',$global:PraGate.X500Legacy,$global:PraGate.X500Older)}
+            }
+            Mock Get-MgUserLicenseDetail { [pscustomobject]@{SkuPartNumber='SYNTHETIC';ServicePlans=@([pscustomobject]@{ServicePlanName='EXCHANGE_S_ENTERPRISE';ProvisioningStatus='Success'})} }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Success'
+        $global:PraGate.CloudContext.Warnings | Should -Be 0
+        $global:PraGate.X500Calls | Should -Be 1
+        Get-X500Log | Should -Match ([regex]::Escape('X500: 2 of 2 present'))
+    }
+    It 'Check shows the same comparison read-only (present, missing) and says when the identity was given as a UPN' {
+        $context=$global:PraGate.CloudContext
+        $context.Mode='Preview'; $context.Action='Check'; $context.AllowMutation=$false; $context.Once=$false; $context.TimeoutMinutes=1
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Older)
+        $global:PraGate.X500Second=New-X500Row -Upn 'upn.only@gate.invalid' -Guid '00000000-0000-0000-0000-000000000009' -NoField -Note 'identity given as a UPN, no Active Directory read: give the sAMAccountName or -Batch'
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@($global:PraGate.X500Legacy)}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow,$global:PraGate.X500Second) 'Convert'
+        }
+        $global:PraGate.CloudRow.Warnings | Should -Match ([regex]::Escape($global:PraGate.X500Older))
+        $global:PraGate.CloudContext.Warnings | Should -Be 1
+        Get-X500Log | Should -Match ([regex]::Escape('upn.only@gate.invalid: X500 control skipped, expected addresses not available (identity given as a UPN'))
+        @(Get-GateWrites $global:PraGate.Runtime).Count | Should -Be 0
+    }
+    It 'the warning travels into the run result, the per-phase data and the global report, HTML-encoded and without markup injection' {
+        $hostile='X500:/o=Synthetic/cn=<b>A&B</b> "q"'
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$hostile)
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@($global:PraGate.X500Legacy)}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $context=$global:PraGate.CloudContext
+        $context.Rows.Add($global:PraGate.CloudRow); $context.BatchId='abcd1234'; $context.NextSteps=@(); $context.PhaseFolders=@()
+        @(Get-PraList $context 'WarningList').Count | Should -Be 1
+        $phase = New-PraPhaseRecord -Context $context
+        (@(Get-PraList $phase 'Warnings') | ForEach-Object { $_.Message }) -join ' ' | Should -Match 'X500 missing in Exchange Online'
+        $report=Write-PraGlobalReport -Context $context
+        $html=[IO.File]::ReadAllText($report.Html)
+        $html | Should -Not -Match '<b>A&B</b>'
+        $html | Should -Match ([regex]::Escape('&lt;b&gt;A&amp;B&lt;/b&gt;'))
+        $html | Should -Match 'X500 missing in Exchange Online'
+        $csv=[IO.File]::ReadAllText($report.Csv)
+        $csv | Should -Match 'X500 missing in Exchange Online'
+    }
+    It 'two servers: the expected X500 list travels in the transfer package and is the one the cloud server proves' {
+        $adRuntime=New-GateRuntime -Name 'x500-two-ad'
+        $oldEvent=$env:PRA_EVENT_FILE; $env:PRA_EVENT_FILE=Join-Path $adRuntime.Root 'engine.events.jsonl'
+        try {
+            $run=Invoke-GateProcess $adRuntime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$adRuntime.ConfigPath} -TimeoutSeconds 120
+            $run.ExitCode | Should -BeIn @(0,2) -Because ($run.Output+$run.Error)
+            $zip=@(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String } | Where-Object kind -eq 'result')[0].transferPackage
+        } finally { $env:PRA_EVENT_FILE=$oldEvent }
+        $cloudRuntime=New-GateRuntime -Name 'x500-two-cloud'
+        $imported=Import-PraTransferPackage -Path $zip -BackupFolder $cloudRuntime.State.BackupFolder -Environment SYNTHETIC_GATE -ExpectedKind Convert
+        $batchFile=@(Get-ChildItem -LiteralPath $imported.Folders[0] -File -Filter 'Convert-*.json' | Where-Object { -not $_.Name.EndsWith('.sha256',[StringComparison]::Ordinal) })[0]
+        $importContext=New-GateContext $cloudRuntime
+        $receipt=Import-PraBackup $importContext $batchFile.FullName
+        @($receipt.Data.Records[0].ExpectedX500) | Should -BeExactly @($global:PraGate.X500Legacy,$global:PraGate.X500Older)
+        # the cloud server: the row is built from the stored record, exactly as the entry script does
+        $global:PraGate.CloudRow=New-X500Row -Expected @()
+        $global:PraGate.CloudRow.BackupRec=$receipt.Data.Records[0]
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@($global:PraGate.X500Legacy)}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.CloudContext.Warnings | Should -Be 1
+        $global:PraGate.CloudRow.Warnings | Should -Match ([regex]::Escape('X500 missing in Exchange Online: '+$global:PraGate.X500Older+'.'))
+        $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Success'
+    }
+}
+
+Describe 'Release 3.1.0 - X500 control through the real main (Check of one identity, Next steps)' -Tag 'Lot6' {
+    It 'Check -Identity <Identity> reads legacyExchangeDN in Active Directory (sAMAccountName) or says why it cannot (UPN)' -ForEach @(
+        @{Identity='user1';Expected='X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user1|X500:/o=Synthetic/ou=Gate/cn=User';Note=''}
+        @{Identity='user1@gate.invalid';Expected='';Note='identity given as a UPN, no Active Directory read'}
+    ) {
+        $runtime=New-GateRuntime -Name 'x500-check-main'
+        $run=Invoke-GateProcess $runtime @{Action='Check';Identity=$Identity;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -BeIn @(0,2) -Because ($run.Output+$run.Error)
+        $barrier=@($run.Events | Where-Object Operation -eq 'CloudRows-SyntheticBarrier')
+        $barrier.Count | Should -Be 1
+        $row=@($barrier[0].Rows)[0]
+        (@($row.ExpectedX500) -join '|') | Should -BeExactly $Expected
+        [string]$row.Note | Should -Match ([regex]::Escape($Note))
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'a missing X500 reported by the cloud phase is a warning in the result and a line in the Next steps with the Check command; the exit code does not change' {
+        $runtime=New-GateRuntime -Name 'x500-next-steps' -Case CloudX500Missing
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output+$run.Error)
+        $run.MainResult.ErrorCount | Should -Be 0
+        $run.MainResult.WarningCount | Should -BeGreaterThan 0
+        $next=($run.MainResult.NextSteps -join "`n")
+        $next | Should -Match 'X500 missing in Exchange Online for 1 object\(s\) \(replies to old messages can bounce\): run an Entra Connect synchronisation, then check again: \.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Batch [0-9a-f]{8} '
+        $next | Should -Match 'To roll back this batch later'
+        $run.Output | Should -Match 'X500 missing in Exchange Online'
     }
 }
 
