@@ -49,7 +49,7 @@ Keep the batch ID | The summary prints it (e.g. `efb9d60a`) with the next comman
 > **Ready-to-use commands** — one user, a whole OU, only the shared mailboxes, a list, the roll-back: chapter 8, recipes 1 to 6.
 
 The **window** opens with `pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui` (native Fluent theme).
-It starts no operation automatically. Version **3.0.0** (unreleased source) has offline validation only; no new
+It starts no operation automatically. Version **3.0.0** has offline validation only; no new
 live-tenant campaign has been performed for this version (the list to replay is in annex B).
 
 > [!IMPORTANT]
@@ -1029,7 +1029,7 @@ It checks every file (parse, UTF-8 BOM, help), runs PSScriptAnalyzer (PowerShell
 
 Requirements: Pester 5 or later and PSScriptAnalyzer 1.25.0 (machine-wide modules). Every test is mandatory: a skipped or missing test fails the gate.
 
-Release 3.0.0 (2026-11-04, unreleased source, working tree **not yet signed**, PowerShell 7.5+): **761 tests, 761 passed**, 0 analyzer error, about 80 minutes under `pwsh` 7.6 (the analyzer lists 1259 non-error diagnostics, among them the 7.5 additions that the PowerShell 7.0 profiles do not know). The gate of 2.3.0 under Windows PowerShell 5.1 was 506 tests; the extra tests are the PowerShell 7 engine, the review fixes, the 54 tests of the ordinal comparisons (tag `Ordinal`), the replay of the 2.2.0 fixtures and the 25 tests of the documentation (`tests\PraDocumentation.Tests.ps1`: pictures, private names, permissions against the code, readability of the user guide).
+Release 3.0.0 (2026-11-05, signed and timestamped, PowerShell 7.5+): **764 tests, 764 passed**, 0 analyzer error, about 80 minutes under `pwsh` 7.6 (the analyzer lists 1263 non-error diagnostics, among them the 7.5 additions that the PowerShell 7.0 profiles do not know). The gate of 2.3.0 under Windows PowerShell 5.1 was 506 tests; the extra tests are the PowerShell 7 engine, the review fixes, the 54 tests of the ordinal comparisons (tag `Ordinal`), the replay of the 2.2.0 fixtures and the 25 tests of the documentation (`tests\PraDocumentation.Tests.ps1`: pictures, private names, permissions against the code, readability of the user guide).
 
 Release 2.3.0 (2026-11-03, unreleased source, working tree **not yet signed**): **506 tests, 506 passed**, 0 analyzer error; the native-state test accepts the fail-closed state of the unsigned package. Run the gate from a Windows PowerShell whose `PSModulePath` does not start with the PowerShell 7 module folders (the tests start `powershell.exe` children that inherit it).
 

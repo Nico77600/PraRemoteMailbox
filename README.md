@@ -41,7 +41,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
-**Author:** Nicolas Fabert · **Version:** 3.0.0, unreleased source ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 3.0.0, 2026-11-05 ([changelog](CHANGELOG.md)).
 
 > [!CAUTION]
 > Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (reference guide, chapter 6).
@@ -275,7 +275,7 @@ Both guides also exist as a single HTML file with a light and a dark theme (`pac
 pwsh -NoProfile -File .\tests\Invoke-TestGate.ps1     # no directory, no tenant needed
 ```
 
-The gate runs the real entry script against a synthetic Active Directory, Entra Connect and Exchange Online: no write before the complete backup, stop at the first error, no write in Preview, no Apply without confirmation, memory bounds, proofs and Finalize packages. It also exercises WPF selection, Preview/Apply guards and OU/CSV targeting, and checks the documentation (pictures, names, the Graph scope documented against the one of the code). Earlier versions were validated on a real Active Directory, Entra Connect and Microsoft 365 tenant (reference guide, annex B); **3.0.0 (unreleased source) has offline validation only, not a new live-tenant campaign** (the lab list for the PowerShell 7 engine is in the guide, annex B). Files written by the real 2.2.0 under Windows PowerShell 5.1 are replayed by the gate (`tests\PraLegacyFixtures.Tests.ps1`, fixtures frozen in `testsixtures\ps51-2.2.0`). `tools\Build-Documentation.ps1` and `tools\New-DocumentationImages.ps1`, which rebuild the HTML guides and the pictures on a workstation, need PowerShell 7.5+ (and Microsoft Edge for the pictures).
+The gate runs the real entry script against a synthetic Active Directory, Entra Connect and Exchange Online: no write before the complete backup, stop at the first error, no write in Preview, no Apply without confirmation, memory bounds, proofs and Finalize packages. It also exercises WPF selection, Preview/Apply guards and OU/CSV targeting, and checks the documentation (pictures, names, the Graph scope documented against the one of the code). Earlier versions were validated on a real Active Directory, Entra Connect and Microsoft 365 tenant (reference guide, annex B); **3.0.0 has offline validation only, not a new live-tenant campaign** (the lab list for the PowerShell 7 engine is in the guide, annex B). Files written by the real 2.2.0 under Windows PowerShell 5.1 are replayed by the gate (`tests\PraLegacyFixtures.Tests.ps1`, fixtures frozen in `tests\fixtures\ps51-2.2.0`). `tools\Build-Documentation.ps1` and `tools\New-DocumentationImages.ps1`, which rebuild the HTML guides and the pictures on a workstation, need PowerShell 7.5+ (and Microsoft Edge for the pictures).
 
 ## License
 
