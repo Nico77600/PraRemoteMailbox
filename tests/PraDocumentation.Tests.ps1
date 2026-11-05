@@ -172,6 +172,77 @@ Describe 'Versions and links' {
     }
 }
 
+Describe 'Links and wording of the guides' {
+    BeforeAll {
+        function script:Read-GuideHtml([string]$Name) { [regex]::Replace((Read-Doc "package\docs\$Name.html"), 'data:image/png;base64,[A-Za-z0-9+/=]+', 'data:image') }
+        $script:Html = [ordered]@{ 'PraRemoteMailbox-UserGuide' = (Read-GuideHtml 'PraRemoteMailbox-UserGuide'); 'PraRemoteMailbox-Guide' = (Read-GuideHtml 'PraRemoteMailbox-Guide') }
+    }
+    It 'every link of the two HTML guides leads somewhere: the file is next to it and the anchor is an id of the target page' {
+        $problems = foreach ($name in $script:Html.Keys) {
+            foreach ($m in [regex]::Matches($script:Html[$name], '<a [^>]*href="([^"]*)"')) {
+                $href = $m.Groups[1].Value
+                if ($href -match '^(https?:|mailto:)') { continue }
+                $file, $anchor = $href -split '#', 2
+                $target = if ($file) { Join-Path $script:Docs $file } else { Join-Path $script:Docs "$name.html" }
+                if (-not (Test-Path -LiteralPath $target -PathType Leaf)) { "${name}: missing file $href"; continue }
+                if ($anchor) {
+                    $page = if ($file) { Read-GuideHtml ([IO.Path]::GetFileNameWithoutExtension($file)) } else { $script:Html[$name] }
+                    if ($page -notmatch ('\sid="' + [regex]::Escape($anchor) + '"')) { "${name}: no id for $href" }
+                }
+            }
+        }
+        @($problems) | Should -BeNullOrEmpty
+    }
+    It 'the HTML guides have no picture without a source (the zoom window creates its picture when it opens)' {
+        foreach ($name in $script:Html.Keys) { @([regex]::Matches($script:Html[$name], '<img\b(?![^>]*\ssrc="[^"]+")[^>]*>')).Count | Should -Be 0 -Because "$name has an <img> without src" }
+    }
+    It 'the guided path is drawn once in the HTML user guide (the picture that follows the path block is for Markdown readers only)' {
+        @([regex]::Matches($script:Html['PraRemoteMailbox-UserGuide'], '<!--path-->')).Count | Should -Be 1
+        $script:Html['PraRemoteMailbox-UserGuide'] | Should -Not -Match '<figcaption>The path\.'
+        $script:UserGuide | Should -Match 'images/readme-path-light\.png'
+    }
+    It 'every mention of a chapter or an annex is a link, in both guides' {
+        foreach ($entry in @(@{ Name = 'user guide'; Text = $script:UserGuide }, @{ Name = 'reference guide'; Text = $script:Guide })) {
+            $text = [regex]::Replace($entry.Text, '(?s)^---\n.*?\n---\n', '')
+            $text = [regex]::Replace($text, '(?s)```.*?```', '')
+            $text = [regex]::Replace($text, '(?m)^#{1,6}\s.*$', '')
+            $text = [regex]::Replace($text, '\[[^\]]*\]\([^)]*\)', '')
+            $text = [regex]::Replace($text, '`[^`]*`', '')
+            @([regex]::Matches($text, '(?i)\b(?:chapter \d+|annex [A-F])\b') | ForEach-Object { $_.Value }) | Should -BeNullOrEmpty -Because "$($entry.Name) names a chapter or an annex without a link"
+        }
+    }
+    It 'every mention of the reference guide in the user guide names its file' {
+        $script:UserGuide | Should -Match 'PraRemoteMailbox-Guide\.html'
+        foreach ($m in [regex]::Matches($script:UserGuide, '\[reference guide[^\]]*\]\(PraRemoteMailbox-Guide\.md[^)]*\)')) {
+            $after = $script:UserGuide.Substring($m.Index + $m.Length, [Math]::Min(120, $script:UserGuide.Length - $m.Index - $m.Length))
+            $before = $script:UserGuide.Substring([Math]::Max(0, $m.Index - 120), [Math]::Min(120, $m.Index))
+            (($before + $after) -match 'PraRemoteMailbox-Guide\.html') | Should -BeTrue -Because "the file is not named near: $($m.Value)"
+        }
+    }
+    It 'the user guide explains the two servers before it uses their names: the cloud server is a machine of the company, not a server in the cloud' {
+        $first = [regex]::Match($script:UserGuide, '(?i)cloud server').Index
+        $script:UserGuide.Substring($first - 2, 40) | Should -Match '\*\*Cloud server\*\*'
+        $first = [regex]::Match($script:UserGuide, '(?i)directory server').Index
+        $script:UserGuide.Substring($first - 2, 40) | Should -Match '\*\*Directory server\*\*'
+        $script:UserGuide | Should -Match '(?s)### Which path is mine\?.*not\*\* a server in the cloud'
+        $script:UserGuide | Should -Match '\| \*\*Cloud server\*\* \| Any Windows machine of your company'
+        $script:Guide | Should -Match 'not a machine hosted in the cloud'
+        $script:Readme | Should -Match 'not a server hosted in the cloud'
+    }
+    It 'the user guide says where the phase is on the Task page, and which server each rollback part runs on' {
+        $script:UserGuide | Should -Match 'What will happen on this server'
+        $script:UserGuide | Should -Match '(?s)pink pill.*Phase: Cloud'
+        $script:UserGuide | Should -Match '\*\*Where do I do this\?\*\*'
+        $script:UserGuide | Should -Match 'column \*\*TYPE\*\*'
+    }
+    It 'the transfer package name pattern of the guide is the one of the code' {
+        $name = [regex]::Match($script:UserGuide, '`(PRA-PROD-Convert-490cc62e-for-Cloud\.zip)`').Groups[1].Value
+        $name | Should -Not -BeNullOrEmpty
+        (Read-Doc 'package\module\PRA.Common.psm1') | Should -Match ([regex]::Escape("'PRA-{0}-{1}-{2}-for-{3}.zip'"))
+        $script:UserGuide | Should -Match 'You never rename the file'
+    }
+}
+
 Describe 'Minimum permissions follow the code' {
     It 'the Graph scopes of the guide are exactly the delegated scopes that the code requests' {
         $code = @([regex]::Matches($script:Cloud, '\$connect\.Scopes\s*=\s*@\(([^)]*)\)') | ForEach-Object { [regex]::Matches($_.Groups[1].Value, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value } } | Sort-Object -Unique)
