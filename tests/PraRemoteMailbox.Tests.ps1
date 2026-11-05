@@ -6509,7 +6509,7 @@ Describe 'Release 3.1.0 - X500 control: Active Directory side (expected addresse
             $record.PSObject.Properties.Remove('ExpectedX500')
             { Assert-PraStoredRecord $record } | Should -Not -Throw
             $bad=@{
-                NotX500=@('smtp:not.x500@gate.invalid'); NullEntry=@('X500:/o=a',$null); Number=@(7); Nested=@(@('X500:/o=a'))
+                NotX500=@('smtp:not.x500@gate.invalid'); NullEntry=@('X500:/o=a',$null); Number=@(7); HashTable=@(@{Value='X500:/o=a'})
                 TooLong=@('X500:'+('a' * 2100)); TooMany=@(1..2001 | ForEach-Object { 'X500:/o=Synthetic/cn=' + $_ }); Object=([pscustomobject]@{Value='X500:/o=a'})
             }
             foreach ($name in $bad.Keys) {
