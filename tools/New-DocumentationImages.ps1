@@ -120,6 +120,7 @@ if ($all -or $Part -eq 'Console') {
     )
     $keepDark = @('setup', 'run-finished')
     foreach ($name in $keepLight) { Copy-Item -LiteralPath (Join-Path $shots "console-$name-light.png") -Destination (Join-Path $OutputFolder "console-$name-light.png") -Force }
+    # Photographed too, but not copied: verify-finalize, run-finalize, next-finalize (see Show-ConsoleScreens.ps1). Use -KeepWork to find them.
     foreach ($name in $keepDark) { Copy-Item -LiteralPath (Join-Path $shots "console-$name-dark.png") -Destination (Join-Path $OutputFolder "console-$name-dark.png") -Force }
     Write-Host ("  {0} console pictures" -f ($keepLight.Count + $keepDark.Count))
 }
@@ -451,10 +452,13 @@ body { display: block; margin: 0; padding: 0; }
             'cloud | Exchange Online | The mail system in the cloud.'
             'refresh | Sync | One trip that tells the cloud what changed.'
             'shield | Backup | The copy of every value before a change.'
-            'folder | Transfer package | One zip file between two servers.'
+            'folder | Transfer package | One zip file between two servers. The tool names it.'
             'chart | Report | The web page that says what was done.'
             'search | Preview | A trial that changes nothing.'
             'batch | Batch | One move of many people, with its short ID.'
+            'server | Directory server | The server that reaches Active Directory.'
+            'terminal | Cloud server | A machine of your company that reaches Microsoft 365. It is not in the cloud.'
+            'layers | Phase | One part of the work: AD, Cloud or Both. A pink pill on the Task page.'
         ) 'rb-cards3')
 }
 #endregion

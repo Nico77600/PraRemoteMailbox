@@ -107,7 +107,8 @@ try {
                 [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }); AD = $false; Cloud = $true; Role = 'Cloud' } }
     $probe = switch ($Scenario) { 'twoserver' { $adProbe } 'finalize' { $adProbe } 'cloud' { $cloudProbe } default { $bothProbe } }
     $identityProbe = { param($identity) [pscustomobject]@{ Success = $true; Found = $true; Count = 1; DisplayName = 'Alice Vance'; UserPrincipalName = 'alice.vance@contoso.com'; SamAccountName = 'alice.vance'; MailboxType = 'User mailbox' } }
-    $g = New-PraGuiWindow -Root $root -ConfigPath $config -Version '3.0.0' -Theme $Theme -PrerequisiteProbe $probe -IdentityProbe $identityProbe
+    $toolVersion = [regex]::Match([IO.File]::ReadAllText((Join-Path $repo 'package\Invoke-PraRemoteMailbox.ps1')), '(?m)^\s*Version\s*:\s*(\d+\.\d+\.\d+)\s*$').Groups[1].Value
+    $g = New-PraGuiWindow -Root $root -ConfigPath $config -Version $toolVersion -Theme $Theme -PrerequisiteProbe $probe -IdentityProbe $identityProbe
 
     function Pump($ms = 120) { $f = New-Object Windows.Threading.DispatcherFrame; $t = New-Object Windows.Threading.DispatcherTimer; $t.Interval = [timespan]::FromMilliseconds($ms); $t.Tag = $f; $t.Add_Tick({ param($s) $s.Tag.Continue = $false; $s.Stop() }); $t.Start(); [Windows.Threading.Dispatcher]::PushFrame($f) }
     $syntheticRoot = 'D:\PRA\PraRemoteMailbox'
@@ -185,7 +186,7 @@ try {
             Shot 'task' @(@('T_Convert', '1'), @('S_Source_Single', '2'))
             $c.F_Identity.Text = 'alice.vance@contoso.com'; Pump
             Click 'BtnCheckIdentity'; Pump
-            Shot 'task-identity' @(@('F_Identity', '1'), @('BtnCheckIdentity', '2'), @('BtnNext', '3'))
+            Shot 'task-identity' @(@('F_Identity', '1'), @('BtnCheckIdentity', '2'), @('PhasePill', '3'), @('BtnNext', '4'))
             PreviewThenConfirm $word
             Shot 'verify-before' @(, @('BtnPreview', '1'))
             Click 'BtnPreview'; Pump 600; WaitRun; Pump
@@ -228,7 +229,7 @@ try {
             Shot 'setup-red' @(, @('Lights', '1')); Shot 'setup-red-lights' -CropTo 'Lights'
             GoToTask 'T_Convert'
             $c.S_Source_Scope.IsChecked = $true; Pump
-            Shot 'task-ad' @(, @('PhaseCard', '1'))
+            Shot 'task-ad' @(, @('PhasePill', '1'))
             PreviewThenConfirm $word
             Click 'BtnPreview'; Pump 600; WaitRun; Pump
             if (-not $g.Pending) { throw "no pending: $($c.SumText.Text) $($g.PreviewError)" }
@@ -245,7 +246,7 @@ try {
             $c.Mode_Continue.IsChecked = $true; Pump; WaitPackages
             Shot 'task-continue' @(@('Mode_Continue', '1'), @('BtnImport', '2'), @('BatchList', '3'))
             if (@($g.BatchRows).Count -gt 0) { $c.BatchList.SelectedIndex = 0; Pump }
-            Shot 'task-package-selected' @(@('BatchList', '1'), @('BtnNext', '2'))
+            Shot 'task-package-selected' @(@('BatchList', '1'), @('PhasePill', '2'), @('BtnNext', '3'))
             PreviewThenConfirm $word
             Click 'BtnPreview'; Pump 600; WaitRun; Pump
             if (-not $g.Pending) { throw "no pending: $($c.SumText.Text) $($g.PreviewError)" }
@@ -275,6 +276,17 @@ try {
             GoToTask 'T_Finalize'
             if (@($g.BatchRows).Count -gt 0) { $c.BatchList.SelectedIndex = 0; Pump }
             Shot 'task-finalize' @(@('T_Finalize', '1'), @('BatchList', '2'), @('BtnNext', '3'))
+            # The Verify, Run and Next steps pages of a Finalize. They are photographed here but not copied to docs\images by New-DocumentationImages.ps1:
+            # a new picture needs its name in the signed integrity verifier (package\module\Test-PackageIntegrity.ps1) first.
+            PreviewThenConfirm 'finalize'
+            Click 'BtnPreview'; Pump 600; WaitRun; Pump
+            if (-not $g.Pending) { throw "no pending: $($c.SumText.Text) $($g.PreviewError)" }
+            $c.ConfirmBox.Text = 'finalize'; Pump
+            Shot 'verify-finalize' @(@('ConfirmBox', '1'), @('BtnNext', '2'))
+            Click 'BtnNext'; Pump 1200
+            WaitRun; Pump
+            Shot 'run-finalize'
+            Click 'BtnNext'; Pump; Shot 'next-finalize' @(, @('BtnReport', '1'))
         }
         'check' {
             GoToTask 'T_Check'
