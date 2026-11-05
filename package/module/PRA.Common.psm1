@@ -171,6 +171,23 @@ function Get-PraOrdinalUnique {
     begin { $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList $(if ($IgnoreCase) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }) }
     process { if ($null -ne $InputObject -and $seen.Add([string]$InputObject)) { [string]$InputObject } }
 }
+
+function Compare-PraX500Address {
+    <#
+    .SYNOPSIS
+        Which of the expected X500 addresses a cloud mailbox carries (EmailAddresses / proxyAddresses): Present and Missing, in the order of Expected.
+    .DESCRIPTION
+        Read only. The whole value is compared, ordinal and ignoring case (Exchange Online may write the type prefix in lower case); the values are returned
+        exactly as they are in Expected.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][string[]]$Expected, [AllowNull()][string[]]$Actual)
+    $actualSet = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($value in @($Actual)) { if ($null -ne $value) { [void]$actualSet.Add([string]$value) } }
+    $present = New-Object 'Collections.Generic.List[string]'; $missing = New-Object 'Collections.Generic.List[string]'
+    foreach ($value in @($Expected)) { if ($null -eq $value) { continue }; if ($actualSet.Contains([string]$value)) { $present.Add([string]$value) } else { $missing.Add([string]$value) } }
+    return [pscustomobject]@{ Total = ($present.Count + $missing.Count); Present = [string[]]$present.ToArray(); Missing = [string[]]$missing.ToArray() }
+}
 #endregion
 
 function Get-PraToolVersion {
@@ -2811,7 +2828,7 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Sort-PraOrdinal, Get-PraOrdinalUnique, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Sort-PraOrdinal, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block

@@ -33,11 +33,11 @@
         # Configuration, paths and CSV (PRA.Common)
         'Import-PraConfiguration', 'New-PraEffectiveConfiguration', 'Get-PraConfigurationDifference', 'Resolve-PraPath', 'Read-PraCsvText', 'Read-PraTargetCsv', 'Get-PraTargetOverride', 'Get-PraToolVersion', 'Get-PraValue', 'Get-PraList',
         # Ordinal helpers, JSON and native calls (PRA.Common)
-        'Test-PraOrdinalEqual', 'Test-PraOrdinalIgnoreCaseEqual', 'Test-PraOrdinalIn', 'Test-PraOrdinalIgnoreCaseIn', 'Sort-PraOrdinal', 'Get-PraOrdinalUnique', 'ConvertFrom-PraJson', 'Get-PraNativeProcessApi', 'Get-PraWin32ErrorText',
+        'Test-PraOrdinalEqual', 'Test-PraOrdinalIgnoreCaseEqual', 'Test-PraOrdinalIn', 'Test-PraOrdinalIgnoreCaseIn', 'Sort-PraOrdinal', 'Get-PraOrdinalUnique', 'Compare-PraX500Address', 'ConvertFrom-PraJson', 'Get-PraNativeProcessApi', 'Get-PraWin32ErrorText',
         # Private folders, phase data and transfer package (PRA.Common)
         'New-PraPrivateDirectorySecurity', 'Initialize-PraPrivateFolder', 'Register-PraObjectName', 'Register-PraObjectBackup', 'Save-PraPhaseData', 'Copy-PraPhaseData', 'Get-PraTransferPackageName', 'Get-PraTransferPackage', 'New-PraTransferPackage', 'Import-PraTransferPackage',
         # Active Directory, backup and proof (PRA.Directory)
-        'Initialize-PraDirectory', 'Initialize-PraPermissionCache', 'Get-PraUser', 'Get-PraTarget', 'New-PraRow', 'New-PraPlan', 'Invoke-PraAdPreview', 'Invoke-PraAdBatch', 'Invoke-PraAdReplication', 'Invoke-PraSync', 'Import-PraBackup', 'Import-PraProof', 'Assert-PraReceipt', 'Assert-PraFollowupState', 'Get-PraHash', 'Write-PraImmutableFile', 'New-PraPrivateDirectory', 'Write-PraJournal'
+        'Initialize-PraDirectory', 'Initialize-PraPermissionCache', 'Get-PraUser', 'Get-PraExpectedX500', 'Get-PraTarget', 'New-PraRow', 'New-PraPlan', 'Invoke-PraAdPreview', 'Invoke-PraAdBatch', 'Invoke-PraAdReplication', 'Invoke-PraSync', 'Import-PraBackup', 'Import-PraProof', 'Assert-PraReceipt', 'Assert-PraFollowupState', 'Get-PraHash', 'Write-PraImmutableFile', 'New-PraPrivateDirectory', 'Write-PraJournal'
     )
     CmdletsToExport       = @()
     VariablesToExport     = @()

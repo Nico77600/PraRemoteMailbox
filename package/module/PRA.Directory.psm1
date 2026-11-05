@@ -62,6 +62,9 @@ $script:AttributeKinds = [ordered]@{
     mDBUseDefaults='Bool'; msExchRecipientDisplayType='Int'; msExchRecipientTypeDetails='Long'
     msExchRemoteRecipientType='Long'; targetAddress='String'; proxyAddresses='MultiString'
 }
+# Bounds of the list of X500 addresses expected in Exchange Online (record field ExpectedX500): count and length of one value.
+$script:MaxExpectedX500 = 2000
+$script:MaxExpectedX500Length = 2048
 # Display names of msExchRecipientTypeDetails values (console only).
 $script:RecipientTypeNames = @{
     '1'='UserMailbox'; '4'='SharedMailbox'; '16'='RoomMailbox'; '32'='EquipmentMailbox'; '128'='MailUser'
@@ -398,7 +401,7 @@ function Get-PraUser {
     #>
     [CmdletBinding()]
     param([hashtable]$Context, [Parameter(Mandatory)][string]$Identity, [string[]]$ExtraProperties = @(), [switch]$Capture)
-    $properties = @('memberOf','uSNChanged','DisplayName','mail','mailNickname','msExchArchiveGUID') + @($script:AttributeKinds.Keys) + $ExtraProperties
+    $properties = @('memberOf','uSNChanged','DisplayName','mail','mailNickname','msExchArchiveGUID','legacyExchangeDN') + @($script:AttributeKinds.Keys) + $ExtraProperties
     if ($Capture) { $properties += @('*','msExchMailboxSecurityDescriptor','nTSecurityDescriptor','publicDelegates') }
     $properties = @($properties | Get-PraOrdinalUnique -IgnoreCase)
     $server = $Context.Server
@@ -735,6 +738,12 @@ function Write-PraAdDelta {
         foreach ($value in $keptCloud) { Write-PraLog -Context $Context -Message ("  proxyAddresses | KEPT X500 (written back by Entra Connect) : {0}" -f (ConvertTo-PraLogText -Value $value)) -Level Detail }
         Write-PraItem -Context $Context -Status Info -Text ('{0}: {1} cloud X500 address(es) kept (written back by Entra Connect; replies to messages sent from the cloud keep working)' -f $record.SamAccountName, $keptCloud.Count)
     }
+    if ((Test-PraOrdinalIgnoreCaseEqual $Plan.Operation 'Convert')) {
+        # The cloud phase proves these addresses in Exchange Online (a reply to an old message is addressed by legacyExchangeDN); here the operator only sees how many.
+        $verifyX500 = @(if ($record.Contains('ExpectedX500')) { $record['ExpectedX500'] | Where-Object { $_ } })
+        foreach ($value in $verifyX500) { Write-PraLog -Context $Context -Message ("  X500 to verify in Exchange Online : {0}" -f (ConvertTo-PraLogText -Value $value)) -Level Detail }
+        Write-PraItem -Context $Context -Status Info -Text ('{0}: X500 to verify after the conversion: {1}{2}' -f $record.SamAccountName, $verifyX500.Count, $(if ($verifyX500.Count) { '' } else { ' (no legacyExchangeDN and no X500 address on premises)' }))
+    }
     if (-not $consoleLines.Count) { Write-PraHost @(@('         '), @('no change: the object is already in the expected state', 'DarkGray')) }
     elseif ($unchanged) { Write-PraHost @(@('         '), @(('{0} other managed attribute(s) unchanged (full values in the log)' -f $unchanged), 'DarkGray')) }
     if ($permissionText) {
@@ -811,6 +820,26 @@ function Get-PraX500Difference {
     $same = ($a.Count -eq $b.Count)
     if ($same) { for ($i = 0; $i -lt $a.Count; $i++) { if (-not (Test-PraOrdinalEqual ([string]$a[$i]) ([string]$b[$i]))) { $same = $false; break } } }
     return [pscustomobject]@{ OtherEqual = $same; Added = [string[]]$added.ToArray(); Removed = [string[]]@($removed) }
+}
+
+function Get-PraExpectedX500 {
+    <#
+    .SYNOPSIS
+        X500 addresses that the cloud mailbox must carry so that a reply to an old message, a meeting update or a cached Outlook entry (all addressed by
+        legacyExchangeDN, internally IMCEAEX) still reaches it: X500:<legacyExchangeDN> when it is not empty, then every X500 entry of the on-premises proxyAddresses.
+    .DESCRIPTION
+        Read only. Duplicates are removed (ordinal, ignoring case, on the whole value); the first spelling is kept, byte for byte. The prefix of the
+        legacyExchangeDN is written X500: (the type prefix of the other entries keeps whatever case it has on premises).
+    #>
+    [OutputType([string[]])]
+    param([AllowNull()][AllowEmptyString()][string]$LegacyExchangeDN, [AllowNull()][string[]]$ProxyAddresses)
+    $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    $list = New-Object 'Collections.Generic.List[string]'
+    if (-not [string]::IsNullOrWhiteSpace($LegacyExchangeDN)) { $value = 'X500:' + $LegacyExchangeDN; if ($seen.Add($value)) { $list.Add($value) } }
+    foreach ($address in @($ProxyAddresses)) { if (Test-PraX500Address $address) { if ($seen.Add([string]$address)) { $list.Add([string]$address) } } }
+    if ($list.Count -gt $script:MaxExpectedX500) { throw "Too many X500 addresses to verify ($($list.Count), limit $($script:MaxExpectedX500)): conversion refused before any change." }
+    foreach ($value in $list) { if ($value.Length -gt $script:MaxExpectedX500Length) { throw "X500 address too long to verify ($($value.Length) characters, limit $($script:MaxExpectedX500Length)): conversion refused before any change." } }
+    return [string[]]$list.ToArray()
 }
 #endregion
 
@@ -1114,10 +1143,12 @@ function New-PraPlan {
     $desired = [ordered]@{}; foreach ($name in $before.Keys) { $desired[$name] = $before[$name] }
     $permissions = @{ FullAccess=@(); SendAs=@(); SendOnBehalf=@() }
     $licensing = [ordered]@{ Enabled=$false; GroupGuid=''; GroupDN=''; WasMember=$false; DesiredMember=$false }
-    $routing = ''; $alreadyRecovered = $false; $keptX500 = @()
+    $routing = ''; $alreadyRecovered = $false; $keptX500 = @(); $expectedX500 = @()
     if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert')) {
         if (-not $user.homeMDB -or [int64]$user.msExchRecipientTypeDetails -notin @(1, 4, 16, 32)) { throw "Not an on-premises mailbox (homeMDB / msExchRecipientTypeDetails): $Identity" }
         $routing = Get-PraRoutingAddress $Context $user
+        # X500 addresses the cloud mailbox must carry (read only: legacyExchangeDN is never written, restored or modified; the control runs in the cloud phase).
+        $expectedX500 = @(Get-PraExpectedX500 -LegacyExchangeDN ([string](Get-PraValue $user 'legacyExchangeDN' '')) -ProxyAddresses @($user.proxyAddresses))
         $rrt = if ($shared) { [int64]$config.SharedMailbox.RemoteRecipientType } else { [int64]$config.Remote.RecipientType }
         if ($shared -and (Test-PraOrdinalIn $rrt @(100, 102) -IgnoreCase)) { throw "SharedMailbox.RemoteRecipientType=$rrt means an already migrated mailbox (Migrated+Shared): first provisioning refused before any change: $Identity" }
         if ($config.Remote.HandleArchives -and (Get-PraValue $user 'msExchArchiveGUID' $null)) { $rrt = $rrt -bor 2 }
@@ -1199,7 +1230,7 @@ function New-PraPlan {
         Attributes=$before; PlannedAttributes=$desired; Licensing=$licensing
         Retention=[ordered]@{ Enabled=[bool]$tagEnabled; Attribute=$tagAttr; Value=$(if ($tagEnabled) { [string]$tag.Value } else { '' }) }
         SharedPermissions=$permissions; PreserveCloudMailbox=[bool]$preserveMailbox; PreserveLicense=[bool]$preserveLicense
-        KeptX500=[string[]]@($keptX500)
+        KeptX500=[string[]]@($keptX500); ExpectedX500=[string[]]@($expectedX500)
     }
     $row = New-PraRow $Context $record
     if ($null -ne $SourceRecord) { $row.BackupRec = $SourceRecord } else { $row.BackupRec = [pscustomobject]$record }
@@ -1257,6 +1288,13 @@ function Assert-PraStoredRecord {
     # Cloud X500 addresses kept by a Recover (absent in a batch written before 3.0.0: none).
     $keptStored = Get-PraValue $Record 'KeptX500' $null
     if ($null -ne $keptStored) { foreach ($value in @($keptStored)) { if ($value -isnot [string] -or -not (Test-PraX500Address $value)) { throw 'Backup: invalid list of kept X500 addresses.' } } }
+    # X500 addresses expected in Exchange Online (absent in a batch written before 3.1.0: the control is skipped).
+    $expectedStored = Get-PraValue $Record 'ExpectedX500' $null
+    if ($null -ne $expectedStored) {
+        if ($expectedStored -isnot [string] -and $expectedStored -isnot [array]) { throw 'Backup: invalid list of expected X500 addresses.' }
+        if (@($expectedStored).Count -gt $script:MaxExpectedX500) { throw 'Backup: too many expected X500 addresses.' }
+        foreach ($value in @($expectedStored)) { if ($value -isnot [string] -or -not (Test-PraX500Address $value) -or $value.Length -gt $script:MaxExpectedX500Length) { throw 'Backup: invalid list of expected X500 addresses.' } }
+    }
     if (-not $Legacy) {
         if ($Record.CapturedUsnChanged -isnot [string] -or $Record.CapturedUsnChanged -notmatch '^[1-9][0-9]*$') { throw 'Backup: original uSNChanged missing or invalid.' }
         $null = [int64]::Parse($Record.CapturedUsnChanged, [Globalization.CultureInfo]::InvariantCulture)
@@ -1342,6 +1380,11 @@ function Assert-PraRecordMatchesPlan {
         $storedKept = @(if ($null -ne $Stored.PSObject.Properties['KeptX500']) { $Stored.KeptX500 | Where-Object { $null -ne $_ } }); $wantedKept = @($Expected['KeptX500'])
         if ($storedKept.Count -ne $wantedKept.Count) { throw 'Backup re-read: kept X500 addresses not preserved.' }
         for ($index = 0; $index -lt $wantedKept.Count; $index++) { if (-not (Test-PraOrdinalEqual ([string]$storedKept[$index]) ([string]$wantedKept[$index]))) { throw 'Backup re-read: kept X500 addresses not preserved.' } }
+    }
+    if ($Expected.Contains('ExpectedX500')) {
+        $storedExpected = @(if ($null -ne $Stored.PSObject.Properties['ExpectedX500']) { $Stored.ExpectedX500 | Where-Object { $null -ne $_ } }); $wantedExpected = @($Expected['ExpectedX500'])
+        if ($storedExpected.Count -ne $wantedExpected.Count) { throw 'Backup re-read: expected X500 addresses not preserved.' }
+        for ($index = 0; $index -lt $wantedExpected.Count; $index++) { if (-not (Test-PraOrdinalEqual ([string]$storedExpected[$index]) ([string]$wantedExpected[$index]))) { throw 'Backup re-read: expected X500 addresses not preserved.' } }
     }
     foreach ($section in @('Attributes','PlannedAttributes')) {
         $actualNames = @($Stored.$section.PSObject.Properties.Name)
@@ -1916,7 +1959,7 @@ function Invoke-PraSync {
 #endregion
 
 Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmutableFile, New-PraPrivateDirectory, Write-PraJournal,
-    Initialize-PraDirectory, Get-PraUser, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
+    Initialize-PraDirectory, Get-PraUser, Get-PraExpectedX500, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
     Import-PraProof, Invoke-PraSync, Invoke-PraAdReplication, Assert-PraReceipt, Test-PraStateEqual, Assert-PraFollowupState, Initialize-PraPermissionCache
 
 # SIG # Begin signature block
