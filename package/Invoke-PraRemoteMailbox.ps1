@@ -131,7 +131,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 3.0.0
+    Version    : 3.1.0
     Requires   : PowerShell 7.5 or later (pwsh.exe; Windows PowerShell 5.1 is refused), RSAT ActiveDirectory,
                  ExchangeOnlineManagement 3.10+, Microsoft.Graph.Authentication and Microsoft.Graph.Users
                  (cloud part), ADSync (sync; through the Windows PowerShell compatibility layer when local).

@@ -9,7 +9,7 @@
     No legacy Assert-MockCalled: counters are mutable objects.
 .NOTES
     Author : Nicolas Fabert
-    Version: 3.0.0
+    Version: 3.1.0
     Run it through tests\Invoke-TestGate.ps1 (evidence, PSScriptAnalyzer, mandatory tests).
 #>
 #Requires -Version 7.5
@@ -4420,7 +4420,7 @@ Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single 
         $version | Should -Match '^\d+\.\d+\.\d+$'
         # External anchors: the version is not only compared with the files that quote it. It must be the release that this tree is
         # (update this literal with the release) and the newest heading of the change log.
-        $version | Should -BeExactly '3.0.0'
+        $version | Should -BeExactly '3.1.0'
         $heading=[regex]::Match([IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'CHANGELOG.md')),'(?m)^## (\d+\.\d+\.\d+)\b')
         $heading.Success | Should -BeTrue
         $heading.Groups[1].Value | Should -BeExactly $version -Because 'the first "## x.y.z" heading of CHANGELOG.md is the version of the tree'
@@ -5259,7 +5259,7 @@ Describe 'Release 3.0.0 - transfer package: verification, extraction and refusal
         $info.Environment | Should -BeExactly 'LAB'
         $info.BatchId | Should -BeExactly '8547ab040273474ba2c720ade6240fc5'
         $info.EntryCount | Should -Be (3 * $Folders.Count)
-        $info.ToolVersion | Should -BeExactly '3.0.0'
+        $info.ToolVersion | Should -BeExactly '3.1.0'
         $info.NextCommand | Should -Match '-Batch'
         @($info.Folders | Sort-PraOrdinal) -join '|' | Should -BeExactly ((@($Folders) | Sort-PraOrdinal) -join '|')
         $info.SizeBytes | Should -Be ((Get-Item -LiteralPath $made.Path).Length)

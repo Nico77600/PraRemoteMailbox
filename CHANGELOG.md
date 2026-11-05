@@ -4,6 +4,22 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
+## 3.1.0 — 2026-11-05
+
+### Added
+- **X500 control at Convert.** The AD phase now also reads `legacyExchangeDN` (read only, never written or restored) and
+  records in the batch the X500 addresses the cloud mailbox must carry: `X500:<legacyExchangeDN>` plus the X500 addresses
+  already in the on-premises `proxyAddresses`. Once the mailbox is ready, the cloud phase proves them in Exchange Online
+  (the Entra `proxyAddresses` when the mailbox check goes through Graph), re-reads a few times for a synchronisation lag,
+  and warns per mailbox when one is missing: replies to old messages and meeting updates could bounce (IMCEAEX NDR).
+  The conversion stays done.
+- The preview shows *X500 to verify after the conversion: N*; `-Action Check` and the console's *Check a mailbox* show
+  the same comparison, read only. The warning is counted in the result, the reports and the Next steps.
+
+### Changed
+- A batch written before 3.1.0 has no expected list: the control is skipped with an information line, never a failure.
+  The backup schema is unchanged (one more optional field per record).
+
 ## 3.0.0 — 2026-11-05
 
 **Breaking: PowerShell 7.5+ required.** Windows PowerShell 5.1 is refused before any code runs; use 2.x there.

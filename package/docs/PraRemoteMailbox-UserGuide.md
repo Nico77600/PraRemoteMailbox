@@ -1,7 +1,7 @@
 ﻿---
 title: PRA Remote Mailbox
 subtitle: User guide
-version: 3.0.0
+version: 3.1.0
 author: Nicolas Fabert
 updated: 2026-11-04
 runtime: PowerShell 7.5+ (engine and window)
@@ -515,6 +515,7 @@ Find what you **see** in the left column. The middle column says what it **means
 | *Active Directory replication was NOT confirmed on …* | One directory server did not receive the change in time. | Read the **Next steps** page. It says to start the synchronisation again later. Ask your administrator. |
 | The result says **Pending** | A part remains. It is **not** an error. | Do what the **Next steps** page says. On two servers: carry the package to the other server. |
 | *Entra Connect server … is not reachable* | The tool cannot talk to the Entra Connect server. | Ask your administrator to check the name in the settings file and the remote connection. |
+| An orange line says *X500 missing in Exchange Online* | The new mailbox is ready, but it does not have an old address of the person. An answer to an **old message** could come back to the sender as an error. | Do not worry about the move: it is done. Ask your administrator to check the synchronisation, and to run a **Check** after it. |
 | Nothing in the list of batches or packages | The files are not on this server. | Copy the folder or the package here. Use **Import package…**. |
 
 <!-- icon: book -->

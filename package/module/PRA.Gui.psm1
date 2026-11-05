@@ -7,7 +7,7 @@
     Local metadata is indicative; the engine remains the authority for all backup/proof checks.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0
+    Version : 3.1.0
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest

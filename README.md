@@ -41,7 +41,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
-**Author:** Nicolas Fabert · **Version:** 3.0.0, 2026-11-05 ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 3.1.0, 2026-11-05 ([changelog](CHANGELOG.md)).
 
 > [!CAUTION]
 > Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (reference guide, chapter 6).
@@ -145,6 +145,7 @@ Keep the `Backups` folder on a durable, protected volume: the backups are the on
 - **Signed package.** The runtime lives in `package\` (same layout as the extracted release ZIP). Every runtime file authenticates the owner-signed manifest before it runs; a changed, missing or unexpected stable file stops the tool before any import or operation. The configuration and your CSV lists are data, outside that check. There is no unsigned mode. The tool refuses to run from any tree whose files are not signed by the owner: use a signed release package. Backup, log and report folders inside the package are limited to the canonical `Backups`, `logs` and `reports`. See [package/README.md](package/README.md).
 - **One script, one configuration file.** The scope is one object (`-Identity`), an OU, the members of an AD group or a CSV list — users only, shared mailboxes only, or both.
 - **Preview by default.** Without `-Mode Apply` the tool only reads. With `-Mode Apply` it shows the plan and asks **one** confirmation (`-Force` for unattended runs).
+- **X500 control.** The batch records the X500 addresses (`legacyExchangeDN` and older X500) that the cloud mailbox must carry; the cloud phase proves them and warns if one is missing, because replies to old messages would otherwise bounce.
 - **One batch ID** links the steps: every Apply prints it with the exact next command, and `-Action Recover -Batch <id>` rolls the batch back.
 - **One or two servers**: everything from one server, or the AD part on-premises and the cloud part on an isolated server.
 

@@ -1,7 +1,7 @@
 ---
 title: PRA Remote Mailbox
 subtitle: Administrator guide
-version: 3.0.0
+version: 3.1.0
 author: Nicolas Fabert
 updated: 2026-11-04
 runtime: PowerShell 7.5+ fengine and window)
@@ -111,6 +111,7 @@ cloud | Exchange Online | mailbox, licence, permissions
 | **AD changes** | Per object: current state re-checked, `Set-ADUser`, AD re-read, licence group, AD re-read. The **first error stops the batch**. |
 | **Entra Connect** | One Delta cycle, local or on `EntraConnect.Server`; the tool waits for its end. |
 | **Exchange Online** | The tool waits (up to `Polling.TimeoutMinutes`) for the mailboxes and the licences, then grants FullAccess / SendAs / SendOnBehalf on the shared mailboxes and checks each grant. |
+| **X500 control** | For each mailbox that is ready, the tool proves that it carries the X500 addresses recorded by the AD phase (next section). A missing one is a warning; the conversion stays done. |
 
 ### What changes in AD
 
@@ -124,6 +125,19 @@ cloud | Exchange Online | mailbox, licence, permissions
 | `homeMDB`, `homeMTA`, `msExchHomeServerName`, `mDBUseDefaults`, `msExchMailboxGuid` | cleared | cleared |
 | retention tag (`extensionAttribute1` by default) | → `Converted` | → `Converted` |
 | licence group | **added** | never (a shared mailbox has no licence) |
+
+### X500 addresses — replies to old messages keep working
+
+Every message, meeting and cached Outlook entry (nickname cache, delegates, meeting organiser) addresses an on-premises mailbox by its `legacyExchangeDN` (internally an `IMCEAEX` address). Convert creates a **new** cloud mailbox. If that mailbox does not carry `X500:<legacyExchangeDN>` of the on-premises object, and the X500 addresses already in its `proxyAddresses` (older `legacyExchangeDN` values from earlier migrations), a reply to an old message, a meeting update or a cached recipient bounces with an `IMCEAEX` non-delivery report.
+
+The tool **proves** this, per object, and never writes a cloud address:
+
+1. **AD phase (Convert, phases AD and Both).** `legacyExchangeDN` is read with the other attributes (read only: it is not one of the managed attributes, is never written, restored or modified). The batch records, for each object, the list `ExpectedX500`: `X500:<legacyExchangeDN>` when it is not empty, then every `X500:` entry of the original `proxyAddresses`. Duplicates are removed (ordinal, ignoring case, on the whole value); each value is kept byte for byte. The preview shows *X500 to verify after the conversion: N* for each object. The field travels in the batch JSON and in the transfer package, so the cloud server on another machine has it.
+2. **Cloud phase (Convert, phases Cloud and Both).** When the mailbox is ready (and its licence, and the shared mailbox permissions), the tool reads `EmailAddresses` of the mailbox in Exchange Online, or the Entra `proxyAddresses` when `Cloud.MailboxCheckVia` is `Graph`, and compares each expected value (ordinal, ignoring case, on the whole value). All present: `X500: N of N present (legacyExchangeDN + older X500)`. Otherwise it re-reads, at the polling interval, up to **three reads in total** (the cloud value can lag one synchronisation; there is no long new wait), then writes ONE warning for the object: `X500 missing in Exchange Online: <values>`. It is a warning, not an error: the conversion stays done. The warning is counted in the run result, the HTML report, the global report (journey of the object) and the Next steps, which give the command to check again after an Entra Connect synchronisation.
+3. **Check.** `-Action Check -Batch <id>` (or `-Identity <sAMAccountName>`, which reads AD) shows the same comparison, read only. An identity given as a UPN has no Active Directory read: the line says so and skips the control.
+4. **Old batches.** A batch written before 3.1.0 has no `ExpectedX500`: the control is skipped with the information line *expected addresses not available (batch from 3.0.0 or older)*, never a failure. The field is validated like `KeptX500` when the batch is read (only strings starting with `X500:`, at most 2,000 values of at most 2,048 characters); a changed or invalid field makes the batch refused.
+
+The control runs only when the mailbox check runs (`Cloud.CheckMailbox`). Recover is unchanged: it keeps the cloud X500 address written back on premises (chapter 3).
 
 ### Shared mailbox permissions — where they come from
 
@@ -340,7 +354,8 @@ These points depend on Microsoft services or on your directory, not on the code.
 3. **That an attribute-level *Write property* ACE is enough for every `msExch*` attribute** with `Set-ADUser` from a non-Exchange account. It is how Active Directory works, but it was validated in the lab with an administrator account only (annex B).
 4. **The exact Exchange role of each cmdlet.** Check it in your tenant: `Get-ManagementRoleEntry "*\Add-MailboxPermission","*\Add-RecipientPermission","*\Set-Mailbox","*\Get-EXOMailbox"` lists the roles that carry each cmdlet; a custom role group with exactly those roles is a narrower alternative to *Exchange Recipient Administrator* (Microsoft, *Option 2: custom role groups* of the app-only authentication article).
 5. **`ADSyncOperators` as the only membership** for `Get-ADSyncScheduler` / `Start-ADSyncSyncCycle`, and **Remote Management Users** for the remote session: Microsoft documentation, not exercised by the tests.
-6. **The certificate store.** The console light looks in `CurrentUser\My` only, the store that Exchange Online (`Connect-ExchangeOnline -CertificateThumbprint`) reads: a thumbprint that exists only in `LocalMachine\My` shows a red light. A green light still does not prove that Exchange Online accepts the certificate (CSP key, application permission): the sign-in is proven by a **Check** on one mailbox.
+6. **How Exchange Online and Entra expose the X500 addresses.** The X500 control reads `EmailAddresses` (`Get-EXOMailbox -Properties EmailAddresses`) or, through Graph, `proxyAddresses`, and assumes that Entra Connect writes the on-premises `legacyExchangeDN` as an X500 address of the cloud object (the normal hybrid result). The lag (how many minutes a value takes to appear) and the property behaviour of your tenant are marked for lab validation; if the property is not returned, the control warns *could not be verified* instead of failing.
+7. **The certificate store.** The console light looks in `CurrentUser\My` only, the store that Exchange Online (`Connect-ExchangeOnline -CertificateThumbprint`) reads: a thumbprint that exists only in `LocalMachine\My` shows a red light. A green light still does not prove that Exchange Online accepts the certificate (CSP key, application permission): the sign-in is proven by a **Check** on one mailbox.
 
 Certificate sign-in for unattended runs: annex C.
 
@@ -741,7 +756,7 @@ Users get their original attributes back and leave the licence group. Shared mai
 .\Invoke-PraRemoteMailbox.ps1 -Action Check -Batch 1d5ac20b -Expect Deprovisioned     # after a Recover
 ```
 
-Read only. Check waits for the expected state (up to `Polling.TimeoutMinutes`); add `-Once` for a single pass.
+Read only. Check waits for the expected state (up to `Polling.TimeoutMinutes`); add `-Once` for a single pass. It also shows whether the mailbox carries the X500 addresses recorded by the Convert (section *X500 addresses*, chapter 2).
 
 ### Scenario C — Convert on two servers
 
@@ -830,7 +845,7 @@ for Convert (AD, then Cloud) as for Recover (AD, Cloud, then Finalize), whatever
 
 ### Warnings
 
-A warning never stops the run and never changes the exit code; it says that something was **left aside on purpose** and should be read. Today: the permission entries of a shared mailbox that point to an account no longer in AD (chapter 2). It is shown in four places: a yellow `▲` line in the console under the object, `[WARN]` in the log, the `Warnings` column of the CSV, and in the HTML report (*Warnings* tile, *Warnings* card, yellow mark on the row). The summary card of the console turns yellow and shows the last warnings.
+A warning never stops the run and never changes the exit code; it says that something was **left aside on purpose** and should be read. Today: the permission entries of a shared mailbox that point to an account no longer in AD (chapter 2), and an X500 address missing in Exchange Online (chapter 2, *X500 addresses*). It is shown in four places: a yellow `▲` line in the console under the object, `[WARN]` in the log, the `Warnings` column of the CSV, and in the HTML report (*Warnings* tile, *Warnings* card, yellow mark on the row). The summary card of the console turns yellow and shows the last warnings.
 
 ![Report of a run with a warning on a shared mailbox (synthetic example data)](images/report-phase-warning-light.png)
 
@@ -1074,6 +1089,7 @@ After a change of the engine, repeat the campaign of annex B on the lab: Preview
 | `Permission ... trustees missing in Exchange Online` | a permission holder is not known in Exchange Online (not synchronised) | check that Entra Connect synchronises the holder, or exclude it (`ExcludeTrusteeSamAccountNames`) |
 | `Trustee not found in Exchange Online at the pre-check: <upn>` | same, found before any AD write (phase Both) | same; nothing was written |
 | `▲ <mailbox>: N permission entries ignored, account unknown in AD (deleted, or from another domain): FullAccess S-1-5-21-...` (warning) | a permission entry of the shared mailbox points to an account that no longer exists ("Account Unknown") | nothing to do: the other holders are granted. To clean the source: SendAs entries in *Active Directory Users and Computers* → account of the shared mailbox → *Security*; FullAccess entries are removed when Exchange is back (`Remove-MailboxPermission`). If the account belongs to **another domain** and must keep its access, grant it by hand in Exchange Online |
+| `▲ <mailbox>: X500 missing in Exchange Online: X500:/o=...` (warning) | the cloud mailbox does not carry an address that the on-premises object had (its `legacyExchangeDN`, or an older X500). A reply to an old message or a meeting update would bounce (`IMCEAEX`). The conversion itself is done | check that Entra Connect synchronises `proxyAddresses` and `legacyExchangeDN` for the object (a customised or filtered rule, an object not yet synchronised, an empty `legacyExchangeDN`), run a synchronisation, then `-Action Check -Batch <id>`. Nothing is written by the tool |
 | `Trustee without UPN` / `Unsupported trustee type` | a holder is an account without UPN, or a contact / computer | give it a UPN, or exclude it (`ExcludeTrusteeSamAccountNames`) |
 | `Apply needs a confirmation and this console cannot ask for one` | `-Mode Apply` in a non-interactive run | add `-Force` |
 
@@ -1204,6 +1220,8 @@ $app                                               # -> Cloud.AppId
 | AD proof `State-<id>.json` | schema 2 | `Kind = ADVerified`, `BackupFile` + `BackupHash`, `Records[]` (`ObjectGuid`, `Operation`, `VerifiedUsnChanged`) |
 | Journal `Journal-<id>.jsonl` (AD) and `CloudOperations.jsonl` (cloud phase, folder `<RunId>-cloud`, created after the confirmation) | one JSON per line | `RunId`, `Utc`, `Target`, `Operation`, `Status`, `Detail`. Statuses: **Started**, **Applied**, **Verified** (a write and its re-read), **FailedOrIndeterminate** (AD write failed or unknown), **Failed** (cloud write failed), **Initialized** (cloud journal opened, no cloud write yet), **Completed** (Entra Connect cycle finished) |
 | Finalize package manifest | schema 2, `Operation = RecoverFinalize` | `SourceBackupHash`, `StateHash`, `Items[]` (`RestoreShared`, `RestoreTag`, `DeprovisionConfirmed`) |
+
+3.1.0 adds one optional field to each record of a Convert backup, `ExpectedX500` (the X500 addresses to verify in Exchange Online); a backup without it is read as before.
 
 Every JSON has a `.sha256` file; a mismatch is refused. **Version 2.0.0 reads the batches of 1.3.x** (tested: Recover of a 1.3.6 Convert batch in the lab).
 

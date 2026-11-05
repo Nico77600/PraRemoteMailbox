@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Documentation tests for PRA Remote Mailbox 3.0.0 (offline; reads the repository files only: no AD, Exchange, Graph or network).
+    Documentation tests for PRA Remote Mailbox 3.1.0 (offline; reads the repository files only: no AD, Exchange, Graph or network).
 .DESCRIPTION
     Keeps the README, the user guide and the reference guide honest:
       - every picture they use exists, has an alternative text, is in the integrity inventory, and no picture is left unused;
@@ -11,7 +11,7 @@
       - the "Start here" part of the user guide keeps short sentences and common words (a simple readability measure).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0
+    Version : 3.1.0
 #>
 #Requires -Version 7.5
 

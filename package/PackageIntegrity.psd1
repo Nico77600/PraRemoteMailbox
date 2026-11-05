@@ -1,4 +1,4 @@
-﻿# PRA Remote Mailbox 3.0.0 - authenticated package integrity manifest
+﻿# PRA Remote Mailbox 3.1.0 - authenticated package integrity manifest
 # Generated only after the final stable-file signatures and timestamps.
 @{
     SchemaVersion = 1
