@@ -16,9 +16,13 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate (PowerShell 7.5)
+    name: Validate (${{ matrix.engine }})
     runs-on: windows-2022
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include: [{"engine":"PowerShell 7","shell":"pwsh","package":true}]
     steps:
       - name: Check out the tested revision
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
