@@ -116,11 +116,10 @@ if ($all -or $Part -eq 'Console') {
         'setup-red', 'setup-red-lights', 'task-ad', 'run-package', 'next-package'
         'task-continue', 'task-package-selected', 'verify-cloud', 'run-cloud', 'next-cloud'
         'task-rollback', 'task-rollback-selected', 'verify-rollback', 'run-rollback', 'next-rollback'
-        'task-finalize', 'task-check', 'verify-check'
+        'task-finalize', 'verify-finalize', 'run-finalize', 'next-finalize', 'task-check', 'verify-check'
     )
     $keepDark = @('setup', 'run-finished')
     foreach ($name in $keepLight) { Copy-Item -LiteralPath (Join-Path $shots "console-$name-light.png") -Destination (Join-Path $OutputFolder "console-$name-light.png") -Force }
-    # Photographed too, but not copied: verify-finalize, run-finalize, next-finalize (see Show-ConsoleScreens.ps1). Use -KeepWork to find them.
     foreach ($name in $keepDark) { Copy-Item -LiteralPath (Join-Path $shots "console-$name-dark.png") -Destination (Join-Path $OutputFolder "console-$name-dark.png") -Force }
     Write-Host ("  {0} console pictures" -f ($keepLight.Count + $keepDark.Count))
 }

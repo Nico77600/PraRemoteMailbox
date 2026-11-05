@@ -30,12 +30,14 @@ package/docs/PraRemoteMailbox-Guide.md -text whitespace=blank-at-eol,space-befor
 package/docs/PraRemoteMailbox-UserGuide.html -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
 package/docs/PraRemoteMailbox-UserGuide.md -text whitespace=blank-at-eol,space-before-tab,blank-at-eof,cr-at-eol
 package/docs/images/console-next-cloud-light.png -text
+package/docs/images/console-next-finalize-light.png -text
 package/docs/images/console-next-global-light.png -text
 package/docs/images/console-next-light.png -text
 package/docs/images/console-next-package-light.png -text
 package/docs/images/console-next-rollback-light.png -text
 package/docs/images/console-run-cloud-light.png -text
 package/docs/images/console-run-early-light.png -text
+package/docs/images/console-run-finalize-light.png -text
 package/docs/images/console-run-finished-dark.png -text
 package/docs/images/console-run-finished-light.png -text
 package/docs/images/console-run-grant-light.png -text
@@ -62,6 +64,7 @@ package/docs/images/console-task-scope-light.png -text
 package/docs/images/console-verify-before-light.png -text
 package/docs/images/console-verify-check-light.png -text
 package/docs/images/console-verify-cloud-light.png -text
+package/docs/images/console-verify-finalize-light.png -text
 package/docs/images/console-verify-light.png -text
 package/docs/images/console-verify-rollback-light.png -text
 package/docs/images/console-verify-scope-light.png -text

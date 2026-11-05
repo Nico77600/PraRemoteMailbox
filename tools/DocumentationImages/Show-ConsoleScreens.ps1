@@ -66,7 +66,10 @@ try {
     $names = @('adele.vance', 'alex.wilber', 'diego.siciliani', 'grady.archie', 'isaiah.langford', 'finance.shared')
     $objects = @($names | ForEach-Object { @{ sam = $_; upn = "$_@contoso.com"; guid = [guid]::NewGuid().ToString(); shared = ($_ -eq 'finance.shared'); warning = $(if ($_ -eq 'finance.shared') { 'Forwarding to an outside address is kept' } else { '' }) } })
     $alice = @{ sam = 'alice.vance'; upn = 'alice.vance@contoso.com'; guid = [guid]::NewGuid().ToString(); shared = $false; warning = '' }
-    W (Join-Path $root 'scenario.json') ($(if ($Scenario -in 'single', 'rollback', 'check') { @($alice) + $objects } else { $objects }) | ConvertTo-Json -Depth 4)
+    # The Finalize package of the two-server rollback story concerns one object only: the shared mailbox that the cloud server removed.
+    $finalizeObject = @{ sam = 'finance.shared'; upn = 'finance.shared@contoso.com'; guid = [guid]::NewGuid().ToString(); shared = $true; warning = '' }
+    $listed = switch ($Scenario) { { $_ -in 'single', 'rollback', 'check' } { @($alice) + $objects } 'finalize' { @($finalizeObject) } default { $objects } }
+    W (Join-Path $root 'scenario.json') (ConvertTo-Json -InputObject @($listed) -Depth 4)
     if ($Scenario -in 'single', 'scope') { foreach ($flag in 'entra', 'grant') { W (Join-Path $root "hold.$flag") 'hold' } }
     # A Convert batch (with its Active Directory proof) in the backup folder.
     $id = [guid]::NewGuid().ToString('N')
@@ -276,8 +279,7 @@ try {
             GoToTask 'T_Finalize'
             if (@($g.BatchRows).Count -gt 0) { $c.BatchList.SelectedIndex = 0; Pump }
             Shot 'task-finalize' @(@('T_Finalize', '1'), @('BatchList', '2'), @('BtnNext', '3'))
-            # The Verify, Run and Next steps pages of a Finalize. They are photographed here but not copied to docs\images by New-DocumentationImages.ps1:
-            # a new picture needs its name in the signed integrity verifier (package\module\Test-PackageIntegrity.ps1) first.
+            # The Verify, Run and Next steps pages of a Finalize (one shared mailbox, as in the guide's rollback story).
             PreviewThenConfirm 'finalize'
             Click 'BtnPreview'; Pump 600; WaitRun; Pump
             if (-not $g.Pending) { throw "no pending: $($c.SumText.Text) $($g.PreviewError)" }

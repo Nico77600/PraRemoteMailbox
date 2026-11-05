@@ -495,9 +495,19 @@ On two servers, a rollback has three parts. Each part gives a file to the next o
 
 ### 2 · Preview, confirm, wait
 
-**Do:** press **Preview**. Read the title. Type the word **FINALIZE** in the box. Press the red button **Finalize the rollback**. Wait until the title says **Done** in green. Press **What next? →**. Then press **Open global report**.
+**Do:** press **Preview**. Read the title. Type the word **FINALIZE** in the box. Press the red button **Finalize the rollback**.
 
-**You should see:** the **Verify** page with the list, then the **Run** page, then the **Next steps** page with the button for the **global report**. In the report, every person shows **done**.
+![The Verify page of Complete a rollback. Number 1 marks the box where you type FINALIZE. Number 2 marks the red button](images/console-verify-finalize-light.png)
+
+Wait until the title says **Done** in green. This is short: the directory server changes the one remaining object.
+
+![The Run page at the end of Complete a rollback](images/console-run-finalize-light.png)
+
+Press **What next? →**. Then press **Open global report**.
+
+![The Next steps page at the end of Complete a rollback. Number 1 marks the button for the global report](images/console-next-finalize-light.png)
+
+**You should see:** the **Verify** page with one shared mailbox, *finance.shared*. Then the **Run** page. Then the **Next steps** page with the button for the **global report**. In the report, every person shows **done**.
 
 **If not:** the red button stays grey until you did the preview **and** typed the word. A step in red means the tool stopped. Stop and ask.
 
