@@ -4,45 +4,33 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
-## 2.2.0 — Unreleased (source only; no tag, no release)
+## 3.0.0 — 2026-11-05
+
+**Breaking: PowerShell 7.5+ required.** Windows PowerShell 5.1 is refused before any code runs; use 2.x there.
+Backups, proofs and Finalize packages written by 2.x restore unchanged. Includes the unpublished 2.2.0 and 2.3.0 work.
 
 ### Added
-- **Signed-package integrity (Windows PowerShell 5.1).** `module\Test-PackageIntegrity.ps1` and the
-  manifest `PackageIntegrity.psd1` verify, before any code runs, the owner's timestamped Authenticode
-  signature (fixed thumbprint) of the verifier, the manifest and every PowerShell file, and the SHA256 of
-  every stable file (modules, XAML, report template, sample CSV files, README, licence, guide, images).
-  The entry script, each module and the GUI helper run the same bootstrap first. A changed, missing,
-  duplicated, unexpected or reparse-point file fails closed; there is no unsigned mode or bypass.
-  The configuration and the operational CSV lists in `config\` are data, outside the check, as are
-  `Backups\`, `logs\` and `reports\`. A backup, log or report folder inside the package other than its own
-  canonical `Backups`, `logs` or `reports` folder (a sub-folder is fine) is now refused before any file is
-  written, judged on the physical location (a `\\?\` prefix, junction, SUBST drive, 8.3 name or `Documents and Settings` alias cannot hide the package; an unresolvable path is refused; external paths are unchanged): such files would be rejected at the next start.
-  The final manifest is generated from the finalized signed and timestamped runtime bytes.
-- `tests\PackageIntegrity.Tests.ps1`: static inventory/bootstrap checks, a controlled fixture (only the
-  signature call is substituted) for tamper, missing, unexpected, duplicate, manifest-schema and reparse
-  cases, builder checks, and the native signed-package or unsigned fail-closed state of the real package.
-
-- **Report export snapshot.** The filtered CSV export in the report page now iterates a copy of the rows selected
-  when it starts, so changing a filter while it runs cannot change the exported rows or the reported count.
-
-- **High-volume HTML report.** The report page no longer builds a table per row. The rows (22 fields),
-  run errors and warnings are streamed by a Windows PowerShell 5.1 writer into dictionary-indexed,
-  gzip+base64 chunks of at most 20,000 rows; the page decodes all chunks when it opens (eager, not lazy)
-  and shows virtualized *Summary* and *All 22 fields* grids with at most 200 data rows in the page.
-  Status/type/action/flag/text filters (AND, over every row), a search over the 22 fields, keyboard
-  navigation, a details dialog, paged warnings and run errors, and a filtered CSV export of all matching
-  rows (BOM, quoted, formulas neutralised). A current desktop Edge or Chrome is required
-  (`DecompressionStream`); otherwise the page explains it and the CSV holds every row. Compression is not
-  encryption. The server CSV is unchanged.
-- `tests\PraReport.Tests.ps1` with synthetic 50,000 and 100,000 row reports (exact counts, chunk
-  boundaries, last row, escaping, fields) and `tests\ReportFixture.ps1`.
+- **Guided console** (`-Gui`, English): Setup, Task, Verify, Run, Next steps. Run-only settings that never rewrite
+  the configuration file, real step progress, and the journey of each mailbox.
+- **Transfer package** for two-server runs: one verified zip to carry to the other server (`-Batch <zip>` or
+  *Import package*).
+- **Global report** (HTML and CSV) on the last server, following each object end to end, Convert and Recover.
+- **Optional forced Active Directory replication** before the Entra Connect sync (off by default).
+- **Signed package integrity**: the owner's timestamped signatures and a signed SHA256 manifest are checked
+  before any code runs; no unsigned mode.
+- Module manifest and root module; a plain-language user guide and a reference guide with minimum permissions.
 
 ### Changed
-- The runtime moved to the `package\` folder (entry, `module\`, `config\`, `templates\`, `docs\`, runtime
-  README and licence). Inside the package, and in the extracted release, every path is unchanged. Tests,
-  tools and the gate stay outside the distribution. `tools\New-PraPackage.ps1` now builds from
-  `package\`, verifies the signed source first and refuses an unsigned or changed one.
-- Documentation and tools (`Build-Documentation.ps1`, `New-ReadmeImages.ps1`) use the new paths.
+- Recover keeps the cloud X500 addresses written back by Entra Connect; Finalize accepts that writeback only.
+- A server that can run both sides runs Phase Both by default; the runtime lives in the `package\` folder.
+- High-volume HTML report (virtualized and filterable; tested with 100,000 rows).
+
+### Fixed
+- Parameter letter case (`-Action convert -Phase cloud`), interactive cloud sign-in from the window (WAM),
+  read-only cloud pre-check before AD writes in Recover Phase Both, and ordinal string comparisons everywhere.
+
+This version has offline validation only; no new live-tenant campaign has been performed.
+The full detail of each change is in the reference guide and in the commit history.
 
 ## 2.1.0 — 2026-10-09
 
@@ -175,7 +163,7 @@ addressed in 2.0.0. No defect of the backup/proof engine was found.
 - Test gate on VMLLM (Windows PowerShell 5.1, Pester 6.0.0, PSScriptAnalyzer 1.25.0): **279 / 279 passed**,
   0 analyzer error (evidence `tests\evidence\gate\v2.0.0-release`). The 61 tests of the removed path options
   of 1.3.6 are replaced by tests of `-Batch` and of the confirmation (1.3.6: 325 tests).
-- Lab campaign 2026-09-30 / 2026-10-01 on `lab.example` + tenant contoso-test (real AD, Entra Connect and
+- Lab campaign 2026-09-30 / 2026-10-01 on a lab Active Directory domain + a Microsoft 365 test tenant (real AD, Entra Connect and
   Exchange Online): 28 runs — Convert, Recover on one and two servers, Finalize, Check, Recover of a 1.3.6
   batch, shared mailbox permissions given to a group (nested group included), SendAs actually granted,
   SendOnBehalf (guide, annex B). 26 PASS; the 5 defects found (approval callback with `-Force` in a

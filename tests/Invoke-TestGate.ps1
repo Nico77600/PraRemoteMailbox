@@ -2,29 +2,24 @@
 .SYNOPSIS
     Runs the PRA Remote Mailbox test gate offline and keeps reproducible evidence.
 .DESCRIPTION
-    Windows PowerShell 5.1 Desktop, Pester >= 5 (imported explicitly in this process),
-    PSScriptAnalyzer 1.25.0 with the Windows PowerShell 5.1 compatibility profiles.
+    PowerShell 7.5+ (pwsh.exe), Pester >= 5 (imported explicitly in this process),
+    PSScriptAnalyzer 1.25.0 with the PowerShell 7 (Core, Windows) compatibility profiles.
     Data, AD/ADSync modules and cloud checks of the entry script are synthetic.
     A missing test, a failed container/block or an analyzer error fails the gate.
 .PARAMETER EvidenceDirectory
     Evidence folder; default tests\evidence\gate\<timestamp-GUID>.
 .EXAMPLE
-    powershell.exe -NoLogo -NoProfile -NonInteractive -File .\tests\Invoke-TestGate.ps1
+    pwsh.exe -NoLogo -NoProfile -NonInteractive -File .\tests\Invoke-TestGate.ps1
 .NOTES
     Author : Nicolas Fabert
-    Version: 2.2.0
+    Version: 3.0.0
 #>
-#Requires -Version 5.1
-#Requires -PSEdition Desktop
+#Requires -Version 7.5
 [CmdletBinding()]
 param([string]$EvidenceDirectory)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
-# A Windows PowerShell launched by pwsh can inherit only Core module paths.
-foreach ($name in @('Microsoft.PowerShell.Utility','Microsoft.PowerShell.Management','Microsoft.PowerShell.Security')) {
-    Import-Module (Join-Path $PSHOME ('Modules\'+$name+'\'+$name+'.psd1')) -ErrorAction Stop
-}
 $root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not $EvidenceDirectory) { $EvidenceDirectory=Join-Path $root ('tests\evidence\gate\'+(Get-Date -Format 'yyyyMMdd-HHmmss')+'-'+[guid]::NewGuid().ToString('N').Substring(0,8)) }
 $evidenceRoot=[IO.Path]::GetFullPath((Join-Path $root 'tests\evidence\gate')).TrimEnd('\')+'\'
@@ -41,8 +36,8 @@ $failures=New-Object 'Collections.Generic.List[string]'
 $summary=[ordered]@{
     Provenance='Synthetic-only. No real AD/EXO/Graph/ADSync access. Main Cloud orchestration uses an explicitly substituted blocking fixture.'
     Command=[Environment]::CommandLine; Invocation=$MyInvocation.Line; Script=$PSCommandPath; StartedUtc=[datetime]::UtcNow.ToString('o')
-    PowerShellVersion=[string]$PSVersionTable.PSVersion; PSEdition=$PSVersionTable.PSEdition; CLRVersion=[string]$PSVersionTable.CLRVersion
-    Executable=(Join-Path $PSHOME 'powershell.exe'); OS=[Environment]::OSVersion.VersionString
+    PowerShellVersion=[string]$PSVersionTable.PSVersion; PSEdition=$PSVersionTable.PSEdition; CLRVersion=[string][Environment]::Version
+    Executable=(Join-Path $PSHOME 'pwsh.exe'); OS=[Environment]::OSVersion.VersionString
     PesterVersion=''; PesterPath=''; AnalyzerVersion=''; AnalyzerProfiles=@(); TotalCount=0; PassedCount=0; FailedCount=0
     FailedBlocksCount=0; FailedContainersCount=0; AnalyzerErrorCount=0; AnalyzerWarningCount=0
     ReleaseDefaultWarningCount=0; ReleaseCompatibilityWarningCount=0; GateWarningCount=0
@@ -64,11 +59,11 @@ try {
         if ($errors.Count) { $failures.Add('AST: '+$file.FullName) }
         $bytes=[IO.File]::ReadAllBytes($file.FullName)
         $bom=$bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
-        $checks.Add([pscustomobject]@{Name='UTF8-BOM';File=$file.FullName;Passed=$bom;Details='Windows PowerShell 5.1 deterministic decoding.'})
+        $checks.Add([pscustomobject]@{Name='UTF8-BOM';File=$file.FullName;Passed=$bom;Details='Deterministic decoding of the signed files (also protects against an accidental run under Windows PowerShell 5.1, which reads BOM-less files as ANSI).'})
         if (-not $bom) { $failures.Add('UTF8 BOM absent: '+$file.FullName) }
     }
     # Honest native state of the runtime signatures: Authenticode is not mocked here; the integrity tests assert fail-closed or valid.
-    $signed=@(foreach ($name in @('Invoke-PraRemoteMailbox.ps1','module\PRA.Common.psm1','module\PRA.Directory.psm1','module\PRA.Backup.psm1','module\PRA.Cloud.psm1','module\PRA.Gui.psm1','module\PRA.Gui.Directory.ps1','module\Test-PackageIntegrity.ps1','PackageIntegrity.psd1')) { $sig=Get-AuthenticodeSignature -LiteralPath (Join-Path $root ('package\'+$name)); [pscustomobject]@{Path=$name;Status=[string]$sig.Status;Signer=if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { '' };Timestamped=($null -ne $sig.TimeStamperCertificate)} })
+    $signed=@(foreach ($name in @('Invoke-PraRemoteMailbox.ps1','PraRemoteMailbox.psd1','PraRemoteMailbox.psm1','module\PRA.Common.psm1','module\PRA.Directory.psm1','module\PRA.Backup.psm1','module\PRA.Cloud.psm1','module\PRA.Gui.psm1','module\PRA.Gui.Directory.ps1','module\Test-PackageIntegrity.ps1','PackageIntegrity.psd1')) { $sig=Get-AuthenticodeSignature -LiteralPath (Join-Path $root ('package\'+$name)); [pscustomobject]@{Path=$name;Status=[string]$sig.Status;Signer=if ($sig.SignerCertificate) { $sig.SignerCertificate.Thumbprint } else { '' };Timestamped=($null -ne $sig.TimeStamperCertificate)} })
     [IO.File]::WriteAllText((Join-Path $EvidenceDirectory 'native-signature-state.json'),(ConvertTo-Json -InputObject $signed -Depth 4),$encoding)
     $summary.NativeSignatureState=@($signed | ForEach-Object { $_.Path+'='+$_.Status })
     $main=Join-Path $root 'package\Invoke-PraRemoteMailbox.ps1'
@@ -82,19 +77,20 @@ try {
     $analyzer=Get-Module PSScriptAnalyzer
     $summary.AnalyzerVersion=[string]$analyzer.Version
     $profileRoot=Join-Path $analyzer.ModuleBase 'compatibility_profiles'
-    $profiles=@(Get-ChildItem -LiteralPath $profileRoot -Filter '*_5.1.*_framework.json' | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) })
-    if (-not $profiles.Count) { throw 'PSSA Windows PowerShell 5.1 compatibility profiles unavailable.' }
+    # PSScriptAnalyzer ships no 7.4/7.5 profile: the newest are the PowerShell 7.0 (Core) ones for Windows. 7.5 additions (-DateKind) are listed as advisory diagnostics, never hidden.
+    $profiles=@(Get-ChildItem -LiteralPath $profileRoot -Filter 'win-*_7.0.0_*_core.json' | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_.Name) })
+    if (-not $profiles.Count) { throw 'PSSA PowerShell 7 (Core, Windows) compatibility profiles unavailable.' }
     $summary.AnalyzerProfiles=$profiles
     $settings=@{
         IncludeDefaultRules=$true
         Rules=@{
-            PSUseCompatibleSyntax=@{Enable=$true;TargetVersions=@('5.1')}
+            PSUseCompatibleSyntax=@{Enable=$true;TargetVersions=@('7.0')}
             PSUseCompatibleCommands=@{Enable=$true;TargetProfiles=$profiles}
             PSUseCompatibleTypes=@{Enable=$true;TargetProfiles=$profiles}
         }
     }
-    $gateSettings=@{IncludeDefaultRules=$true;Rules=@{PSUseCompatibleSyntax=@{Enable=$true;TargetVersions=@('5.1')}}}
-    $analyzerScopes=@{Release=$settings;Gate=$gateSettings;Reason='Compatibility command/type profiles apply to delivered release. Test harness requires Pester >=5, not legacy Pester metadata in native Windows profiles; gate still receives every default rule and 5.1 syntax checks.'}
+    $gateSettings=@{IncludeDefaultRules=$true;Rules=@{PSUseCompatibleSyntax=@{Enable=$true;TargetVersions=@('7.0')}}}
+    $analyzerScopes=@{Release=$settings;Gate=$gateSettings;Reason='Compatibility command/type profiles apply to delivered release. Test harness requires Pester >=5, which the PowerShell 7.0 profiles do not describe; gate still receives every default rule and 7.0 syntax checks.'}
     [IO.File]::WriteAllText((Join-Path $EvidenceDirectory 'analyzer-settings.json'),($analyzerScopes | ConvertTo-Json -Depth 10),$encoding)
     $releaseRoot=$root.TrimEnd('\')+'\'
     $diagnostics=@(foreach ($file in $files) {
@@ -112,7 +108,7 @@ try {
     if ($summary.AnalyzerErrorCount) { $failures.Add('PSScriptAnalyzer error diagnostics: '+$summary.AnalyzerErrorCount) }
     $rationales=@(foreach ($diagnostic in $diagnostics | Where-Object Severity -ne 'Error') {
         $reason=switch -Regex ($diagnostic.RuleName) {
-            'PSUseCompatible(Commands|Types)' { 'Windows 5.1 profiles describe native/legacy Pester 3.4 metadata, not the required Pester >=5 test DSL. Gate imports Pester 6 explicitly; external AD/Graph/EXO boundaries are synthetic or mocked. Diagnostics are retained, never globally disabled.'; break }
+            'PSUseCompatible(Commands|Types)' { 'The PowerShell 7.0 profiles predate 7.5 (for example ConvertFrom-Json -DateKind) and know nothing of the Pester >=5 test DSL. Gate imports Pester 6 explicitly; external AD/Graph/EXO boundaries are synthetic or mocked. Diagnostics are retained, never globally disabled.'; break }
             'PSUseShouldProcessForStateChangingFunctions|PSShouldProcess' { 'Memory-only status helpers must still record failures under WhatIf; actual permission writes are individually gated by Invoke-PraPermissionGrant, proof callbacks and native preferences, covered by readonly boundary tests.'; break }
             'PSUseDeclaredVarsMoreThanAssignments' { 'Pester discovery/runtime scopes and mocked scriptblocks can appear unused to static analysis; diagnostic retained.'; break }
             'PSAvoidGlobalVars' { 'Gate-only mutable fixture/counter scope shared with InModuleScope; cleanup in AfterAll; no production globals added.'; break }
@@ -135,7 +131,7 @@ try {
     if ($pester.Version.Major -lt 5) { throw 'Pester >= 5 is mandatory.' }
     $summary.PesterVersion=[string]$pester.Version; $summary.PesterPath=$pester.Path
     $configuration=New-PesterConfiguration
-    $configuration.Run.Path=@((Join-Path $PSScriptRoot 'PraRemoteMailbox.Tests.ps1'),(Join-Path $PSScriptRoot 'PraRemoteMailbox.Gui.Tests.ps1'),(Join-Path $PSScriptRoot 'PackageIntegrity.Tests.ps1'),(Join-Path $PSScriptRoot 'PraReport.Tests.ps1'))
+    $configuration.Run.Path=@((Join-Path $PSScriptRoot 'PraRemoteMailbox.Tests.ps1'),(Join-Path $PSScriptRoot 'PraRemoteMailbox.Gui.Tests.ps1'),(Join-Path $PSScriptRoot 'PackageIntegrity.Tests.ps1'),(Join-Path $PSScriptRoot 'PraReport.Tests.ps1'),(Join-Path $PSScriptRoot 'PraLegacyFixtures.Tests.ps1'),(Join-Path $PSScriptRoot 'PraDocumentation.Tests.ps1'))
     $configuration.Run.PassThru=$true
     $configuration.Run.Exit=$false
     $configuration.Output.Verbosity='Detailed'

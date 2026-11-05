@@ -24,11 +24,12 @@
     servers (Phase AD, then Phase Cloud with a copy of the batch folder).
 
 .PARAMETER Action
-    Convert, Recover, Finalize or Check.
+    Convert, Recover, Finalize or Check. The value is case-insensitive (convert, CONVERT); the entry script
+    rewrites it to its official spelling right after the parameters are bound.
 
 .PARAMETER Mode
     Preview (default): read, plan and report; nothing is changed.
-    Apply: perform the changes (one confirmation unless -Force).
+    Apply: perform the changes (one confirmation unless -Force or -Confirm is given, see -Force).
 
 .PARAMETER Phase
     Convert and Recover only. Default: Execution.Phase in the configuration.
@@ -39,7 +40,10 @@
 
 .PARAMETER Batch
     Batch ID printed at the end of an Apply (8 characters are enough), or the full path of the batch
-    JSON file. Required by: Recover (the Convert batch), -Phase Cloud (the batch of the AD part),
+    JSON file, or a transfer package (.zip) written by the other server (a bare file name is looked up in
+    <Storage.BackupFolder>\Inbox, then Outbox, then the current folder). The package is verified (checksums,
+    Environment, names, sizes) and extracted to private folders first; every proof check then runs unchanged.
+    Required by: Recover (the Convert batch), -Phase Cloud (the batch of the AD part),
     Finalize (the Finalize package). Optional for Check.
 
 .PARAMETER Identity
@@ -48,6 +52,9 @@
 
 .PARAMETER Scope
     All (default), UsersOnly or SharedOnly: filters the configured scope or the batch.
+    Convert with -Identity ignores -Scope: the one named object is converted whatever its type (user, shared
+    mailbox, room or equipment mailbox that the eligibility rules accept). -Scope still filters a batch
+    (Recover, cloud phase) and the Check of a whole batch.
 
 .PARAMETER SearchBase
     Convert AD/Both only: select an OU (distinguished name), including its child OUs, for this run.
@@ -66,8 +73,23 @@
 .PARAMETER ConfigPath
     Configuration file. Default: config\PraRemoteMailbox.config.psd1 next to this script.
 
+.PARAMETER BaseConfigPath
+    Used by the window: -ConfigPath is then the generated, private configuration of ONE run (the configuration file plus the run settings
+    changed in the window) and -BaseConfigPath is the configuration file itself, never modified. The settings that differ are listed in the log,
+    the summary and the result of the run. Not needed on the command line.
+
+.PARAMETER ForceAdReplication
+    Turns Directory.ForceReplication on for this run (it is OFF by default). Before the Entra Connect synchronisation, each object changed in the run is
+    pushed from the domain controller that was written to the other writable domain controllers (Sync-ADObject; Directory.ReplicationTargets restricts the
+    list), then read back on each of them. A domain controller that does not confirm is a warning that names it; the synchronisation still runs and the
+    Next steps say how to run it again later. Needs the right to replicate a single object (normally Domain Admins). A Preview never replicates.
+
 .PARAMETER Force
     Apply without the confirmation prompt (scheduled or unattended runs). Never skips a safety check.
+    The single confirmation of an Apply is also skipped when -Confirm is given explicitly, with either value:
+    -Confirm:$false behaves like -Force for this prompt (and for the per-write prompts, which are then off),
+    whereas a plain -Confirm replaces the single confirmation by the PowerShell confirmation of every write.
+    Use -Confirm:$false only in a scheduled or unattended run, after a Preview that was reviewed.
 
 .PARAMETER Once
     Cloud checks: one pass only instead of waiting (Polling.TimeoutMinutes) for the cloud.
@@ -77,8 +99,7 @@
     log and report paths), for a script or an orchestrator. Without it, nothing is written to the pipeline.
 
 .PARAMETER Gui
-    Opens the WPF window. PowerShell 7.5+ uses the native Fluent theme; Windows PowerShell 5.1 uses
-    compatible WPF controls. Every operation runs in its own Windows PowerShell 5.1 process.
+    Opens the WPF window (native Fluent theme). Every operation runs in its own PowerShell 7.5+ process (pwsh.exe).
 
 .EXAMPLE
     pwsh -STA -File .\Invoke-PraRemoteMailbox.ps1 -Gui
@@ -110,9 +131,10 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 2.2.0
-    Requires   : Windows PowerShell 5.1 (not PowerShell 7), RSAT ActiveDirectory, ExchangeOnlineManagement
-                 3.10+, Microsoft.Graph.Authentication and Microsoft.Graph.Users (cloud part), ADSync (sync).
+    Version    : 3.0.0
+    Requires   : PowerShell 7.5 or later (pwsh.exe; Windows PowerShell 5.1 is refused), RSAT ActiveDirectory,
+                 ExchangeOnlineManagement 3.10+, Microsoft.Graph.Authentication and Microsoft.Graph.Users
+                 (cloud part), ADSync (sync; through the Windows PowerShell compatibility layer when local).
     Exit codes : 0 = done, 1 = failed, 2 = done but a next step is required (Pending objects).
     Documentation : docs\PraRemoteMailbox-Guide.md (or .html)
 
@@ -124,7 +146,7 @@
 
     The tool changes production objects in Active Directory and creates mailboxes in Exchange Online: run the preview, review the plan, keep the backups and test in a lab before using it in a real disaster.
 #>
-#Requires -Version 5.1
+#Requires -Version 7.5
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Run')]
 param(
     [Parameter(Mandatory, ParameterSetName = 'Run')][ValidateSet('Convert','Recover','Finalize','Check')][string]$Action,
@@ -138,6 +160,8 @@ param(
     [Parameter(ParameterSetName = 'Run')][ValidateRange(0, 2147483647)][int]$MaxObjects = 0,
     [Parameter(ParameterSetName = 'Run')][ValidateSet('Provisioned','Deprovisioned','Retained')][string]$Expect = 'Provisioned',
     [string]$ConfigPath,
+    [Parameter(ParameterSetName = 'Run')][string]$BaseConfigPath,
+    [Parameter(ParameterSetName = 'Run')][switch]$ForceAdReplication,
     [Parameter(ParameterSetName = 'Run')][switch]$Force,
     [Parameter(ParameterSetName = 'Run')][switch]$Once,
     [Parameter(ParameterSetName = 'Run')][switch]$PassThru,
@@ -159,32 +183,46 @@ $ProgressPreference = 'SilentlyContinue'
         $cursor = [IO.Path]::GetDirectoryName($cursor)
     }
     $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $verifier -ErrorAction Stop
-    if ([string]$signature.Status -cne 'Valid' -or $null -eq $signature.SignerCertificate -or
-        $signature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
+    if (-not [string]::Equals([string]$signature.Status, 'Valid', [StringComparison]::Ordinal) -or $null -eq $signature.SignerCertificate -or
+        -not [string]::Equals([string]$signature.SignerCertificate.Thumbprint, '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6', [StringComparison]::Ordinal) -or
         $null -eq $signature.TimeStamperCertificate) {
         throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
     }
     & $verifier -Root $PackageRoot
 } $PSScriptRoot
 # <<< PRA package integrity bootstrap
-# Not a parameter default: Windows PowerShell 5.1 leaves $PSScriptRoot empty in param() defaults when the script
-# runs with powershell.exe -File (scheduled task). An explicit -ConfigPath is unchanged ($script:ConfigPathBound).
+# Not a parameter default (kept from 2.x, where Windows PowerShell 5.1 left $PSScriptRoot empty in param() defaults under
+# -File): the default path is computed here. An explicit -ConfigPath is unchanged ($script:ConfigPathBound).
 if (-not $ConfigPath) { $ConfigPath = Join-Path $PSScriptRoot 'config\PraRemoteMailbox.config.psd1' }
+# ValidateSet accepts any casing (-Action convert) but binds the value AS TYPED, while the proof, batch and journal
+# checks of the modules compare the official spelling, ordinally (a tampered file must not pass).
+# Rewrite every ValidateSet string parameter to its official spelling NOW, before anything reads it; the
+# downstream comparisons stay exactly as strict as they were. ValidateSet itself uses the CULTURE comparison (ICU): it also accepts
+# "Apply<U+0001>" or "Ap<U+200B>ply". The lookup below is ordinal (case-insensitive) and refuses any value that has no ordinal match.
+foreach ($parameterInfo in $MyInvocation.MyCommand.Parameters.Values) {
+    if ($parameterInfo.ParameterType -ne [string]) { continue }
+    $validSet = @($parameterInfo.Attributes | Where-Object { $_ -is [Management.Automation.ValidateSetAttribute] })
+    if ($validSet.Count -ne 1) { continue }
+    $typed = [string](Get-Variable -Name $parameterInfo.Name -ValueOnly)
+    if (-not $typed) { continue }
+    $official = @($validSet[0].ValidValues | Where-Object { [string]::Equals($_, $typed, [StringComparison]::OrdinalIgnoreCase) })
+    if ($official.Count -ne 1) { throw ("Parameter -{0}: '{1}' is not one of the accepted values ({2})." -f $parameterInfo.Name, $typed, ($validSet[0].ValidValues -join ', ')) }
+    if (-not [string]::Equals([string]$official[0], $typed, [StringComparison]::Ordinal)) {
+        Set-Variable -Name $parameterInfo.Name -Value ([string]$official[0])
+        if ($PSBoundParameters.ContainsKey($parameterInfo.Name)) { $PSBoundParameters[$parameterInfo.Name] = [string]$official[0] }
+    }
+}
 if ($Gui) {
     try {
-        Import-Module (Join-Path $PSScriptRoot 'module\PRA.Common.psm1') -Force -ErrorAction Stop
+        Import-Module (Join-Path $PSScriptRoot 'PraRemoteMailbox.psd1') -Force -ErrorAction Stop
         Import-Module (Join-Path $PSScriptRoot 'module\PRA.Gui.psm1') -Force -ErrorAction Stop
-        Show-PraGui -Root $PSScriptRoot -ConfigPath $ConfigPath -Version '2.2.0'
+        Show-PraGui -Root $PSScriptRoot -ConfigPath $ConfigPath -Version (Get-PraToolVersion)
         exit 0
     }
     catch { Write-Error ('The window could not open: {0}' -f $_.Exception.Message) -ErrorAction Continue; exit 1 }
 }
-if ($PSVersionTable.PSEdition -ne 'Desktop') {
-    Write-Error "$Action runs in Windows PowerShell 5.1 Desktop (powershell.exe), not PowerShell 7. Use powershell.exe -File .\Invoke-PraRemoteMailbox.ps1 with the same parameters, or -Gui for the window." -ErrorAction Continue
-    exit 1
-}
-Import-Module (Join-Path $PSScriptRoot 'module\PRA.Common.psm1') -Force -ErrorAction Stop
-Import-Module (Join-Path $PSScriptRoot 'module\PRA.Directory.psm1') -Force -ErrorAction Stop
+# The manifest loads PRA.Common and PRA.Directory (and PRA.Backup through it). PRA.Cloud is imported later, only when the cloud phase needs it; PRA.Gui only for -Gui.
+Import-Module (Join-Path $PSScriptRoot 'PraRemoteMailbox.psd1') -Force -ErrorAction Stop
 
 # -WhatIf always wins: the run becomes a Preview whatever -Mode says.
 $effectiveMode = if ($WhatIfPreference) { 'Preview' } else { $Mode }
@@ -206,7 +244,7 @@ function New-PraApprovalCallback {
     }.GetNewClosure()
 }
 $context = @{
-    Root = $PSScriptRoot; Version = '2.2.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
+    Root = $PSScriptRoot; Version = (Get-PraToolVersion); RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
     StartTime = Get-Date; Action = $Action; Mode = $effectiveMode; Phase = ''
     CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 0; Warnings = 0
     Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
@@ -214,10 +252,10 @@ $context = @{
     LogFolder = (Join-Path $PSScriptRoot 'logs'); ReportFolder = (Join-Path $PSScriptRoot 'reports'); BackupFolder = (Join-Path $PSScriptRoot 'Backups')
     LogFile = ''; TranscriptPath = ''; TranscriptStarted = $false; NoReport = $false
     Server = ''; NamingContext = ''; CloudConnectFailed = $false; ExitCode = 0; ResultStatus = ''
-    AllowMutation = ($effectiveMode -eq 'Apply' -and $Action -ne 'Check'); Config = @{}; KeepCloudShared = $false
+    AllowMutation = ((Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply') -and (-not (Test-PraOrdinalIgnoreCaseEqual $Action 'Check'))); Config = @{}; KeepCloudShared = $false
     Approval = $null; ConfirmPreference = [string]$ConfirmPreference
-    Once = [bool]$Once; IntervalMinutes = 0; TimeoutMinutes = 0; CloudCheckScope = 'Both'
-    VerboseEnabled = ($VerbosePreference -eq 'Continue' -or $DebugPreference -eq 'Continue')
+    Once = [bool]$Once; IntervalMinutes = 0; TimeoutMinutes = 0
+    VerboseEnabled = ((Test-PraOrdinalIgnoreCaseEqual $VerbosePreference 'Continue') -or (Test-PraOrdinalIgnoreCaseEqual $DebugPreference 'Continue'))
     SourceBackupHash = ''; Source = $null; Proof = $null; LastVerifiedReceipt = $null; OperationFailed = $false; JournalPath = ''
     BatchId = ''; NextSteps = @()
 }
@@ -234,22 +272,31 @@ function Get-PraShortId {
     return $Id
 }
 
+function ConvertTo-PraLiteral {
+    <# A value as a single-quoted PowerShell literal: the apostrophe AND the typographic quotes that PowerShell also reads as quotes are doubled. #>
+    param([AllowEmptyString()][string]$Value)
+    $escaped = $Value.Replace("'", "''")
+    foreach ($code in @(0x2018, 0x2019, 0x201A, 0x201B)) { $quote = [string][char]$code; $escaped = $escaped.Replace($quote, $quote + $quote) }
+    return "'" + $escaped + "'"
+}
+
 function Get-PraCommandLine {
-    <# Command line suggested in "Next step", with the options of this run that still apply. #>
+    <# Command line suggested in "Next step", with the options of this run that still apply. Every free-text value is quoted as data. #>
     param([string]$ActionName, [string]$ModeName = 'Apply', [string]$PhaseName = '', [string]$BatchId = '', [switch]$KeepFilters, [switch]$OtherServer)
     $parts = @('.\Invoke-PraRemoteMailbox.ps1', "-Action $ActionName")
     if ($PhaseName) { $parts += "-Phase $PhaseName" }
-    if ($ModeName -eq 'Apply') { $parts += '-Mode Apply' }
-    if ($BatchId) { $parts += $(if ($BatchId -match '[\\/ ]') { "-Batch '$BatchId'" } else { "-Batch $BatchId" }) }
+    if ((Test-PraOrdinalIgnoreCaseEqual $ModeName 'Apply')) { $parts += '-Mode Apply' }
+    if ($BatchId) { $parts += $(if ($BatchId -match '^[0-9a-fA-F]+$') { "-Batch $BatchId" } else { '-Batch ' + (ConvertTo-PraLiteral $BatchId) }) }
     if ($KeepFilters) {
-        if ($Identity) { $parts += "-Identity '$Identity'" }
-        if ($Scope -ne 'All') { $parts += "-Scope $Scope" }
+        if ($Identity) { $parts += '-Identity ' + (ConvertTo-PraLiteral $Identity) }
+        if ((-not (Test-PraOrdinalIgnoreCaseEqual $Scope 'All'))) { $parts += "-Scope $Scope" }
         if ($MaxObjects -gt 0) { $parts += "-MaxObjects $MaxObjects" }
-        if ($SearchBase) { $parts += "-SearchBase '" + $SearchBase.Replace("'","''") + "'" }
-        if ($CsvPath) { $parts += "-CsvPath '" + $CsvPath.Replace("'","''") + "'" }
+        if ($SearchBase) { $parts += '-SearchBase ' + (ConvertTo-PraLiteral $SearchBase) }
+        if ($CsvPath) { $parts += '-CsvPath ' + (ConvertTo-PraLiteral $CsvPath) }
     }
     # On another server the configuration file is that server's own: -ConfigPath is not repeated.
-    if ($script:ConfigPathBound -and -not $OtherServer) { $parts += "-ConfigPath '$ConfigPath'" }
+    # Run from the window, -ConfigPath is the generated configuration of that run: the suggested command names the configuration file itself.
+    if ($script:ConfigPathBound -and -not $OtherServer) { $parts += '-ConfigPath ' + (ConvertTo-PraLiteral $(if ($BaseConfigPath) { $BaseConfigPath } else { $ConfigPath })) }
     return ($parts -join ' ')
 }
 
@@ -267,7 +314,7 @@ function Get-PraBatchFile {
     param([Parameter(Mandatory)][string]$Value, [Parameter(Mandatory)][string[]]$Operations)
     $context.CurrentOperation = 'Resolve-Batch'
     $candidate = $null
-    if ($Value -match '[\\/:]' -or $Value -like '*.json') {
+    if ($Value -match '[\\/:]' -or $Value.EndsWith('.json', [StringComparison]::OrdinalIgnoreCase)) {
         $candidate = Resolve-PraPath $Value 'Batch' (Get-Location).Path
         if (Test-Path -LiteralPath $candidate -PathType Container) { $folders = @(Get-Item -LiteralPath $candidate) }
         elseif (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
@@ -278,18 +325,21 @@ function Get-PraBatchFile {
         $folders = @(Get-ChildItem -LiteralPath $context.BackupFolder -Directory -Recurse -ErrorAction Stop |
             Where-Object { $_.Name -match ('^(Batch|Finalize)-' + [regex]::Escape($Value.ToLowerInvariant())) })
         if (-not $folders.Count) { throw "Batch $Value not found under $($context.BackupFolder). Copy the batch folder there (Batch-$Value... or Finalize-$Value...) or give the path of its JSON file." }
-        if (@($folders | Select-Object -ExpandProperty Name -Unique).Count -gt 1) { throw "Batch ID $Value is ambiguous ($($folders.Count) folders): give more characters." }
+        if (@($folders | ForEach-Object Name | Get-PraOrdinalUnique).Count -gt 1) { throw "Batch ID $Value is ambiguous ($($folders.Count) folders): give more characters." }
     }
     $found = New-Object 'Collections.Generic.List[string]'
     foreach ($folder in $folders) {
-        foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { $_.Name -notlike 'State-*' })) {
-            try { $operation = [string](([IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json -ErrorAction Stop).Operation) } catch { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not $_.Name.StartsWith('State-', [StringComparison]::OrdinalIgnoreCase) })) {
+            try { $operation = [string](([IO.File]::ReadAllText($file.FullName) | ConvertFrom-PraJson).Operation) } catch { continue }
             # In a Finalize package only the manifest counts (the other JSON files are copies of the source batches).
-            if ($operation -in $Operations -and ($folder.Name -match '^Batch-' -or $operation -eq 'RecoverFinalize')) { $found.Add($file.FullName) }
+            if ((Test-PraOrdinalIn $operation $Operations) -and ($folder.Name -match '^Batch-' -or (Test-PraOrdinalEqual $operation 'RecoverFinalize'))) { $found.Add($file.FullName) }
         }
     }
     # The same batch folder copied twice (identical content) is not an ambiguity.
-    $distinct = @($found | Group-Object { Get-PraHash $_ } | ForEach-Object { $_.Group[0] })
+    # (Group-Object would compare the hash texts with the culture comparison.)
+    $byHash = New-Object 'Collections.Generic.Dictionary[string,string]' -ArgumentList ([StringComparer]::Ordinal)
+    foreach ($candidatePath in $found) { $candidateHash = Get-PraHash $candidatePath; if (-not $byHash.ContainsKey($candidateHash)) { $byHash[$candidateHash] = $candidatePath } }
+    $distinct = @($byHash.Values)
     if ($distinct.Count -ne 1) { throw ("Batch {0}: expected one {1} file, found {2}. Check the batch ID (the batch of the previous step is expected)." -f $Value, ($Operations -join '/'), $distinct.Count) }
     return $distinct[0]
 }
@@ -302,7 +352,7 @@ function Find-PraConvertSource {
     #>
     param([Parameter(Mandatory)][string]$Hash)
     $found = @(Get-ChildItem -LiteralPath $context.BackupFolder -Recurse -File -Filter 'Convert-*.json.sha256' -ErrorAction Stop | Where-Object {
-            ([IO.File]::ReadAllText($_.FullName).Trim()) -ceq $Hash } | ForEach-Object { $_.FullName.Substring(0, $_.FullName.Length - 7) })
+            [string]::Equals(([IO.File]::ReadAllText($_.FullName).Trim()), $Hash, [StringComparison]::Ordinal) } | ForEach-Object { $_.FullName.Substring(0, $_.FullName.Length - 7) })
     $original = @($found | Where-Object { (Split-Path (Split-Path $_ -Parent) -Leaf) -match '^Batch-' })
     if ($original.Count) { $found = $original }
     if (-not $found.Count) { throw "The Convert batch used by this Recover is not in $($context.BackupFolder). Copy its Batch-... folder there as well." }
@@ -314,11 +364,11 @@ function Select-PraSourceRecord {
     param($Source)
     $records = @($Source.Data.Records)
     if ($Identity) {
-        $records = @($records | Where-Object { $_.SamAccountName -eq $Identity -or $_.UserPrincipalName -eq $Identity -or $_.ObjectGuid -eq $Identity })
+        $records = @($records | Where-Object { (Test-PraOrdinalIgnoreCaseEqual $_.SamAccountName $Identity) -or (Test-PraOrdinalIgnoreCaseEqual $_.UserPrincipalName $Identity) -or (Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $Identity) })
         if ($records.Count -ne 1) { throw "Identity '$Identity' is not in the batch (or matches several objects)." }
     }
-    elseif ($Scope -eq 'SharedOnly') { $records = @($records | Where-Object IsShared) }
-    elseif ($Scope -eq 'UsersOnly') { $records = @($records | Where-Object { -not $_.IsShared }) }
+    elseif ((Test-PraOrdinalIgnoreCaseEqual $Scope 'SharedOnly')) { $records = @($records | Where-Object IsShared) }
+    elseif ((Test-PraOrdinalIgnoreCaseEqual $Scope 'UsersOnly')) { $records = @($records | Where-Object { -not $_.IsShared }) }
     return $records
 }
 
@@ -334,7 +384,7 @@ function Initialize-PraCloudAuthority {
         param($Row)
         if (-not $capturedContext.AllowMutation -or $capturedContext.OperationFailed -or $capturedContext.Issues.Count -gt 0 -or $null -eq $capturedContext.Proof) { throw 'Cloud write refused: no authorisation or the run already has an error.' }
         $proof = Import-PraProof $capturedContext $capturedContext.Proof.Path $capturedContext.Source $capturedContext.Action
-        if (@($proof.Data.Records | Where-Object ObjectGuid -eq $Row.ObjectGuid).Count -ne 1) { throw 'Cloud write refused: the object is not in a verified AD phase.' }
+        if (@($proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $Row.ObjectGuid }).Count -ne 1) { throw 'Cloud write refused: the object is not in a verified AD phase.' }
         Assert-PraReceipt $capturedContext $capturedContext.Source $Row.ObjectGuid
     }.GetNewClosure()
     $context.JournalMutation = { param($Target, $Operation, $Status, $Detail) Write-PraJournal $capturedContext $Target $Operation $Status ([string]$Detail) }.GetNewClosure()
@@ -343,7 +393,7 @@ function Initialize-PraCloudAuthority {
 function Initialize-PraCloudJournal {
     <# Private folder <RunId>-cloud with the journal of the Exchange Online writes of this run. #>
     $directory = Join-Path $context.BackupFolder ($context.RunId + '-cloud')
-    New-PraPrivateDirectory $directory
+    New-PraPrivateDirectory $directory -Root $context.BackupFolder
     $context.JournalPath = Join-Path $directory 'CloudOperations.jsonl'
     Write-PraImmutableFile $context.JournalPath ''
     $context.StateFiles.Add($context.JournalPath)
@@ -354,11 +404,11 @@ function Copy-PraBundleFile {
     param([string]$Path, [string]$Directory)
     $destination = Join-Path $Directory ([IO.Path]::GetFileName($Path))
     if (Test-Path -LiteralPath $destination) {
-        if ((Get-PraHash $Path) -cne (Get-PraHash $destination)) { throw 'Two different files with the same name in the Finalize package.' }
+        if (-not (Test-PraOrdinalEqual (Get-PraHash $Path) (Get-PraHash $destination))) { throw 'Two different files with the same name in the Finalize package.' }
         return
     }
     [IO.File]::Copy($Path, $destination, $false)
-    if ((Get-PraHash $Path) -cne (Get-PraHash $destination)) { throw 'Copy of a proof file is incomplete.' }
+    if (-not (Test-PraOrdinalEqual (Get-PraHash $Path) (Get-PraHash $destination))) { throw 'Copy of a proof file is incomplete.' }
 }
 
 function Copy-PraBackupBundle {
@@ -380,15 +430,18 @@ function Save-PraFinalizePackage {
     if (-not $context.AllowMutation -or -not (& $context.Approval 'AD server' 'Publish a Finalize package')) { throw 'Finalize package not authorised.' }
     $proof = Import-PraProof $context $context.Proof.Path $context.Source 'Recover'
     $items = @(foreach ($row in $Rows) {
-            if ($row.CloudStatus -ne 'Success' -or $row.DeprovisionConfirmed -ne $true -or $row.ADVerified -ne $true) { throw 'Finalize package refused: AD proof or cloud deprovisioning not confirmed for every object.' }
+            if (-not (Test-PraOrdinalEqual $row.CloudStatus 'Success') -or $row.DeprovisionConfirmed -ne $true -or $row.ADVerified -ne $true) { throw 'Finalize package refused: AD proof or cloud deprovisioning not confirmed for every object.' }
             [ordered]@{ ObjectGuid = $row.ObjectGuid; RestoreShared = [bool]$row.DeproPending; RestoreTag = [bool](Get-PraValue (Get-PraValue $row.BackupRec 'Retention' $null) 'Enabled' $false); CloudConfirmed = $true; DeprovisionConfirmed = $true }
         })
     $packageId = [guid]::NewGuid().ToString('N')
     $directory = Join-Path $context.BackupFolder ('Finalize-' + $packageId)
-    New-PraPrivateDirectory $directory
+    New-PraPrivateDirectory $directory -Root $context.BackupFolder
     Copy-PraBackupBundle $context.Source $directory
     Copy-PraBackupBundle $proof.Receipt $directory
     Copy-PraBundleFile $proof.Path $directory; Copy-PraBundleFile ($proof.Path + '.sha256') $directory
+    # The earlier phases (Recover on the AD server, the original Convert) travel with the package, for the global report of the AD server.
+    $null = Copy-PraPhaseData -SourceFolder @(Get-PraList $context 'PhaseFolders') -Destination $directory
+    $context.PhaseWriteFolder = $directory; $context.PhaseDataSaved = $false
     $path = Join-Path $directory ("Finalize-$($context.Config.Environment)-$(Get-Date -Format 'yyyyMMdd_HHmmss')-$($packageId.Substring(0, 8)).json")
     $manifest = [ordered]@{
         SchemaVersion = 2; Operation = 'RecoverFinalize'; Environment = $context.Config.Environment; CreatedUtc = [DateTime]::UtcNow.ToString('o')
@@ -402,41 +455,98 @@ function Save-PraFinalizePackage {
     $short = Get-PraShortId $packageId
     $context.BatchId = $short
     Write-PraItem -Context $context -Status Ok -Icon Batch -Text ("Finalize package {0} written: {1}" -f $short, $directory)
-    $context.NextSteps = @("Copy the folder $directory to the Backups folder of the AD server, then run there:",
-        (Get-PraCommandLine -ActionName 'Finalize' -BatchId $short -OtherServer))
+    Publish-PraTransferPackage -Kind 'Finalize' -BatchId $packageId -Folders @($directory) -NextAction 'Finalize' `
+        -FallbackSteps @("Copy the folder $directory to the Backups folder of the AD server, then run there:", (Get-PraCommandLine -ActionName 'Finalize' -BatchId $short -OtherServer))
 }
 
 function Get-PraFinalizeInput {
     <# Reads and checks a Finalize package; returns the objects it authorises to restore. #>
     $path = Get-PraBatchFile -Value $Batch -Operations @('RecoverFinalize')
     $context.CurrentOperation = 'Read-FinalizePackage'
-    $manifest = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    if ((Get-PraValue $manifest 'SchemaVersion' 0) -ne 2 -or $manifest.Operation -ne 'RecoverFinalize' -or $manifest.Environment -cne $context.Config.Environment) { throw 'Finalize package of another version or Environment: nothing restored.' }
-    if ((Get-Content -LiteralPath ($path + '.sha256') -Raw -ErrorAction Stop).Trim() -cne (Get-PraHash $path)) { throw 'Finalize package: SHA-256 mismatch.' }
+    $manifest = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson
+    if ((Get-PraValue $manifest 'SchemaVersion' 0) -ne 2 -or -not (Test-PraOrdinalEqual $manifest.Operation 'RecoverFinalize') -or -not (Test-PraOrdinalEqual $manifest.Environment $context.Config.Environment)) { throw 'Finalize package of another version or Environment: nothing restored.' }
+    if (-not (Test-PraOrdinalEqual (Get-Content -LiteralPath ($path + '.sha256') -Raw -ErrorAction Stop).Trim() (Get-PraHash $path))) { throw 'Finalize package: SHA-256 mismatch.' }
     foreach ($property in @('SourceBackupFile','StateFile')) {
-        if ([IO.Path]::GetFileName($manifest.$property) -cne $manifest.$property) { throw 'Finalize package: a file path points outside the package.' }
+        if (-not (Test-PraOrdinalEqual ([IO.Path]::GetFileName($manifest.$property)) $manifest.$property)) { throw 'Finalize package: a file path points outside the package.' }
     }
     $context.Source = Import-PraBackup $context (Join-Path (Split-Path $path -Parent) $manifest.SourceBackupFile)
+    $context.PhaseFolders = @(Split-Path $path -Parent)
     $context.Proof = Import-PraProof $context (Join-Path (Split-Path $path -Parent) $manifest.StateFile) $context.Source 'Recover'
-    if ($context.Source.Hash -cne $manifest.SourceBackupHash -or $context.Proof.Hash -cne $manifest.StateHash) { throw 'Finalize package: manifest and proofs do not match.' }
+    if (-not (Test-PraOrdinalEqual $context.Source.Hash $manifest.SourceBackupHash) -or -not (Test-PraOrdinalEqual $context.Proof.Hash $manifest.StateHash)) { throw 'Finalize package: manifest and proofs do not match.' }
     $records = @(Select-PraSourceRecord $context.Source); $seen = @{}
     $items = @($manifest.Items)
     if (-not $items.Count) { throw 'Finalize package is empty.' }
     foreach ($item in $items) {
         if ($item.CloudConfirmed -isnot [bool] -or -not $item.CloudConfirmed -or $item.DeprovisionConfirmed -isnot [bool] -or -not $item.DeprovisionConfirmed -or $item.RestoreShared -isnot [bool] -or $item.RestoreTag -isnot [bool] -or
-            $item.ObjectGuid -notin @($context.Proof.Data.Records.ObjectGuid) -or $seen.ContainsKey($item.ObjectGuid)) { throw 'Finalize package: invalid object confirmation.' }
-        $proofEntry = @($context.Proof.Data.Records | Where-Object ObjectGuid -eq $item.ObjectGuid)[0]
-        $snapshotEntry = @($context.Proof.Receipt.Data.Records | Where-Object ObjectGuid -eq $item.ObjectGuid)[0]
-        $sourceEntry = @($context.Source.Data.Records | Where-Object ObjectGuid -eq $item.ObjectGuid)[0]
-        if ($snapshotEntry.PreserveCloudMailbox -or ($item.RestoreShared -and ($proofEntry.Operation -ne 'Deprovision' -or -not $sourceEntry.IsShared)) -or
+            -not (Test-PraOrdinalIn $item.ObjectGuid @($context.Proof.Data.Records.ObjectGuid) -IgnoreCase) -or $seen.ContainsKey($item.ObjectGuid)) { throw 'Finalize package: invalid object confirmation.' }
+        $proofEntry = @($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
+        $snapshotEntry = @($context.Proof.Receipt.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
+        $sourceEntry = @($context.Source.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
+        if ($snapshotEntry.PreserveCloudMailbox -or ($item.RestoreShared -and (-not (Test-PraOrdinalEqual $proofEntry.Operation 'Deprovision') -or -not $sourceEntry.IsShared)) -or
             ($item.RestoreTag -and -not [bool](Get-PraValue (Get-PraValue $sourceEntry 'Retention' $null) 'Enabled' $false)) -or
             (-not $item.RestoreShared -and -not $item.RestoreTag)) { throw 'Finalize package does not match the AD operations it proves.' }
         $seen[$item.ObjectGuid] = $true
     }
-    if ($Identity -and @($records | Where-Object { $_.ObjectGuid -in @($items.ObjectGuid) }).Count -ne 1) { throw "Identity '$Identity' is not authorised by this Finalize package." }
+    if ($Identity -and @($records | Where-Object { Test-PraOrdinalIn $_.ObjectGuid @($items.ObjectGuid) -IgnoreCase }).Count -ne 1) { throw "Identity '$Identity' is not authorised by this Finalize package." }
     $context.BatchId = Get-PraShortId ((Split-Path (Split-Path $path -Parent) -Leaf) -replace '^Finalize-', '')
-    return @($records | Where-Object { $_.ObjectGuid -in @($items.ObjectGuid) } | ForEach-Object {
-            [pscustomobject]@{ Record = $_; Item = ($items | Where-Object ObjectGuid -eq $_.ObjectGuid) } })
+    return @($records | Where-Object { Test-PraOrdinalIn $_.ObjectGuid @($items.ObjectGuid) -IgnoreCase } | ForEach-Object {
+            $recordGuid = $_.ObjectGuid
+            [pscustomobject]@{ Record = $_; Item = ($items | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $recordGuid }) } })
+}
+
+function Format-PraByteSize {
+    param([long]$Bytes)
+    if ($Bytes -ge 1MB) { return ('{0:0.0} MB' -f ($Bytes / 1MB)).Replace(',', '.') }
+    if ($Bytes -ge 1KB) { return ('{0:0.0} KB' -f ($Bytes / 1KB)).Replace(',', '.') }
+    return ('{0} bytes' -f $Bytes)
+}
+
+function Publish-PraTransferPackage {
+    <#
+    .SYNOPSIS
+        Hand-off: writes the ONE transfer package (ZIP + .sha256, in <Storage.BackupFolder>\Outbox) that the other server imports, and sets the
+        next steps. The batch folders stay the source of truth; if the package cannot be written the run keeps its result, a warning explains it
+        and the next steps fall back to the copy of the folders.
+    #>
+    param([Parameter(Mandatory)][string]$Kind, [Parameter(Mandatory)][string]$BatchId, [Parameter(Mandatory)][string[]]$Folders,
+        [Parameter(Mandatory)][string]$NextAction, [string]$NextPhase = '', [Parameter(Mandatory)][string[]]$FallbackSteps)
+    $targetName = if ((Test-PraOrdinalIgnoreCaseEqual $Kind 'Finalize')) { 'AD' } else { 'cloud' }
+    $context.CurrentOperation = 'Create-TransferPackage'; $context.CurrentIdentity = ''
+    # This run is not the last one: what it did travels in the package, so that the last server can report on every object from end to end.
+    $context.HandOff = $Kind
+    $phaseFolder = [string](Get-PraValue $context 'PhaseWriteFolder' '')
+    if ($phaseFolder -and -not [bool](Get-PraValue $context 'PhaseDataSaved' $false)) {
+        try { $null = Save-PraPhaseData -Context $context -Folder $phaseFolder -HandOff $Kind; $context.PhaseDataSaved = $true }
+        catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}): the package is complete, the other server will report this side as not available.' -f $_.Exception.Message) -Level Warning }
+    }
+    try {
+        $name = Get-PraTransferPackageName -Kind $Kind -Environment $context.Config.Environment -BatchId $BatchId
+        $command = Get-PraCommandLine -ActionName $NextAction -PhaseName $NextPhase -BatchId $name -OtherServer
+        $package = New-PraTransferPackage -Kind $Kind -Environment $context.Config.Environment -BatchId $BatchId -Folders $Folders `
+            -OutboxFolder (Join-Path $context.BackupFolder 'Outbox') -NextCommand $command -ToolVersion $context.Version
+        $context.TransferPackage = $package.Path; $context.TransferPackageKind = $Kind
+        Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Transfer package {0} written ({1}, checksums verified)' -f $package.Name, (Format-PraByteSize $package.SizeBytes)) -Detail $package.Path
+        $context.NextSteps = @(('Copy {0} to the {1} server (anywhere), then run there:' -f $package.Path, $targetName), $command)
+    }
+    catch {
+        Write-PraLog -Context $context -Message ('The transfer package could not be created ({0}). The folders are complete: copy them by hand as indicated below.' -f $_.Exception.Message) -Level Warning
+        $context.NextSteps = @($FallbackSteps)
+    }
+}
+
+function Resolve-PraTransferPackagePath {
+    <# A -Batch value ending in .zip: a path, or a bare file name looked up in Inbox, then Outbox (under Storage.BackupFolder), then the current folder. #>
+    param([Parameter(Mandatory)][string]$Value)
+    if ($Value -match '[\/:]') {
+        $candidate = Resolve-PraPath $Value 'Batch' (Get-Location).Path
+        if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { throw "Transfer package not found: $candidate" }
+        return $candidate
+    }
+    foreach ($folder in @((Join-Path $context.BackupFolder 'Inbox'), (Join-Path $context.BackupFolder 'Outbox'), (Get-Location).Path)) {
+        $candidate = Join-Path $folder $Value
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    throw "Transfer package $Value not found in $(Join-Path $context.BackupFolder 'Inbox'), in the Outbox folder or in the current folder: give its full path."
 }
 
 function Test-PraSyncAvailable {
@@ -453,7 +563,7 @@ function Test-PraSyncAvailable {
         catch { throw "Entra Connect server $($sync.Server) is not reachable with PowerShell remoting (WinRM): $($_.Exception.Message). Fix the access, or set EntraConnect.Sync = `$false and run the synchronisation yourself." }
         Write-PraItem -Context $context -Status Ok -Icon Sync -Text ("Entra Connect: {0} reachable, a {1} cycle runs after the AD changes" -f $sync.Server, $sync.PolicyType)
     }
-    elseif (-not @(Get-Module -ListAvailable ADSync).Count) {
+    elseif (-not @(Get-Module -ListAvailable -SkipEditionCheck ADSync).Count) {
         throw 'EntraConnect.Sync = $true but the ADSync module is not on this server. Run the AD part on the Entra Connect server, set EntraConnect.Server, or set EntraConnect.Sync = $false and run the synchronisation yourself.'
     }
     else { Write-PraItem -Context $context -Status Ok -Icon Sync -Text ('Entra Connect: ADSync module found, a {0} cycle runs after the AD changes' -f $sync.PolicyType) }
@@ -484,13 +594,13 @@ function Confirm-PraApply {
 function Show-PraPlanSummary {
     <# One line per planned object + totals (details of the AD attributes are shown by Write-PraAdDelta). #>
     param([object[]]$Plans)
-    $changes = @($Plans | Where-Object { $_.Operation -ne 'AlreadyRecovered' })
+    $changes = @($Plans | Where-Object { -not (Test-PraOrdinalEqual $_.Operation 'AlreadyRecovered') })
     $users = @($Plans | Where-Object { -not $_.Record.IsShared }).Count
     $shared = @($Plans | Where-Object { $_.Record.IsShared }).Count
     $grants = 0
     foreach ($plan in $Plans) { foreach ($right in @('FullAccess','SendAs','SendOnBehalf')) { $grants += @($plan.Record.SharedPermissions.$right).Count } }
     $text = '{0} object(s): {1} user(s), {2} shared' -f $Plans.Count, $users, $shared
-    if ($Action -eq 'Convert' -and $shared) { $text += (' {0} {1} permission(s) to reproduce in Exchange Online' -f [char]0x00B7, $grants) }
+    if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and $shared) { $text += (' {0} {1} permission(s) to reproduce in Exchange Online' -f [char]0x00B7, $grants) }
     Write-PraItem -Context $context -Status Info -Icon Target -Text $text
     return $changes.Count
 }
@@ -498,8 +608,19 @@ function Show-PraPlanSummary {
 function Skip-PraStep {
     <# Prints a step that does not run in this execution (numbering stays in the announced order). #>
     param([Parameter(Mandatory)][string]$Title, [Parameter(Mandatory)][string]$Reason, [string]$Icon = 'Skip')
-    Write-PraStep -Context $context -Title $Title -Icon $Icon
+    Write-PraStep -Context $context -Title $Title -Icon $Icon -Skipped
     Write-PraItem -Context $context -Status Skip -Text $Reason
+}
+
+function Send-PraPlanCount {
+    <# Once the objects are known (after targeting), tells the window how many objects each step works on (the batch-wide steps have none). One 'count' event. #>
+    param([int]$Count)
+    if (-not $env:PRA_EVENT_FILE -or $Count -le 0) { return }
+    $batchWide = @('Active Directory connection', 'Entra Connect synchronisation', 'Active Directory replication', 'Creating the transfer package', 'Loading the Convert batch', 'Loading the Recover batch',
+        'Loading the batch of the AD phase', 'Loading the Finalize package', 'Exchange Online pre-check')
+    $ids = @(); $index = 0
+    foreach ($label in @($steps)) { $index++; if (-not (Test-PraOrdinalIn ([string]$label) $batchWide)) { $ids += ('s' + $index) } }
+    Write-PraEvent -Kind count -Data @{ count = $Count; stepIds = $ids }
 }
 
 function Get-PraSkipReason {
@@ -531,79 +652,121 @@ try {
     $context.TimeoutMinutes = $config.Polling.TimeoutMinutes
     $context.KeepCloudShared = [bool]$config.SharedMailbox.KeepCloudSharedOnRecover
     $defer = [bool]$config.SharedMailbox.DeferOnPremRestore
+    if ($ForceAdReplication -and -not [bool]$config.Directory.ForceReplication) {
+        $config.Directory.ForceReplication = $true
+        $context.ConfigOverrides = @(@(Get-PraList $context 'ConfigOverrides') + 'Directory.ForceReplication: False -> True (-ForceAdReplication)')
+    }
+    $replicate = [bool]$config.Directory.ForceReplication
+    # Run from the window: -ConfigPath is the generated configuration of this run, -BaseConfigPath the configuration file (never modified).
+    # What differs is written to the log, the summary card and the result.
+    $configDifferences = @()
+    if ($BaseConfigPath) {
+        $baseConfig = Import-PraConfiguration -Path $BaseConfigPath -Root $PSScriptRoot -ScopeOverride $targetOverride
+        $configDifferences = @(Get-PraConfigurationDifference -Base $baseConfig -Effective $config)
+        $context.ConfigOverrides = @(@(Get-PraList $context 'ConfigOverrides') + @($configDifferences | ForEach-Object { $_.Text }))
+    }
     $effectivePhase = switch ($Action) {
         'Finalize' { 'Finalize' }
         'Check' { 'Cloud' }
         default { if ($Phase) { $Phase } else { $config.Execution.Phase } }
     }
     $context.Phase = $effectivePhase
-    if (($SearchBase -or $CsvPath) -and ($Action -ne 'Convert' -or $effectivePhase -notin @('AD','Both'))) {
+    if (($SearchBase -or $CsvPath) -and ((-not (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert')) -or (-not (Test-PraOrdinalIn $effectivePhase @('AD','Both') -IgnoreCase)))) {
         throw 'SearchBase/CsvPath are only available for Convert -Phase AD or Both.'
     }
 
     Initialize-PraAudit $context
 
     $dot = [char]0x00B7
-    $modeText = if ($effectiveMode -eq 'Apply') { 'Apply (changes are made)' } else { 'Preview (nothing is changed)' }
+    $modeText = if ((Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) { 'Apply (changes are made)' } else { 'Preview (nothing is changed)' }
     $actionText = $Action
-    if ($Action -in @('Convert','Recover')) { $actionText += " $dot phase $effectivePhase" }
-    if ($Action -eq 'Check') { $actionText += " $dot expect $Expect" }
+    if ((Test-PraOrdinalIn $Action @('Convert','Recover') -IgnoreCase)) { $actionText += " $dot phase $effectivePhase" }
+    if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check')) { $actionText += " $dot expect $Expect" }
     $scopeText = if ($Identity) { "one object: $Identity" }
-        elseif ($Batch) { "batch $Batch" + $(if ($Scope -ne 'All') { " $dot $Scope" } else { '' }) }
+        elseif ($Batch) { "batch $Batch" + $(if ((-not (Test-PraOrdinalIgnoreCaseEqual $Scope 'All'))) { " $dot $Scope" } else { '' }) }
         else {
             $s = $config.Scope
             $base = switch ($s.Mode) { 'OU' { $s.SearchBase } 'Group' { "members of $($s.GroupDN)" } 'Csv' { "CSV $($s.CsvPath)" } default { if ($s.SearchBase) { $s.SearchBase } else { 'whole domain' } } }
             $kinds = @('users'); if ($s.IncludeShared) { $kinds += 'shared' }; if ($s.IncludeRoom) { $kinds += 'rooms' }; if ($s.IncludeEquip) { $kinds += 'equipment' }
             # -Scope replaces the mailbox types of the configuration.
-            if ($Scope -eq 'UsersOnly') { $kinds = @('users only') } elseif ($Scope -eq 'SharedOnly') { $kinds = @('shared mailboxes only') }
+            if ((Test-PraOrdinalIgnoreCaseEqual $Scope 'UsersOnly')) { $kinds = @('users only') } elseif ((Test-PraOrdinalIgnoreCaseEqual $Scope 'SharedOnly')) { $kinds = @('shared mailboxes only') }
             '{0} {1} {2}' -f $base, $dot, ($kinds -join ' + ') + $(if ($MaxObjects) { " $dot max $MaxObjects" } else { '' })
         }
-    $banner = [ordered]@{ 'Action' = @('Mode', $actionText); 'Mode' = @($(if ($effectiveMode -eq 'Apply') { 'Write' } else { 'Plan' }), $modeText) }
-    if ($Action -ne 'Finalize') { $banner['Scope'] = @('Target', $scopeText) }
-    if ($config.Cloud.Organization -and $Action -ne 'Finalize' -and $effectivePhase -ne 'AD') { $banner['Tenant'] = @('Cloud', $config.Cloud.Organization) }
+    $banner = [ordered]@{ 'Action' = @('Mode', $actionText); 'Mode' = @($(if ((Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) { 'Write' } else { 'Plan' }), $modeText) }
+    if ((-not (Test-PraOrdinalIgnoreCaseEqual $Action 'Finalize'))) { $banner['Scope'] = @('Target', $scopeText) }
+    if ($config.Cloud.Organization -and (-not (Test-PraOrdinalIgnoreCaseEqual $Action 'Finalize')) -and (-not (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD'))) { $banner['Tenant'] = @('Cloud', $config.Cloud.Organization) }
     $banner['Config'] = @('Config', ('{0} {1} Environment {2}' -f (Split-Path $config._Path -Leaf), $dot, $config.Environment))
+    if ($configDifferences.Count) { $banner['Overrides'] = @('Config', ('{0} run setting(s) differ from {1}' -f $configDifferences.Count, (Split-Path $baseConfig._Path -Leaf))) }
     $banner['Log'] = @('Log', $context.LogFile)
     Write-PraBanner -Context $context -Title 'PRA Remote Mailbox' -Subtitle "Hybrid Exchange disaster recovery $dot on-premises $([char]0x2192) Exchange Online" -Details $banner
+    foreach ($difference in $configDifferences) {
+        Write-PraItem -Context $context -Status Info -Icon Config -Text ('Run setting: {0} {1} (configuration file: {2})' -f $difference.Key, $(if ($difference.Effective) { $difference.Effective } else { '(empty)' }), $(if ($difference.Base) { $difference.Base } else { '(empty)' }))
+    }
 
     # Steps of this run (numbered x/total in the console).
     $steps = switch ($Action) {
         'Convert' {
-            if ($effectivePhase -eq 'Cloud') { @('Loading the batch of the AD phase','Exchange Online: mailboxes, licences and permissions') }
+            if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { @('Loading the batch of the AD phase','Exchange Online: mailboxes, licences and permissions') }
             else {
                 @('Active Directory connection','Targets and planned changes') +
-                $(if ($effectivePhase -eq 'Both') { @('Exchange Online pre-check') } else { @() }) +
-                @('Backup and Active Directory changes','Entra Connect synchronisation') +
-                $(if ($effectivePhase -eq 'Both') { @('Exchange Online: mailboxes, licences and permissions') } else { @() })
+                $(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { @('Exchange Online pre-check') } else { @() }) +
+                @('Backup and Active Directory changes') + $(if ($replicate) { @('Active Directory replication') } else { @() }) + @('Entra Connect synchronisation') +
+                $(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { @('Exchange Online: mailboxes, licences and permissions') } else { @('Creating the transfer package') })
             }
         }
         'Recover' {
-            if ($effectivePhase -eq 'Cloud') { @('Loading the Recover batch','Exchange Online: deprovisioning checks','Final restore of shared mailboxes and tags') }
+            if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { @('Loading the Recover batch','Exchange Online: deprovisioning checks','Final restore of shared mailboxes and tags') }
             else {
-                @('Loading the Convert batch','Active Directory connection','Planned restore','Backup and Active Directory changes','Entra Connect synchronisation') +
-                $(if ($effectivePhase -eq 'Both') { @('Exchange Online: deprovisioning checks','Final restore of shared mailboxes and tags') } else { @() })
+                @('Loading the Convert batch','Active Directory connection','Planned restore') +
+                $(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { @('Exchange Online pre-check') } else { @() }) +
+                @('Backup and Active Directory changes') + $(if ($replicate) { @('Active Directory replication') } else { @() }) + @('Entra Connect synchronisation') +
+                $(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { @('Exchange Online: deprovisioning checks','Final restore of shared mailboxes and tags') } else { @('Creating the transfer package') })
             }
         }
-        'Finalize' { @('Loading the Finalize package','Active Directory connection','Planned restore','Backup and Active Directory changes','Entra Connect synchronisation') }
+        'Finalize' { @('Loading the Finalize package','Active Directory connection','Planned restore','Backup and Active Directory changes') + $(if ($replicate) { @('Active Directory replication') } else { @() }) + @('Entra Connect synchronisation') }
         'Check' { @('Objects to check','Exchange Online checks') }
     }
     $context.StepTotal = @($steps).Count
+    # The whole ordered list of steps is announced once, for the window (ids are 's' + the position, as in the step and item events).
+    $planSteps = @(); $planIndex = 0
+    foreach ($announcedStep in @($steps)) { $planIndex++; $planSteps += [ordered]@{ id = ('s' + $planIndex); label = [string]$announcedStep; count = $null } }
+    Write-PraEvent -Kind plan -Data @{ steps = $planSteps }
 
     foreach ($forbidden in $config.Storage.ForbiddenBackupRoots) {
         if ($context.AllowMutation -and ($context.BackupFolder.TrimEnd('\') + '\').StartsWith($forbidden, [StringComparison]::OrdinalIgnoreCase)) { throw "Backup folder on a forbidden volume (Storage.ForbiddenBackupRoots): $forbidden" }
     }
-    if ($Batch -and $Action -eq 'Convert' -and $effectivePhase -ne 'Cloud') { throw '-Batch is not used by Convert on the AD side: the targets come from the configuration (or -Identity).' }
-    if (-not $Batch -and ($Action -in @('Recover','Finalize') -or ($Action -eq 'Convert' -and $effectivePhase -eq 'Cloud'))) {
-        throw ("-Batch is required for {0}{1}: give the batch ID printed at the end of the previous step." -f $Action, $(if ($effectivePhase -eq 'Cloud') { ' -Phase Cloud' } else { '' }))
+    if ($Batch -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (-not (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud'))) { throw '-Batch is not used by Convert on the AD side: the targets come from the configuration (or -Identity).' }
+    if (-not $Batch -and ((Test-PraOrdinalIn $Action @('Recover','Finalize') -IgnoreCase) -or ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')))) {
+        throw ("-Batch is required for {0}{1}: give the batch ID printed at the end of the previous step." -f $Action, $(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { ' -Phase Cloud' } else { '' }))
     }
-    if ($Action -eq 'Check' -and -not $Batch -and -not $Identity) { throw 'Check needs -Identity or -Batch.' }
+    if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and -not $Batch -and -not $Identity) { throw 'Check needs -Identity or -Batch.' }
+    if ($Batch -and $Batch.EndsWith('.zip', [StringComparison]::OrdinalIgnoreCase)) {
+        # A transfer package from the other server: verified completely, then extracted to private folders; -Batch becomes the batch it carries and every
+        # existing proof and hash check runs unchanged on the extracted folders.
+        $context.CurrentOperation = 'Import-TransferPackage'
+        $packagePath = Resolve-PraTransferPackagePath $Batch
+        $expectedKind = switch ($Action) { 'Recover' { if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { 'Recover' } else { 'Convert' } } 'Finalize' { 'Finalize' } default { 'Convert' } }
+        $importRoot = $context.BackupFolder
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) {
+            $importRoot = Join-Path $context.LogFolder ('preview-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+            Initialize-PraPrivateFolder -Path $importRoot
+            $context.PreviewStaging = $importRoot; $context.BackupFolder = $importRoot
+        }
+        $imported = Import-PraTransferPackage -Path $packagePath -BackupFolder $importRoot -Environment $config.Environment -ExpectedKind $expectedKind
+        Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Transfer package {0} verified (checksums, Environment, names): {1} folder(s) extracted, {2} already present and identical' -f $imported.Name, $imported.Created.Count, $imported.Existing.Count)
+        if ((-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply'))) { Write-PraItem -Context $context -Status Info -Text 'Preview: the package was verified and read from a private temporary folder, deleted at the end. Nothing was written to the backup folder.' }
+        $Batch = [string]$imported.BatchId
+        if ($PSBoundParameters.ContainsKey('Batch')) { $PSBoundParameters['Batch'] = $Batch }
+    }
 
-    $runCloud = $false; $cloudAction = $Action
+    $runCloud = $false; $cloudAction = $Action; $needCloudJournal = $false
     # ---------------------------------------------------------------------------------------------
     # FINALIZE - AD server, after the cloud phase of a Recover.
     # ---------------------------------------------------------------------------------------------
-    if ($Action -eq 'Finalize') {
+    if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Finalize')) {
         Write-PraStep -Context $context -Title 'Loading the Finalize package' -Icon Batch
         $finalizeEntries = @(Get-PraFinalizeInput)
+        Send-PraPlanCount $finalizeEntries.Count
         $context.SourceBackupHash = $context.Source.Hash
         Write-PraItem -Context $context -Status Ok -Text ("Package {0}: {1} object(s) confirmed by Exchange Online, proofs verified" -f $context.BatchId, $finalizeEntries.Count)
         if (-not $context.Server) { $context.Server = [string]$context.Proof.Receipt.Data.Server }
@@ -627,20 +790,27 @@ try {
         }
         Write-PraStep -Context $context -Title 'Backup and Active Directory changes' -Icon Backup
         $receipt = Invoke-PraAdBatch $context $plans 'Finalize'
-        if ($null -ne $receipt) { Write-PraStep -Context $context -Title 'Entra Connect synchronisation' -Icon Sync; Invoke-PraSync $context }
-        else { Skip-PraStep -Title 'Entra Connect synchronisation' -Reason (Get-PraSkipReason $plans.Count) }
+        if ($null -ne $receipt) {
+            if ($replicate) { Write-PraStep -Context $context -Title 'Active Directory replication' -Icon Directory; Invoke-PraAdReplication $context $plans }
+            Write-PraStep -Context $context -Title 'Entra Connect synchronisation' -Icon Sync; Invoke-PraSync $context
+        }
+        else {
+            if ($replicate) { Skip-PraStep -Title 'Active Directory replication' -Reason (Get-PraSkipReason $plans.Count) -Icon Directory }
+            Skip-PraStep -Title 'Entra Connect synchronisation' -Reason (Get-PraSkipReason $plans.Count)
+        }
         if (-not $context.AllowMutation) { $context.NextSteps = @(Get-PraCommandLine -ActionName 'Finalize' -BatchId $context.BatchId) }
     }
     # ---------------------------------------------------------------------------------------------
     # CONVERT - AD side (phase AD or Both).
     # ---------------------------------------------------------------------------------------------
-    elseif ($Action -eq 'Convert' -and $effectivePhase -in @('Both','AD')) {
+    elseif ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIn $effectivePhase @('Both','AD') -IgnoreCase)) {
         Write-PraStep -Context $context -Title 'Active Directory connection' -Icon Directory
         Initialize-PraDirectory $context -ValidateScope
         Write-PraStep -Context $context -Title 'Targets and planned changes' -Icon Plan
         $targets = @(Get-PraTarget $context $Identity $Scope $MaxObjects)
         if (-not $targets.Count) { Write-PraItem -Context $context -Status Warn -Text 'No on-premises mailbox found in the scope: nothing to convert.' }
         $plans = @(foreach ($target in $targets) { New-PraPlan $context ([string]$target.ObjectGUID) 'Convert' })
+        Send-PraPlanCount $plans.Count
         if ($plans.Count) {
             $null = Show-PraPlanSummary $plans
             Invoke-PraAdPreview $context $plans
@@ -648,10 +818,10 @@ try {
         if ($context.AllowMutation -and $plans.Count) {
             Test-PraSyncAvailable
             $question = "Convert the {0} object(s) listed above? A backup is written first; then AD is changed{1}." -f $plans.Count, $(if ($config.EntraConnect.Sync) { ', Entra Connect synchronises' } else { '' })
-            if ($effectivePhase -eq 'Both') { $question = $question.TrimEnd('.') + ' and Exchange Online is completed.' }
+            if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { $question = $question.TrimEnd('.') + ' and Exchange Online is completed.' }
             Confirm-PraApply $question
         }
-        if ($effectivePhase -eq 'Both') {
+        if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) {
             if ($context.AllowMutation -and $plans.Count) {
                 # Sign-in and identities are checked BEFORE the first AD write.
                 Write-PraStep -Context $context -Title 'Exchange Online pre-check' -Icon Cloud
@@ -665,18 +835,23 @@ try {
         Write-PraStep -Context $context -Title 'Backup and Active Directory changes' -Icon Backup
         $receipt = Invoke-PraAdBatch $context $plans 'Convert'
         if ($null -ne $receipt) {
+            $context.PhaseWriteFolder = Split-Path $receipt.Path -Parent
+            if ($replicate) { Write-PraStep -Context $context -Title 'Active Directory replication' -Icon Directory; Invoke-PraAdReplication $context $plans }
             Write-PraStep -Context $context -Title 'Entra Connect synchronisation' -Icon Sync
             $context.Source = $receipt
             $context.Proof = Import-PraProof $context $receipt.StatePath $receipt 'Convert'
             $context.BatchId = Get-PraShortId $receipt.Data.BatchId
             Invoke-PraSync $context
-            $runCloud = $effectivePhase -eq 'Both'
-            if ($effectivePhase -eq 'AD') {
-                $context.NextSteps = @("Copy the folder $(Split-Path $receipt.Path -Parent) to the Backups folder of the cloud server, then run there:",
-                    (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'Cloud' -BatchId $context.BatchId -OtherServer))
+            $runCloud = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')
+            if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) {
+                Write-PraStep -Context $context -Title 'Creating the transfer package' -Icon Batch
+                Publish-PraTransferPackage -Kind 'Convert' -BatchId ([string]$receipt.Data.BatchId) -Folders @(Split-Path $receipt.Path -Parent) -NextAction 'Convert' -NextPhase 'Cloud' `
+                    -FallbackSteps @("Copy the folder $(Split-Path $receipt.Path -Parent) to the Backups folder of the cloud server, then run there:",
+                        (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'Cloud' -BatchId $context.BatchId -OtherServer))
             }
         }
         else {
+            if ($replicate) { Skip-PraStep -Title 'Active Directory replication' -Reason (Get-PraSkipReason $plans.Count) -Icon Directory }
             Skip-PraStep -Title 'Entra Connect synchronisation' -Reason (Get-PraSkipReason $plans.Count)
             if ($plans.Count) { $context.NextSteps = @(Get-PraCommandLine -ActionName 'Convert' -PhaseName $(if ($Phase) { $Phase } else { '' }) -KeepFilters) }
         }
@@ -684,12 +859,14 @@ try {
     # ---------------------------------------------------------------------------------------------
     # RECOVER - AD side (phase AD or Both).
     # ---------------------------------------------------------------------------------------------
-    elseif ($Action -eq 'Recover' -and $effectivePhase -in @('Both','AD')) {
+    elseif ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover') -and (Test-PraOrdinalIn $effectivePhase @('Both','AD') -IgnoreCase)) {
         Write-PraStep -Context $context -Title 'Loading the Convert batch' -Icon Batch
         $context.Source = Import-PraBackup $context (Get-PraBatchFile -Value $Batch -Operations @('Convert'))
-        if ($context.Source.Data.Operation -ne 'Convert') { throw 'Recover needs the original Convert batch.' }
+        if (-not (Test-PraOrdinalEqual $context.Source.Data.Operation 'Convert')) { throw 'Recover needs the original Convert batch.' }
         $context.SourceBackupHash = $context.Source.Hash
         $records = @(Select-PraSourceRecord $context.Source)
+        $context.PhaseFolders = @(Split-Path $context.Source.Path -Parent)
+        Send-PraPlanCount $records.Count
         Write-PraItem -Context $context -Status Ok -Text ("Convert batch {0}: {1} object(s) selected, backup and SHA-256 verified" -f (Get-PraShortId ([string]$context.Source.Data.BatchId)), $records.Count)
         Write-PraStep -Context $context -Title 'Active Directory connection' -Icon Directory
         Initialize-PraDirectory $context
@@ -706,34 +883,53 @@ try {
             Test-PraSyncAvailable
             Confirm-PraApply ("Roll back the {0} object(s) listed above? Users get their on-premises attributes back; shared mailboxes are first deprovisioned in Exchange Online." -f $plans.Count)
         }
+        if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) {
+            if ($context.AllowMutation -and $plans.Count) {
+                # Same guarantee as Convert: the Exchange Online sign-in, tenant and targets are checked (read only)
+                # BEFORE the first AD write, so a cloud problem does not leave AD restored and the cloud part undone.
+                Write-PraStep -Context $context -Title 'Exchange Online pre-check' -Icon Cloud
+                $context.CurrentOperation = 'CloudPreflightBeforeAD'
+                Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
+                Initialize-PraCloudPreflight -Context $context -Rows @($plans | ForEach-Object { $_.Row })
+                if ($context.Issues.Count) { throw 'Exchange Online pre-check failed: no AD change made.' }
+            }
+            else { Skip-PraStep -Title 'Exchange Online pre-check' -Reason (Get-PraSkipReason $plans.Count) }
+        }
         Write-PraStep -Context $context -Title 'Backup and Active Directory changes' -Icon Backup
         $receipt = Invoke-PraAdBatch $context $plans 'Recover'
         if ($null -ne $receipt) {
+            $context.PhaseWriteFolder = Split-Path $receipt.Path -Parent
+            if ($replicate) { Write-PraStep -Context $context -Title 'Active Directory replication' -Icon Directory; Invoke-PraAdReplication $context $plans }
             Write-PraStep -Context $context -Title 'Entra Connect synchronisation' -Icon Sync
             $context.Proof = Import-PraProof $context $receipt.StatePath $context.Source 'Recover'
             $context.BatchId = Get-PraShortId $receipt.Data.BatchId
             Invoke-PraSync $context
-            $runCloud = $effectivePhase -eq 'Both'
-            if ($effectivePhase -eq 'AD') {
-                $context.NextSteps = @("Copy the folders $(Split-Path $receipt.Path -Parent) and $(Split-Path $context.Source.Path -Parent) to the Backups folder of the cloud server, then run there:",
-                    (Get-PraCommandLine -ActionName 'Recover' -PhaseName 'Cloud' -BatchId $context.BatchId -OtherServer))
+            $runCloud = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')
+            if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) {
+                Write-PraStep -Context $context -Title 'Creating the transfer package' -Icon Batch
+                Publish-PraTransferPackage -Kind 'Recover' -BatchId ([string]$receipt.Data.BatchId) -Folders @((Split-Path $receipt.Path -Parent), (Split-Path $context.Source.Path -Parent)) -NextAction 'Recover' -NextPhase 'Cloud' `
+                    -FallbackSteps @("Copy the folders $(Split-Path $receipt.Path -Parent) and $(Split-Path $context.Source.Path -Parent) to the Backups folder of the cloud server, then run there:",
+                        (Get-PraCommandLine -ActionName 'Recover' -PhaseName 'Cloud' -BatchId $context.BatchId -OtherServer))
             }
         }
-        elseif ($plans.Count) { $context.NextSteps = @(Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -BatchId $Batch -KeepFilters) }
+        elseif ($plans.Count) {
+            if ($replicate) { Skip-PraStep -Title 'Active Directory replication' -Reason (Get-PraSkipReason $plans.Count) -Icon Directory }
+            $context.NextSteps = @(Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -BatchId $Batch -KeepFilters)
+        }
     }
     # ---------------------------------------------------------------------------------------------
     # CLOUD SIDE - Convert/Recover -Phase Cloud and Check.
     # ---------------------------------------------------------------------------------------------
     else {
-        if ($Action -eq 'Check') { $cloudAction = if ($Expect -eq 'Deprovisioned') { 'Recover' } else { 'Convert' } }
+        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check')) { $cloudAction = if ((Test-PraOrdinalIgnoreCaseEqual $Expect 'Deprovisioned')) { 'Recover' } else { 'Convert' } }
         $stepTitle = switch ($Action) { 'Check' { 'Objects to check' } 'Recover' { 'Loading the Recover batch' } default { 'Loading the batch of the AD phase' } }
         Write-PraStep -Context $context -Title $stepTitle -Icon Batch
-        if ($Action -eq 'Check' -and $Identity -and -not $Batch) {
-            if ($Identity -match '@') { $record = [pscustomobject]@{ ObjectGuid = ''; SamAccountName = $Identity; UserPrincipalName = $Identity; IsShared = ($Scope -eq 'SharedOnly') } }
+        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and $Identity -and -not $Batch) {
+            if ($Identity -match '@') { $record = [pscustomobject]@{ ObjectGuid = ''; SamAccountName = $Identity; UserPrincipalName = $Identity; IsShared = ((Test-PraOrdinalIgnoreCaseEqual $Scope 'SharedOnly')) } }
             else {
                 Initialize-PraDirectory $context
                 $user = Get-PraUser $context $Identity
-                $record = [pscustomobject]@{ ObjectGuid = ([guid]$user.ObjectGUID).ToString(); SamAccountName = $user.SamAccountName; UserPrincipalName = $user.UserPrincipalName; IsShared = ($user.msExchRecipientTypeDetails -in @(4, 34359738368)) }
+                $record = [pscustomobject]@{ ObjectGuid = ([guid]$user.ObjectGUID).ToString(); SamAccountName = $user.SamAccountName; UserPrincipalName = $user.UserPrincipalName; IsShared = ((Test-PraOrdinalIn $user.msExchRecipientTypeDetails @(4, 34359738368) -IgnoreCase)) }
             }
             $context.Rows.Add((New-PraRow $context $record))
             Write-PraItem -Context $context -Status Ok -Text ("{0} ({1})" -f $record.UserPrincipalName, $(if ($record.IsShared) { 'shared mailbox' } else { 'user mailbox' }))
@@ -742,10 +938,10 @@ try {
             # Which batch? Convert cloud phase and Check: the Convert batch. Recover cloud phase:
             # the Recover batch (proof of the AD part), its Convert source is found by its hash.
             $proofPath = ''
-            if ($Action -eq 'Recover') {
+            if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover')) {
                 $batchFile = Get-PraBatchFile -Value $Batch -Operations @('Recover','Convert')
-                $batchData = [IO.File]::ReadAllText($batchFile) | ConvertFrom-Json
-                if ($batchData.Operation -eq 'Recover') {
+                $batchData = [IO.File]::ReadAllText($batchFile) | ConvertFrom-PraJson
+                if (Test-PraOrdinalEqual $batchData.Operation 'Recover') {
                     $proofPath = Join-Path (Split-Path $batchFile -Parent) ('State-' + $batchData.BatchId + '.json')
                     $context.Source = Import-PraBackup $context (Find-PraConvertSource -Hash ([string]$batchData.SourceBackupHash))
                     $context.BatchId = Get-PraShortId $batchData.BatchId
@@ -758,30 +954,33 @@ try {
                 $context.BatchId = Get-PraShortId ([string]$context.Source.Data.BatchId)
                 if (-not $context.Source.Legacy) { $proofPath = Join-Path (Split-Path $context.Source.Path -Parent) ('State-' + $context.Source.Data.BatchId + '.json') }
             }
-            if ($context.Source.Data.Operation -ne 'Convert') { throw 'The source of a cloud phase must be the original Convert batch.' }
+            if (-not (Test-PraOrdinalEqual $context.Source.Data.Operation 'Convert')) { throw 'The source of a cloud phase must be the original Convert batch.' }
             $context.SourceBackupHash = $context.Source.Hash
             $records = @(Select-PraSourceRecord $context.Source)
             if ($context.AllowMutation) {
                 if (-not $proofPath) { throw 'This batch has no AD proof (State file): the cloud phase cannot write.' }
                 $context.Proof = Import-PraProof $context $proofPath $context.Source $Action
-                Initialize-PraCloudJournal
+                # The journal folder is created after the operator's confirmation (below), never before it.
+                $needCloudJournal = $true
             }
             foreach ($record in $records) {
                 $row = New-PraRow $context $record
                 $originalLicensing = Get-PraValue $record 'Licensing' $null
-                $row.PreserveLicense = ($cloudAction -eq 'Recover') -and [bool](Get-PraValue $originalLicensing 'Enabled' $false) -and [bool](Get-PraValue $originalLicensing 'WasMember' $false)
-                $row.PreserveCloudMailbox = ($cloudAction -eq 'Recover') -and $row.IsShared -and $context.KeepCloudShared
+                $row.PreserveLicense = ((Test-PraOrdinalIgnoreCaseEqual $cloudAction 'Recover')) -and [bool](Get-PraValue $originalLicensing 'Enabled' $false) -and [bool](Get-PraValue $originalLicensing 'WasMember' $false)
+                $row.PreserveCloudMailbox = ((Test-PraOrdinalIgnoreCaseEqual $cloudAction 'Recover')) -and $row.IsShared -and $context.KeepCloudShared
                 $holders = Get-PraValue $record 'SharedPermissions' $null
                 $row.SharedFullAccess = Get-PraValue $holders 'FullAccess' @(); $row.SharedSendAs = Get-PraValue $holders 'SendAs' @(); $row.SharedSendOnBehalf = Get-PraValue $holders 'SendOnBehalf' @()
                 if ($null -ne $context.Proof) {
-                    $verified = @($context.Proof.Data.Records | Where-Object ObjectGuid -eq $record.ObjectGuid)
+                    $verified = @($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid })
                     if ($verified.Count -ne 1) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName)" }
-                    $row.ADVerified = $true; $row.DeproPending = ($verified[0].Operation -eq 'Deprovision'); $row.BackupPath = $context.Proof.Receipt.Path
-                    $provenPlan = @($context.Proof.Receipt.Data.Records | Where-Object ObjectGuid -eq $record.ObjectGuid)[0]
+                    $row.ADVerified = $true; $row.DeproPending = (Test-PraOrdinalEqual $verified[0].Operation 'Deprovision'); $row.BackupPath = $context.Proof.Receipt.Path
+                    $provenPlan = @($context.Proof.Receipt.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid })[0]
                     $row.PreserveCloudMailbox = [bool]$provenPlan.PreserveCloudMailbox; $row.PreserveLicense = [bool]$provenPlan.PreserveLicense
                 }
                 $context.Rows.Add($row)
             }
+            $context.PhaseFolders = @(@(Split-Path $context.Source.Path -Parent) + $(if ($proofPath) { @(Split-Path $proofPath -Parent) } else { @() }))
+            Send-PraPlanCount $context.Rows.Count
             Write-PraItem -Context $context -Status Ok -Text ("Batch {0}: {1} object(s){2}" -f $context.BatchId, $records.Count, $(if ($null -ne $context.Proof) { ', AD proof verified' } else { '' }))
         }
         $runCloud = $true
@@ -793,36 +992,37 @@ try {
     if ($runCloud -and $context.Rows.Count -gt 0) {
         if ($context.Issues.Count) { throw 'Cloud part not started: the AD part has errors.' }
         $cloudTitle = switch ($cloudAction) { 'Recover' { 'Exchange Online: deprovisioning checks' } default { 'Exchange Online: mailboxes, licences and permissions' } }
-        if ($Action -eq 'Check') { $cloudTitle = 'Exchange Online checks' }
+        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check')) { $cloudTitle = 'Exchange Online checks' }
         Write-PraStep -Context $context -Title $cloudTitle -Icon Cloud
         # A preview of the cloud phase looks once: it never waits for the cloud.
-        if (-not $context.AllowMutation -and $Action -ne 'Check') { $context.Once = $true }
-        if ($context.AllowMutation -and $effectivePhase -eq 'Cloud' -and $Action -eq 'Convert') {
+        if (-not $context.AllowMutation -and (-not (Test-PraOrdinalIgnoreCaseEqual $Action 'Check'))) { $context.Once = $true }
+        if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert')) {
             $grants = 0; foreach ($row in $context.Rows) { $grants += @($row.SharedFullAccess).Count + @($row.SharedSendAs).Count + @($row.SharedSendOnBehalf).Count }
             Confirm-PraApply ("Complete {0} object(s) in Exchange Online (wait for the mailboxes, grant up to {1} shared mailbox permission(s))?" -f $context.Rows.Count, $grants)
         }
-        elseif ($context.AllowMutation -and $effectivePhase -eq 'Cloud' -and $Action -eq 'Recover') {
+        elseif ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Recover')) {
             Confirm-PraApply ("Check the deprovisioning of {0} object(s) in Exchange Online, then package any final shared mailbox and tag restoration for the AD server?" -f $context.Rows.Count)
         }
+        if ($needCloudJournal) { Initialize-PraCloudJournal }
         Initialize-PraCloudAuthority
         Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
-        if ($Action -eq 'Check' -and $Expect -eq 'Retained') { Invoke-PraRetentionCheck -Context $context -Rows $context.Rows.ToArray() }
+        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { Invoke-PraRetentionCheck -Context $context -Rows $context.Rows.ToArray() }
         else { Invoke-PraCloudPhase -Context $context -Rows $context.Rows.ToArray() -Act $cloudAction }
-        if ($context.Issues.Count -or @($context.Rows | Where-Object CloudStatus -eq 'Error').Count) { throw 'Exchange Online check failed: no restore or clean-up is done.' }
+        if ($context.Issues.Count -or @($context.Rows | Where-Object { Test-PraOrdinalEqual $_.CloudStatus 'Error' }).Count) { throw 'Exchange Online check failed: no restore or clean-up is done.' }
 
         # Recover: shared mailboxes (deprovisioned in the cloud) and retention tags are restored only now.
-        if ($Action -eq 'Recover') {
+        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover')) {
             Write-PraStep -Context $context -Title 'Final restore of shared mailboxes and tags' -Icon Write
             if ($context.AllowMutation) {
                 $tagged = @($context.Rows | Where-Object { [bool](Get-PraValue (Get-PraValue $_.BackupRec 'Retention' $null) 'Enabled' $false) })
                 foreach ($row in $tagged | Where-Object PreserveCloudMailbox) {
                     $row.FinalStatus = 'Pending'; $row.Detail += ' | Cloud mailbox kept on purpose: the retention tag stays.'
                 }
-                $followup = @($context.Rows | Where-Object { -not $_.PreserveCloudMailbox -and ($_.DeproPending -or $_ -in $tagged) })
-                foreach ($row in $followup) { if ($row.CloudStatus -ne 'Success' -or $row.DeprovisionConfirmed -ne $true -or $row.ADVerified -ne $true) { throw 'Cloud deprovisioning or AD proof not confirmed: restore and tag clean-up blocked.' } }
+                $followup = @($context.Rows | Where-Object { -not $_.PreserveCloudMailbox -and ($_.DeproPending -or $tagged.Contains($_)) })
+                foreach ($row in $followup) { if (-not (Test-PraOrdinalEqual $row.CloudStatus 'Success') -or $row.DeprovisionConfirmed -ne $true -or $row.ADVerified -ne $true) { throw 'Cloud deprovisioning or AD proof not confirmed: restore and tag clean-up blocked.' } }
                 if (-not $followup.Count) { Write-PraItem -Context $context -Status Skip -Text 'Nothing left to restore.' }
-                elseif ($effectivePhase -eq 'Cloud' -or $defer -or -not @(Get-Module -ListAvailable ActiveDirectory).Count) {
-                    if ($effectivePhase -eq 'Cloud') { Write-PraItem -Context $context -Status Info -Text 'Cloud-only phase: final AD restoration is packaged for Finalize on the AD server.' }
+                elseif ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -or $defer -or -not @(Get-Module -ListAvailable ActiveDirectory).Count) {
+                    if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { Write-PraItem -Context $context -Status Info -Text 'Cloud-only phase: final AD restoration is packaged for Finalize on the AD server.' }
                     elseif (-not $defer) { Write-PraItem -Context $context -Status Info -Text 'ActiveDirectory module not found on this server: the restore is packaged for the AD server.' }
                     Save-PraFinalizePackage $followup
                 }
@@ -838,12 +1038,13 @@ try {
                         })
                     Invoke-PraAdPreview $context $plans
                     $null = Invoke-PraAdBatch $context $plans 'Finalize'
+                    if ($replicate) { Invoke-PraAdReplication $context $plans }
                     Invoke-PraSync $context
                 }
             }
             else { Write-PraItem -Context $context -Status Skip -Text 'Preview: nothing restored.' }
         }
-        if (-not $context.AllowMutation -and $Action -in @('Convert','Recover') -and -not $context.NextSteps.Count) {
+        if (-not $context.AllowMutation -and (Test-PraOrdinalIn $Action @('Convert','Recover') -IgnoreCase) -and -not $context.NextSteps.Count) {
             $context.NextSteps = @(Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $Batch -KeepFilters)
         }
     }
@@ -853,8 +1054,8 @@ try {
     $announced = @($steps)
     for ($i = [int]$context.StepIndex; $i -lt $announced.Count; $i++) { Skip-PraStep -Title $announced[$i] -Reason (Get-PraSkipReason ($context.Rows.Count -gt 0)) }
 
-    if ($context.AllowMutation -and $Action -eq 'Convert' -and $effectivePhase -in @('Both','Cloud') -and $context.BatchId -and -not $context.Issues.Count) {
-        $context.NextSteps = @($(if ($effectivePhase -eq 'Cloud') { 'To roll back this batch later, on the AD server: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId -OtherServer) } else { 'To roll back this batch later: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId) }))
+    if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIn $effectivePhase @('Both','Cloud') -IgnoreCase) -and $context.BatchId -and -not $context.Issues.Count) {
+        $context.NextSteps = @($(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { 'To roll back this batch later, on the AD server: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId -OtherServer) } else { 'To roll back this batch later: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId) }))
     }
 }
 catch {
@@ -875,6 +1076,13 @@ catch {
 }
 finally {
     Initialize-PraPermissionCache -Context $context
+    if ([string](Get-PraValue $context 'PreviewStaging' '')) {
+        try { [IO.Directory]::Delete($context.PreviewStaging, $true) } catch { try { Write-PraLog -Context $context -Message ('The temporary Preview folder could not be deleted: {0}' -f $_.Exception.Message) -Level Detail } catch { $null = $_ } }
+    }
+    if ($context.AllowMutation -and [string](Get-PraValue $context 'PhaseWriteFolder' '') -and -not [bool](Get-PraValue $context 'PhaseDataSaved' $false)) {
+        try { $null = Save-PraPhaseData -Context $context -Folder $context.PhaseWriteFolder; $context.PhaseDataSaved = $true }
+        catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}).' -f $_.Exception.Message) -Level Detail }
+    }
     if (Get-Command Close-PraCloudSession -ErrorAction SilentlyContinue) {
         try { Close-PraCloudSession -Context $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Cloud sign-out: $($_.Exception.Message)"; Source = 'Cloud' }) }
     }
@@ -884,10 +1092,10 @@ finally {
 }
 
 # SIG # Begin signature block
-# MIIghgYJKoZIhvcNAQcCoIIgdzCCIHMCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCpjqYhB1xOrtKu
-# ss0ziKekOhi72NF6k9P3wp6stV7Nx6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCAN4PAFJSz2zQQ
+# Gwe+twn/3/mYLIv98VXJbULaXK3Kd6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -959,103 +1167,133 @@ finally {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYISbTCCEmkCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCA7rJeZawR0
-# TARvXGNIPigEjo32GShUB4kZVIt3BUJYPjANBgkqhkiG9w0BAQEFAASCAgCrBfXO
-# W/Dl9iul0Vv30tRD81YbdQoRHwcLSJqr4undy2xqfmqO9GO0Yz2irqGq4MWKq4C8
-# 8dqnOz1IUw161TkSzqBkTAptAu44HijyVwG2Y8+d5eD3+VHLvOwwbo7NE8ZHARuQ
-# AVZQEcg7kKrrM0A87gI+TGRHLBzZq/SvCvPrgeZXZgr/pjIrOiqDJGI/Paq0jVOA
-# fzhrzybZKIVN1LGlUYKNID9lyGJ7qdOopDkSZ8IipDnfDHa9/QpcYItQbjFIkjFU
-# 2SGIGVUFtquUHA/5SLz8LKfkrS/hT4qohvO7ksCesjx9qjhid75UWddStJZkqrFb
-# UQn5l5TyGyQ3iLc9bXYkEsqU+hua8MDaqap4HVScUZ8N5aCcHVtbPuyxdZ64zDEw
-# 4aJUaTKTAYQAeNTtjkpNvg9iTTBlRPD3dZC4imxdwvvRQ8YStEF//bODLjAdSGK7
-# pgaUgZIxjE1+P4By8ZfGDW7CJrQoRAWFqacWMfUPolkvpuX4SpW9W2vesDbyActS
-# +dGf+ahK33ooEfmmSMG3hkVgI4B1X0Xp0bEbvr2vbo731xlf5FQFCt5d+uUQ21s8
-# hMILr46OLV0Z4vl4c5uEpdQ4f4bltE86vKWTtI2jAXcriQRwGJhqli14zGFA7rhq
-# XAHYzT8mfE9ACDTVNN34eac6UepgsR2lVIBX1qGCDyowgg8mBgorBgEEAYI3AwMB
-# MYIPFjCCDxIGCSqGSIb3DQEHAqCCDwMwgg7/AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAa3Omqnqd/
+# lp7elPYtA9yb4FFl3pp/LJDdmUNJt78nODANBgkqhkiG9w0BAQEFAASCAgB5VefZ
+# jbIcp5d8XRTHQ9MusJGxJroHfWoIhiCfujpaF4YNk+RQhjlDPDW9esyAsPRc9xYq
+# CUjJKDycV3Kq+z7kpvaXPP4LcPIZrZ6lUacTzfHPBzQJT7OVWCFtDEFsMaM87YL1
+# fgagKUCqEpuZDDoBIs71sRz6kskQQrfakS2jzjAIu7HKngnv9Ua/68dhyephFG5X
+# SDYssUgdN9q2dMo2/NrtAYt/pUG+1nLr5h/8APKeRFegjEZtkygW9UeF/3oJGC6v
+# kAd4GnBAsl1tV2YejufnczzL/kpmhPEQ2DUr5v/EJtFPEpIJOhVJSfKLszYh2nc5
+# nvBypdoeSANxP27J4F7za57h+CBbzy17qSnM+Gyu31EuQxyutNypJLc2pf9GJDCL
+# /YSyUhjUki3TFjxYjth966CydCgooDY5HFJPyWHXpTktlBiil8Pfe28g+Ng9lHat
+# KjqLYhYyS1Nr2ZkX3Gh1/Hg5u4gX91iiI7H/sJ/xLofawHontx7xdEFYG0EgsAHl
+# rXI+z/oDU8sBA9EkaSdMI3cynwNa6KrbqbiS7aTLp2zY/DF36vhiCCIPyzEK8soq
+# vEu3ieoWDApQ43s30WibhA4mfDHYKK4gcD/q5isXzh3IK6IEWHQcsckHwxrkXuE8
+# C+wSpJdU9Z8RCirqAGVJDLGMW8/L1rktmNO/yqGCFM8wghTLBgorBgEEAYI3AwMB
+# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIDpK8HOXsIFEFjZTRMxoRKSUJEDNCFbb+iE8GDUxDt3rAgheYiDnwDWW
-# JhgPMjAyNjEwMTUyMTIyNTdaMAMCAQECEHHciDEehJcio4/xmT3qHH6gggwAMIIE
-# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
+# BAIBBQAEIDyADsBxslH2ITvDCWcNvxjUpvQTif0nNZVMM4Y5En+yAghW5rMZ5vWg
+# FhgPMjAyNjExMDUwODA2MzNaMAMCAQECEBN4Ra/DVcIYYwtRR1xoXUmgghGnMIIE
+# 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
-# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
-# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
-# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
-# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
-# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
-# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
-# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
-# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
-# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
-# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
-# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
-# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
-# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
-# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
-# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
-# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
-# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
-# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
-# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
-# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
-# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
-# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
-# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
-# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
-# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
-# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
-# VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
-# cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
-# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
-# A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
-# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
-# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
-# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
-# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
-# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
-# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
-# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
-# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
-# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
-# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
-# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
-# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
-# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
-# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
-# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
-# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
-# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
+# BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSAyMB4XDTI2MDYxMjE3MjI0NloXDTM2MDYwOTE3MjI0NVow
+# bjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9u
+# MREwDwYDVQQKDAhTU0wgQ29ycDEqMCgGA1UEAwwhU1NMLmNvbSBUaW1lc3RhbXBp
+# bmcgVW5pdCAyMDI2IEUxMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE6CWLuGYT
+# LkiSOPMLNskOBthXsIhRSA46feOQwvSLcDaNh6vxUzBKEx1KdFBRFs7OHrnH/K0V
+# A6MbDQIFpUg0PaOCAVIwggFOMB8GA1UdIwQYMBaAFHCaZcFDgKP86bFkiW7xMJwJ
+# Icl8ME0GCCsGAQUFBwEBBEEwPzA9BggrBgEFBQcwAoYxaHR0cDovL2NlcnQuc3Ns
+# LmNvbS9TU0wuY29tLXRpbWVTdGFtcGluZy1JLVIyLmNlcjBRBgNVHSAESjBIMDwG
+# DCsGAQQBgqkwAQMGATAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29t
+# L3JlcG9zaXRvcnkwCAYGZ4EMAQQCMBYGA1UdJQEB/wQMMAoGCCsGAQUFBwMIMEIG
+# A1UdHwQ7MDkwN6A1oDOGMWh0dHA6Ly9jcmxzLnNzbC5jb20vU1NMLmNvbS10aW1l
+# U3RhbXBpbmctSS1SMi5jcmwwHQYDVR0OBBYEFCesA1a6KGq6FzuDPUB/eagk7MM8
+# MA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAT3ZuzvwDnsIZTXBn
+# +hjmuBXgzB12fbYxT9uYe6ZvhvpbZWKcyDQgacETkPw8k6yeqnYCYyFZ063lMPEq
+# AhAD2nMG614Zh7PtHW9DWqfsgivxbPYBeN+t7UxgkYT3expbWMdPEqBtWVyHOvLc
+# KvMxgJWfJjANwVkwVDfky/j7cf28+iimN8PKc7S/u8/LenRRnV2W2YfncRnkz9Cf
+# s5nRDzaZguiHrrp2GxwgnNQSH4GBjHOl3PzLsnVbGoZKi4ZEjgXups4mGGOK7+GB
+# 2HAlQn+OS944cHqlkH0gElt2WezoCNRpELph9qaxuBnjSEqXWWfgE6yGBwO0uxKN
+# qpWVTHmAwr6SvBPofxubXIuEn9ivR4CLOuAxUSrJ41ZBg/qqG0oJjF6GkRKbxq7c
+# yWSkEZYJhmKCg2Hg5fXHagOxiwbmn5JPZ1vhWCrbk3v/dTx2gvTK5+erC5H9/rTc
+# ljUI776yd2rfhjfkpvyAsbtXs4D7nrnw8i9wor5+fdtRSJBVxqzLmykFftoL0Up2
+# Q++tyKCUdribdcnrB4HKS3s+t3AjdcbA06DCL8GifQi9fL0yRBRNlA4o6BP+Sr75
+# 5MaCNjURYZDvDyxJHBBT7cqjZIwsiR8s+6860noFbBBtdge2Iw7CPC/1Q31I27hV
+# olS7B0yao3v8X2MtWy3msZlXTcEwggXdMIIDxaADAgECAgh7LJvTFoAymTANBgkq
+# hkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNV
+# BAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8GA1UEAwwo
+# U1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAeFw0xNjAy
+# MTIxNzM5MzlaFw00MTAyMTIxNzM5MzlaMHwxCzAJBgNVBAYTAlVTMQ4wDAYDVQQI
+# DAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBvcmF0
+# aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRob3Jp
+# dHkgUlNBMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA+Q/doyt9y9Aq
+# /uxnhabnLhu6d+Hj9a+k7PpKXZHEV0drGHdrdvL9k+Q9D8IWngtmw1aUnheDhc5W
+# 7/IW/QBi9SIJVOhlF05BueBPRpeqG8i4bmJeabFf2yoCfvxsyvNB2O3Q6Pw/YUjt
+# sAMUHRAOSxngu07shmX/NvNeZwILnYZVYf16OO3+4hkAt2+hUGJ1dDyg+sglkrRu
+# eiLH+B6h47LdkTGrKx0E/6VKBDfphaQzK/3i1lU0fBmkSmjHsqjTt8qhk4jrwZe8
+# jPkd2SKEJHTHBD1qqSmTzOu4W+H+XyWqNFjIwSNUnRuYEcM4nH49hmylD0CGfAL0
+# XAJPKMuucZ8POsgz/hElNer8usVgPdl8GNWyqdN1eANyIso6wx/vLOUuqfqeLLZR
+# Rv2vA9bqYGjqhRY2a4XpHsCz3cQk3IAqgUFtlD7I4MmBQQCeXr9/xQiYohgsQkCz
+# +W84J0tOgPQ9gUfgiHzqHM61dVxRLhwrfxpyKOcAtdF0xtfkn60Hk7ZTNTX8N+TD
+# 9l0WviFz3pIK+KBjaryWkmo++LxlVZve9Q2JJgT8JRqmJWnLwm3KfOJZX5es6+8u
+# yLzXG1k8K8zyGciTaydjGc/86Sb4ynGbf5P+NGeETpnr/LN4CTNwumamdu0bc+sa
+# pQ3EIhMglFYKTixsTrH9z5wJuqIz7YcCAwEAAaNjMGEwHQYDVR0OBBYEFN0ECQei
+# 9Xp9UlMSkpXuOIAlDaZZMA8GA1UdEwEB/wQFMAMBAf8wHwYDVR0jBBgwFoAU3QQJ
+# B6L1en1SUxKSle44gCUNplkwDgYDVR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBCwUA
+# A4ICAQAgGBGUKfsmnRweHnBh8ZVyk3EkrWiTWI4yrxuzcAP8JSt0hZA9eGr0uYul
+# lzu1GJG7Hqf5QFuR+VWZrx4R0Fwdp2bjsZQHDDI5puobsHnYHZxwROOK3cT5lR+K
+# OEM/AYWlR6c9RrK85SJo93uc2Cw+CiHILTOsv8WBmTF0wXVxxb6x8CNF9J1r/Blj
+# naO8BMYYCyW7U4kPs4BQ3kXuRH+rlHhkmNP2KN2H2HBldPsOuRPrpw9hqTKWzN67
+# 7WNMGLupQPegVG4giHF1GOp6tDRy4CMnd1y2kOqGJUCr7zMPy5+CvqIg+/a1LRrm
+# woWxdA/7yGUCpFIBR91JIsG/2OtrrH7e7GMzFbcjCI/GD41BWt2OxbmP5UU/eNu6
+# 0htAsf5xTT/ggaK6XrTsFeCT3QgffuFVmQsh3pOeCvvmo0m9NjD+53eyoHWXtS2B
+# iBdlIPfakACfyVLMMso1fPU9D9gr1/UmbMkGNJYW6nBZGjJ5eQu2iH8PUkg9v2zY
+# okQu0U63cljTiROV/kSr+NeLG26cvCygW9VqAK9fN+HV+hALmJyG5yaPzvDsbopX
+# C4DjTrLAoGNhkLpVaDd0araS25+hhiK2ZScO7LafQmDkZ8K12kELxNOLYRu8+h+R
+# K9dEB166KazZxenvU0ha64DxKFghzbAGVfsnP1OQcKkEHlcnuTCCBsswggSzoAMC
+# AQICEFKdu8K4iYf1g4DgsOuiBjYwDQYJKoZIhvcNAQELBQAwfDELMAkGA1UEBhMC
+# VVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQKDA9T
+# U0wgQ29ycG9yYXRpb24xMTAvBgNVBAMMKFNTTC5jb20gUm9vdCBDZXJ0aWZpY2F0
+# aW9uIEF1dGhvcml0eSBSU0EwHhcNMjYwNjEyMTY0MjE1WhcNNDEwMjEyMTczOTM5
+# WjByMQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0
+# b24xETAPBgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFt
+# cGluZyBJc3N1aW5nIFJTQSBDQSAyMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
+# CgKCAgEAny+r5nNNkLwxRps2B3laUGNU9y7vWiJ5013yf0iXz65bQdwa9bjj8l/S
+# keXqHGqfSh2Foae+80E8mDEf93oIwjsy2CX2cXmKxqtF8HJGYB4f6yRhKED50wkb
+# OysL02IXf+/EZna44jffhhVz4OU/k52xQ/PnIg/uFhc2Wk+Sc/CHqAr+lYVkPz7L
+# y5RqB9f1RKGr9JC37W1LgVdHC50dNIdsa3QXPhltYZubR3npE4Bbfi0joUW5n5O0
+# ayweN45R/YVLxA0YGlp1OHVfVnsqXq8bhnw1Lc4kjJ6XOgXlOlw/a8ze57TvbduZ
+# l3ehewTmvO0Aky/nqOWDS9IPPxdxdG6vprBbSuHlxNANBAbHTiFgkfZmf0dZYlT/
+# AnZIoFxAq0HILPolf4OgWgET76SiWSlm2XYRIXwVjpeqG0plvXwRIQBzSiEJj7Qe
+# QFnCvHx4gQMINvN3+yG/1rxhEbajGve0tTP3lX4PPOHVAE0QJp4ZzPI1YYJkhVRr
+# iVVxVRU4Fsg4BPwP6I+YLmHb1tZ4RLwOFNLh/gJYDgPlChCoxOogFxXgwPZZrDyE
+# RYB0aeOexW0OKacN4RRu9cqF2KKu/Ab5AL7eYDLVGUPrEEyYbIMApVKqpebc0/jD
+# QniC+3rkauRAjgVc8m1ip/CQgG1Dw4Z9ulVRAY9VR6Za26LsTbUCAwEAAaOCAVEw
+# ggFNMBIGA1UdEwEB/wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAU3QQJB6L1en1SUxKS
+# le44gCUNplkwTQYIKwYBBQUHAQEEQTA/MD0GCCsGAQUFBzAChjFodHRwOi8vY2Vy
+# dC5zc2wuY29tL1NTTGNvbS1Sb290Q0EtUlNBLTQwOTYtUjEuY2VyMD8GA1UdIAQ4
 # MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
-# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
-# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
-# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
-# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
-# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
-# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
-# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
-# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
-# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
-# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
-# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
-# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
-# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
-# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
-# WTCCAlUCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
-# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
-# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
-# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
-# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNTIxMjI1N1owKAYJKoZIhvcNAQk0MRswGTAL
-# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIM2L1d0sO6IO
-# lASlHFmd9jlQIsjs1dMNr/kNdun1Sz+vMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
-# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
-# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
-# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
-# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
-# BEgwRgIhALcapGqWCFks0TlPeAI3O44M1AAiwT6I/0IAeeFh3cocAiEA2MPIZDbW
-# LKsDrZbSsafvwHCcCGHWU/Rg+WMKGRjFKd8=
+# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwQgYDVR0fBDswOTA3oDWgM4Yx
+# aHR0cDovL2NybHMuc3NsLmNvbS9TU0xjb20tUm9vdENBLVJTQS00MDk2LVIxLmNy
+# bDAdBgNVHQ4EFgQUcJplwUOAo/zpsWSJbvEwnAkhyXwwDgYDVR0PAQH/BAQDAgGG
+# MA0GCSqGSIb3DQEBCwUAA4ICAQBlFFvNMemA6iBiBYo56IKQjWhWuQaYKuo4qpf0
+# KJNERAt1gz+HsA2SL3xA/V+EA8SRPNP9SvX0is+5mDsppYvpKyYGqYP36YFW0mbF
+# 1F0ZtXxumCUUO/ZV5mBNKDf5Q4PY7Qb0eWAepUc0rNJr/Mvn5ZiXfJPxDb2xmcg8
+# aRD652/nr+Ork2UBP0E43iJdI4LF7Vs29R3SGRLYZOxM15DI4QebsKRl0KDlf4Om
+# YGCKc7umTxibkZtN1C1KWgnf9jadU/JwnySaYEBgx6/v+FVC6SGONziY7TcvI9MV
+# +qYxHUPlOm6AaQP2dS4bjWXnm86ldCbUkxtOACumSfT97077JNiVa7PZ1IBkd/2P
+# E1AC8gs7U+/Yk1BN9XRPIi15k/uA1xF9oeee5KGjyiGKkqIT7W8QkgUT5zeCinFK
+# kcKafZMcROSVYpXtmtQqGGR2g4uPYqJ0K1hms6gJXrHt/34p8M9PrV8oNWe0Zl1E
+# rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
+# fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
+# 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
+# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
+# JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
+# AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNTA4MDYzM1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIF0i
+# BU8I4C5c+wIx/OLtoNifPSSKqDTWgUbaZJhOxbcGMIHIBgsqhkiG9w0BCRACLzGB
+# uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
+# dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
+# c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
+# YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
+# zj0EAwIESDBGAiEA/47ZDiMY3Nf7Jxm/ld/a6bj/H0pwv68on85J1uIoSKACIQDo
+# AuhCh/62oIm0zWH78l0Au1MBcJHIQVNQRDtxjbBmGw==
 # SIG # End signature block

@@ -1,8 +1,8 @@
 # PRA Remote Mailbox
 
-When the on-premises Exchange servers are lost, gives every user a mailbox in Exchange Online and rolls everything back when Exchange is available again. Windows PowerShell 5.1 engine, optional WPF window. Author: Nicolas Fabert. Version 2.2.0.
+When the on-premises Exchange servers are lost, gives every user a mailbox in Exchange Online and rolls everything back when Exchange is available again. PowerShell 7.5+ engine, optional WPF window. Author: Nicolas Fabert. Version 3.0.0.
 
-This folder contains everything needed to run the tool: `Invoke-PraRemoteMailbox.ps1`, its modules and WPF window, the configuration and CSV samples, the report template and the administrator guide. Tests and build tools stay outside it, in the repository.
+This folder contains everything needed to run the tool: `Invoke-PraRemoteMailbox.ps1`, its modules and WPF window, the configuration and CSV samples, the report template and the two guides (user guide and reference guide). Tests and build tools stay outside it, in the repository.
 
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
@@ -17,9 +17,9 @@ This folder contains everything needed to run the tool: `Invoke-PraRemoteMailbox
 
 ## Requirements
 
-- Windows PowerShell 5.1 for the operations; PowerShell 7.5+ only for the native Fluent window (operations still run in Windows PowerShell 5.1).
-- RSAT `ActiveDirectory`, `ExchangeOnlineManagement` 3.10 or later, `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users`.
-- A hybrid Exchange organisation synchronised by Entra Connect, and the permissions listed in the administrator guide, chapter 4.
+- PowerShell 7.5 or later (`pwsh.exe`) for the operations and the window. Windows PowerShell 5.1 is refused; the 2.2.x releases are the Windows PowerShell 5.1 version. Backups written by 2.x restore unchanged.
+- RSAT `ActiveDirectory`, `ExchangeOnlineManagement` 3.10 or later, `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users`, installed for PowerShell 7.
+- A hybrid Exchange organisation synchronised by Entra Connect, and the minimum permissions listed in the reference guide, chapter 4 (derived from the code; the plain version is in the user guide, chapter 2).
 - Windows Terminal for emoji and colours.
 - To read the HTML report: a current desktop Microsoft Edge or Google Chrome (the report is compressed and needs `DecompressionStream`; the CSV with the same name works everywhere).
 
@@ -39,7 +39,7 @@ Keep the `Backups` folder on a durable, protected volume: the backups are the on
 
 ## Package integrity
 
-The tool runs only from a package signed by its owner. `module\Test-PackageIntegrity.ps1` and `PackageIntegrity.psd1` must carry a valid, timestamped signature of `0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6`; every PowerShell file must be signed by the same owner; every stable file (modules, XAML, template, sample CSV files, README, licence, guide, images) must match the signed manifest. The entry script, each module and the GUI helper check this first. A changed, missing, duplicated, unexpected or reparse-point file stops the tool before any import, window or operation. There is no unsigned mode, switch or environment bypass; do not disable your execution policy or this check to clear an error.
+The tool runs only from a package signed by its owner. `module\Test-PackageIntegrity.ps1` and `PackageIntegrity.psd1` must carry a valid, timestamped signature of `0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6`; every PowerShell file must be signed by the same owner; every stable file (modules, XAML, template, sample CSV files, README, licence, change log, guide, images) must match the signed manifest. The entry script, each module and the GUI helper check this first. A changed, missing, duplicated, unexpected or reparse-point file stops the tool before any import, window or operation. There is no unsigned mode, switch or environment bypass; do not disable your execution policy or this check to clear an error.
 
 Edit only `config\PraRemoteMailbox.config.psd1` and your own CSV lists in `config\`: they are data, outside the check, like the generated `Backups`, `logs` and `reports` folders. A signature detects a change; it does not stop the file system from being written.
 
@@ -53,7 +53,8 @@ Output folders: `Storage.BackupFolder`, `Logging.Folder` and `Report.Folder` mus
 | `module\` | Modules, WPF window (`PRA.Gui.xaml`), direct GUI helper and the integrity verifier. |
 | `config\` | Configuration to fill in and the two CSV samples. |
 | `templates\` | HTML report template. |
-| `docs\` | Administrator guide, Markdown and self-contained HTML, with images. |
+| `docs\` | User guide and reference guide, Markdown and self-contained HTML, with images. |
+| `PraRemoteMailbox.psd1`, `PraRemoteMailbox.psm1` | Module manifest and root module (loaded by the script). |
 | `PackageIntegrity.psd1` | Owner-signed manifest of the stable files. |
 | `README.md` | This package readme. |
 | `LICENSE` | MIT license. |
@@ -61,7 +62,8 @@ Output folders: `Storage.BackupFolder`, `Logging.Folder` and `Report.Folder` mus
 
 ## Documentation
 
-- [Administrator guide](docs/PraRemoteMailbox-Guide.md) - also `docs/PraRemoteMailbox-Guide.html`, a single file to open locally
+- [User guide](docs/PraRemoteMailbox-UserGuide.md) - the guided path in plain words, one picture per step; also `docs/PraRemoteMailbox-UserGuide.html`, a single file to open locally
+- [Reference guide](docs/PraRemoteMailbox-Guide.md) - everything else, including the exact minimum permissions; also `docs/PraRemoteMailbox-Guide.html`
 
 Project page, releases and change log: https://github.com/Nico77600/PraRemoteMailbox
 

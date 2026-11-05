@@ -1,0 +1,91 @@
+<Objs Version="1.1.0.1" xmlns="http://schemas.microsoft.com/powershell/2004/04">
+  <Obj RefId="0">
+    <TN RefId="0">
+      <T>System.Object[]</T>
+      <T>System.Array</T>
+      <T>System.Object</T>
+    </TN>
+    <LST>
+      <Obj RefId="1">
+        <TN RefId="1">
+          <T>Microsoft.ActiveDirectory.Management.ADUser</T>
+          <T>Microsoft.ActiveDirectory.Management.ADAccount</T>
+          <T>Microsoft.ActiveDirectory.Management.ADPrincipal</T>
+          <T>Microsoft.ActiveDirectory.Management.ADObject</T>
+          <T>System.Object</T>
+        </TN>
+        <ToString>CN=User1,OU=Tests,DC=contoso,DC=com</ToString>
+        <Props>
+          <S N="mail">user1@contoso.com</S>
+          <S N="homeMDB">CN=Database1,CN=Databases,DC=contoso,DC=com</S>
+          <S N="homeMTA">CN=OriginalMTA,DC=contoso,DC=com</S>
+          <S N="msExchHomeServerName">/o=Synthetic/ou=Gate/cn=Servers/cn=Original</S>
+          <BA N="msExchMailboxGuid">AAECf4D+/wE=</BA>
+          <B N="mDBUseDefaults">false</B>
+          <I32 N="msExchRecipientDisplayType">0</I32>
+          <I64 N="msExchRecipientTypeDetails">1</I64>
+          <S N="extensionAttribute1">OriginalTag-1</S>
+          <Obj N="proxyAddresses" RefId="2">
+            <TN RefId="2">
+              <T>System.String[]</T>
+              <T>System.Array</T>
+              <T>System.Object</T>
+            </TN>
+            <LST>
+              <S>SMTP:user1@contoso.com</S>
+              <S>smtp:alias1@contoso.com</S>
+              <S>X500:/o=Synthetic/ou=Gate/cn=User</S>
+            </LST>
+          </Obj>
+          <Obj N="memberOf" RefId="3">
+            <TNRef RefId="2" />
+            <LST />
+          </Obj>
+          <S N="UserPrincipalName">user1@contoso.com</S>
+          <S N="DisplayName">Synthetic User 1</S>
+          <S N="SamAccountName">user1</S>
+          <G N="ObjectGUID">00000000-0000-0000-0000-000000000001</G>
+          <S N="DistinguishedName">CN=User1,OU=Tests,DC=contoso,DC=com</S>
+          <S N="Name">User1</S>
+          <S N="ObjectClass">user</S>
+          <I64 N="uSNChanged">100</I64>
+        </Props>
+      </Obj>
+      <Obj RefId="4">
+        <TNRef RefId="1" />
+        <ToString>CN=User2,OU=Tests,DC=contoso,DC=com</ToString>
+        <Props>
+          <S N="mail">user2@contoso.com</S>
+          <S N="homeMDB">CN=Database2,CN=Databases,DC=contoso,DC=com</S>
+          <S N="homeMTA">CN=OriginalMTA,DC=contoso,DC=com</S>
+          <S N="msExchHomeServerName">/o=Synthetic/ou=Gate/cn=Servers/cn=Original</S>
+          <BA N="msExchMailboxGuid">AAECf4D+/wI=</BA>
+          <B N="mDBUseDefaults">false</B>
+          <I32 N="msExchRecipientDisplayType">0</I32>
+          <I64 N="msExchRecipientTypeDetails">1</I64>
+          <S N="extensionAttribute1">OriginalTag-2</S>
+          <Obj N="proxyAddresses" RefId="5">
+            <TNRef RefId="2" />
+            <LST>
+              <S>SMTP:user2@contoso.com</S>
+              <S>smtp:alias2@contoso.com</S>
+              <S>X500:/o=Synthetic/ou=Gate/cn=User</S>
+            </LST>
+          </Obj>
+          <Obj N="memberOf" RefId="6">
+            <TNRef RefId="2" />
+            <LST />
+          </Obj>
+          <S N="UserPrincipalName">user2@contoso.com</S>
+          <S N="DisplayName">Synthetic User 2</S>
+          <S N="SamAccountName">user2</S>
+          <G N="ObjectGUID">00000000-0000-0000-0000-000000000002</G>
+          <S N="DistinguishedName">CN=User2,OU=Tests,DC=contoso,DC=com</S>
+          <S N="Name">User2</S>
+          <S N="ObjectClass">user</S>
+          <I64 N="uSNChanged">100</I64>
+        </Props>
+      </Obj>
+    </LST>
+  </Obj>
+</Objs>

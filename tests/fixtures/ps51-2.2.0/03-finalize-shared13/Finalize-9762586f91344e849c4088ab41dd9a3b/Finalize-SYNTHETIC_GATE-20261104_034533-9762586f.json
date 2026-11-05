@@ -1,0 +1,103 @@
+{
+    "SchemaVersion":  2,
+    "Operation":  "RecoverFinalize",
+    "Environment":  "SYNTHETIC_GATE",
+    "CreatedUtc":  "2026-11-04T02:45:33.4847174Z",
+    "SourceBackupFile":  "Convert-SYNTHETIC_GATE-20261104_034400-cf72361c.json",
+    "SourceBackupHash":  "3c56c496e057b59b943b5c5aa283fbb61b96d6678937e20c3fe8891b3b161537",
+    "StateFile":  "State-fbb1600986cc48e8b61bb2fba771eb8d.json",
+    "StateHash":  "7dc1317babd34ba9e07eb06fcd3cc8cf6d85eb8f93d88df4e3556b76bc92b9d5",
+    "Items":  [
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000001",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000002",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000003",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000004",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000005",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000006",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000007",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000008",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000009",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000010",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000011",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000012",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  },
+                  {
+                      "ObjectGuid":  "00000000-0000-0000-0000-000000000013",
+                      "RestoreShared":  true,
+                      "RestoreTag":  true,
+                      "CloudConfirmed":  true,
+                      "DeprovisionConfirmed":  true
+                  }
+              ]
+}

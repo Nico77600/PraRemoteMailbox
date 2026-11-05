@@ -2,7 +2,7 @@
 #  PRA Remote Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 2.2.0
+#  Version : 3.0.0
 #
 #  This file is read by Invoke-PraRemoteMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -101,6 +101,22 @@
     }
 
     # ---------------------------------------------------------------------
+    # Optional forced Active Directory replication, before the Entra Connect synchronisation.
+    #   ForceReplication = $true : each object changed in the run is pushed from the domain controller that was written to the other
+    #                  writable domain controllers (Sync-ADObject), then read back there. A domain controller that does not confirm
+    #                  is a warning that names it (the synchronisation still runs). Needs the right to replicate a single object
+    #                  (normally Domain Admins). OFF by default; -ForceAdReplication or the checkbox of the window turn it on for one run.
+    #   ReplicationTargets : optional list of domain controllers to restrict it to (for example the ones the Entra Connect connector reads);
+    #                  empty = every other writable domain controller of the domain.
+    # ---------------------------------------------------------------------
+    Directory = @{
+        ForceReplication              = $false
+        ReplicationTargets            = @()
+        ReplicationVerifyAttempts     = 6
+        ReplicationVerifyDelaySeconds = 10
+    }
+
+    # ---------------------------------------------------------------------
     # Entra Connect synchronisation after the AD changes (Apply).
     #   Sync = $true : one cycle is run and the tool waits for its end before the cloud part.
     #                  On this server (ADSync module) or on Server through PowerShell remoting.
@@ -137,7 +153,7 @@
     Exo = @{
         MinModuleVersion        = '3.10.0'   # older = child process isolation (certificate sign-in only)
         UseSubprocess           = $false     # $true = every Exchange Online call in a child PowerShell
-        DisableWAM              = $true      # interactive sign-in in the browser instead of the Windows broker
+        DisableWAM              = $false     # $false (default) = interactive sign-in through the Windows broker (WAM); $true = browser sign-in instead
         GrantVerifyAttempts     = 13         # re-reads after ONE grant (never retried)
         GrantVerifyDelaySeconds = 10
     }

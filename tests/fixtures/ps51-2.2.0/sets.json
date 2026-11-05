@@ -1,0 +1,101 @@
+[
+    {
+        "Set":  "05-legacy",
+        "Role":  "LegacyBackup",
+        "Path":  "05-legacy/schema1/historical.json",
+        "Records":  2,
+        "Operation":  "Convert",
+        "Schema":  1,
+        "Legacy":  true
+    },
+    {
+        "Set":  "05-legacy",
+        "Role":  "LegacyBackup",
+        "Path":  "05-legacy/schema2/historical.json",
+        "Records":  2,
+        "Operation":  "Convert",
+        "Schema":  2,
+        "Legacy":  false
+    },
+    {
+        "Set":  "01-convert-users",
+        "Role":  "Backup",
+        "Path":  "01-convert-users/Batch-501c35a4807142b0af0b10ce98252607/Convert-SYNTHETIC_GATE-20261104_034340-501c35a4.json",
+        "Records":  2,
+        "Operation":  "Convert",
+        "Schema":  3
+    },
+    {
+        "Set":  "01-convert-users",
+        "Role":  "Proof",
+        "Path":  "01-convert-users/Batch-501c35a4807142b0af0b10ce98252607/State-501c35a4807142b0af0b10ce98252607.json",
+        "Records":  2,
+        "Operation":  "Convert",
+        "Backup":  "01-convert-users/Batch-501c35a4807142b0af0b10ce98252607/Convert-SYNTHETIC_GATE-20261104_034340-501c35a4.json"
+    },
+    {
+        "Set":  "02-recover-users",
+        "Role":  "Backup",
+        "Path":  "02-recover-users/Batch-273f5cf39b4a48b880d235391acabc92/Recover-SYNTHETIC_GATE-20261104_034351-273f5cf3.json",
+        "Records":  2,
+        "Operation":  "Recover",
+        "Schema":  3
+    },
+    {
+        "Set":  "02-recover-users",
+        "Role":  "Proof",
+        "Path":  "02-recover-users/Batch-273f5cf39b4a48b880d235391acabc92/State-273f5cf39b4a48b880d235391acabc92.json",
+        "Records":  2,
+        "Operation":  "Recover",
+        "Backup":  "02-recover-users/Batch-273f5cf39b4a48b880d235391acabc92/Recover-SYNTHETIC_GATE-20261104_034351-273f5cf3.json"
+    },
+    {
+        "Set":  "04-shared13",
+        "Role":  "Backup",
+        "Path":  "03-finalize-shared13/Finalize-9762586f91344e849c4088ab41dd9a3b/Convert-SYNTHETIC_GATE-20261104_034400-cf72361c.json",
+        "Records":  13,
+        "Operation":  "Convert",
+        "Schema":  3,
+        "Note":  "file lives in the Finalize package (set 03)"
+    },
+    {
+        "Set":  "04-shared13",
+        "Role":  "Proof",
+        "Path":  "04-shared13/Batch-cf72361c626a45b1929f878eecf932f5/State-cf72361c626a45b1929f878eecf932f5.json",
+        "Records":  13,
+        "Operation":  "Convert",
+        "Backup":  "03-finalize-shared13/Finalize-9762586f91344e849c4088ab41dd9a3b/Convert-SYNTHETIC_GATE-20261104_034400-cf72361c.json"
+    },
+    {
+        "Set":  "04-shared13",
+        "Role":  "Backup",
+        "Path":  "03-finalize-shared13/Finalize-9762586f91344e849c4088ab41dd9a3b/Recover-SYNTHETIC_GATE-20261104_034437-fbb16009.json",
+        "Records":  13,
+        "Operation":  "Recover",
+        "Schema":  3,
+        "Note":  "file lives in the Finalize package (set 03)"
+    },
+    {
+        "Set":  "04-shared13",
+        "Role":  "Proof",
+        "Path":  "04-shared13/Batch-fbb1600986cc48e8b61bb2fba771eb8d/State-fbb1600986cc48e8b61bb2fba771eb8d.json",
+        "Records":  13,
+        "Operation":  "Recover",
+        "Backup":  "03-finalize-shared13/Finalize-9762586f91344e849c4088ab41dd9a3b/Recover-SYNTHETIC_GATE-20261104_034437-fbb16009.json"
+    },
+    {
+        "Set":  "03-finalize-shared13",
+        "Role":  "FinalizeManifest",
+        "Path":  "03-finalize-shared13/Finalize-9762586f91344e849c4088ab41dd9a3b/Finalize-SYNTHETIC_GATE-20261104_034533-9762586f.json",
+        "Operation":  "RecoverFinalize",
+        "Schema":  2,
+        "Items":  13
+    },
+    {
+        "Set":  "06-all-types",
+        "Role":  "AllTypes",
+        "Path":  "06-all-types/all-types.clixml",
+        "Records":  1,
+        "CapturedUtc":  "2026-09-07T01:02:03.0000000Z"
+    }
+]

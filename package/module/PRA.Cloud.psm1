@@ -6,8 +6,8 @@
     Public functions (no pipeline output; result rows are updated in place; an error sets the row to
     Error and records a run error, or throws):
 
-      Initialize-PraCloudPreflight  Convert, Apply, phase Both: sign-in, targets and trustees resolved
-                                    in Exchange Online BEFORE the AD part (read only)
+      Initialize-PraCloudPreflight  Convert or Recover, Apply, phase Both: sign-in, targets (and, for Convert,
+                                    trustees) resolved in Exchange Online BEFORE the AD part (read only)
       Invoke-PraCloudPhase          checks (and waits for) the expected cloud state of every row and, in
                                     Apply, grants the shared mailbox permissions
       Invoke-PraRetentionCheck      Check -Expect Retained: retention policy holds (read only)
@@ -28,17 +28,18 @@
     bounded re-reads (Exo.GrantVerifyAttempts x Exo.GrantVerifyDelaySeconds) and a line "Verified".
     A grant is never retried.
 
-    Sessions: Microsoft Graph is connected before Exchange Online (assembly conflicts in Windows
-    PowerShell 5.1); an Exchange Online or Graph session that already exists in the console is refused;
+    Sessions: Microsoft Graph is connected before Exchange Online (kept from 2.x, where both modules shared
+    one set of assemblies under Windows PowerShell 5.1; free of cost under PowerShell 7); an Exchange Online
+    or Graph session that already exists in the console is refused;
     tenant, token, connection ID and module path are checked before each call. Exo.UseSubprocess (or
     an ExchangeOnlineManagement older than Exo.MinModuleVersion) runs every Exchange Online call in a
-    child Windows PowerShell (certificate sign-in only).
+    child PowerShell 7 process (certificate sign-in only).
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 2.2.0
+    Version : 3.0.0
 #>
-#Requires -Version 5.1
+#Requires -Version 7.5
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 # >>> PRA package integrity bootstrap: identical in every runtime PowerShell file (checked by the tests).
@@ -53,8 +54,8 @@ $ErrorActionPreference = 'Stop'
         $cursor = [IO.Path]::GetDirectoryName($cursor)
     }
     $signature = Microsoft.PowerShell.Security\Get-AuthenticodeSignature -LiteralPath $verifier -ErrorAction Stop
-    if ([string]$signature.Status -cne 'Valid' -or $null -eq $signature.SignerCertificate -or
-        $signature.SignerCertificate.Thumbprint -cne '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6' -or
+    if (-not [string]::Equals([string]$signature.Status, 'Valid', [StringComparison]::Ordinal) -or $null -eq $signature.SignerCertificate -or
+        -not [string]::Equals([string]$signature.SignerCertificate.Thumbprint, '0F28E442889F17B5F4D251E8F96E7CC6E2C9C6D6', [StringComparison]::Ordinal) -or
         $null -eq $signature.TimeStamperCertificate) {
         throw 'Package integrity: verifier must have the trusted, timestamped owner signature.'
     }
@@ -64,7 +65,7 @@ $ErrorActionPreference = 'Stop'
 
 # Fixed worker body, also run in the child process: no code or cmdlet name ever comes from data.
 $script:PraExoWorker = {
-    param([ValidateSet('Probe','Preflight','Mailbox','Recipient','Hold','Permission','Grant')][string]$Operation,$P,$Permit,$SessionBinding,$OnApplied)
+    param([ValidateSet('Probe','Preflight','Mailbox','Recipient','Hold','Permission','Grant')][string]$Operation,$P,$Permit,$SessionBinding,$OnApplied,$OnProgress)
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     function V {
@@ -76,6 +77,20 @@ $script:PraExoWorker = {
         }
         return ,$Default
     }
+    # Ordinal comparisons only (the child process cannot load PRA.Common): on .NET with ICU, -eq/-ceq/-in/-like/switch and the
+    # string overloads of StartsWith/IndexOf ignore zero-weight characters (U+0001, U+200B...), so "a" would equal "a<U+0001>".
+    function SameOrdinal { param($A,$B) if ($null -eq $A -or $null -eq $B) { return ($null -eq $A -and $null -eq $B) }; return [string]::Equals([string]$A,[string]$B,[StringComparison]::Ordinal) }
+    function SameIgnoreCase { param($A,$B) if ($null -eq $A -or $null -eq $B) { return ($null -eq $A -and $null -eq $B) }; return [string]::Equals([string]$A,[string]$B,[StringComparison]::OrdinalIgnoreCase) }
+    function InSet {
+        param($Value,$Set,[switch]$IgnoreCase)
+        $comparison=if ($IgnoreCase) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        foreach ($item in @($Set)) {
+            if ($null -eq $item -or $null -eq $Value) { if ($null -eq $item -and $null -eq $Value) { return $true }; continue }
+            if ([string]::Equals([string]$Value,[string]$item,$comparison)) { return $true }
+        }
+        return $false
+    }
+    function InSetIgnoreCase { param($Value,$Set) return (InSet -Value $Value -Set $Set -IgnoreCase) }
     function Session {
         param([string]$Right='')
         $tenant=[string](V $SessionBinding 'TenantId' (V $P 'TenantId' ''))
@@ -89,23 +104,23 @@ $script:PraExoWorker = {
         # Interactive sign-in reports the tenant GUID; certificate (app-only) sign-in reports the
         # organisation domain (tenant.onmicrosoft.com) and the AppId: both are accepted, nothing else.
         $sessionTenant=[string](V $c 'TenantID' '')
-        $tenantOk=($sessionTenant -eq $tenant) -or ($organization -and $sessionTenant -eq $organization)
-        if ($appId -and [string](V $c 'AppId' '') -ne $appId) { $tenantOk=$false }
-        if (-not $tenantOk -or [string](V $c 'State' '') -ne 'Connected' -or
-            [string](V $c 'TokenStatus' '') -ne 'Active' -or -not $id -or -not [IO.Path]::IsPathRooted($location)) {
+        $tenantOk=(SameIgnoreCase $sessionTenant $tenant) -or ($organization -and (SameIgnoreCase $sessionTenant $organization))
+        if ($appId -and -not (SameIgnoreCase ([string](V $c 'AppId' '')) $appId)) { $tenantOk=$false }
+        if (-not $tenantOk -or -not (SameIgnoreCase ([string](V $c 'State' '')) 'Connected') -or
+            -not (SameIgnoreCase ([string](V $c 'TokenStatus' '')) 'Active') -or -not $id -or -not [IO.Path]::IsPathRooted($location)) {
             throw ("Exchange Online session: wrong tenant ({0}), state, token, connection ID or module path." -f $sessionTenant)
         }
-        $modules=@(Get-Module | Where-Object { $_.ModuleBase -eq $location -or $_.Path -eq $location })
+        $modules=@(Get-Module | Where-Object { (SameIgnoreCase $_.ModuleBase $location) -or (SameIgnoreCase $_.Path $location) })
         if ($modules.Count -ne 1 -or -not $modules[0].Path) { throw 'Module of the Exchange Online session not found or ambiguous.' }
         if ($null -ne $SessionBinding -and (V $SessionBinding 'ConnectionId' '')) {
-            if ($id -ne (V $SessionBinding 'ConnectionId') -or $location -ne (V $SessionBinding 'ModuleLocation') -or
-                $modules[0].Path -ne (V $SessionBinding 'ModulePath')) { throw 'The Exchange Online session changed.' }
+            if (-not (SameIgnoreCase $id (V $SessionBinding 'ConnectionId')) -or -not (SameIgnoreCase $location (V $SessionBinding 'ModuleLocation')) -or
+                -not (SameIgnoreCase $modules[0].Path (V $SessionBinding 'ModulePath'))) { throw 'The Exchange Online session changed.' }
         }
         $command=$null
         if ($Right) {
-            $name=switch ($Right) { 'FullAccess' { 'Add-MailboxPermission' }; 'SendAs' { 'Add-RecipientPermission' }; 'SendOnBehalf' { 'Set-Mailbox' }; default { throw 'Unknown permission.' } }
+            $name=if (SameIgnoreCase $Right 'FullAccess') { 'Add-MailboxPermission' } elseif (SameIgnoreCase $Right 'SendAs') { 'Add-RecipientPermission' } elseif (SameIgnoreCase $Right 'SendOnBehalf') { 'Set-Mailbox' } else { throw 'Unknown permission.' }
             $commands=@(Get-Command -Name $name -Module $modules[0].Name -All -ErrorAction Stop)
-            if ($commands.Count -ne 1 -or $null -eq $commands[0].Module -or $commands[0].Module.Path -ne $modules[0].Path) {
+            if ($commands.Count -ne 1 -or $null -eq $commands[0].Module -or -not (SameIgnoreCase $commands[0].Module.Path $modules[0].Path)) {
                 throw "Command $name is not from the module of the Exchange Online session."
             }
             $command=$commands[0]
@@ -126,10 +141,11 @@ $script:PraExoWorker = {
         $json=[regex]::Match($text,'(?s)\{\s*"error"\s*:\s*\{.*\}\s*\}')
         if (-not $json.Success) { return $false }
         try {
-            $payload=$json.Value | ConvertFrom-Json -ErrorAction Stop
-            $object="object '"+[WildcardPattern]::Escape($Upn)+"' couldn't be found"
-            $detail=@($payload.error.details | Where-Object { [string]$_.message -like '*|Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException|*' })
-            return ($payload.error.code -ceq 'NotFound' -and [string]$payload.error.message -like "*$object*" -and $detail.Count -gt 0 -and [string]$detail[0].message -like "*$object*")
+            $payload=$json.Value | ConvertFrom-Json -DateKind String -ErrorAction Stop
+            # Substring searches are ordinal and case-insensitive (the former -like was case-insensitive, and culture-sensitive under ICU).
+            $object="object '"+$Upn+"' couldn't be found"
+            $detail=@($payload.error.details | Where-Object { ([string]$_.message).IndexOf('|Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException|',[StringComparison]::OrdinalIgnoreCase) -ge 0 })
+            return ((SameOrdinal $payload.error.code 'NotFound') -and ([string]$payload.error.message).IndexOf($object,[StringComparison]::OrdinalIgnoreCase) -ge 0 -and $detail.Count -gt 0 -and ([string]$detail[0].message).IndexOf($object,[StringComparison]::OrdinalIgnoreCase) -ge 0)
         } catch { return $false }
     }
     function Recipient {
@@ -156,11 +172,12 @@ $script:PraExoWorker = {
         $parsed=[guid]::Empty
         if (-not [guid]::TryParse($oid,[ref]$parsed) -or $parsed -eq [guid]::Empty -or [string]::IsNullOrWhiteSpace($smtp)) { throw "Recipient identity incomplete: $Upn" }
         $expected=V (V $P 'ExpectedIdentities' @{}) $Upn
-        if ($null -ne $expected -and ($oid -ne (V $expected 'ObjectId') -or $smtp -ne (V $expected 'PrimarySmtpAddress'))) { throw "Recipient identity changed since the pre-check: $Upn" }
+        if ($null -ne $expected -and (-not (SameIgnoreCase $oid (V $expected 'ObjectId')) -or -not (SameIgnoreCase $smtp (V $expected 'PrimarySmtpAddress')))) { throw "Recipient identity changed since the pre-check: $Upn" }
         $keys = @($Upn) + @(foreach ($key in @('UserPrincipalName','PrimarySmtpAddress','ExternalDirectoryObjectId','Guid','DistinguishedName','Identity','Alias','Name','DisplayName','Sid','SamAccountName')) {
             $val = [string](V $items[0] $key); if (-not [string]::IsNullOrWhiteSpace($val)) { $val }
         })
-        return @{ Found=$true; Type=$type; Keys=@($keys | Select-Object -Unique); ObjectId=$oid; PrimarySmtpAddress=$smtp }
+        $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        return @{ Found=$true; Type=$type; Keys=@($keys | Where-Object { $seenKeys.Add([string]$_) }); ObjectId=$oid; PrimarySmtpAddress=$smtp }
     }
     function Mailbox {
         param([string]$Upn,[switch]$Hold)
@@ -178,19 +195,19 @@ $script:PraExoWorker = {
     }
     function NormalizeAcl {
         param([object[]]$Entries,[string]$Right,$Target)
-        $field=if ($Right -eq 'FullAccess') { 'User' } else { 'Trustee' }
+        $field=if ((SameIgnoreCase $Right 'FullAccess')) { 'User' } else { 'Trustee' }
         foreach ($entry in $Entries) {
             foreach ($key in @('Identity',$field,'AccessRights','IsInherited')) {
                 if ($null -eq (V $entry $key)) { throw "$Right permission entry: field $key missing or null" }
             }
             $identity=[string](V $entry 'Identity'); $principal=[string](V $entry $field)
             $inherited=V $entry 'IsInherited'; $rawRights=V $entry 'AccessRights'; $rawRights=@($rawRights)
-            if ($identity -notin $Target.Keys -or [string]::IsNullOrWhiteSpace($principal) -or $inherited -isnot [bool] -or $rawRights.Count -eq 0) { throw "Unexpected $Right permission entry (format or identity)." }
+            if (-not (InSetIgnoreCase $identity $Target.Keys) -or [string]::IsNullOrWhiteSpace($principal) -or $inherited -isnot [bool] -or $rawRights.Count -eq 0) { throw "Unexpected $Right permission entry (format or identity)." }
             $rights=@(foreach ($access in $rawRights) {
                 if (($access -isnot [string] -and $access -isnot [enum]) -or [string]::IsNullOrWhiteSpace([string]$access)) { throw "Invalid $Right access right type." }
                 [string]$access
             })
-            if ($Right -eq 'FullAccess') {
+            if ((SameIgnoreCase $Right 'FullAccess')) {
                 $deny=V $entry 'Deny'
                 if ($deny -is [System.Management.Automation.SwitchParameter]) { $deny=$deny.IsPresent }
                 if ($deny -isnot [bool]) { throw 'Invalid FullAccess Deny value.' }
@@ -199,41 +216,50 @@ $script:PraExoWorker = {
                 $rawControl=V $entry 'AccessControlType'
                 if ($rawControl -isnot [string] -and $rawControl -isnot [enum]) { throw 'Invalid AccessControlType type.' }
                 $control=[string]$rawControl
-                if ($control -notin @('Allow','Deny')) { throw 'Invalid AccessControlType value.' }
+                if (-not (InSetIgnoreCase $control @('Allow','Deny'))) { throw 'Invalid AccessControlType value.' }
+                $control=if (SameIgnoreCase $control 'Deny') { 'Deny' } else { 'Allow' }
             }
-            if ($control -eq 'Deny' -and $Right -in $rights) { throw "A $Right Deny entry exists: grant refused." }
+            if ((SameIgnoreCase $control 'Deny') -and (InSetIgnoreCase $Right $rights)) { throw "A $Right Deny entry exists: grant refused." }
             [pscustomobject]@{ Identity=$identity; Principal=$principal; Rights=$rights; Control=$control; Inherited=$inherited }
         }
     }
     function AclKey {
         param($Entry)
-        return ($Entry.Principal+'|'+$Entry.Control+'|'+$Entry.Inherited+'|'+(($Entry.Rights | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object) -join ',')).ToLowerInvariant()
+        $sortedRights=[string[]]@($Entry.Rights | ForEach-Object { $_.ToLowerInvariant() })
+        [Array]::Sort($sortedRights,[StringComparer]::Ordinal)
+        return ($Entry.Principal+'|'+$Entry.Control+'|'+$Entry.Inherited+'|'+($sortedRights -join ',')).ToLowerInvariant()
     }
     function MissingFullAccess {
         param([System.Management.Automation.ErrorRecord]$Record,[string]$Trustee)
         $json=[regex]::Match($Record.Exception.Message,'(?s)\{\s*"error"\s*:\s*\{.*\}\s*\}')
         if (-not $json.Success) { return $false }
         try {
-            $payload=$json.Value | ConvertFrom-Json -ErrorAction Stop
-            $expected='No permissions were found for the user:'+$Trustee
-            return ($payload.error.code -ceq 'NotFound' -and $payload.error.message -ceq $expected -and
-                $payload.error.innererror.message -ceq $expected -and $payload.error.innererror.type -ceq 'Microsoft.Exchange.Admin.OData.Core.ODataServiceException')
+            $payload=$json.Value | ConvertFrom-Json -DateKind String -ErrorAction Stop
+            # The message prefix stays an exact (case-sensitive) match. The trustee echoed by Exchange Online is compared
+            # case-insensitively: the service may return the UPN or alias with another casing than the one requested.
+            $prefix='No permissions were found for the user:'
+            $messages=@([string]$payload.error.message,[string]$payload.error.innererror.message)
+            foreach ($message in $messages) {
+                if (-not $message.StartsWith($prefix,[StringComparison]::Ordinal) -or
+                    -not [string]::Equals($message.Substring($prefix.Length),$Trustee,[StringComparison]::OrdinalIgnoreCase)) { return $false }
+            }
+            return ((SameOrdinal $payload.error.code 'NotFound') -and (SameOrdinal $payload.error.innererror.type 'Microsoft.Exchange.Admin.OData.Core.ODataServiceException'))
         } catch { return $false }
     }
     function Permission {
         param([string]$Upn,[string]$Trustee,[string]$Right,$Recipient,$Target,[switch]$AllowPendingVisibility)
-        if ($Right -in @('FullAccess','SendAs')) {
-            $globalRaw=@(if ($Right -eq 'FullAccess') { Get-EXOMailboxPermission -Identity $Upn -ErrorAction Stop -WarningAction Stop }
+        if ((SameIgnoreCase $Right 'FullAccess') -or (SameIgnoreCase $Right 'SendAs')) {
+            $globalRaw=@(if ((SameIgnoreCase $Right 'FullAccess')) { Get-EXOMailboxPermission -Identity $Upn -ErrorAction Stop -WarningAction Stop }
                 else { Get-EXORecipientPermission -Identity $Upn -ErrorAction Stop -WarningAction Stop })
             if ($globalRaw.Count -eq 0 -or $globalRaw.Count -ge 1000) { throw "$Right permission list empty or possibly truncated." }
             $globalEntries=@(NormalizeAcl $globalRaw $Right $Target)
-            if (-not @($globalEntries | Where-Object { $_.Principal -in @('NT AUTHORITY\SELF','S-1-5-10') -and $Right -in $_.Rights -and -not $_.Inherited }).Count) { throw "$Right permission list without the expected SELF entry." }
-            $expectedEntries=@($globalEntries | Where-Object { $Right -in $_.Rights -and $_.Principal -in $Recipient.Keys })
+            if (-not @($globalEntries | Where-Object { (InSetIgnoreCase $_.Principal @('NT AUTHORITY\SELF','S-1-5-10')) -and (InSetIgnoreCase $Right $_.Rights) -and -not $_.Inherited }).Count) { throw "$Right permission list without the expected SELF entry." }
+            $expectedEntries=@($globalEntries | Where-Object { (InSetIgnoreCase $Right $_.Rights) -and (InSetIgnoreCase $_.Principal $Recipient.Keys) })
             # "No permissions were found" is the normal answer before a grant. It is read through -ErrorVariable,
             # not -ErrorAction Stop, so that Windows PowerShell does not write it as an error in the transcript.
             # Every error record is still checked: anything else than that exact answer stops, as before.
             $filteredErrors=$null
-            $filteredRaw=@(if ($Right -eq 'FullAccess') { Get-EXOMailboxPermission -Identity $Upn -User $Trustee -ErrorAction SilentlyContinue -ErrorVariable filteredErrors -WarningAction Stop }
+            $filteredRaw=@(if ((SameIgnoreCase $Right 'FullAccess')) { Get-EXOMailboxPermission -Identity $Upn -User $Trustee -ErrorAction SilentlyContinue -ErrorVariable filteredErrors -WarningAction Stop }
                 else { Get-EXORecipientPermission -Identity $Upn -Trustee $Trustee -ErrorAction Stop -WarningAction Stop })
             $filteredErrors=@($filteredErrors | Where-Object { $null -ne $_ })
             if ($filteredErrors.Count) {
@@ -244,15 +270,15 @@ $script:PraExoWorker = {
                 $filteredRaw=@()
             }
             $entries=@(NormalizeAcl $filteredRaw $Right $Target)
-            foreach ($entry in $entries) { if ($entry.Principal -notin $Recipient.Keys) { throw "Filtered $Right read inconsistent for $Trustee." } }
-            $actualEntries=@($entries | Where-Object { $Right -in $_.Rights })
-            $expected=@($expectedEntries | ForEach-Object { AclKey $_ } | Sort-Object)
-            $actual=@($actualEntries | ForEach-Object { AclKey $_ } | Sort-Object)
-            if (($expected | ConvertTo-Json -Compress) -cne ($actual | ConvertTo-Json -Compress)) {
+            foreach ($entry in $entries) { if (-not (InSetIgnoreCase $entry.Principal $Recipient.Keys)) { throw "Filtered $Right read inconsistent for $Trustee." } }
+            $actualEntries=@($entries | Where-Object { InSetIgnoreCase $Right $_.Rights })
+            $expected=[string[]]@($expectedEntries | ForEach-Object { AclKey $_ }); [Array]::Sort($expected,[StringComparer]::Ordinal)
+            $actual=[string[]]@($actualEntries | ForEach-Object { AclKey $_ }); [Array]::Sort($actual,[StringComparer]::Ordinal)
+            if (-not (SameOrdinal ($expected | ConvertTo-Json -Compress) ($actual | ConvertTo-Json -Compress))) {
                 if ($AllowPendingVisibility -and (($expected.Count -eq 0) -xor ($actual.Count -eq 0))) { return $false }
                 throw "Full and filtered $Right reads disagree for $Trustee."
             }
-            return (@($actualEntries | Where-Object { -not $_.Inherited -and $_.Control -eq 'Allow' }).Count -gt 0)
+            return (@($actualEntries | Where-Object { -not $_.Inherited -and (SameIgnoreCase $_.Control 'Allow') }).Count -gt 0)
         }
         $mb = @(Get-Mailbox -Filter (ExactFilter $Upn) -ResultSize Unlimited -ErrorAction Stop)
         if ($mb.Count -ne 1) { throw "Mailbox not unique for the SendOnBehalf read: $Upn" }
@@ -260,24 +286,26 @@ $script:PraExoWorker = {
         foreach ($delegate in $delegates) {
             if ($null -eq $delegate) { continue }
             $ids = @([string]$delegate, [string](V $delegate 'DistinguishedName'), [string](V $delegate 'ObjectGuid'))
-            if (@($ids | Where-Object { $_ -and $_ -in $Recipient.Keys }).Count) { return $true }
+            if (@($ids | Where-Object { $_ -and (InSetIgnoreCase $_ $Recipient.Keys) }).Count) { return $true }
             # Exchange Online can return an ADObjectId as a Name: exact resolution, an ambiguity stops.
             $name = ([string]$delegate).Replace("'","''")
             $resolved = @(Get-EXORecipient -Filter "Name -eq '$name'" -Properties Guid,DistinguishedName,ExternalDirectoryObjectId -ResultSize Unlimited -ErrorAction Stop)
             if ($resolved.Count -gt 1) { throw "SendOnBehalf delegate not unique: $delegate" }
             foreach ($r in $resolved) {
                 foreach ($key in @('Guid','DistinguishedName','ExternalDirectoryObjectId')) {
-                    $id = [string](V $r $key); if ($id -and $id -in $Recipient.Keys) { return $true }
+                    $id = [string](V $r $key); if ($id -and (InSetIgnoreCase $id $Recipient.Keys)) { return $true }
                 }
             }
         }
         return $false
     }
+    # The ValidateSet of the worker accepts any casing and, under ICU, names with an invisible character: only the exact names pass.
+    if (-not (InSet $Operation @('Probe','Preflight','Mailbox','Recipient','Hold','Permission','Grant'))) { throw 'Unknown Exchange Online operation.' }
     $binding=Session
-    if ($Operation -eq 'Probe') { [void]$binding.Remove('Command'); return @{ Connected=$true; Binding=$binding } }
+    if ((SameIgnoreCase $Operation 'Probe')) { [void]$binding.Remove('Command'); return @{ Connected=$true; Binding=$binding } }
     $SessionBinding=$binding
     $upn = [string](V $P 'Upn')
-    if ($Operation -eq 'Preflight') {
+    if ((SameIgnoreCase $Operation 'Preflight')) {
         $target=Recipient $upn
         if (-not $target.Found) { throw "Target not found in Exchange Online at the pre-check: $upn" }
         $identities=@{}; $identities[$upn]=$target
@@ -287,7 +315,7 @@ $script:PraExoWorker = {
             $null=Session $right
             $resolved=Recipient $trustee
             if (-not $resolved.Found) { throw "Trustee not found in Exchange Online at the pre-check: $trustee" }
-            if ($resolved.ObjectId -eq $target.ObjectId) { throw 'A mailbox cannot be delegated to itself.' }
+            if (SameIgnoreCase $resolved.ObjectId $target.ObjectId) { throw 'A mailbox cannot be delegated to itself.' }
             $identities[$trustee]=$resolved
         }
         return @{ Found=$true; Type=$target.Type; Identities=$identities }
@@ -298,27 +326,30 @@ $script:PraExoWorker = {
         'Hold' { return (Mailbox $upn -Hold) }
     }
     $trustee = [string](V $P 'Trustee'); $right = [string](V $P 'Right')
-    if ($right -notin @('FullAccess','SendAs','SendOnBehalf')) { throw 'Unknown permission.' }
-    if ($Operation -eq 'Grant') {
+    if (-not (InSetIgnoreCase $right @('FullAccess','SendAs','SendOnBehalf'))) { throw 'Unknown permission.' }
+    # From here on the right has its official spelling (the permit below is still compared with the right as it was requested).
+    $requestedRight = $right
+    $right = @('FullAccess','SendAs','SendOnBehalf') | Where-Object { SameIgnoreCase $_ $requestedRight } | Select-Object -First 1
+    if ((SameIgnoreCase $Operation 'Grant')) {
         foreach ($flag in @('AllowMutation','Approved','Authorized','JournalStarted')) {
             $b = V -Object $Permit -Name $flag -Default $false
             if ($b -isnot [bool] -or -not $b) { throw 'Exchange Online grant without its individual authorisation.' }
         }
-        if ((V $Permit 'Target') -cne $upn -or (V $Permit 'Trustee') -cne $trustee -or (V $Permit 'Right') -cne $right -or
-            (V $Permit 'Action') -ne 'Convert' -or (V $Permit 'Mode') -ne 'Apply' -or (V $Permit 'Phase') -notin @('Cloud','Both')) { throw 'Exchange Online authorisation does not match this grant.' }
-        if ((Mailbox $upn).Type -ne 'SharedMailbox') { throw 'Grant refused: SharedMailbox not confirmed.' }
+        if (-not (SameOrdinal (V $Permit 'Target') $upn) -or -not (SameOrdinal (V $Permit 'Trustee') $trustee) -or -not (SameOrdinal (V $Permit 'Right') $requestedRight) -or
+            -not (SameIgnoreCase (V $Permit 'Action') 'Convert') -or -not (SameIgnoreCase (V $Permit 'Mode') 'Apply') -or -not (InSetIgnoreCase (V $Permit 'Phase') @('Cloud','Both'))) { throw 'Exchange Online authorisation does not match this grant.' }
+        if (-not (SameIgnoreCase (Mailbox $upn).Type 'SharedMailbox')) { throw 'Grant refused: SharedMailbox not confirmed.' }
     }
     $rcpt = Recipient $trustee
     if (-not $rcpt.Found) {
-        if ($Operation -eq 'Grant') { throw "Trustee no longer in Exchange Online: $trustee" }
+        if ((SameIgnoreCase $Operation 'Grant')) { throw "Trustee no longer in Exchange Online: $trustee" }
         return @{ TrusteeFound=$false; Verified=$false; Mutated=$false }
     }
     $target=Recipient $upn
     if (-not $target.Found) { throw "Target not found in Exchange Online: $upn" }
-    if ($Operation -eq 'Grant' -and $target.Type -ne 'SharedMailbox') { throw 'Grant refused: SharedMailbox recipient not confirmed.' }
-    if ($target.ObjectId -eq $rcpt.ObjectId) { throw 'A mailbox cannot be delegated to itself.' }
+    if ((SameIgnoreCase $Operation 'Grant') -and -not (SameIgnoreCase $target.Type 'SharedMailbox')) { throw 'Grant refused: SharedMailbox recipient not confirmed.' }
+    if (SameIgnoreCase $target.ObjectId $rcpt.ObjectId) { throw 'A mailbox cannot be delegated to itself.' }
     $ok = Permission -Upn $upn -Trustee $trustee -Right $right -Recipient $rcpt -Target $target
-    if ($Operation -eq 'Permission' -or $ok) { return @{ TrusteeFound=$true; Verified=[bool]$ok; Mutated=$false } }
+    if ((SameIgnoreCase $Operation 'Permission') -or $ok) { return @{ TrusteeFound=$true; Verified=[bool]$ok; Mutated=$false } }
     $attempts=V $P 'GrantVerifyAttempts' 13; $delay=V $P 'GrantVerifyDelaySeconds' 10
     if (($attempts -isnot [int] -and $attempts -isnot [long]) -or $attempts -lt 1 -or $attempts -gt 60 -or
         ($delay -isnot [int] -and $delay -isnot [long]) -or $delay -lt 1 -or $delay -gt 30) { throw 'Invalid Exchange Online verification cadence (1..60 reads, 1..30 seconds).' }
@@ -336,12 +367,13 @@ $script:PraExoWorker = {
             $null=Session
             $currentTarget=Recipient $upn; $currentTrustee=Recipient $trustee
             foreach ($pair in @(@($target,$currentTarget),@($rcpt,$currentTrustee))) {
-                if (-not $pair[1].Found -or $pair[0].ObjectId -ne $pair[1].ObjectId -or $pair[0].PrimarySmtpAddress -ne $pair[1].PrimarySmtpAddress -or $pair[0].Type -ne $pair[1].Type) { throw 'Exchange Online identity changed during the verification.' }
+                if (-not $pair[1].Found -or -not (SameIgnoreCase $pair[0].ObjectId $pair[1].ObjectId) -or -not (SameIgnoreCase $pair[0].PrimarySmtpAddress $pair[1].PrimarySmtpAddress) -or -not (SameIgnoreCase $pair[0].Type $pair[1].Type)) { throw 'Exchange Online identity changed during the verification.' }
             }
-            if ((Mailbox $upn).Type -ne 'SharedMailbox') { throw 'SharedMailbox lost during the verification.' }
+            if (-not (SameIgnoreCase (Mailbox $upn).Type 'SharedMailbox')) { throw 'SharedMailbox lost during the verification.' }
             if (Permission -Upn $upn -Trustee $trustee -Right $right -Recipient $currentTrustee -Target $currentTarget -AllowPendingVisibility) {
                 return @{ TrusteeFound=$true; Verified=$true; Mutated=$true; Error='' }
             }
+            if ($OnProgress -is [scriptblock]) { $null=& $OnProgress $attempt $attempts $(if ($attempt -lt $attempts) { $delay } else { 0 }) }
             if ($attempt -lt $attempts) { Start-Sleep -Seconds $delay }
         }
         throw "$right added but not verified after $attempts reads: $upn / $trustee"
@@ -371,12 +403,38 @@ function Write-PraCloudError {
     $null = Write-PraLog -Context $Context -Message $Message -Level Warning
 }
 
+function Read-PraExoProgress {
+    <# New complete lines of the progress file of the child process (from Offset); each valid line is passed to Relay (attempt, max, next). Returns the new offset. #>
+    param([string]$Path,[long]$Offset,[scriptblock]$Relay)
+    if (-not [IO.File]::Exists($Path)) { return $Offset }
+    try {
+        $stream=New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+        try {
+            if ($stream.Length -le $Offset) { return $Offset }
+            [void]$stream.Seek($Offset,[IO.SeekOrigin]::Begin)
+            $bytes=New-Object byte[] ([int][Math]::Min(65536,$stream.Length-$Offset))
+            $count=$stream.Read($bytes,0,$bytes.Length)
+        } finally { $stream.Dispose() }
+        $text=(New-Object Text.UTF8Encoding($false)).GetString($bytes,0,$count)
+        $end=$text.LastIndexOf("`n",[StringComparison]::Ordinal)
+        if ($end -lt 0) { return $Offset }
+        foreach ($line in $text.Substring(0,$end).Split("`n")) {
+            try {
+                $entry=$line | ConvertFrom-PraJson
+                $null=& $Relay ([int](Get-PraValue $entry 'Attempt' 0)) ([int](Get-PraValue $entry 'Max' 0)) ([int](Get-PraValue $entry 'Next' 0))
+            } catch { $null=$_ }
+        }
+        return ($Offset+(New-Object Text.UTF8Encoding($false)).GetByteCount($text.Substring(0,$end+1)))
+    } catch { return $Offset }
+}
+
 function Invoke-PraExoSubprocess {
-    param([hashtable]$Context,[string]$Operation,[hashtable]$Params,$Permit,$OnApplied)
+    param([hashtable]$Context,[string]$Operation,[hashtable]$Params,$Permit,$OnApplied,$OnProgress)
     $cloud = Get-PraValue $Context.Config 'Cloud' @{}
     $id = [guid]::NewGuid().ToString('N')
     $appliedPath=Join-Path ([IO.Path]::GetTempPath()) ('praexo_'+$id+'.applied.json')
-    $request = @{ Protocol=1; Id=$id; Operation=$Operation; Params=$Params; Permit=$Permit; AppliedPath=$appliedPath
+    $progressPath=Join-Path ([IO.Path]::GetTempPath()) ('praexo_'+$id+'.progress.jsonl')
+    $request = @{ Protocol=1; Id=$id; Operation=$Operation; Params=$Params; Permit=$Permit; AppliedPath=$appliedPath; ProgressPath=$progressPath
         TenantId=(Get-PraValue $cloud 'TenantId' ''); DisableWAM=(Get-PraValue (Get-PraValue $Context.Config 'Exo' @{}) 'DisableWAM' $false)
         AppId=(Get-PraValue $cloud 'AppId' ''); Thumb=(Get-PraValue $cloud 'CertificateThumbprint' ''); Org=(Get-PraValue $cloud 'Organization' '') }
     $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($request | ConvertTo-Json -Depth 12 -Compress)))
@@ -385,10 +443,15 @@ $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $ProgressPreference='SilentlyContinue'
+# The parent accepts ONE line of JSON on stdout and nothing on stderr. A module warning (ExchangeOnlineManagement prints
+# update and deprecation notices) or an information record must not reach those streams. Errors are NOT silenced:
+# $ErrorActionPreference='Stop' turns them into the JSON failure, and the worker's own -WarningAction Stop calls
+# (explicit on the cmdlet) still turn a warning raised by a cmdlet of the worker into a failure (fail closed).
+$WarningPreference='SilentlyContinue'; $InformationPreference='SilentlyContinue'
 $cfg=$null; $data=$null; $failure=''; $attempted=$false; $ownedIds=@()
 try {
-    $cfg = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__REQUEST__')) | ConvertFrom-Json -ErrorAction Stop
-    if ($cfg.Protocol -ne 1 -or $cfg.Id -notmatch '^[a-f0-9]{32}$') { throw 'Invalid Exchange Online request.' }
+    $cfg = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__REQUEST__')) | ConvertFrom-Json -DateKind String -ErrorAction Stop
+    if ($cfg.Protocol -ne 1 -or $cfg.Id -notmatch '^[a-f0-9]{32}\z') { throw 'Invalid Exchange Online request.' }
     Import-Module ExchangeOnlineManagement -ErrorAction Stop
     if (@(Get-ConnectionInformation -ErrorAction Stop).Count) { throw 'The Exchange Online child process is not clean.' }
     $connect=@{ AppId=$cfg.AppId; CertificateThumbprint=$cfg.Thumb; Organization=$cfg.Org; ShowBanner=$false; ErrorAction='Stop' }
@@ -397,7 +460,7 @@ try {
         $connect.DisableWAM=$true
     }
     $attempted=$true
-    try { Connect-ExchangeOnline @connect | Out-Null }
+    try { Connect-ExchangeOnline @connect -WarningAction SilentlyContinue -InformationAction SilentlyContinue 6>$null 3>$null | Out-Null }
     finally { $ownedIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId }) }
     $worker = {
 __WORKER__
@@ -408,7 +471,12 @@ __WORKER__
         $stream=New-Object IO.FileStream($cfg.AppliedPath,[IO.FileMode]::CreateNew,[IO.FileAccess]::Write,[IO.FileShare]::None)
         try { $bytes=[Text.Encoding]::UTF8.GetBytes($text); $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
     }
-    $results = @(& $worker $cfg.Operation $cfg.Params $cfg.Permit $probe.Binding $onApplied)
+    $onProgress={
+        param($attempt,$max,$next)
+        $line=(@{ Attempt=[int]$attempt; Max=[int]$max; Next=[int]$next } | ConvertTo-Json -Compress)+"`n"
+        [IO.File]::AppendAllText($cfg.ProgressPath,$line,(New-Object Text.UTF8Encoding($false)))
+    }
+    $results = @(& $worker $cfg.Operation $cfg.Params $cfg.Permit $probe.Binding $onApplied $onProgress)
     if ($results.Count -ne 1) { throw 'Exchange Online result not unique.' }
     $data=$results[0]
 } catch { $failure=$_.Exception.Message }
@@ -424,7 +492,7 @@ finally {
     }
 }
 $correlation = if ($null -ne $cfg) { $cfg.Id } else { '' }
-[Console]::Out.WriteLine(([ordered]@{ Protocol=1; Id=$correlation; Ok=($failure -eq ''); Data=$data; Error=$failure } | ConvertTo-Json -Depth 12 -Compress))
+[Console]::Out.WriteLine(([ordered]@{ Protocol=1; Id=$correlation; Ok=($failure.Length -eq 0); Data=$data; Error=$failure } | ConvertTo-Json -Depth 12 -Compress))
 if ($failure) { exit 1 }; exit 0
 '@
     $child = $child.Replace('__REQUEST__',$b64).Replace('__WORKER__',$script:PraExoWorker.ToString())
@@ -432,7 +500,8 @@ if ($failure) { exit 1 }; exit 0
     $process = $null; $started=$false
     try {
         [IO.File]::WriteAllText($tmp,$child,(New-Object Text.UTF8Encoding($true)))
-        $exe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $exe = Join-Path $PSHOME 'pwsh.exe'
+        if (-not [IO.File]::Exists($exe)) { throw 'PowerShell 7 (pwsh.exe) is not available for the Exchange Online child process.' }
         $si = New-Object Diagnostics.ProcessStartInfo
         $si.FileName=$exe; $si.Arguments='-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "'+$tmp+'"'
         $si.UseShellExecute=$false; $si.CreateNoWindow=$true; $si.RedirectStandardOutput=$true; $si.RedirectStandardError=$true
@@ -442,16 +511,22 @@ if ($failure) { exit 1 }; exit 0
         if (-not $started) { throw 'The Exchange Online child process cannot start.' }
         $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
         $wait = [int][Math]::Min(2147483647,([Math]::Max(1,[int]$Context.TimeoutMinutes)*60000.0))
-        $timedOut = -not $process.WaitForExit($wait)
-        if ($timedOut) { $process.Kill(); $process.WaitForExit() }
+        # The wait is a loop: every second the progress lines the child appended (one per verification read) are relayed to the window.
+        $waitClock=[Diagnostics.Stopwatch]::StartNew(); $progressOffset=[long]0; $timedOut=$false
+        while ($true) {
+            if ($process.WaitForExit(1000)) { break }
+            if ($waitClock.ElapsedMilliseconds -ge $wait) { $timedOut=$true; $process.Kill(); $process.WaitForExit(); break }
+            if ($OnProgress -is [scriptblock]) { $progressOffset=Read-PraExoProgress -Path $progressPath -Offset $progressOffset -Relay $OnProgress }
+        }
+        if ($OnProgress -is [scriptblock]) { $progressOffset=Read-PraExoProgress -Path $progressPath -Offset $progressOffset -Relay $OnProgress }
         $out = $stdout.GetAwaiter().GetResult().Trim(); $err = $stderr.GetAwaiter().GetResult().Trim()
         if ($timedOut) { throw "Exchange Online timeout; write state unknown. stderr=[$err], stdout=[$out]" }
         if ($process.ExitCode -ne 0 -or $err) { throw "Exchange Online child process code=$($process.ExitCode), stderr=[$err], stdout=[$out]" }
-        if (-not $out.StartsWith('{') -or -not $out.EndsWith('}') -or $out -match '[\r\n]') { throw 'Exchange Online child output is not the expected one-line JSON.' }
-        $res = $out | ConvertFrom-Json -ErrorAction Stop
+        if (-not $out.StartsWith('{',[StringComparison]::Ordinal) -or -not $out.EndsWith('}',[StringComparison]::Ordinal) -or $out -match '[\r\n]') { throw 'Exchange Online child output is not the expected one-line JSON.' }
+        $res = $out | ConvertFrom-PraJson
         if (@($res.PSObject.Properties.Name).Count -ne 5 -or (Get-PraValue $res 'Protocol' 0) -ne 1 -or
-            (Get-PraValue $res 'Id' '') -cne $id -or (Get-PraValue $res 'Ok' $false) -isnot [bool] -or
-            (Get-PraValue $res 'Ok' $false) -ne $true -or (Get-PraValue $res 'Error' 'invalid') -ne '') { throw 'Exchange Online child result invalid or failed.' }
+            -not (Test-PraOrdinalEqual (Get-PraValue $res 'Id' '') $id) -or (Get-PraValue $res 'Ok' $false) -isnot [bool] -or
+            (Get-PraValue $res 'Ok' $false) -ne $true -or -not (Test-PraOrdinalEqual (Get-PraValue $res 'Error' 'invalid') '')) { throw 'Exchange Online child result invalid or failed.' }
         $data = Get-PraValue $res 'Data' $null
         if ($null -eq $data) { throw 'Exchange Online result missing.' }
         return $data
@@ -465,39 +540,38 @@ if ($failure) { exit 1 }; exit 0
             try {
                 # Child's durable Applied receipt survives timeout/protocol/verification failures.
                 if ([IO.File]::Exists($appliedPath)) {
-                    $receipt=[IO.File]::ReadAllText($appliedPath) | ConvertFrom-Json -ErrorAction Stop
-                    if ($Operation -ne 'Grant' -or $receipt.Protocol -ne 1 -or $receipt.Id -cne $id -or $receipt.Status -cne 'Applied' -or
-                        $receipt.Target -cne $Params.Upn -or $receipt.Trustee -cne $Params.Trustee -or $receipt.Right -cne $Params.Right -or $OnApplied -isnot [scriptblock]) { throw 'Invalid Applied receipt from the Exchange Online child process.' }
+                    $receipt=[IO.File]::ReadAllText($appliedPath) | ConvertFrom-PraJson
+                    if ((-not (Test-PraOrdinalIgnoreCaseEqual $Operation 'Grant')) -or $receipt.Protocol -ne 1 -or -not (Test-PraOrdinalEqual $receipt.Id $id) -or -not (Test-PraOrdinalEqual $receipt.Status 'Applied') -or
+                        -not (Test-PraOrdinalEqual $receipt.Target $Params.Upn) -or -not (Test-PraOrdinalEqual $receipt.Trustee $Params.Trustee) -or -not (Test-PraOrdinalEqual $receipt.Right $Params.Right) -or $OnApplied -isnot [scriptblock]) { throw 'Invalid Applied receipt from the Exchange Online child process.' }
                     $null=& $OnApplied
                     [IO.File]::Delete($appliedPath)
                 }
-            } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
+            } finally { foreach ($leftover in @($tmp,$progressPath)) { if ([IO.File]::Exists($leftover)) { [IO.File]::Delete($leftover) } } }
         }
     }
 }
 
 function Invoke-PraExo {
-    param([hashtable]$Context,[ValidateSet('Probe','Preflight','Mailbox','Recipient','Hold','Permission','Grant')][string]$Operation,[hashtable]$Params=@{},$Permit=$null,$OnApplied=$null)
+    param([hashtable]$Context,[ValidateSet('Probe','Preflight','Mailbox','Recipient','Hold','Permission','Grant')][string]$Operation,[hashtable]$Params=@{},$Permit=$null,$OnApplied=$null,$OnProgress=$null)
     $session = Get-PraCloudSession $Context
     if (-not $session.Exo) { throw 'Exchange Online connection required but not available.' }
-    if (-not $session.Subprocess -and [string](Get-PraValue (Get-PraValue $session 'Binding' $null) 'TenantId' '') -ne
-        [string](Get-PraValue (Get-PraValue $Context.Config 'Cloud' @{}) 'TenantId' '')) { throw 'Exchange Online tenant of the session differs from Cloud.TenantId.' }
-    if ($Operation -eq 'Grant' -and ($null -eq $Permit -or $Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or
-        $Context.Mode -ne 'Apply' -or $Context.Action -ne 'Convert' -or $Context.Phase -notin @('Cloud','Both') -or $WhatIfPreference)) { throw 'Grant without an active write authorisation.' }
+    if (-not $session.Subprocess -and -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue (Get-PraValue $session 'Binding' $null) 'TenantId' '')) ([string](Get-PraValue (Get-PraValue $Context.Config 'Cloud' @{}) 'TenantId' '')))) { throw 'Exchange Online tenant of the session differs from Cloud.TenantId.' }
+    if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Grant') -and ($null -eq $Permit -or $Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or
+        -not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or -not (Test-PraOrdinalEqual $Context.Action 'Convert') -or -not (Test-PraOrdinalIn $Context.Phase @('Cloud','Both')) -or $WhatIfPreference)) { throw 'Grant without an active write authorisation.' }
     $Params=$Params.Clone()
     $Params.ExpectedIdentities=Get-PraValue $session 'Identities' @{}
-    if ($Operation -eq 'Grant') {
+    if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Grant')) {
         $exo=Get-PraValue $Context.Config 'Exo' @{}
         $Params.GrantVerifyAttempts=Get-PraValue $exo 'GrantVerifyAttempts' 13
         $Params.GrantVerifyDelaySeconds=Get-PraValue $exo 'GrantVerifyDelaySeconds' 10
     }
-    $results = @(if ($session.Subprocess) { Invoke-PraExoSubprocess -Context $Context -Operation $Operation -Params $Params -Permit $Permit -OnApplied $OnApplied }
-        else { & $script:PraExoWorker $Operation $Params $Permit (Get-PraValue $session 'Binding' $null) $OnApplied })
+    $results = @(if ($session.Subprocess) { Invoke-PraExoSubprocess -Context $Context -Operation $Operation -Params $Params -Permit $Permit -OnApplied $OnApplied -OnProgress $OnProgress }
+        else { & $script:PraExoWorker $Operation $Params $Permit (Get-PraValue $session 'Binding' $null) $OnApplied $OnProgress })
     if ($results.Count -ne 1) { throw 'Exchange Online result not unique.' }
     $result=$results[0]
     $booleans=switch ($Operation) { 'Probe' { 'Connected' }; 'Permission' { 'TrusteeFound'; 'Verified' }; 'Grant' { 'TrusteeFound'; 'Verified'; 'Mutated' }; default { 'Found' } }
     foreach ($key in $booleans) { if ((Get-PraValue $result $key $null) -isnot [bool]) { throw "Invalid Exchange Online result: $key must be a boolean." } }
-    if ($Operation -in @('Mailbox','Recipient','Hold') -and (Get-PraValue $result 'Found' $false) -and -not [string](Get-PraValue $result 'Type' '')) { throw 'Exchange Online result without type.' }
+    if ((Test-PraOrdinalIn $Operation @('Mailbox','Recipient','Hold')) -and (Get-PraValue $result 'Found' $false) -and -not [string](Get-PraValue $result 'Type' '')) { throw 'Exchange Online result without type.' }
     return $result
 }
 
@@ -516,7 +590,7 @@ function Connect-PraCloudSession {
         $Context.CurrentOperation='Connect-MgGraph'
         Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
         Import-Module Microsoft.Graph.Users -ErrorAction Stop
-        if ($null -ne (Get-MgContext -ErrorAction Stop)) { throw 'A Microsoft Graph session already exists in this console: run the tool in a new Windows PowerShell window.' }
+        if ($null -ne (Get-MgContext -ErrorAction Stop)) { throw 'A Microsoft Graph session already exists in this console: run the tool in a new PowerShell 7 window.' }
         $connect=@{ TenantId=$tenant; ContextScope='Process'; NoWelcome=$true; ErrorAction='Stop' }
         if ($app) { $connect.ClientId=$app; $connect.CertificateThumbprint=$thumb } else { $connect.Scopes=@('User.Read.All') }
         $s.GraphAttempted=$true
@@ -524,7 +598,7 @@ function Connect-PraCloudSession {
         catch {
             # Typical when Exchange Online was used earlier in the same console: its assemblies stay loaded.
             if ($_.Exception.Message -match 'does not have an implementation|Could not load (type|file or assembly)|Method not found') {
-                throw ('Microsoft Graph cannot load in this console (assembly conflict, usually because Exchange Online was used earlier in the same window): run the tool in a new Windows PowerShell window. Detail: '+$_.Exception.Message)
+                throw ('Microsoft Graph cannot load in this console (assembly conflict, usually because Exchange Online was used earlier in the same window): run the tool in a new PowerShell 7 window. Detail: '+$_.Exception.Message)
             }
             throw
         }
@@ -547,7 +621,7 @@ function Connect-PraCloudSession {
             if ((Get-PraValue $probe 'Connected' $false) -ne $true) { throw 'Exchange Online child process connection not confirmed.' }
         } else {
             Import-Module ExchangeOnlineManagement -MinimumVersion $min -ErrorAction Stop
-            if (@(Get-ConnectionInformation -ErrorAction Stop).Count) { throw 'An Exchange Online session already exists in this console: run the tool in a new Windows PowerShell window (nothing was signed out).' }
+            if (@(Get-ConnectionInformation -ErrorAction Stop).Count) { throw 'An Exchange Online session already exists in this console: run the tool in a new PowerShell 7 window (nothing was signed out).' }
             if (-not (Get-Command Disconnect-ExchangeOnline -ErrorAction Stop).Parameters.ContainsKey('ConnectionId')) { throw 'This ExchangeOnlineManagement cannot sign out one connection (ConnectionId): update the module.' }
             $connect=@{ ShowBanner=$false; ErrorAction='Stop' }
             if ($app) { $connect.AppId=$app; $connect.CertificateThumbprint=$thumb; $connect.Organization=Get-PraValue $cloud 'Organization' '' }
@@ -578,10 +652,10 @@ function Assert-PraGraphSession {
     param([hashtable]$Context)
     $s=Get-PraCloudSession $Context; $current=Get-MgContext -ErrorAction Stop
     $tenant=[string](Get-PraValue (Get-PraValue $Context.Config 'Cloud' @{}) 'TenantId' '')
-    if ($null -eq $current -or [string](Get-PraValue $current 'TenantId' '') -ne $tenant -or
-        [string](Get-PraValue $current 'ContextScope' '') -ne 'Process') { throw 'Microsoft Graph session missing, on another tenant or not limited to this process.' }
+    if ($null -eq $current -or -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $current 'TenantId' '')) $tenant) -or
+        -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $current 'ContextScope' '')) 'Process')) { throw 'Microsoft Graph session missing, on another tenant or not limited to this process.' }
     foreach ($key in @('TenantId','ClientId','Account','AuthType','ContextScope')) {
-        if ([string](Get-PraValue $current $key '') -cne [string](Get-PraValue $s.GraphContext $key '')) { throw 'The Microsoft Graph session changed.' }
+        if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $current $key '')) ([string](Get-PraValue $s.GraphContext $key '')))) { throw 'The Microsoft Graph session changed.' }
     }
 }
 
@@ -601,7 +675,7 @@ function Close-PraCloudSession {
             $ownedIds=Get-PraValue $s 'OwnedExoIds' @()
             foreach ($id in @($ownedIds)) {
                 if (-not $id) { throw 'Own connection ID missing: a global sign-out is not allowed.' }
-                if ($id -in $currentIds) { Disconnect-ExchangeOnline -ConnectionId $id -Confirm:$false -ErrorAction Stop 6>$null | Out-Null }
+                if (Test-PraOrdinalIgnoreCaseIn $id $currentIds) { Disconnect-ExchangeOnline -ConnectionId $id -Confirm:$false -ErrorAction Stop 6>$null | Out-Null }
             }
             $s.ExoAttempted=$false; $s.Exo=$false
         }
@@ -613,7 +687,7 @@ function Close-PraCloudSession {
             if ($null -ne $current) {
                 if ($null -eq (Get-PraValue $s 'GraphContext' $null)) { throw 'The Microsoft Graph session was not opened by the tool: not signed out.' }
                 foreach ($key in @('TenantId','ClientId','Account','AuthType','ContextScope')) {
-                    if ([string](Get-PraValue $current $key '') -cne [string](Get-PraValue $s.GraphContext $key '')) { throw 'The Microsoft Graph session was replaced: not signed out.' }
+                    if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $current $key '')) ([string](Get-PraValue $s.GraphContext $key '')))) { throw 'The Microsoft Graph session was replaced: not signed out.' }
                 }
                 Disconnect-MgGraph -ErrorAction Stop | Out-Null
             }
@@ -635,9 +709,9 @@ function Get-PraPermissionRequest {
     $cfg = Get-PraValue $Context.Config 'SharedMailbox' @{}
     if (-not [bool](Get-PraValue $cfg 'Enabled' $false)) { return }
     foreach ($right in @('FullAccess','SendAs','SendOnBehalf')) {
-        if ($right -ne 'SendOnBehalf' -and (Get-PraValue $cfg 'PermissionSource' 'None') -eq 'None') { continue }
+        if ((-not (Test-PraOrdinalIgnoreCaseEqual $right 'SendOnBehalf')) -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $cfg 'PermissionSource' 'None') 'None')) { continue }
         if ([bool](Get-PraValue $cfg ('Grant'+$right) $false)) {
-            foreach ($u in @((Get-PraValue $Row ('Shared'+$right) @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)) {
+            foreach ($u in @((Get-PraValue $Row ('Shared'+$right) @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Get-PraOrdinalUnique -IgnoreCase)) {
                 [pscustomobject]@{ Right=$right; Trustee=[string]$u }
             }
         }
@@ -653,23 +727,26 @@ function Initialize-PraCloudPreflight {
     param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
     $Context.CurrentPhase='CloudPreflight'; $Context.CurrentOperation='Prepare'; $Context.CurrentIdentity=''
     try {
-        if ($Context.Action -ne 'Convert' -or $Context.Mode -ne 'Apply' -or $Context.Phase -ne 'Both' -or
-            $Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or $WhatIfPreference) { throw 'The pre-check is only for Convert, Apply, phase Both.' }
-        if ($Context.CloudCheckScope -notin @('Both','MailboxOnly','LicenseOnly')) { throw 'Invalid CloudCheckScope.' }
+        if (-not (Test-PraOrdinalIn $Context.Action @('Convert','Recover')) -or -not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or -not (Test-PraOrdinalEqual $Context.Phase 'Both') -or
+            $Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or $WhatIfPreference) { throw 'The pre-check is only for Convert or Recover, Apply, phase Both.' }
+        # Recover mirrors the checks its cloud phase will make (mailbox gone, licence removed), so it needs the same
+        # sessions; it has no trustees to resolve and does not pin identities (a deprovisioned user becomes a MailUser).
+        $isRecover=(Test-PraOrdinalEqual $Context.Action 'Recover')
         $cloud=Get-PraValue $Context.Config 'Cloud' @{}; $exo=Get-PraValue $Context.Config 'Exo' @{}
         foreach ($key in @('CheckMailbox','CheckLicense')) { if ((Get-PraValue $cloud $key $false) -isnot [bool]) { throw "Cloud.$key must be `$true or `$false." } }
         foreach ($key in @('UseSubprocess','DisableWAM')) { if ((Get-PraValue $exo $key $false) -isnot [bool]) { throw "Exo.$key must be `$true or `$false." } }
         $attempts=Get-PraValue $exo 'GrantVerifyAttempts' 13; $delay=Get-PraValue $exo 'GrantVerifyDelaySeconds' 10
         if (($attempts -isnot [int] -and $attempts -isnot [long]) -or $attempts -lt 1 -or $attempts -gt 60 -or
             ($delay -isnot [int] -and $delay -isnot [long]) -or $delay -lt 1 -or $delay -gt 30) { throw 'Invalid Exchange Online verification cadence.' }
-        $via=[string](Get-PraValue $cloud 'MailboxCheckVia' 'Graph')
-        if ($via -notin @('Graph','Exo')) { throw 'Invalid Cloud.MailboxCheckVia.' }
+        $via=[string](Get-PraValue $cloud 'MailboxCheckVia' 'Exo')
+        if (-not (Test-PraOrdinalIgnoreCaseIn $via @('Graph','Exo'))) { throw 'Invalid Cloud.MailboxCheckVia.' }
+        $via=if (Test-PraOrdinalIgnoreCaseEqual $via 'Graph') { 'Graph' } else { 'Exo' }
         $needGraph=$false
         foreach ($row in $Rows) {
-            if ((Get-PraValue $row 'IsShared' $false) -isnot [bool] -or (Get-PraValue $row 'FinalStatus' '') -eq 'Error') { throw 'Invalid or failed row at the pre-check.' }
+            if ((Get-PraValue $row 'IsShared' $false) -isnot [bool] -or (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $row 'FinalStatus' '') 'Error')) { throw 'Invalid or failed row at the pre-check.' }
             $shared=[bool](Get-PraValue $row 'IsShared' $false)
-            if (-not $shared -and (($Context.CloudCheckScope -ne 'MailboxOnly' -and (Get-PraValue $cloud 'CheckLicense' $false)) -or
-                ($Context.CloudCheckScope -ne 'LicenseOnly' -and (Get-PraValue $cloud 'CheckMailbox' $false) -and $via -eq 'Graph'))) { $needGraph=$true }
+            $mailboxCheck=($isRecover -or [bool](Get-PraValue $cloud 'CheckMailbox' $false))
+            if (-not $shared -and ([bool](Get-PraValue $cloud 'CheckLicense' $false) -or ($mailboxCheck -and (Test-PraOrdinalIgnoreCaseEqual $via 'Graph')))) { $needGraph=$true }
         }
         # EXO resolves each target even while it is still a MailUser; no provisioning assertion here.
         Connect-PraCloudSession -Context $Context -NeedGraph $needGraph -NeedExo ($Rows.Count -gt 0)
@@ -677,27 +754,28 @@ function Initialize-PraCloudPreflight {
         foreach ($row in $Rows) {
             $upn=[string](Get-PraValue $row 'UserPrincipalName' '')
             $Context.CurrentIdentity=$upn; $Context.CurrentOperation='ResolvePreflightIdentity'
-            $requests=@(Get-PraPermissionRequest $Context $row)
+            $requests=if ($isRecover) { @() } else { @(Get-PraPermissionRequest $Context $row) }
             $result=Invoke-PraExo -Context $Context -Operation Preflight -Params @{ Upn=$upn; Requests=$requests }
             $identities=Get-PraValue $result 'Identities' @{}
             $names=if ($identities -is [System.Collections.IDictionary]) { @($identities.Keys) } else { @($identities.PSObject.Properties.Name) }
             foreach ($name in $names) {
+                if ($isRecover) { continue }
                 $identity=Get-PraValue $identities $name $null
                 $previous=Get-PraValue $session.Identities $name $null
-                if ($null -ne $previous -and ((Get-PraValue $previous 'ObjectId') -ne (Get-PraValue $identity 'ObjectId') -or
-                    (Get-PraValue $previous 'PrimarySmtpAddress') -ne (Get-PraValue $identity 'PrimarySmtpAddress'))) { throw 'Contradictory identities at the pre-check.' }
+                if ($null -ne $previous -and (-not (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $previous 'ObjectId') (Get-PraValue $identity 'ObjectId')) -or
+                    -not (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $previous 'PrimarySmtpAddress') (Get-PraValue $identity 'PrimarySmtpAddress')))) { throw 'Contradictory identities at the pre-check.' }
                 $session.Identities[$name]=$identity
             }
             if ($needGraph -and -not [bool](Get-PraValue $row 'IsShared' $false)) {
                 Assert-PraGraphSession $Context
                 $users=@(Get-MgUser -UserId $upn -Property Id,UserPrincipalName -ErrorAction Stop)
-                $target=Get-PraValue $session.Identities $upn $null
-                if ($users.Count -ne 1 -or [string](Get-PraValue $users[0] 'Id' '') -ne [string](Get-PraValue $target 'ObjectId' '') -or
-                    [string](Get-PraValue $users[0] 'UserPrincipalName' '') -ne $upn) { throw "Graph and Exchange Online identities differ at the pre-check: $upn" }
+                $target=Get-PraValue $identities $upn $null
+                if ($users.Count -ne 1 -or -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $users[0] 'Id' '')) ([string](Get-PraValue $target 'ObjectId' ''))) -or
+                    -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $users[0] 'UserPrincipalName' '')) $upn)) { throw "Graph and Exchange Online identities differ at the pre-check: $upn" }
             }
         }
         $session.Preflight=$true; $Context.CloudConnectFailed=$false
-        $null=Write-PraLog -Context $Context -Message ('Pre-check passed: {0} target(s) and their trustees resolved in Exchange Online (read only)' -f $Rows.Count) -Level Success
+        $null=Write-PraLog -Context $Context -Message $(if ($isRecover) { 'Pre-check passed: {0} target(s) resolved in Exchange Online (read only)' -f $Rows.Count } else { 'Pre-check passed: {0} target(s) and their trustees resolved in Exchange Online (read only)' -f $Rows.Count }) -Level Success
     } catch {
         $failure=$_.Exception.Message; $Context.CloudConnectFailed=$true
         try { Close-PraCloudSession -Context $Context } catch { $failure+=' | sign-out after the pre-check: '+$_.Exception.Message }
@@ -707,8 +785,8 @@ function Initialize-PraCloudPreflight {
 
 function Invoke-PraPermissionGrant {
     param([hashtable]$Context,$Row,[hashtable]$Params)
-    if ($Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or $Context.Mode -ne 'Apply' -or
-        $Context.Action -ne 'Convert' -or $Context.Phase -notin @('Cloud','Both') -or $WhatIfPreference) { throw 'Permission missing and writes are not allowed in this mode.' }
+    if ($Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or -not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or
+        -not (Test-PraOrdinalEqual $Context.Action 'Convert') -or -not (Test-PraOrdinalIn $Context.Phase @('Cloud','Both')) -or $WhatIfPreference) { throw 'Permission missing and writes are not allowed in this mode.' }
     $adVerified=Get-PraValue $Row 'ADVerified' $false
     if ($adVerified -isnot [bool] -or -not $adVerified) { throw 'Grant refused: a verified AD proof is required.' }
     foreach ($name in @('Approval','AssertCloudAuthorization','JournalMutation')) {
@@ -721,7 +799,7 @@ function Invoke-PraPermissionGrant {
     $proof = @(& $Context.AssertCloudAuthorization $Row)
     if ($proof.Count -gt 1 -or ($proof.Count -eq 1 -and ($proof[0] -isnot [bool] -or -not $proof[0]))) { throw 'Backup/AD proof refused or ambiguous.' }
     # The callbacks cannot re-open a forbidden mode before the call.
-    if (-not $Context.AllowMutation -or $Context.Mode -ne 'Apply' -or $Context.Action -ne 'Convert' -or $WhatIfPreference) { throw 'Authorisation revoked.' }
+    if (-not $Context.AllowMutation -or -not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or -not (Test-PraOrdinalEqual $Context.Action 'Convert') -or $WhatIfPreference) { throw 'Authorisation revoked.' }
     $detail="UPN=$target; Trustee=$($Params.Trustee); Right=$($Params.Right); ObjectGuid=$($Context.CurrentIdentity)"
     $Row.LastOperation=$operation
     $null = & $Context.JournalMutation $target $operation 'Started' $detail
@@ -729,7 +807,12 @@ function Invoke-PraPermissionGrant {
         Trustee=$Params.Trustee; Right=$Params.Right; Action=$Context.Action; Mode=$Context.Mode; Phase=$Context.Phase }
     try {
         $onApplied={ $null=& $Context.JournalMutation $target $operation 'Applied' ($detail+'; Add returned; verification pending') }.GetNewClosure()
-        $res = Invoke-PraExo -Context $Context -Operation 'Grant' -Params $Params -Permit $permit -OnApplied $onApplied
+        $exoSettings=Get-PraValue $Context.Config 'Exo' @{}
+        $verifyAttempts=[int](Get-PraValue $exoSettings 'GrantVerifyAttempts' 13); $verifyDelay=[int](Get-PraValue $exoSettings 'GrantVerifyDelaySeconds' 10)
+        Write-PraProgress -Context $Context -Text ("Granting {0} to {1} on {2}: the change is verified up to {3} times, {4} s apart" -f $Params.Right,$Params.Trustee,$target,$verifyAttempts,$verifyDelay) -Attempt 0 -MaxAttempts $verifyAttempts -NextInSeconds $verifyDelay
+        $grantText="Verifying {0} for {1} on {2}" -f $Params.Right,$Params.Trustee,$target
+        $onProgress={ param($attempt,$max,$next) Write-PraProgress -Context $Context -Text $grantText -Attempt $attempt -MaxAttempts $max -NextInSeconds $next }.GetNewClosure()
+        $res = Invoke-PraExo -Context $Context -Operation 'Grant' -Params $Params -Permit $permit -OnApplied $onApplied -OnProgress $onProgress
         $verified=Get-PraValue $res 'Verified' $false
         if ($verified -isnot [bool] -or -not $verified) { throw ([string](Get-PraValue $res 'Error' 'Permission re-read not confirmed.')) }
         $null = & $Context.JournalMutation $target $operation 'Verified' ($detail+'; Mutated='+(Get-PraValue $res 'Mutated' $false))
@@ -756,7 +839,7 @@ function Invoke-PraSharedPermission {
     $Row.PermMissing=@(); $verified=0; $toGrant=0; $missing=New-Object 'System.Collections.Generic.List[string]'
     $cfg=Get-PraValue $Context.Config 'SharedMailbox' @{}
     $upn=[string](Get-PraValue $Row 'UserPrincipalName' '')
-    $preview=($Context.Action -eq 'Convert' -and ($Context.Mode -ne 'Apply' -or -not $Context.AllowMutation -or $WhatIfPreference))
+    $preview=((Test-PraOrdinalEqual $Context.Action 'Convert') -and (-not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or -not $Context.AllowMutation -or $WhatIfPreference))
     foreach ($request in $Requests) {
         $p=@{ Upn=$upn; Trustee=$request.Trustee; Right=$request.Right; AutoMapping=[bool](Get-PraValue $cfg 'AutoMapping' $false) }
         $Row.PermDetail="Permissions verified=$verified/$($Requests.Count); current=$($request.Right)/$($request.Trustee)"
@@ -767,8 +850,8 @@ function Invoke-PraSharedPermission {
         }
         if ((Get-PraValue $r 'Verified' $false) -ne $true) {
             if ($preview) { $toGrant++; continue }
-            if ($Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or $Context.Mode -ne 'Apply' -or
-                $Context.Action -ne 'Convert' -or $Context.Phase -notin @('Cloud','Both') -or $WhatIfPreference) { throw 'Permission missing and writes are not allowed in this mode.' }
+            if ($Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or -not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or
+                -not (Test-PraOrdinalEqual $Context.Action 'Convert') -or -not (Test-PraOrdinalIn $Context.Phase @('Cloud','Both')) -or $WhatIfPreference) { throw 'Permission missing and writes are not allowed in this mode.' }
             # Native ShouldProcess per right; it never replaces the approval, proof and journal of the grant.
             if (-not $PSCmdlet.ShouldProcess($upn,"Grant $($request.Right) to $($request.Trustee)")) { throw 'Exchange Online grant refused (ShouldProcess).' }
             Invoke-PraPermissionGrant -Context $Context -Row $Row -Params $p
@@ -803,24 +886,24 @@ function Get-PraGraphFact {
             if (-not [string](Get-PraValue $p 'Service' '') -or -not [string](Get-PraValue $p 'ProvisioningStatus' '')) { throw 'Microsoft Graph: incomplete provisionedPlan.' }
         }
     }
-    $enabled=@($values.assignedPlans | Where-Object { (Get-PraValue $_ 'Service' '') -eq 'exchange' -and (Get-PraValue $_ 'CapabilityStatus' '') -eq 'Enabled' }).Count -gt 0
+    $enabled=@($values.assignedPlans | Where-Object { (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $_ 'Service' '') 'exchange') -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $_ 'CapabilityStatus' '') 'Enabled') }).Count -gt 0
     $prov=$false; $plans=@(); $sku=@()
-    if ($Mailbox) { $prov=@($values.provisionedPlans | Where-Object { (Get-PraValue $_ 'Service' '') -eq 'exchange' -and (Get-PraValue $_ 'ProvisioningStatus' '') -eq 'Success' }).Count -gt 0 }
+    if ($Mailbox) { $prov=@($values.provisionedPlans | Where-Object { (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $_ 'Service' '') 'exchange') -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $_ 'ProvisioningStatus' '') 'Success') }).Count -gt 0 }
     $required=[string](Get-PraValue (Get-PraValue $Context.Config 'Cloud' @{}) 'RequiredSkuPartNumber' '')
     if ($Mailbox -or ($License -and $required)) {
         $details=@(Get-MgUserLicenseDetail -UserId $Upn -All -ErrorAction Stop)
         foreach ($d in $details) {
             $sku += [string](Get-PraValue $d 'SkuPartNumber' '')
-            foreach ($p in @((Get-PraValue $d 'ServicePlans' @()) | Where-Object { (Get-PraValue $_ 'ServicePlanName' '') -like 'EXCHANGE_*' })) {
+            foreach ($p in @((Get-PraValue $d 'ServicePlans' @()) | Where-Object { ([string](Get-PraValue $_ 'ServicePlanName' '')).StartsWith('EXCHANGE_',[StringComparison]::OrdinalIgnoreCase) })) {
                 $status=[string](Get-PraValue $p 'ProvisioningStatus' '')
                 $plans += ([string](Get-PraValue $p 'ServicePlanName' '')+':'+$status)
-                if ($status -eq 'Success') { $prov=$true }
+                if (Test-PraOrdinalIgnoreCaseEqual $status 'Success') { $prov=$true }
             }
         }
     }
     $count=0; if ($License) { $count=$values.assignedLicenses.Count }
     return @{ Enabled=$enabled; Provisioned=$prov; LicenseCount=$count; RequiredSku=$required
-        RequiredSkuOk=(-not $required -or $required -in $sku); Detail=($plans -join ',') }
+        RequiredSkuOk=(-not $required -or (Test-PraOrdinalIgnoreCaseIn $required $sku)); Detail=($plans -join ',') }
 }
 
 function Invoke-PraCloudPhase {
@@ -834,33 +917,33 @@ function Invoke-PraCloudPhase {
     $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='Prepare'; $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$false
     $states=New-Object 'System.Collections.Generic.List[object]'
     try {
-        $scope=[string]$Context.CloudCheckScope
-        if ($Context.Action -in @('Convert','Recover') -and $Context.Action -ne $Act) { throw 'Context action and -Act differ.' }
-        if ($scope -notin @('Both','MailboxOnly','LicenseOnly')) { throw 'Invalid CloudCheckScope.' }
+        if (-not (Test-PraOrdinalIn $Act @('Convert','Recover'))) { throw 'Unknown -Act.' }
+        if ((Test-PraOrdinalIn $Context.Action @('Convert','Recover')) -and -not (Test-PraOrdinalEqual $Context.Action $Act)) { throw 'Context action and -Act differ.' }
         if ([int]$Context.TimeoutMinutes -lt 0 -or [int]$Context.IntervalMinutes -lt 0) { throw 'Negative cloud polling values.' }
         $cloud=Get-PraValue $Context.Config 'Cloud' @{}
-        $via=[string](Get-PraValue $cloud 'MailboxCheckVia' 'Graph')
-        if ($via -notin @('Graph','Exo')) { throw 'Invalid Cloud.MailboxCheckVia.' }
+        $via=[string](Get-PraValue $cloud 'MailboxCheckVia' 'Exo')
+        if (-not (Test-PraOrdinalIgnoreCaseIn $via @('Graph','Exo'))) { throw 'Invalid Cloud.MailboxCheckVia.' }
+        $via=if (Test-PraOrdinalIgnoreCaseEqual $via 'Graph') { 'Graph' } else { 'Exo' }
         $needGraph=$false; $needExo=$false
         foreach ($row in $Rows) {
             Add-Member -InputObject $row -NotePropertyName DeprovisionConfirmed -NotePropertyValue $false -Force
             $row.CloudMailbox=$null; $row.CloudLicense=$null; $row.CloudStatus='Pending'; $row.CloudDetail=''
             $upn=[string](Get-PraValue $row 'UserPrincipalName' '')
             if (-not $upn) { Write-PraCloudError -Context $Context -Row $row -Message 'UPN missing: check impossible.'; continue }
-            if ((Get-PraValue $row 'FinalStatus' '') -eq 'Error') { Write-PraCloudError -Context $Context -Row $row -Message 'Previous error: cloud part not allowed.'; continue }
+            if (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $row 'FinalStatus' '') 'Error') { Write-PraCloudError -Context $Context -Row $row -Message 'Previous error: cloud part not allowed.'; continue }
             $shared=[bool](Get-PraValue $row 'IsShared' $false)
             $preserveMailbox=Get-PraValue $row 'PreserveCloudMailbox' $false; $preserveLicense=Get-PraValue $row 'PreserveLicense' $false
             if ($preserveMailbox -isnot [bool] -or $preserveLicense -isnot [bool] -or ($preserveMailbox -and -not $shared)) {
                 Write-PraCloudError -Context $Context -Row $row -Message 'Invalid keep flags (PreserveCloudMailbox is for shared mailboxes only).'; continue
             }
-            $requests=@(); if ($Act -eq 'Convert') { $requests=@(Get-PraPermissionRequest $Context $row) }
-            $mb=($scope -ne 'LicenseOnly') -and ([bool](Get-PraValue $cloud 'CheckMailbox' $false) -or $Act -eq 'Recover' -or $requests.Count -gt 0)
-            $lic=($scope -ne 'MailboxOnly') -and -not $shared -and [bool](Get-PraValue $cloud 'CheckLicense' $false)
+            $requests=@(); if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { $requests=@(Get-PraPermissionRequest $Context $row) }
+            $mb=([bool](Get-PraValue $cloud 'CheckMailbox' $false) -or (Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -or $requests.Count -gt 0)
+            $lic=-not $shared -and [bool](Get-PraValue $cloud 'CheckLicense' $false)
             if (-not $mb -and -not $lic) {
                 $row.CloudStatus='Skipped'; $row.CloudDetail='No applicable check; no restore confirmation.'; $row.FinalStatus='Skipped'; continue
             }
-            $graphMailbox=$mb -and -not $shared -and $via -eq 'Graph'
-            $exoMailbox=$mb -and ($Act -eq 'Recover' -or $shared -or $via -eq 'Exo')
+            $graphMailbox=$mb -and -not $shared -and (Test-PraOrdinalIgnoreCaseEqual $via 'Graph')
+            $exoMailbox=$mb -and ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -or $shared -or (Test-PraOrdinalIgnoreCaseEqual $via 'Exo'))
             $needGraph=$needGraph -or $lic -or $graphMailbox; $needExo=$needExo -or $exoMailbox
             [void]$states.Add(@{ Row=$row; Upn=$upn; Shared=$shared; Mailbox=$mb; License=$lic; GraphMailbox=$graphMailbox
                 ExoMailbox=$exoMailbox; Requests=$requests; PreserveMailbox=$preserveMailbox; PreserveLicense=$preserveLicense; Done=$false })
@@ -879,44 +962,44 @@ function Invoke-PraCloudPhase {
                     if ($s.GraphMailbox -or $s.License) { $facts=Get-PraGraphFact -Context $Context -Upn $s.Upn -Mailbox $s.GraphMailbox -License $s.License }
                     if ($s.ExoMailbox) {
                         $m=Invoke-PraExo -Context $Context -Operation 'Mailbox' -Params @{ Upn=$s.Upn }
-                        if ($Act -eq 'Recover') {
+                        if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) {
                             if ($s.PreserveMailbox) {
-                                $mbok=(Get-PraValue $m 'Found' $false) -eq $true -and (Get-PraValue $m 'Type' '') -eq 'SharedMailbox'
+                                $mbok=(Get-PraValue $m 'Found' $false) -eq $true -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $m 'Type' '') 'SharedMailbox')
                                 [void]$details.Add("MBX:KeepCloudShared SharedMailbox present=$mbok; deprovisioning NOT confirmed, tag kept")
                             } else {
                                 $r=Invoke-PraExo -Context $Context -Operation 'Recipient' -Params @{ Upn=$s.Upn }
-                                $mbok=(Get-PraValue $m 'Found' $true) -eq $false -and (Get-PraValue $r 'Found' $false) -eq $true -and (Get-PraValue $r 'Type' '') -eq 'MailUser'
+                                $mbok=(Get-PraValue $m 'Found' $true) -eq $false -and (Get-PraValue $r 'Found' $false) -eq $true -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $r 'Type' '') 'MailUser')
                                 [void]$details.Add("MBX:absence=$(-not [bool](Get-PraValue $m 'Found' $true)); recipient=$(Get-PraValue $r 'Type' 'none')")
                                 if ($s.GraphMailbox) { [void]$details.Add("Graph:Enabled=$($facts.Enabled),Provisioned=$($facts.Provisioned) (Exchange Online is authoritative, Graph errors stop)") }
                             }
                         } else {
                             $type=[string](Get-PraValue $m 'Type' '')
-                            $mbok=if ($s.Shared) { $type -eq 'SharedMailbox' } else { $type -in @('UserMailbox','SharedMailbox','RoomMailbox','EquipmentMailbox') }
+                            $mbok=if ($s.Shared) { Test-PraOrdinalIgnoreCaseEqual $type 'SharedMailbox' } else { Test-PraOrdinalIgnoreCaseIn $type @('UserMailbox','SharedMailbox','RoomMailbox','EquipmentMailbox') }
                             [void]$details.Add("MBX:EXO type=$type")
                         }
                     } elseif ($s.GraphMailbox) { $mbok=$facts.Provisioned; [void]$details.Add("MBX:Graph provisioning=$mbok; Enabled=$($facts.Enabled) [$($facts.Detail)]") }
                     if ($s.Mailbox) { $row.CloudMailbox=[bool]$mbok }
                     if ($s.License) {
-                        $licok=if ($Act -eq 'Convert' -or $s.PreserveLicense) { $facts.LicenseCount -gt 0 -and $facts.Enabled -and $facts.RequiredSkuOk }
+                        $licok=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert') -or $s.PreserveLicense) { $facts.LicenseCount -gt 0 -and $facts.Enabled -and $facts.RequiredSkuOk }
                             elseif ($facts.RequiredSku) { -not $facts.RequiredSkuOk } else { -not $facts.Enabled }
                         $row.CloudLicense=[bool]$licok
                         [void]$details.Add("LIC:OK=$licok; Preserve=$($s.PreserveLicense); ExpectedSKU=$($facts.RequiredSku); SKUPresent=$($facts.RequiredSkuOk); licences=$($facts.LicenseCount); ExchangeEnabled=$($facts.Enabled)")
                     } elseif ($s.Shared) { [void]$details.Add('LIC:N/A (shared)') }
                     $row.CloudDetail=$details -join ' | '
                     if ($mbok -and $licok) {
-                        if ($Act -eq 'Recover' -and -not $s.ExoMailbox) {
+                        if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -and -not $s.ExoMailbox) {
                             $row.CloudStatus='Skipped'; $row.FinalStatus='Skipped'; $row.CloudDetail+=' | LicenseOnly: no Exchange Online confirmation, restore not allowed.'
                         } else {
                             $toGrant=0
                             if ($s.Mailbox -and $s.Requests.Count) { $toGrant=[int](Invoke-PraSharedPermission -Context $Context -Row $row -Requests $s.Requests) }
-                            $row.DeprovisionConfirmed=($Act -eq 'Recover' -and $s.ExoMailbox -and -not $s.PreserveMailbox)
+                            $row.DeprovisionConfirmed=((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -and $s.ExoMailbox -and -not $s.PreserveMailbox)
                             if ($toGrant -gt 0) {
                                 $row.CloudStatus='Planned'; $row.FinalStatus='Planned'
                                 $null=Write-PraLog -Context $Context -Message ("{0}: SharedMailbox ready, {1} permission(s) to grant in Apply" -f $s.Upn, $toGrant) -Level Info
                             } else {
                                 $row.CloudStatus='Success'
-                                $row.FinalStatus=if ($Act -eq 'Recover' -and [bool](Get-PraValue $row 'DeproPending' $false)) { 'Pending' } else { 'Success' }
-                                $what=if ($Act -eq 'Recover') { if ($s.PreserveMailbox) { 'shared mailbox kept in Exchange Online' } else { 'deprovisioned in Exchange Online (now a MailUser)' } }
+                                $row.FinalStatus=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -and [bool](Get-PraValue $row 'DeproPending' $false)) { 'Pending' } else { 'Success' }
+                                $what=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { if ($s.PreserveMailbox) { 'shared mailbox kept in Exchange Online' } else { 'deprovisioned in Exchange Online (now a MailUser)' } }
                                     elseif ($s.Shared) { 'SharedMailbox ready, ' + ([string]$row.PermDetail -replace '; to grant=0; trustees missing in Exchange Online=0', '') }
                                     else { 'mailbox' + $(if ($s.License) { ' and licence' } else { '' }) + ' ready' }
                                 $null=Write-PraLog -Context $Context -Message ("{0}: {1}" -f $s.Upn, $what) -Level Success
@@ -931,9 +1014,12 @@ function Invoke-PraCloudPhase {
             $seconds=[Math]::Min([Math]::Max(1,([double]$Context.IntervalMinutes*60)),[Math]::Max(0,($timeout-$clock.Elapsed.TotalSeconds)))
             $null=Write-PraLog -Context $Context -Message ("Not ready yet: {0} - next check in {1:0} s (waiting up to {2} min in total)" -f (($pending | ForEach-Object { $_.Upn }) -join ', '), $seconds, $Context.TimeoutMinutes) -Level Sub
             foreach ($s in $pending) { $null=Write-PraLog -Context $Context -Message ("{0} | {1}" -f $s.Upn, $s.Row.CloudDetail) -Level Detail }
+            $intervalSeconds=[Math]::Max(1,([double]$Context.IntervalMinutes*60))
+            $waitText=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { 'Waiting for Exchange Online to finish deprovisioning' } elseif ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { 'Waiting for the mailbox and licence to appear in Exchange Online' } else { 'Waiting for Exchange Online' }
+            Write-PraProgress -Context $Context -Text ("{0} ({1} object(s) not ready)" -f $waitText,$pending.Count) -Current ([int]$clock.Elapsed.TotalSeconds) -Total ([int]$timeout) -Attempt $attempt -MaxAttempts ([int][Math]::Ceiling($timeout/$intervalSeconds)+1) -NextInSeconds ([int][Math]::Ceiling($seconds))
             if ($seconds -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(2147483647,($seconds*1000))) }
         } while ($true)
-        $preview=(-not $Context.AllowMutation -and $Context.Action -in @('Convert','Recover'))
+        $preview=(-not $Context.AllowMutation -and (Test-PraOrdinalIn $Context.Action @('Convert','Recover')))
         foreach ($s in $states) {
             if ($s.Done) { continue }
             if ($preview) {
@@ -980,7 +1066,7 @@ function Invoke-PraRetentionCheck {
             $session.ExoAttempted=$true
             try { Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop | Out-Null }
             finally {
-                $newIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId } | Where-Object { $_ -notin $beforeIds })
+                $newIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId } | Where-Object { -not (Test-PraOrdinalIgnoreCaseIn $_ $beforeIds) })
                 $session.OwnedExoIds=@($session.OwnedExoIds)+$newIds
             }
             try {
@@ -1004,10 +1090,10 @@ function Invoke-PraRetentionCheck {
                 $holds=Get-PraValue $h 'Holds' @(); $holds=@($holds | Where-Object { $null -ne $_ })
                 $included=$false; $excluded=$false; $deleteOnly=$false
                 foreach ($hold in $holds) {
-                    if ([string]$hold -match '^(?<excluded>-)?(?:mbx|grp|skp|UniH)?(?<id>[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})(?::(?<action>[123]))?$') {
-                        if (($Matches.id -replace '-','') -eq $guid) {
+                    if ([string]$hold -match '^(?<excluded>-)?(?:mbx|grp|skp|UniH)?(?<id>[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})(?::(?<action>[123]))?\z') {
+                        if (Test-PraOrdinalIgnoreCaseEqual ($Matches.id -replace '-','') $guid) {
                             if ($Matches.ContainsKey('excluded')) { $excluded=$true }
-                            elseif ($Matches.ContainsKey('action') -and $Matches.action -eq '1') { $deleteOnly=$true }
+                            elseif ($Matches.ContainsKey('action') -and (Test-PraOrdinalIgnoreCaseEqual $Matches.action '1')) { $deleteOnly=$true }
                             else { $included=$true }
                         }
                     }
@@ -1016,7 +1102,7 @@ function Invoke-PraRetentionCheck {
                 if (-not $row.CloudMailbox) { throw ('Mailbox not found (active or inactive). '+$row.CloudDetail) }
                 if (-not $guid) { throw ('Policy unknown: set Retention.PolicyGuid (a hold may exist, check it manually). '+$row.CloudDetail) }
                 if ($excluded -or $deleteOnly -or -not $included) { throw ('Not covered by the policy (or excluded, or delete-only); an adaptive scope can take several days. '+$row.CloudDetail) }
-                $row.CloudStatus='Success'; if ($row.FinalStatus -ne 'Error') { $row.FinalStatus='Success' }
+                $row.CloudStatus='Success'; if (-not (Test-PraOrdinalIgnoreCaseEqual $row.FinalStatus 'Error')) { $row.FinalStatus='Success' }
                 $row.CloudDetail+=' | COVERED (GUID='+$guid+')'
                 $null=Write-PraLog -Context $Context -Message $row.CloudDetail -Level Success
             } catch { Write-PraCloudError -Context $Context -Row $row -Message $_.Exception.Message }
@@ -1034,10 +1120,10 @@ function Invoke-PraRetentionCheck {
 Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,Invoke-PraRetentionCheck,Close-PraCloudSession
 
 # SIG # Begin signature block
-# MIIghQYJKoZIhvcNAQcCoIIgdjCCIHICAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDP6YMLXwuieK0M
-# wdNQo7YJ6hUjA157qf9kec08CziymKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBZrHfC/rQGoWEg
+# pQzVyAc2qo0IqDgqI+PeTgmw0u+5paCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1109,103 +1195,133 @@ Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYISbDCCEmgCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCAexmcgFvZ
-# YbGDuPj+C1Bf2dgB+Jiq4eFO+7ks621VyTANBgkqhkiG9w0BAQEFAASCAgAhCZ2A
-# fXviZA0h2JB+vbcGww8iwBTfNzY5tlzpVvAMiTnrCvzefSCOMKbSnSDwmDbaiiEJ
-# MQ+4EuS/4dlU5eb3iJ6aVjL8XaycEXRLZnQsmGN9TrDT2xgoFgn0fEg3cN7j0PDS
-# W+KoA+sgfSXmBj+XXm93ksnNYBg0B9CMheVtAqc/QLrHQ91nzlvIKOpQc7jjk85o
-# DpxF/p+4pfrxPIUeKbYj7KHOMhduuDXRy+f5+yU65F0+DYJ4eam8/+1wLaQc0qGh
-# qFAE0mKxqOA0ucw2GvkFobTX64yGKkxj408KCZy2UYI9T7UAwQ8M4zBLCxmZTGOH
-# j0jcY/yprRMIvJFEBZ8k5Wh6YFGhITDQ8hEW8B1Ju1kfp+UCU9KFcj1XN71/O9se
-# QByNZD45ZvxwLuDEI4YBevrhwu1V6n8v5OztLdEzyFtcLe1DQG0xkVYt2O4iGq19
-# hEXPgTMVPFP8duxrF7rkR0ZSb+297P7plyMHUHqW3+olXFu7qU1VJ7ulHojrzDAP
-# T98Eb64DaIyzaK7wRv5RleiaW6oNYzUhcBW3pM34ik1BKsCyY0l0OezcoO4HVoaJ
-# 0XCCGrA49OQtM19Kg452rZGZYKN4stwFEAE1bB7MeQOlmAfxMTWig5cuUaOqZzgF
-# xvM1yUf7rFGYpM8TRtKkIJYAM4RyTA2P/5dVLaGCDykwgg8lBgorBgEEAYI3AwMB
-# MYIPFTCCDxEGCSqGSIb3DQEHAqCCDwIwgg7+AgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCUrSB6bOuw
+# zvxzFLmWon8oNEeLaji39UVrtHytYF9d1DANBgkqhkiG9w0BAQEFAASCAgCPXdum
+# F3QwfVC2EgQlvYuBavXRU9NnyP6jk99/uYAk1UCQckgAxK648XfCZx3WTLZE9DJV
+# lLfsL08F29F+YjzvGNfz1gvWwXlo5Ol/pBLu42/aQdEyZh8JMYXC11w4nKL18VMy
+# UiqUhXJ3ag5+k3p0R39oKnBd0L2XrbfYX0DuvdvPQLvLmKFYVLatgaD6ohImvdKr
+# 9ta0oFxce7GfhBqJAmxU9IackAUB6Luf/5LM0LH8ftkYGzHfudbXTmHxq6BINSTL
+# uyt2Wxb2IfPr4gWfNu5zY7INA3WhEMGACIIRV+Mpmx/1ZXlifBZzcz/7kcS5XDTH
+# i3sjbTnLjdxaGmC0pxdCQcQ8Pm2LTO8piHz7GKhIIqnZ9f3jk0kDTHZuflGb4auH
+# 8wzYX6/C6cV+60KSvcR+ALAh8uvhOb7OhyzqKTlApiNnx6+04D/CrhfdFKyB2rcH
+# HvpRlWNMDHPCVDud0KXxhmsG8cld347AhD9frl4k4CsNY/Exf/Ab+IlyzoII2crF
+# eCY4VX7c0bRfQmJZYbui9cBOs+ZKjogo2gL7HF6B/PCudJdUAYH3eumRZEEjBAXn
+# 7oeO26Do8C4F2VJ8nxsAcyPuFB9CjMH/6eyLDOAG7ODLSFDMZH1pB4nMlGFa9ssQ
+# QMfpVcFUPbcamPDSspnaNNrZDCPVoZouFXEaC6GCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEILuuFQ8ECcgloEon2JbAHBX+n6SLW1A8wz8z8mW3UntLAghRQz9p+O1W
-# mxgPMjAyNjEwMTUyMTIzMTBaMAMCAQECEHMUNjLjehi3GiwR9Z1qGcugggwAMIIE
-# /DCCAuSgAwIBAgIQH2sWYtIuG2xd8cDBoGAOODANBgkqhkiG9w0BAQsFADBzMQsw
+# BAIBBQAEIB7VHM729Fy6t2DajRKeWuXq/bOpJ9rk3qrZ1wBsPdinAggFmaOQw7zN
+# yhgPMjAyNjExMDUwODA3MzhaMAMCAQECEDWOmBZeeEXY5lG2pNBxBrCgghGnMIIE
+# 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
-# BgNVBAoMCFNTTCBDb3JwMS8wLQYDVQQDDCZTU0wuY29tIFRpbWVzdGFtcGluZyBJ
-# c3N1aW5nIFJTQSBDQSBSMTAeFw0yNTAyMTgxNjMyMDJaFw0zNDExMTIxODUwMDVa
-# MG4xCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
-# bjERMA8GA1UECgwIU1NMIENvcnAxKjAoBgNVBAMMIVNTTC5jb20gVGltZXN0YW1w
-# aW5nIFVuaXQgMjAyNSBFMTBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBv7UVHH
-# b+ZVluxPXlfE3M6tg0Xnq8dic+O3vPOCRpalUM1vO9A+GRzSVVjyygHhYrBw62XL
-# Fh1kv7e+yRd/aTajggFaMIIBVjAfBgNVHSMEGDAWgBQMnRAljpqnG5mHQ88IfuG9
-# gZD0zzBRBggrBgEFBQcBAQRFMEMwQQYIKwYBBQUHMAKGNWh0dHA6Ly9jZXJ0LnNz
-# bC5jb20vU1NMLmNvbS10aW1lU3RhbXBpbmctSS1SU0EtUjEuY2VyMFEGA1UdIARK
-# MEgwPAYMKwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNz
-# bC5jb20vcmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUH
-# AwgwRgYDVR0fBD8wPTA7oDmgN4Y1aHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29t
-# LXRpbWVTdGFtcGluZy1JLVJTQS1SMS5jcmwwHQYDVR0OBBYEFM582cAEgMUkEGoJ
-# 6hyrJT0R/ajSMA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAgHN1
-# JIW9ZlNip07FfY9r1LJwLKTl1h/y9r1BjDgHMEz7U7J7mAy32JxA1KLyjCCJqNku
-# RfhDHGFEfZtjTOru7AQMDSDiUDvCCc3jaz5py9jGvwIe5npkLbXqXhA+SqCzG719
-# USigwhHkYr7v8NiXoaY0Xu03p0BiZZreZlpngmGB9+86N94FqIFx2I5Z5iuu7d4j
-# 7aAOZBNxfU9jFDIIGDtWfWeCpF0Q8rLE/3DHDlzJKs5Il3i/VoOl7rTU938oSrxM
-# www6GDBlKX8rGHxvkjgIb9MXkVglJSDHsNAZDeCS/inaxKHA+ChuB8K4OxIxa6k1
-# e+eHBypakAY3wuN7w7PlPmhN6k5IdqZn3HZHs2VjoR841Z9wmVPFdGDdkBZ7XOmb
-# 5OZUaKufsvtER0VbY2DkzaqAaItt1kc+I+FUz7PiVz2PUzpegkftRRxvrPyIL08b
-# lJTnbMQ0XrqDN0rEfuTLv4XhhnKyJaXhxCUdjO/cRumMzZ35QTUMItBWy1xGp0iy
-# oFVnAya2pPsVMuAI+sy1zxlOS9l5iSxvKJ8gpnpOgjqYTa7u1eyZo+4JlcGoiiR1
-# 7LthMTrF1q62tO5xOpI8txUZ6gtKGtkJV6wdj+vZLcwKZ2M93GqVpOo6UBlGjx1s
-# KsVZ7AIUzJZli4NJ0M2KYcrfNnlebkYKpDnSqWwwggb8MIIE5KADAgECAhBtUhhw
-# h+gjTYVgANCAj5NWMA0GCSqGSIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYD
-# VQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBv
-# cmF0aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRo
-# b3JpdHkgUlNBMB4XDTE5MTExMzE4NTAwNVoXDTM0MTExMjE4NTAwNVowczELMAkG
-# A1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYD
-# VQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNz
-# dWluZyBSU0EgQ0EgUjEwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCu
-# URAT0vk8IKAghd7JUBxkyeH9xek0/wp/MUjoclrFXqhh/fGH91Fc+7fm0MHCE7A+
-# wmOiqBj9ODrJAYGq3rm33jCnHSsCBNWAQYyoauLq8IjqsS1JlXL29qDNMMdwZ8UN
-# zQS7vWZMDJ40JSGNphMGTIA2qn2bohGtgRc4p1395ESypUOaGvJ3t0FNL3BuKmb6
-# YctMcQUF2sqooMzd89h0E6ujdvBDo6ZwNnWoxj7YmfWjSXg33A5GuY9ym4QZM5OE
-# Vgo8ebz/B+gyhyCLNNhh4Mb/4xvCTCMVmNYrBviGgdPZYrym8Zb84TQCmSuX0JlL
-# La6WK1aO6qlwISbb9bVGh866ekKblC/XRP20gAu1CjvcYciUgNTrGFg8f8AJgQPO
-# Cc1/CCdaJSYwhJpSdheKOnQgESgNmYZPhFOC6IKaMAUXk5U1tjTcFCgFvvArXtK4
-# azAWUOO1Y3fdldIBL6LjkzLUCYJNkFXqhsBVcPMuB0nUDWvLJfPimstjJ8lF4S6E
-# CxWnlWi7OElVwTnt1GtRqeY9ydvvGLntU+FecK7DbqHDUd366UreMkSBtzevAc9a
-# qoZPnjVMjvFqV1pYOjzmTiVHZtAc80bAfFe5LLfJzPI6DntNyqobpwTevQpHqPDN
-# 9qqNO83r3kaw8A9j+HZiSw2AX5cGdQP0kG0vhzfgBwIDAQABo4IBgTCCAX0wEgYD
-# VR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV7jiAJQ2m
-# WTCBgwYIKwYBBQUHAQEEdzB1MFEGCCsGAQUFBzAChkVodHRwOi8vd3d3LnNzbC5j
-# b20vcmVwb3NpdG9yeS9TU0xjb21Sb290Q2VydGlmaWNhdGlvbkF1dGhvcml0eVJT
-# QS5jcnQwIAYIKwYBBQUHMAGGFGh0dHA6Ly9vY3Nwcy5zc2wuY29tMD8GA1UdIAQ4
+# BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSAyMB4XDTI2MDYxMjE3MjI0NloXDTM2MDYwOTE3MjI0NVow
+# bjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9u
+# MREwDwYDVQQKDAhTU0wgQ29ycDEqMCgGA1UEAwwhU1NMLmNvbSBUaW1lc3RhbXBp
+# bmcgVW5pdCAyMDI2IEUxMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE6CWLuGYT
+# LkiSOPMLNskOBthXsIhRSA46feOQwvSLcDaNh6vxUzBKEx1KdFBRFs7OHrnH/K0V
+# A6MbDQIFpUg0PaOCAVIwggFOMB8GA1UdIwQYMBaAFHCaZcFDgKP86bFkiW7xMJwJ
+# Icl8ME0GCCsGAQUFBwEBBEEwPzA9BggrBgEFBQcwAoYxaHR0cDovL2NlcnQuc3Ns
+# LmNvbS9TU0wuY29tLXRpbWVTdGFtcGluZy1JLVIyLmNlcjBRBgNVHSAESjBIMDwG
+# DCsGAQQBgqkwAQMGATAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29t
+# L3JlcG9zaXRvcnkwCAYGZ4EMAQQCMBYGA1UdJQEB/wQMMAoGCCsGAQUFBwMIMEIG
+# A1UdHwQ7MDkwN6A1oDOGMWh0dHA6Ly9jcmxzLnNzbC5jb20vU1NMLmNvbS10aW1l
+# U3RhbXBpbmctSS1SMi5jcmwwHQYDVR0OBBYEFCesA1a6KGq6FzuDPUB/eagk7MM8
+# MA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAT3ZuzvwDnsIZTXBn
+# +hjmuBXgzB12fbYxT9uYe6ZvhvpbZWKcyDQgacETkPw8k6yeqnYCYyFZ063lMPEq
+# AhAD2nMG614Zh7PtHW9DWqfsgivxbPYBeN+t7UxgkYT3expbWMdPEqBtWVyHOvLc
+# KvMxgJWfJjANwVkwVDfky/j7cf28+iimN8PKc7S/u8/LenRRnV2W2YfncRnkz9Cf
+# s5nRDzaZguiHrrp2GxwgnNQSH4GBjHOl3PzLsnVbGoZKi4ZEjgXups4mGGOK7+GB
+# 2HAlQn+OS944cHqlkH0gElt2WezoCNRpELph9qaxuBnjSEqXWWfgE6yGBwO0uxKN
+# qpWVTHmAwr6SvBPofxubXIuEn9ivR4CLOuAxUSrJ41ZBg/qqG0oJjF6GkRKbxq7c
+# yWSkEZYJhmKCg2Hg5fXHagOxiwbmn5JPZ1vhWCrbk3v/dTx2gvTK5+erC5H9/rTc
+# ljUI776yd2rfhjfkpvyAsbtXs4D7nrnw8i9wor5+fdtRSJBVxqzLmykFftoL0Up2
+# Q++tyKCUdribdcnrB4HKS3s+t3AjdcbA06DCL8GifQi9fL0yRBRNlA4o6BP+Sr75
+# 5MaCNjURYZDvDyxJHBBT7cqjZIwsiR8s+6860noFbBBtdge2Iw7CPC/1Q31I27hV
+# olS7B0yao3v8X2MtWy3msZlXTcEwggXdMIIDxaADAgECAgh7LJvTFoAymTANBgkq
+# hkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNV
+# BAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8GA1UEAwwo
+# U1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAeFw0xNjAy
+# MTIxNzM5MzlaFw00MTAyMTIxNzM5MzlaMHwxCzAJBgNVBAYTAlVTMQ4wDAYDVQQI
+# DAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBvcmF0
+# aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRob3Jp
+# dHkgUlNBMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA+Q/doyt9y9Aq
+# /uxnhabnLhu6d+Hj9a+k7PpKXZHEV0drGHdrdvL9k+Q9D8IWngtmw1aUnheDhc5W
+# 7/IW/QBi9SIJVOhlF05BueBPRpeqG8i4bmJeabFf2yoCfvxsyvNB2O3Q6Pw/YUjt
+# sAMUHRAOSxngu07shmX/NvNeZwILnYZVYf16OO3+4hkAt2+hUGJ1dDyg+sglkrRu
+# eiLH+B6h47LdkTGrKx0E/6VKBDfphaQzK/3i1lU0fBmkSmjHsqjTt8qhk4jrwZe8
+# jPkd2SKEJHTHBD1qqSmTzOu4W+H+XyWqNFjIwSNUnRuYEcM4nH49hmylD0CGfAL0
+# XAJPKMuucZ8POsgz/hElNer8usVgPdl8GNWyqdN1eANyIso6wx/vLOUuqfqeLLZR
+# Rv2vA9bqYGjqhRY2a4XpHsCz3cQk3IAqgUFtlD7I4MmBQQCeXr9/xQiYohgsQkCz
+# +W84J0tOgPQ9gUfgiHzqHM61dVxRLhwrfxpyKOcAtdF0xtfkn60Hk7ZTNTX8N+TD
+# 9l0WviFz3pIK+KBjaryWkmo++LxlVZve9Q2JJgT8JRqmJWnLwm3KfOJZX5es6+8u
+# yLzXG1k8K8zyGciTaydjGc/86Sb4ynGbf5P+NGeETpnr/LN4CTNwumamdu0bc+sa
+# pQ3EIhMglFYKTixsTrH9z5wJuqIz7YcCAwEAAaNjMGEwHQYDVR0OBBYEFN0ECQei
+# 9Xp9UlMSkpXuOIAlDaZZMA8GA1UdEwEB/wQFMAMBAf8wHwYDVR0jBBgwFoAU3QQJ
+# B6L1en1SUxKSle44gCUNplkwDgYDVR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBCwUA
+# A4ICAQAgGBGUKfsmnRweHnBh8ZVyk3EkrWiTWI4yrxuzcAP8JSt0hZA9eGr0uYul
+# lzu1GJG7Hqf5QFuR+VWZrx4R0Fwdp2bjsZQHDDI5puobsHnYHZxwROOK3cT5lR+K
+# OEM/AYWlR6c9RrK85SJo93uc2Cw+CiHILTOsv8WBmTF0wXVxxb6x8CNF9J1r/Blj
+# naO8BMYYCyW7U4kPs4BQ3kXuRH+rlHhkmNP2KN2H2HBldPsOuRPrpw9hqTKWzN67
+# 7WNMGLupQPegVG4giHF1GOp6tDRy4CMnd1y2kOqGJUCr7zMPy5+CvqIg+/a1LRrm
+# woWxdA/7yGUCpFIBR91JIsG/2OtrrH7e7GMzFbcjCI/GD41BWt2OxbmP5UU/eNu6
+# 0htAsf5xTT/ggaK6XrTsFeCT3QgffuFVmQsh3pOeCvvmo0m9NjD+53eyoHWXtS2B
+# iBdlIPfakACfyVLMMso1fPU9D9gr1/UmbMkGNJYW6nBZGjJ5eQu2iH8PUkg9v2zY
+# okQu0U63cljTiROV/kSr+NeLG26cvCygW9VqAK9fN+HV+hALmJyG5yaPzvDsbopX
+# C4DjTrLAoGNhkLpVaDd0araS25+hhiK2ZScO7LafQmDkZ8K12kELxNOLYRu8+h+R
+# K9dEB166KazZxenvU0ha64DxKFghzbAGVfsnP1OQcKkEHlcnuTCCBsswggSzoAMC
+# AQICEFKdu8K4iYf1g4DgsOuiBjYwDQYJKoZIhvcNAQELBQAwfDELMAkGA1UEBhMC
+# VVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQKDA9T
+# U0wgQ29ycG9yYXRpb24xMTAvBgNVBAMMKFNTTC5jb20gUm9vdCBDZXJ0aWZpY2F0
+# aW9uIEF1dGhvcml0eSBSU0EwHhcNMjYwNjEyMTY0MjE1WhcNNDEwMjEyMTczOTM5
+# WjByMQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0
+# b24xETAPBgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFt
+# cGluZyBJc3N1aW5nIFJTQSBDQSAyMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
+# CgKCAgEAny+r5nNNkLwxRps2B3laUGNU9y7vWiJ5013yf0iXz65bQdwa9bjj8l/S
+# keXqHGqfSh2Foae+80E8mDEf93oIwjsy2CX2cXmKxqtF8HJGYB4f6yRhKED50wkb
+# OysL02IXf+/EZna44jffhhVz4OU/k52xQ/PnIg/uFhc2Wk+Sc/CHqAr+lYVkPz7L
+# y5RqB9f1RKGr9JC37W1LgVdHC50dNIdsa3QXPhltYZubR3npE4Bbfi0joUW5n5O0
+# ayweN45R/YVLxA0YGlp1OHVfVnsqXq8bhnw1Lc4kjJ6XOgXlOlw/a8ze57TvbduZ
+# l3ehewTmvO0Aky/nqOWDS9IPPxdxdG6vprBbSuHlxNANBAbHTiFgkfZmf0dZYlT/
+# AnZIoFxAq0HILPolf4OgWgET76SiWSlm2XYRIXwVjpeqG0plvXwRIQBzSiEJj7Qe
+# QFnCvHx4gQMINvN3+yG/1rxhEbajGve0tTP3lX4PPOHVAE0QJp4ZzPI1YYJkhVRr
+# iVVxVRU4Fsg4BPwP6I+YLmHb1tZ4RLwOFNLh/gJYDgPlChCoxOogFxXgwPZZrDyE
+# RYB0aeOexW0OKacN4RRu9cqF2KKu/Ab5AL7eYDLVGUPrEEyYbIMApVKqpebc0/jD
+# QniC+3rkauRAjgVc8m1ip/CQgG1Dw4Z9ulVRAY9VR6Za26LsTbUCAwEAAaOCAVEw
+# ggFNMBIGA1UdEwEB/wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAU3QQJB6L1en1SUxKS
+# le44gCUNplkwTQYIKwYBBQUHAQEEQTA/MD0GCCsGAQUFBzAChjFodHRwOi8vY2Vy
+# dC5zc2wuY29tL1NTTGNvbS1Sb290Q0EtUlNBLTQwOTYtUjEuY2VyMD8GA1UdIAQ4
 # MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
-# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwOwYDVR0fBDQwMjAwoC6gLIYq
-# aHR0cDovL2NybHMuc3NsLmNvbS9zc2wuY29tLXJzYS1Sb290Q0EuY3JsMB0GA1Ud
-# DgQWBBQMnRAljpqnG5mHQ88IfuG9gZD0zzAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZI
-# hvcNAQELBQADggIBAJIZdQ2mWkLPGQfZ8vyU+sCb8BXpRJZaL3Ez3VDlE3uZk3cP
-# xPtybVfLuqaci0W6SB22JTMttCiQMnIVOsXWnIuAbD/aFTcUkTLBI3xys+wEajzX
-# aXJYWACDS47BRjDtYlDW14gLJxf8W6DQoH3jHDGGy8kGJFOlDKG7/YrK7UGfHtBA
-# EDVe6lyZ+FtCsrk7dD/IiL/+Q3Q6SFASJLQ2XI89ihFugdYL77CiDNXrI2MFspQG
-# swXEAGpHuaQDTHUp/LdR3TyrIsLlnzoLskUGswF/KF8+kpWUiKJNC4rPWtNrxlbX
-# YRGgdEdx8SMjUTDClldcrknlFxbqHsVmr9xkT2QtFmG+dEq1v5fsIK0vHaHrWjMM
-# maJ9i+4qGJSD0stYfQ6v0PddT7EpGxGd867Ada6FZyHwbuQSadMb0K0P0OC2r7rw
-# qBUe0BaMqTa6LWzWItgBjGcObXeMxmbQqlEz2YtAcErkZvh0WABDDE4U8GyV/32F
-# daAvJgTfe9MiL2nSBioYe/g5mHUSWAay/Ip1RQmQCvmF9sNfqlhJwkjy/1U1ibUk
-# TIUBX3HgymyQvqQTZLLys6pL2tCdWcjI9YuLw30rgZm8+K387L7ycUvqrmQ3ZJlu
-# jHl3r1hgV76s3WwMPgKk1bAEFMj+rRXimSC+Ev30hXZdqyMdl/il5Ksd0vhGMYIC
-# WDCCAlQCAQEwgYcwczELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYD
-# VQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEvMC0GA1UEAwwmU1NMLmNv
-# bSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgUjECEB9rFmLSLhtsXfHAwaBg
-# DjgwCwYJYIZIAWUDBAIBoIIBYTAaBgkqhkiG9w0BCQMxDQYLKoZIhvcNAQkQAQQw
-# HAYJKoZIhvcNAQkFMQ8XDTI2MTAxNTIxMjMxMFowKAYJKoZIhvcNAQk0MRswGTAL
-# BglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEICXwdXDjrCUG
-# SJtcFqqUtcFpWU/9e7Azz2cvUDSm01RWMIHJBgsqhkiG9w0BCRACLzGBuTCBtjCB
-# szCBsAQgVCr5oWqNci5mEUl4iumUwYqaruWmXLNEolSa+Wx5x4swgYswd6R1MHMx
-# CzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjER
-# MA8GA1UECgwIU1NMIENvcnAxLzAtBgNVBAMMJlNTTC5jb20gVGltZXN0YW1waW5n
-# IElzc3VpbmcgUlNBIENBIFIxAhAfaxZi0i4bbF3xwMGgYA44MAoGCCqGSM49BAMC
-# BEcwRQIhAILReuvH0Aghv6TORix3qtSCM7Wem06+72IRDgdIUwxgAiBPMYQbAeO9
-# oeBP5ptHyrcysbQcAVWiySbT3s+bjvy5aw==
+# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwQgYDVR0fBDswOTA3oDWgM4Yx
+# aHR0cDovL2NybHMuc3NsLmNvbS9TU0xjb20tUm9vdENBLVJTQS00MDk2LVIxLmNy
+# bDAdBgNVHQ4EFgQUcJplwUOAo/zpsWSJbvEwnAkhyXwwDgYDVR0PAQH/BAQDAgGG
+# MA0GCSqGSIb3DQEBCwUAA4ICAQBlFFvNMemA6iBiBYo56IKQjWhWuQaYKuo4qpf0
+# KJNERAt1gz+HsA2SL3xA/V+EA8SRPNP9SvX0is+5mDsppYvpKyYGqYP36YFW0mbF
+# 1F0ZtXxumCUUO/ZV5mBNKDf5Q4PY7Qb0eWAepUc0rNJr/Mvn5ZiXfJPxDb2xmcg8
+# aRD652/nr+Ork2UBP0E43iJdI4LF7Vs29R3SGRLYZOxM15DI4QebsKRl0KDlf4Om
+# YGCKc7umTxibkZtN1C1KWgnf9jadU/JwnySaYEBgx6/v+FVC6SGONziY7TcvI9MV
+# +qYxHUPlOm6AaQP2dS4bjWXnm86ldCbUkxtOACumSfT97077JNiVa7PZ1IBkd/2P
+# E1AC8gs7U+/Yk1BN9XRPIi15k/uA1xF9oeee5KGjyiGKkqIT7W8QkgUT5zeCinFK
+# kcKafZMcROSVYpXtmtQqGGR2g4uPYqJ0K1hms6gJXrHt/34p8M9PrV8oNWe0Zl1E
+# rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
+# fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
+# 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
+# JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
+# AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNTA4MDczOFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIM+8
+# opHO4iViAacvYyy1chQpTRZQpjqUepWPWWjHVVqlMIHIBgsqhkiG9w0BCRACLzGB
+# uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
+# dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
+# c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
+# YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
+# zj0EAwIERzBFAiEAsHA1b9a094XVlx8casBFZlDDx9A81ZEE9JwFuB12OqACIDh/
+# NHt+wqp7vDmfH/xBFNkS1G7vZYgaMvelrF9wZjtB
 # SIG # End signature block

@@ -1,0 +1,91 @@
+{
+    "SchemaVersion":  2,
+    "Operation":  "Recover",
+    "Kind":  "ADVerified",
+    "Environment":  "SYNTHETIC_GATE",
+    "RunId":  "20261104_034427-a07e7d383fbe4ca68abcc8ed7b3a5580",
+    "BackupFile":  "Recover-SYNTHETIC_GATE-20261104_034437-fbb16009.json",
+    "BackupHash":  "8c51eaadc0574474617369e7846839594872b0a84cbdfbf90b1d1f4c3277ad24",
+    "SourceBackupHash":  "3c56c496e057b59b943b5c5aa283fbb61b96d6678937e20c3fe8891b3b161537",
+    "CreatedUtc":  "2026-11-04T02:45:18.4456491Z",
+    "Records":  [
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000001",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000002",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000003",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000004",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000005",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000006",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000007",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000008",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000009",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000010",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000011",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000012",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    },
+                    {
+                        "ObjectGuid":  "00000000-0000-0000-0000-000000000013",
+                        "Operation":  "Deprovision",
+                        "ADVerified":  true,
+                        "VerifiedUsnChanged":  "102"
+                    }
+                ]
+}
