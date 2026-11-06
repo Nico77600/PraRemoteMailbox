@@ -1,0 +1,7 @@
+PRA Remote Mailbox: this archive is the source code, not the tool.
+
+To use PRA Remote Mailbox, download the release ZIP, signed by the owner, from:
+
+    https://github.com/Nico77600/PraRemoteMailbox/releases/latest
+
+On that page, under Assets, download PraRemoteMailbox-<version>.zip, not the Source code archives.

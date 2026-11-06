@@ -16,6 +16,13 @@
   <a href="package/docs/PraRemoteMailbox-Guide.md"><b>Reference guide</b></a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/Nico77600/PraRemoteMailbox/releases/latest"><img alt="Download the latest release" src="https://img.shields.io/github/v/release/Nico77600/PraRemoteMailbox?label=Download%20the%20latest%20release&amp;style=for-the-badge"></a>
+</p>
+
+> [!TIP]
+> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/PraRemoteMailbox/releases/latest) and download **`PraRemoteMailbox-3.1.0.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the signed tool, with the HTML guides. Do not use the **Source code** archives or the green **Code** button: they are a copy of the repository, not the release package.
+
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
 >
@@ -61,7 +68,7 @@ One path for everyone. Set the tool up once (**1 to 4**), then take branch **A**
 # 1 · Get your rights. Give the table "Requirements" below to your administrator (minimum rights, derived from the code).
 
 # 2 · On the server, in PowerShell 7.5+ as administrator: put the tool in its folder and unblock it.
-#     Use the zip of the latest release, or copy the repository package folder to D:\PRA\PraRemoteMailbox
+#     Download PraRemoteMailbox-3.1.0.zip from the latest release (under Assets, not Source code) and extract it to D:\PRA\PraRemoteMailbox
 Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File
 Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -Force
 Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllUsers -Force
