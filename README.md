@@ -41,7 +41,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
-**Author:** Nicolas Fabert · **Version:** 3.0.0, 2026-11-05 ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 3.1.0, 2026-11-06 ([changelog](CHANGELOG.md)).
 
 > [!CAUTION]
 > Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (reference guide, chapter 6).
@@ -69,7 +69,7 @@ Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllU
 # 3 · Fill in the settings: scope, licence group, routing domain, Entra Connect server, tenant
 notepad D:\PRA\PraRemoteMailbox\config\PraRemoteMailbox.config.psd1
 
-# 4 · Open the console: five lights on the first page, all green or grey
+# 4 · Open the console: the lights on the first page, all green or grey
 pwsh -STA -File D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1 -Gui
 ```
 
@@ -78,7 +78,7 @@ pwsh -STA -File D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1 -Gui
 <br>
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/console-setup-dark.png">
-  <img alt="The Setup page of the console: the environment, what this server can run, and five prerequisite lights, all green" src="package/docs/images/console-setup-light.png">
+  <img alt="The Setup page of the console: the environment, what this server can run, and the prerequisite lights, all green" src="package/docs/images/console-setup-light.png">
 </picture>
 </details>
 
@@ -93,7 +93,7 @@ cd D:\PRA\PraRemoteMailbox
 # 6 · Move everyone: the scope of the settings file, on one server
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert                  # preview
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Mode Apply      # backup, AD, sync, Exchange Online
-#     Two servers (the AD server cannot reach the cloud): on the AD server, then copy ONE zip file to the cloud server
+#     Two servers (no single server reaches both Active Directory and Microsoft 365): on the AD server, then copy ONE zip file to the cloud server
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply
 .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Batch 'PRA-PROD-Convert-490cc62e-for-Cloud.zip' -Mode Apply   # on the cloud server
 
@@ -145,8 +145,9 @@ Keep the `Backups` folder on a durable, protected volume: the backups are the on
 - **Signed package.** The runtime lives in `package\` (same layout as the extracted release ZIP). Every runtime file authenticates the owner-signed manifest before it runs; a changed, missing or unexpected stable file stops the tool before any import or operation. The configuration and your CSV lists are data, outside that check. There is no unsigned mode. The tool refuses to run from any tree whose files are not signed by the owner: use a signed release package. Backup, log and report folders inside the package are limited to the canonical `Backups`, `logs` and `reports`. See [package/README.md](package/README.md).
 - **One script, one configuration file.** The scope is one object (`-Identity`), an OU, the members of an AD group or a CSV list — users only, shared mailboxes only, or both.
 - **Preview by default.** Without `-Mode Apply` the tool only reads. With `-Mode Apply` it shows the plan and asks **one** confirmation (`-Force` for unattended runs).
+- **X500 control.** The batch records the X500 addresses (`legacyExchangeDN` and older X500) that the cloud mailbox must carry; the cloud phase proves them and warns if one is missing, because replies to old messages would otherwise bounce.
 - **One batch ID** links the steps: every Apply prints it with the exact next command, and `-Action Recover -Batch <id>` rolls the batch back.
-- **One or two servers**: everything from one server, or the AD part on-premises and the cloud part on an isolated server.
+- **One or two servers**: everything from one server that reaches both Active Directory and Microsoft 365, or the AD part on the AD server and the cloud part on a **cloud server**. The cloud server is not a server hosted in the cloud: it is any Windows machine of your organisation that reaches Microsoft 365 through the Internet, with no access to Active Directory.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-principles-dark.png">
@@ -194,7 +195,7 @@ Exchange on-premises is down, so the tool reads the permissions where Exchange k
 
 Open the console with `pwsh -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui` (native Fluent theme, PowerShell 7.5+, English). It starts no operation by itself; every operation runs the existing engine in a separate **PowerShell 7.5+** process (the same `pwsh.exe`).
 
-The console is a guided path of five pages: **Setup** (the environment, what this server can run, the prerequisite lights from real detection, one line of run settings), **Task** (move mailboxes, roll back, complete a rollback, check a mailbox, on what: one identity to test first, the configured scope, an OU or a CSV, or a batch or package to continue), **Verify** (the Preview in plain words, then the confirmation word in any letter case), **Run** (the steps announced by the engine, with their waits and warnings in plain words; click a step or an object) and **Next steps**. Run settings changed in the window apply to that run only, through a guarded effective copy of the configuration: the file is never rewritten. See the [reference guide](package/docs/PraRemoteMailbox-Guide.md), chapter 8.
+The console is a guided path of five pages: **Setup** (the environment, what this server can run, the prerequisite lights from real detection, one line of run settings), **Task** (move mailboxes, roll back, complete a rollback, check a mailbox, on what: one identity to test first, the configured scope, an OU or a CSV, or a batch or package to continue), **Verify** (the Preview in plain words, then the confirmation word in any letter case), **Run** (the steps announced by the engine, with their waits and warnings in plain words; click a step or an object) and **Next steps**. Run settings changed in the window apply to that run only, through a guarded effective copy of the configuration: the file is never rewritten. See the [reference guide, chapter 8](package/docs/PraRemoteMailbox-Guide.md#8-everyday-use).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/console-run-finished-dark.png">

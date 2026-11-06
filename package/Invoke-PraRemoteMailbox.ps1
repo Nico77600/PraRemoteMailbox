@@ -131,7 +131,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 3.0.0
+    Version    : 3.1.0
     Requires   : PowerShell 7.5 or later (pwsh.exe; Windows PowerShell 5.1 is refused), RSAT ActiveDirectory,
                  ExchangeOnlineManagement 3.10+, Microsoft.Graph.Authentication and Microsoft.Graph.Users
                  (cloud part), ADSync (sync; through the Windows PowerShell compatibility layer when local).
@@ -925,11 +925,12 @@ try {
         $stepTitle = switch ($Action) { 'Check' { 'Objects to check' } 'Recover' { 'Loading the Recover batch' } default { 'Loading the batch of the AD phase' } }
         Write-PraStep -Context $context -Title $stepTitle -Icon Batch
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and $Identity -and -not $Batch) {
-            if ($Identity -match '@') { $record = [pscustomobject]@{ ObjectGuid = ''; SamAccountName = $Identity; UserPrincipalName = $Identity; IsShared = ((Test-PraOrdinalIgnoreCaseEqual $Scope 'SharedOnly')) } }
+            if ($Identity -match '@') { $record = [pscustomobject]@{ ObjectGuid = ''; SamAccountName = $Identity; UserPrincipalName = $Identity; IsShared = ((Test-PraOrdinalIgnoreCaseEqual $Scope 'SharedOnly')); ExpectedX500Note = 'identity given as a UPN, no Active Directory read: give the sAMAccountName or -Batch' } }
             else {
                 Initialize-PraDirectory $context
                 $user = Get-PraUser $context $Identity
-                $record = [pscustomobject]@{ ObjectGuid = ([guid]$user.ObjectGUID).ToString(); SamAccountName = $user.SamAccountName; UserPrincipalName = $user.UserPrincipalName; IsShared = ((Test-PraOrdinalIn $user.msExchRecipientTypeDetails @(4, 34359738368) -IgnoreCase)) }
+                $record = [pscustomobject]@{ ObjectGuid = ([guid]$user.ObjectGUID).ToString(); SamAccountName = $user.SamAccountName; UserPrincipalName = $user.UserPrincipalName; IsShared = ((Test-PraOrdinalIn $user.msExchRecipientTypeDetails @(4, 34359738368) -IgnoreCase))
+                    ExpectedX500 = [string[]]@(Get-PraExpectedX500 -LegacyExchangeDN ([string](Get-PraValue $user 'legacyExchangeDN' '')) -ProxyAddresses @($user.proxyAddresses)) }
             }
             $context.Rows.Add((New-PraRow $context $record))
             Write-PraItem -Context $context -Status Ok -Text ("{0} ({1})" -f $record.UserPrincipalName, $(if ($record.IsShared) { 'shared mailbox' } else { 'user mailbox' }))
@@ -1057,6 +1058,13 @@ try {
     if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIn $effectivePhase @('Both','Cloud') -IgnoreCase) -and $context.BatchId -and -not $context.Issues.Count) {
         $context.NextSteps = @($(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { 'To roll back this batch later, on the AD server: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId -OtherServer) } else { 'To roll back this batch later: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId) }))
     }
+
+    # X500 addresses missing in Exchange Online (warning of the cloud phase): synchronise, then check again.
+    $x500Missing = @(Get-PraList $context 'X500Missing')
+    if ($x500Missing.Count) {
+        $checkCommand = Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $context.BatchId -KeepFilters
+        $context.NextSteps = @(@(Get-PraList $context 'NextSteps') + ('X500 missing in Exchange Online for {0} object(s) (replies to old messages can bounce): run an Entra Connect synchronisation, then check again: {1}' -f $x500Missing.Count, $checkCommand))
+    }
 }
 catch {
     $failure = $_; $failureOperation = $context.CurrentOperation
@@ -1094,8 +1102,8 @@ finally {
 # SIG # Begin signature block
 # MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCAN4PAFJSz2zQQ
-# Gwe+twn/3/mYLIv98VXJbULaXK3Kd6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCa7Gk0KToze9rW
+# 3k8bkhuW4STeCjF3rhOENN1bvCyG4aCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1172,23 +1180,23 @@ finally {
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAa3Omqnqd/
-# lp7elPYtA9yb4FFl3pp/LJDdmUNJt78nODANBgkqhkiG9w0BAQEFAASCAgB5VefZ
-# jbIcp5d8XRTHQ9MusJGxJroHfWoIhiCfujpaF4YNk+RQhjlDPDW9esyAsPRc9xYq
-# CUjJKDycV3Kq+z7kpvaXPP4LcPIZrZ6lUacTzfHPBzQJT7OVWCFtDEFsMaM87YL1
-# fgagKUCqEpuZDDoBIs71sRz6kskQQrfakS2jzjAIu7HKngnv9Ua/68dhyephFG5X
-# SDYssUgdN9q2dMo2/NrtAYt/pUG+1nLr5h/8APKeRFegjEZtkygW9UeF/3oJGC6v
-# kAd4GnBAsl1tV2YejufnczzL/kpmhPEQ2DUr5v/EJtFPEpIJOhVJSfKLszYh2nc5
-# nvBypdoeSANxP27J4F7za57h+CBbzy17qSnM+Gyu31EuQxyutNypJLc2pf9GJDCL
-# /YSyUhjUki3TFjxYjth966CydCgooDY5HFJPyWHXpTktlBiil8Pfe28g+Ng9lHat
-# KjqLYhYyS1Nr2ZkX3Gh1/Hg5u4gX91iiI7H/sJ/xLofawHontx7xdEFYG0EgsAHl
-# rXI+z/oDU8sBA9EkaSdMI3cynwNa6KrbqbiS7aTLp2zY/DF36vhiCCIPyzEK8soq
-# vEu3ieoWDApQ43s30WibhA4mfDHYKK4gcD/q5isXzh3IK6IEWHQcsckHwxrkXuE8
-# C+wSpJdU9Z8RCirqAGVJDLGMW8/L1rktmNO/yqGCFM8wghTLBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBDZK6ILOnP
+# OJwMbi34+2qLdmTgd74OleZVI3TBYDtNjjANBgkqhkiG9w0BAQEFAASCAgBX+x9Z
+# XqYl9f/3b/m21oPxUHfwN6F1+QD5DAOkvp1Qz6fmxf5aTgvTbXP2hv2TH9AtLWTe
+# aw1Skl1TkE+kilv6fO1i2ewbB3g2lgigf/mTFtBDyZlPTvGmazQTFD00sA+98LWG
+# iyD/jDuXOPGQICqfxdwtPfGYCXKcUb0D9zR488kAGpqt+2gwnMiCvgS2s0LNrCv4
+# iDgmCs/ECQQ4D4+G3V1LTlMoX428eTkytvwiCqMWuXuBDCb806eKa4923hU/CW0T
+# S2o5ZuyZPJjZMClCMI9PnJwVmtQIKuDNbkw7kZAxI0hPfhH3JjScGpyFacjJO2/k
+# FSAYZ5jYGiuJppnsaZKIbJYWGk6Dp1j4WOxvVIMs11kPByHJeJpIvvfslElLv28i
+# YGjU6skshfpjBN+wv+nvrHGUxzhysSz5h64RRqquZFgF0Zqm2G/IUl5clWYWVFgQ
+# VcTzWHd6PxKPY3QKQp4naUMjzPLOXOpxL73ALmIaxfI5pH3LxjBwCuKwSQhBM42V
+# EF10vfHDf2LV8fGhHpgdDBPBz9UCmJpAdLHjTUfvPDOYj1o9Mk4M4/z8n77bQlqy
+# wgFvcl0Gp9FD0DJnyTmPeARtQl2TwOINcTwAqanxv+fNGMQNXPSvHvPt6AvcIsVX
+# 4xWoakdi05alU4SYNfI6yX9BefFvZPLk63pO+KGCFM8wghTLBgorBgEEAYI3AwMB
 # MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIDyADsBxslH2ITvDCWcNvxjUpvQTif0nNZVMM4Y5En+yAghW5rMZ5vWg
-# FhgPMjAyNjExMDUwODA2MzNaMAMCAQECEBN4Ra/DVcIYYwtRR1xoXUmgghGnMIIE
+# BAIBBQAEIHclmH1AWEj/DIfNLP1P+yVpT0kYQ5JH7NqMwIMAP09oAggXC9BN6gmA
+# 0xgPMjAyNjExMDYwODM5NTJaMAMCAQECEG9MT+LVb8vWA6nsIorrIE6gghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1287,13 +1295,13 @@ finally {
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNTA4MDYzM1owKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIF0i
-# BU8I4C5c+wIx/OLtoNifPSSKqDTWgUbaZJhOxbcGMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNjA4Mzk1MlowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEINVY
+# StWKLisMMM9E6QMFlDN+mFMwUvOPAWCyKxfm5HarMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIESDBGAiEA/47ZDiMY3Nf7Jxm/ld/a6bj/H0pwv68on85J1uIoSKACIQDo
-# AuhCh/62oIm0zWH78l0Au1MBcJHIQVNQRDtxjbBmGw==
+# zj0EAwIESDBGAiEAxox1kVVF9/qO8qVTflouiqM94RIsWcn05OzGaDOqaSECIQCr
+# DGC7Kpq4yRq1deLquoxLosvd6+eovl+7fvjIgQ2iMg==
 # SIG # End signature block

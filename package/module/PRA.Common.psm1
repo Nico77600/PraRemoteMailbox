@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0
+    Version : 3.1.0
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # window, run context, report, audit). The literal comments "Version : x.y.z" of the file headers cannot be
 # computed (the signature and the manifest hash the exact bytes): they are listed in the guide, annex D, and
 # checked against this value by the tests. tools\New-PraPackage.ps1 reads the version from this line.
-$script:ToolVersion = '3.0.0'
+$script:ToolVersion = '3.1.0'
 $script:TranscriptOwner = $null
 $script:PraNativePath = $null
 $script:PraNativeProcess = $null
@@ -170,6 +170,23 @@ function Get-PraOrdinalUnique {
     param([Parameter(ValueFromPipeline, Mandatory)][AllowNull()][AllowEmptyString()][object]$InputObject, [switch]$IgnoreCase)
     begin { $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList $(if ($IgnoreCase) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }) }
     process { if ($null -ne $InputObject -and $seen.Add([string]$InputObject)) { [string]$InputObject } }
+}
+
+function Compare-PraX500Address {
+    <#
+    .SYNOPSIS
+        Which of the expected X500 addresses a cloud mailbox carries (EmailAddresses / proxyAddresses): Present and Missing, in the order of Expected.
+    .DESCRIPTION
+        Read only. The whole value is compared, ordinal and ignoring case (Exchange Online may write the type prefix in lower case); the values are returned
+        exactly as they are in Expected.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][string[]]$Expected, [AllowNull()][string[]]$Actual)
+    $actualSet = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($value in @($Actual)) { if ($null -ne $value) { [void]$actualSet.Add([string]$value) } }
+    $present = New-Object 'Collections.Generic.List[string]'; $missing = New-Object 'Collections.Generic.List[string]'
+    foreach ($value in @($Expected)) { if ($null -eq $value) { continue }; if ($actualSet.Contains([string]$value)) { $present.Add([string]$value) } else { $missing.Add([string]$value) } }
+    return [pscustomobject]@{ Total = ($present.Count + $missing.Count); Present = [string[]]$present.ToArray(); Missing = [string[]]$missing.ToArray() }
 }
 #endregion
 
@@ -543,7 +560,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v3.0.0 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v3.1.0 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)
@@ -2811,14 +2828,14 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Sort-PraOrdinal, Get-PraOrdinalUnique, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Sort-PraOrdinal, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
 # MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAhMPObTYSXbho+
-# KyH9GAyQxYF9bqM22mWpKtRTXxz88aCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAIIkVjcHW31kiK
+# 425vDuJoe9b3jl46gWt/1FFNyk8mW6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -2895,23 +2912,23 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAPgoYmZz3o
-# f0NNXRKE2VXEaiMWALXUj70AMKjVhDBYkjANBgkqhkiG9w0BAQEFAASCAgACbatB
-# R0OxC4mEh3jw+Wwq1vTfos4c7W0VB2s7TO5xS/LXQMgTdO70BXAObSwvz/icUEPn
-# lSs+kBLSwdKnOurFNwrROo7kseKezSSaz3hUyiRWstr9bBq5nYBabsXgznixMquA
-# +OykhXiwHb0+6cWYDBXCqEWuRpC/0iSwgypw/SWtn2DtH35YKaUTP/R9lrde9n1L
-# 2GzQHF9xxZ084uRZ4EMKdFtPO4agv3vfj8tmSScfmxU7O/Uji+ZmQ7VhCE0H57UW
-# se76pfaL+p3Uhn8braAmlFpt1BcOI8CNb/gcLTE6rIy7nRZzn/tSjFlY8a9TSjBo
-# 0ecEs7PcxQXLxsek12RnpJGWIkDFQP8UUvv4o0U2yRvOt9pxAGOyYiLMQI+zKnNB
-# kJzB4RqEarhPZ8T4UAulagS7cIn/qb9YneFgUBF1YG870ZtEJ0UoI+AuxO/RGLpe
-# yLMRZNncWv8j+paflmy0LHkoKjE+VXFEawZfeYTjuoUnIsoYHkQCUgzvcEcLZ1WC
-# IFYZFLXy3m001de6TQjeWXGodcn1BFnYAmrMsnBsGePZOOdHju0B8TBF211s3r4p
-# w0LNG2hn9CN8Nupyd+5vcPWaWAs9e79/3AYp6PhOERBokvqsL9EMWiBugXukzUK8
-# 8YmYiFgutYqYTT/X2lVRhp6qLIGMIddCGaSUaqGCFM0wghTJBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDMJZEFrgNG
+# H+8f8PcdMWJHjnufi1Pth+UI4P8RzXpwGDANBgkqhkiG9w0BAQEFAASCAgB6SdPq
+# CX2e4h9oSqr3GopXX1rF5mR5Cy6EHVCtW2fk883i1eXT4Jzd3OhSluCwaajP94MY
+# 8dde/DbtVvQAQcR2AxhNex68Q6G15PtdUUjbThAY2nds1HCyFtRgAqsjy35pyNxJ
+# G9c7dDgOd7wQfG0SWfj9J6ut0o5zEslLl5GTU/JP9LlMa8Wnoutn5lMOUuB8xbxr
+# f2yKb4u0F4bh+ZgTGlHCReU+TTTjV4xOsqZ0zBf5ccIaKXUAWtM4g9r/LcHvLTaD
+# Z/Tdhaq6FD+7upCLqiQwndbo0OxBVrZtrnQkZs3HRNYlxBlC4pGDroey98Q9JFuH
+# XMUGsCET5jNeOINGmFwGtkhgh2RHBbaQmUDh3yIKU64vvAHeTRODzxixuf9k12qE
+# xYYjfBGamfiegoO/UhoERA+a5aJLQfuK3Nbex8dgEcbHiYu5NFpyEdq84RA/DDH3
+# 0bbagqiHL15Pfz9q9T0IbETIXmA5gQZ5LYoenuJKEyuTZy5qi9SC/4i462SNW+d1
+# cDUQJ9wTOwwnnho28aDV6yBAmOqkkdj7Z6hK16KJEShMV3dgm0WgvkTytnELOvOG
+# 6tGlVvTOikGNPj9tHZ2X1JK3pclgH9K+g2zI8Zn2FNgnULlODMXhrc+ipYtz1HUW
+# GRXWGIhFlH/serR7qnmDo2Ia+UHZnxrXmH1+PaGCFM0wghTJBgorBgEEAYI3AwMB
 # MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIGktP+0PW4oSgo5vjr5bZnEcKdLZ+XBRDuSqzSSA5gjbAggzp90dQKL5
-# hhgPMjAyNjExMDUwODA3MTVaMAMCAQECEH11bsWg+IUi7w67ase4qmigghGnMIIE
+# BAIBBQAEIPbTAZ6t5wKwGJUjZOgDw5/o/SI0Io0psKET7W62mOmeAggBafbdKcWg
+# rxgPMjAyNjExMDYwODQwMTBaMAMCAQECEF+5W6lb3p/H6CtDzEzCHu+gghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3010,13 +3027,13 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNTA4MDcxNVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGV2
-# 0QhOYb07Uzkpuv6zpKbIWMOb5SbG6e7xNwPj1wX6MIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNjA4NDAxMFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEICvr
+# Ru0LODFt0j0K2REStd8QpZVBrL7G7T/vceoed84NMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERjBEAiA2AktKCq3/anT9pczSk+s/n0C6XhRepQaYpYMucrs41AIgHCoc
-# 6hRuY3xBI75H3U0WMx7m44nl9WWMYXvawVhEhbQ=
+# zj0EAwIERjBEAiB8r3OBdc5IKjYEse1PwboQFAMAtdMEhCh13AcNPpKQvgIgedqD
+# 8W6neal1ZEdko4YVLj8q8RUkkrLCwphm6nncouo=
 # SIG # End signature block

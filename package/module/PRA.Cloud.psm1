@@ -37,7 +37,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0
+    Version : 3.1.0
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -181,17 +181,21 @@ $script:PraExoWorker = {
     }
     function Mailbox {
         param([string]$Upn,[switch]$Hold)
-        $grantParameters = @{ Filter=(ExactFilter $Upn); Properties=@('RecipientTypeDetails'); ResultSize='Unlimited' }
+        $grantParameters = @{ Filter=(ExactFilter $Upn); Properties=@('RecipientTypeDetails','EmailAddresses'); ResultSize='Unlimited' }
         if ($Hold) { $grantParameters.Properties += @('IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled') }
         $items = @(Get-EXOMailbox @grantParameters -ErrorAction Stop)
         if ($Hold -and $items.Count -eq 0) { $items = @(Get-EXOMailbox @grantParameters -InactiveMailboxOnly -ErrorAction Stop) }
         if ($items.Count -gt 1) { throw "Exchange Online mailbox not unique: $Upn" }
-        if ($items.Count -eq 0) { return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false } }
+        if ($items.Count -eq 0) { return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@() } }
         $m = $items[0]; $type = [string](V $m 'RecipientTypeDetails')
         if (-not $type) { throw "Mailbox type not returned: $Upn" }
         $holds = V -Object $m -Name 'InPlaceHolds' -Default @()
+        # EmailAddresses (every proxy address of the mailbox, X500 included): whether Exchange Online returned the property at all is kept apart from "empty".
+        $hasAddresses = if ($m -is [System.Collections.IDictionary]) { $m.Contains('EmailAddresses') } else { $null -ne $m.PSObject.Properties['EmailAddresses'] }
+        $rawAddresses = V -Object $m -Name 'EmailAddresses' -Default @()
         return @{ Found=$true; Type=$type; Holds=@($holds | Where-Object { $null -ne $_ }); IsInactive=[bool](V -Object $m -Name 'IsInactiveMailbox' -Default $false)
-            Litigation=[bool](V -Object $m -Name 'LitigationHoldEnabled' -Default $false); RetentionHold=[bool](V -Object $m -Name 'RetentionHoldEnabled' -Default $false) }
+            Litigation=[bool](V -Object $m -Name 'LitigationHoldEnabled' -Default $false); RetentionHold=[bool](V -Object $m -Name 'RetentionHoldEnabled' -Default $false)
+            HasAddresses=[bool]$hasAddresses; Addresses=[string[]]@($rawAddresses | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) }
     }
     function NormalizeAcl {
         param([object[]]$Entries,[string]$Right,$Target)
@@ -866,10 +870,10 @@ function Invoke-PraSharedPermission {
 }
 
 function Get-PraGraphFact {
-    param([hashtable]$Context,[string]$Upn,[bool]$Mailbox,[bool]$License)
+    param([hashtable]$Context,[string]$Upn,[bool]$Mailbox,[bool]$License,[bool]$Addresses=$false)
     if (-not (Get-PraCloudSession $Context).Graph) { throw 'Microsoft Graph required but not connected.' }
     Assert-PraGraphSession $Context
-    $props=@('assignedPlans'); if ($Mailbox) { $props+='provisionedPlans' }; if ($License) { $props+='assignedLicenses' }
+    $props=@('assignedPlans'); if ($Mailbox) { $props+='provisionedPlans' }; if ($License) { $props+='assignedLicenses' }; if ($Addresses) { $props+='proxyAddresses' }
     $users=@(Get-MgUser -UserId $Upn -Property $props -ErrorAction Stop)
     if ($users.Count -ne 1 -or $null -eq $users[0]) { throw "Microsoft Graph: user not found or not unique ($Upn)." }
     $values=@{}; $sentinel=New-Object object
@@ -903,7 +907,69 @@ function Get-PraGraphFact {
     }
     $count=0; if ($License) { $count=$values.assignedLicenses.Count }
     return @{ Enabled=$enabled; Provisioned=$prov; LicenseCount=$count; RequiredSku=$required
-        RequiredSkuOk=(-not $required -or (Test-PraOrdinalIgnoreCaseIn $required $sku)); Detail=($plans -join ',') }
+        RequiredSkuOk=(-not $required -or (Test-PraOrdinalIgnoreCaseIn $required $sku)); Detail=($plans -join ','); Addresses=[string[]]@(if ($Addresses) { $values.proxyAddresses | ForEach-Object { [string]$_ } }) }
+}
+
+function Get-PraCloudAddress {
+    <# Addresses of the cloud mailbox (read only): Exchange Online EmailAddresses, or the Entra proxyAddresses when the mailbox check goes through Graph. Has = the property was returned. #>
+    param([hashtable]$Context,$State)
+    if ($State.ExoMailbox) {
+        $m = Invoke-PraExo -Context $Context -Operation 'Mailbox' -Params @{ Upn=$State.Upn }
+        if ((Get-PraValue $m 'Found' $false) -ne $true) { throw 'the mailbox is no longer found in Exchange Online' }
+        return @{ Has=[bool](Get-PraValue $m 'HasAddresses' $false); List=[string[]]@(Get-PraList $m 'Addresses') }
+    }
+    $facts = Get-PraGraphFact -Context $Context -Upn $State.Upn -Mailbox $false -License $false -Addresses $true
+    return @{ Has=$true; List=[string[]]@($facts.Addresses) }
+}
+
+function Complete-PraX500Check {
+    <# Result of the X500 control of one object: an Ok line when every expected address is there, otherwise ONE warning (the conversion itself stays done). #>
+    param([hashtable]$Context,$State)
+    $row = $State.Row; $failure = [string](Get-PraValue $State 'X500Failure' ''); $last = $State.X500Last
+    $Context.CurrentIdentity = [string](Get-PraValue $row 'ObjectGuid' $State.Upn); $Context.CurrentOperation = 'X500Check'
+    $State.Done = $true
+    if (-not $failure -and $null -ne $last -and $last.Missing.Count -eq 0) {
+        Write-PraItem -Context $Context -Status Ok -Text ('{0}: X500: {1} of {1} present (legacyExchangeDN + older X500)' -f $State.Upn, $last.Total)
+        $row.CloudDetail = ([string]$row.CloudDetail + ' | X500:present=' + $last.Total + '/' + $last.Total).Trim(' ', '|')
+        return
+    }
+    $advice = 'Replies to old messages and meeting updates to this mailbox can bounce (IMCEAEX NDR). Check that Entra Connect syncs proxyAddresses and legacyExchangeDN for this object, run a sync, then run -Action Check.'
+    if ($failure) {
+        $text = '{0}: X500 could not be verified in Exchange Online ({1}). {2}' -f $State.Upn, $failure, $advice
+        $row.CloudDetail = ([string]$row.CloudDetail + ' | X500:not verified').Trim(' ', '|')
+    }
+    else {
+        $shown = @($last.Missing | Select-Object -First 5) -join ', '
+        if ($last.Missing.Count -gt 5) { $shown += (' + {0} more (full list in the log)' -f ($last.Missing.Count - 5)) }
+        foreach ($value in $last.Missing) { Write-PraLog -Context $Context -Message ('{0} | X500 missing in Exchange Online : {1}' -f $State.Upn, $value) -Level Detail }
+        $text = '{0}: X500 missing in Exchange Online: {1}. {2}' -f $State.Upn, $shown, $advice
+        $row.CloudDetail = ([string]$row.CloudDetail + ' | X500:missing=' + $last.Missing.Count + '/' + $last.Total).Trim(' ', '|')
+    }
+    Write-PraItem -Context $Context -Status Warn -Text $text
+    $row.Warnings = ([string](Get-PraValue $row 'Warnings' '') + '; ' + $text).Trim(' ', ';')
+    if (-not $Context.ContainsKey('X500Missing')) { $Context['X500Missing'] = New-Object 'Collections.Generic.List[string]' }
+    [void]$Context['X500Missing'].Add([string]$State.Upn)
+}
+
+function Invoke-PraX500Step {
+    <#
+    .SYNOPSIS
+        One read of the X500 control (Convert): the addresses read in this iteration (Fresh) or a new read. Returns true once the result is final:
+        every address present, or the bounded number of reads used up, or Final (a single look: preview, -Once).
+    #>
+    param([hashtable]$Context,$State,$Fresh,[int]$MaxReads,[bool]$Final)
+    $State.X500Reads++; $State.X500Failure = ''
+    try {
+        $addresses = if ($null -ne $Fresh) { $Fresh } else { Get-PraCloudAddress -Context $Context -State $State }
+        if (-not $addresses.Has) { throw $(if ($State.ExoMailbox) { 'EmailAddresses not returned by Exchange Online' } else { 'proxyAddresses not returned by Microsoft Graph' }) }
+        $State.X500Last = Compare-PraX500Address -Expected $State.X500 -Actual $addresses.List
+    }
+    catch { $State.X500Failure = [string]$_.Exception.Message; $State.X500Last = $null }
+    $good = ([string]::IsNullOrEmpty($State.X500Failure) -and $State.X500Last.Missing.Count -eq 0)
+    if ($good -or $Final -or $State.X500Reads -ge $MaxReads) { Complete-PraX500Check -Context $Context -State $State; return $true }
+    $found = if ($null -ne $State.X500Last) { 'X500:{0} of {1} present, read {2} of {3}' -f $State.X500Last.Present.Count, $State.X500Last.Total, $State.X500Reads, $MaxReads } else { 'X500:not readable yet, read {0} of {1}' -f $State.X500Reads, $MaxReads }
+    $State.Row.CloudDetail = ([string]$State.Row.CloudDetail -replace ' \| X500:[^|]*\z', '') + ' | ' + $found
+    return $false
 }
 
 function Invoke-PraCloudPhase {
@@ -942,24 +1008,44 @@ function Invoke-PraCloudPhase {
             if (-not $mb -and -not $lic) {
                 $row.CloudStatus='Skipped'; $row.CloudDetail='No applicable check; no restore confirmation.'; $row.FinalStatus='Skipped'; continue
             }
+            # X500 control (Convert): the addresses recorded by the AD phase must be on the cloud mailbox. A batch written before 3.1.0 has none: skipped, never a failure.
+            $x500Expected=$null
+            if ($mb -and (Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) {
+                $source=Get-PraValue $row 'BackupRec' $null
+                $stored=Get-PraValue $source 'ExpectedX500' $null
+                $Context.CurrentIdentity=[string](Get-PraValue $row 'ObjectGuid' $upn); $Context.CurrentOperation='X500Check'
+                if ($null -eq $stored) {
+                    Write-PraItem -Context $Context -Status Info -Text ('{0}: X500 control skipped, expected addresses not available ({1})' -f $upn, [string](Get-PraValue $source 'ExpectedX500Note' 'batch from 3.0.0 or older'))
+                }
+                else {
+                    $x500Expected=[string[]]@(@($stored) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+                    if (-not $x500Expected.Count) {
+                        Write-PraItem -Context $Context -Status Info -Text ('{0}: X500 control skipped, nothing to verify (no legacyExchangeDN and no X500 address on premises)' -f $upn)
+                        $x500Expected=$null
+                    }
+                }
+            }
             $graphMailbox=$mb -and -not $shared -and (Test-PraOrdinalIgnoreCaseEqual $via 'Graph')
             $exoMailbox=$mb -and ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -or $shared -or (Test-PraOrdinalIgnoreCaseEqual $via 'Exo'))
             $needGraph=$needGraph -or $lic -or $graphMailbox; $needExo=$needExo -or $exoMailbox
             [void]$states.Add(@{ Row=$row; Upn=$upn; Shared=$shared; Mailbox=$mb; License=$lic; GraphMailbox=$graphMailbox
-                ExoMailbox=$exoMailbox; Requests=$requests; PreserveMailbox=$preserveMailbox; PreserveLicense=$preserveLicense; Done=$false })
+                ExoMailbox=$exoMailbox; Requests=$requests; PreserveMailbox=$preserveMailbox; PreserveLicense=$preserveLicense; Done=$false
+                X500=$x500Expected; X500Reads=0; X500Failure=''; X500Last=$null; CoreDone=$false })
         }
         if ($states.Count -eq 0) { return }
         try { Connect-PraCloudSession -Context $Context -NeedGraph $needGraph -NeedExo $needExo }
         catch { $Context.CloudConnectFailed=$true; throw }
         $clock=[Diagnostics.Stopwatch]::StartNew(); $timeout=[double]$Context.TimeoutMinutes*60; $attempt=0
+        $x500MaxReads=3   # first read + two re-reads at the polling interval: the cloud value can lag one synchronisation, never a long new wait
         do {
             $attempt++; $pending=@($states | Where-Object { -not $_.Done })
             $null=Write-PraLog -Context $Context -Message ("Check {0}: {1} object(s) in Exchange Online" -f $attempt, $pending.Count) -Level Info
             foreach ($s in $pending) {
                 $row=$s.Row; $Context.CurrentIdentity=[string](Get-PraValue $row 'ObjectGuid' $s.Upn); $Context.CurrentOperation='CloudCheck'
                 try {
+                    if ($s.CoreDone) { $null=Invoke-PraX500Step -Context $Context -State $s -Fresh $null -MaxReads $x500MaxReads -Final ([bool]$Context.Once); continue }
                     $details=New-Object 'System.Collections.Generic.List[string]'; $mbok=$true; $licok=$true; $facts=$null
-                    if ($s.GraphMailbox -or $s.License) { $facts=Get-PraGraphFact -Context $Context -Upn $s.Upn -Mailbox $s.GraphMailbox -License $s.License }
+                    if ($s.GraphMailbox -or $s.License) { $facts=Get-PraGraphFact -Context $Context -Upn $s.Upn -Mailbox $s.GraphMailbox -License $s.License -Addresses ([bool]($null -ne $s.X500 -and $s.GraphMailbox)) }
                     if ($s.ExoMailbox) {
                         $m=Invoke-PraExo -Context $Context -Operation 'Mailbox' -Params @{ Upn=$s.Upn }
                         if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) {
@@ -1005,7 +1091,13 @@ function Invoke-PraCloudPhase {
                                 $null=Write-PraLog -Context $Context -Message ("{0}: {1}" -f $s.Upn, $what) -Level Success
                             }
                         }
-                        $s.Done=$true
+                        $s.CoreDone=$true
+                        if ($null -ne $s.X500) {
+                            $fresh=$null
+                            if ($s.ExoMailbox) { $fresh=@{ Has=[bool](Get-PraValue $m 'HasAddresses' $false); List=[string[]]@(Get-PraList $m 'Addresses') } }
+                            elseif ($s.GraphMailbox -and $null -ne $facts) { $fresh=@{ Has=$true; List=[string[]]@($facts.Addresses) } }
+                            $null=Invoke-PraX500Step -Context $Context -State $s -Fresh $fresh -MaxReads $x500MaxReads -Final ([bool]$Context.Once)
+                        } else { $s.Done=$true }
                     } else { $row.CloudStatus='Pending' }
                 } catch { Write-PraCloudError -Context $Context -Row $row -Message ($_.Exception.Message+' | '+[string]$row.PermDetail); $s.Done=$true }
             }
@@ -1016,12 +1108,14 @@ function Invoke-PraCloudPhase {
             foreach ($s in $pending) { $null=Write-PraLog -Context $Context -Message ("{0} | {1}" -f $s.Upn, $s.Row.CloudDetail) -Level Detail }
             $intervalSeconds=[Math]::Max(1,([double]$Context.IntervalMinutes*60))
             $waitText=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { 'Waiting for Exchange Online to finish deprovisioning' } elseif ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { 'Waiting for the mailbox and licence to appear in Exchange Online' } else { 'Waiting for Exchange Online' }
+            if (@($pending | Where-Object { -not $_.CoreDone }).Count -eq 0) { $waitText='Waiting for the X500 addresses to appear in Exchange Online (Entra Connect synchronisation)' }
             Write-PraProgress -Context $Context -Text ("{0} ({1} object(s) not ready)" -f $waitText,$pending.Count) -Current ([int]$clock.Elapsed.TotalSeconds) -Total ([int]$timeout) -Attempt $attempt -MaxAttempts ([int][Math]::Ceiling($timeout/$intervalSeconds)+1) -NextInSeconds ([int][Math]::Ceiling($seconds))
             if ($seconds -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(2147483647,($seconds*1000))) }
         } while ($true)
         $preview=(-not $Context.AllowMutation -and (Test-PraOrdinalIn $Context.Action @('Convert','Recover')))
         foreach ($s in $states) {
             if ($s.Done) { continue }
+            if ($s.CoreDone) { Complete-PraX500Check -Context $Context -State $s; continue }
             if ($preview) {
                 $s.Row.CloudStatus='Pending'; $s.Row.FinalStatus='Planned'
                 $s.Row.Detail=([string]$s.Row.Detail+' | not yet in the expected state in Exchange Online (preview): '+$s.Row.CloudDetail).Trim(' ','|')
@@ -1122,8 +1216,8 @@ Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBZrHfC/rQGoWEg
-# pQzVyAc2qo0IqDgqI+PeTgmw0u+5paCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAFSrN6+aGNev+D
+# DxCL8gfpVOvhK3owgQLolyI53HAzBaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1200,23 +1294,23 @@ Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCUrSB6bOuw
-# zvxzFLmWon8oNEeLaji39UVrtHytYF9d1DANBgkqhkiG9w0BAQEFAASCAgCPXdum
-# F3QwfVC2EgQlvYuBavXRU9NnyP6jk99/uYAk1UCQckgAxK648XfCZx3WTLZE9DJV
-# lLfsL08F29F+YjzvGNfz1gvWwXlo5Ol/pBLu42/aQdEyZh8JMYXC11w4nKL18VMy
-# UiqUhXJ3ag5+k3p0R39oKnBd0L2XrbfYX0DuvdvPQLvLmKFYVLatgaD6ohImvdKr
-# 9ta0oFxce7GfhBqJAmxU9IackAUB6Luf/5LM0LH8ftkYGzHfudbXTmHxq6BINSTL
-# uyt2Wxb2IfPr4gWfNu5zY7INA3WhEMGACIIRV+Mpmx/1ZXlifBZzcz/7kcS5XDTH
-# i3sjbTnLjdxaGmC0pxdCQcQ8Pm2LTO8piHz7GKhIIqnZ9f3jk0kDTHZuflGb4auH
-# 8wzYX6/C6cV+60KSvcR+ALAh8uvhOb7OhyzqKTlApiNnx6+04D/CrhfdFKyB2rcH
-# HvpRlWNMDHPCVDud0KXxhmsG8cld347AhD9frl4k4CsNY/Exf/Ab+IlyzoII2crF
-# eCY4VX7c0bRfQmJZYbui9cBOs+ZKjogo2gL7HF6B/PCudJdUAYH3eumRZEEjBAXn
-# 7oeO26Do8C4F2VJ8nxsAcyPuFB9CjMH/6eyLDOAG7ODLSFDMZH1pB4nMlGFa9ssQ
-# QMfpVcFUPbcamPDSspnaNNrZDCPVoZouFXEaC6GCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDI3J77bUWe
+# PXcf+bYJ4+SDUOl331fCZYLSz44YnhuonjANBgkqhkiG9w0BAQEFAASCAgBLC1OK
+# 4zZ8CusrIhMtDNNkLdmIgNkaRR82FKarq2MSp8k6YxJGq4OyZY5u12WvBe958PfA
+# J+NZZtZkfMMYtodH0KPaCb6y6Eey2W6G43G5S4UXojGJ0NBVF+C7MdMVx3l+S5ar
+# ZUggKH+VLOm0k1t8EhRYHliNW7jlPaQoA1NY4ReEulZH7CvyteFLvYcQNW4mtx1T
+# p3ZAryz9DjVPrKV/L3qIppvY7nZ4Cd1/fj5Iob2gl6Z/FYnXGPLChBoaBPCye8F5
+# 22D3qeik0Y80+r7V6bwdS71SgYX9hj7mXtIqGaeD/NbJtg5HUbo4cq6QD0u3G2XH
+# pr37aHefQgUt6+1H6REDuJHabvcDPfmjYSVqUqS4EYXq/NU3lTrO0q5/UdiPeh39
+# VCXAX2wx/csKZJ7FvVEC8REKDkubOW/yjgdWckvsGMZ4luZfRItYYRB0fzuhT+ia
+# Gl5+otKDZOALY3m2qLw3ArtKn7192DEBpeQHWHNTc0TqTwTdzdVt7dft1J9henQV
+# PIo4T6spIm6emZ6pXQv/jGH9YrdQQOAkZ4Q0jeWg19zX+SiUkwY/h4msqS48eDmA
+# TF9LQZyFa6p6doqIRnZj7gd2m7XTEDotGX6GT2uGA20p8vzH/Udr+8L29V/cz0NS
+# qdstqV5blsfp5x4zOASv25xvO2lShnqvuft66qGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIB7VHM729Fy6t2DajRKeWuXq/bOpJ9rk3qrZ1wBsPdinAggFmaOQw7zN
-# yhgPMjAyNjExMDUwODA3MzhaMAMCAQECEDWOmBZeeEXY5lG2pNBxBrCgghGnMIIE
+# BAIBBQAEIDgdb1M+J1RdHzis6vTnSSJTKwBxbqO+xlcUgnrCkghKAghwbdIArOIb
+# qxgPMjAyNjExMDYwODQwMjRaMAMCAQECED3XFYysjs5GEfjzA3j6lhugghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1315,13 +1409,13 @@ Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNTA4MDczOFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIM+8
-# opHO4iViAacvYyy1chQpTRZQpjqUepWPWWjHVVqlMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNjA4NDAyNFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIL19
+# 1HKhWDYx0BixDkwCMZMPCGnOc8JX4RgNfb+wB/WEMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEAsHA1b9a094XVlx8casBFZlDDx9A81ZEE9JwFuB12OqACIDh/
-# NHt+wqp7vDmfH/xBFNkS1G7vZYgaMvelrF9wZjtB
+# zj0EAwIERzBFAiBZpRpTLqbr/x1ZihRIA3hrWaafrch2Sj4XI/K/zkt+awIhALTU
+# KidhOgpyl/XmUlaoLzyaZcFWd8owx/yBiwog/zrh
 # SIG # End signature block

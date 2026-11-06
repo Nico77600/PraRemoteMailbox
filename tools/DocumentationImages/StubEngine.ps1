@@ -9,7 +9,7 @@
     Nothing here reads Active Directory, Exchange Online, Microsoft Graph or Entra Connect.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0
+    Version : 3.1.0
     Part of : PRA Remote Mailbox (repository tool, not in the package)
 #>
 param($Action, $Mode, $ConfigPath, $Scope, $Phase, $Identity, $MaxObjects, $SearchBase, $CsvPath, $Batch, $BaseConfigPath, $Expect, [switch]$Once, [switch]$Force)
@@ -24,6 +24,8 @@ if (-not $objs.Count) { $objs = @($all[0]) }
 # A rollback of the one-mailbox test batch concerns that mailbox only.
 if ($Action -eq 'Recover' -and -not $Identity) { $objs = @($all[0]) }
 $apply = ($Mode -eq 'Apply')
+# The console passes -Phase AD for a Finalize; the real engine reports the phase Finalize.
+if ($Action -eq 'Finalize') { $Phase = 'Finalize' }
 $batchId = '490cc62e'; $backup = 'D:\PRA\Backups\Batch-490cc62e5f2b4d0e9c1a7b36d8e41f02\Convert-LAB-20261104_091200-490cc62e.json'
 $steps = switch ("$Action|$Phase") {
     'Convert|Both' { @('Active Directory connection', 'Targets and planned changes', 'Exchange Online pre-check', 'Backup and Active Directory changes', 'Entra Connect synchronisation', 'Exchange Online: mailboxes, licences and permissions') }

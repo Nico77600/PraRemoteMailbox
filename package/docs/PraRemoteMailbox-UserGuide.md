@@ -1,7 +1,7 @@
 ﻿---
 title: PRA Remote Mailbox
 subtitle: User guide
-version: 3.0.0
+version: 3.1.0
 author: Nicolas Fabert
 updated: 2026-11-04
 runtime: PowerShell 7.5+ (engine and window)
@@ -10,9 +10,9 @@ safety: Backup before every change
 
 # PRA Remote Mailbox — User guide
 
-> Follow the path, one step after the other. Each step says **what to do**, **what you should see**, and **what to do if not**. You do not need to know anything before you start: every word is explained. How the tool works inside, every setting and the exact rights are in the [reference guide](PraRemoteMailbox-Guide.md).
+> Follow the path, one step after the other. Each step says **what to do**, **what you should see**, and **what to do if not**. You do not need to know anything before you start: every word is explained. How the tool works inside, every setting and the exact rights are in the [reference guide](PraRemoteMailbox-Guide.md). It is a second file, `PraRemoteMailbox-Guide.html`, in the same `docs` folder as this one.
 
-> [!IMPnRTANT]
+> [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
 >
 > ```powershell
@@ -35,7 +35,7 @@ Your company mail servers are lost. People cannot send or read mail. This tool g
 
 Think of a fire in an office building. Everyone moves to a temporary office the same day. When the building is repaired, everyone moves back. The tool is the moving team. It writes a list of every desk before it moves anybody. The list is the **backup**.
 
-> [!CAUTInN]
+> [!CAUTION]
 > The new mailbox is **empty**. The old messages are **not** copied by this tool. They come back when the old servers are repaired, or from your backup product. Messages received in the cloud may be lost if you roll back without saving them first. Exchange Online seems to keep a removed mailbox for a while. Nobody knows for how long. Save the mail before you roll back. Ask before you roll back.
 
 ### The path
@@ -59,6 +59,25 @@ B | 7 | Read the report | it says what was done
 ```
 
 ![The path. Set up once: get your rights, put the tool on the server, fill in the settings file, open the console. Then A: try one mailbox, move everyone, read the report. Or B: roll back, complete the rollback, read the report](images/readme-path-light.png)
+
+### Which path is mine?
+
+Ask one question. **Can one server reach both Active Directory and Microsoft 365?** Microsoft 365 is reached through the Internet.
+
+| Your answer | Your path |
+|---|---|
+| **Yes.** One server does both. | **One server.** Do Path 1, then Path 2. |
+| **No.** No server does both. | **Two servers.** Do Path 1, then Path 3. The directory part runs on a server that sees Active Directory. The cloud part runs on a machine that reaches the Internet. |
+
+Not sure? Ask your administrator this one question. Do not guess.
+
+> [!IMPORTANT]
+> **Two words you will meet often.**
+>
+> - **Directory server**: the server that can reach Active Directory. It has the add-on called RSAT.
+> - **Cloud server**: any Windows machine of your company that can reach Microsoft 365 through the Internet. It is **not** a server in the cloud. You do not rent or build anything. It can stand in your own server room. It can be an administrator's PC. It does **not** need Active Directory.
+>
+> With one server, the same machine is both.
 
 ### The example in this guide
 
@@ -91,7 +110,8 @@ The tool has one window, the **console**. It has **five pages**. You go from the
 Tick every box before you begin. If you cannot tick a box, stop and ask.
 
 - [ ] I have this guide and a quiet hour. A move of many mailboxes can take an hour or more.
-- [ ] I know which server I sit at. Its name is in the top right of the **Setup** page.
+- [ ] I know which server I sit at. Its name is in the box **This computer**, on the right of the **Setup** page.
+- [ ] I know if I use **one server** or **two servers** (see [Which path is mine?](#which-path-is-mine)). With two servers, I know which one is the directory server and which one is the cloud server.
 - [ ] My administrator gave me the rights in the list below.
 - [ ] The tool folder is on the server, and the files are unblocked (see the yellow box at the top).
 - [ ] There is a **safe place for the backups**: a disk that is not lost with the server.
@@ -100,7 +120,7 @@ Tick every box before you begin. If you cannot tick a box, stop and ask.
 
 ### Ask your administrator for these rights
 
-You do not need to understand this list. Give it to your administrator. Each line is a right that the tool needs. The exact technical table is in the [reference guide, chapter 4](PraRemoteMailbox-Guide.md#permissions).
+You do not need to understand this list. Give it to your administrator. Each line is a right that the tool needs. The exact technical table is in the [reference guide, chapter 4](PraRemoteMailbox-Guide.md#permissions). The reference guide is the file `PraRemoteMailbox-Guide.html`, in the same `docs` folder as this guide.
 
 | Where | Ask for | Why the tool needs it |
 |---|---|---|
@@ -109,19 +129,19 @@ You do not need to understand this list. Give it to your administrator. Each lin
 | **The Entra Connect server** | Your account in the group **ADSyncOperators**. If the tool runs on another server: the right to **connect remotely** (WinRM). | The tool starts one synchronisation. It sends the changes to the cloud. |
 | **Microsoft 365, sign-in by a person** | Permission **User.Read.All** for the sign-in window (an administrator accepts it once). A role that can read users, for example **Global Reader**. | The tool reads each person to check the licence and the new mailbox. |
 | **Exchange Online, sign-in by a person** | The role **Exchange Recipient Administrator** (or the role group **Recipient Management**). | The tool reads the mailboxes. It gives people access to shared mailboxes. |
-| **Exchange Online and Microsoft 365, no person present** | An **application** with a **certificate**. Application permissions **User.Read.All** (Graph) and **Exchange.ManageAsApp**, accepted by an administrator. The role **Exchange Recipient Administrator** for the application. | Same work, without a person at the keyboard. Annex C of the reference guide shows the commands. |
+| **Exchange Online and Microsoft 365, no person present** | An **application** with a **certificate**. Application permissions **User.Read.All** (Graph) and **Exchange.ManageAsApp**, accepted by an administrator. The role **Exchange Recipient Administrator** for the application. | Same work, without a person at the keyboard. [Annex C of the reference guide](PraRemoteMailbox-Guide.md#annex-c--certificate-sign-in-application) shows the commands. |
 
 > [!NOTE]
-> A few rights could not be confirmed from the tool itself. They are marked in the [reference guide, chapter 4](PraRemoteMailbox-Guide.md#permissions). Your administrator tests them once in a lab, before the real day.
+> A few rights could not be confirmed from the tool itself. They are marked in the [reference guide, chapter 4](PraRemoteMailbox-Guide.md#permissions) (file `PraRemoteMailbox-Guide.html`). Your administrator tests them once in a lab, before the real day.
 
 <!-- icon: settings -->
 ## 3. Set up once
 
-You do this part **one time**. It is best to do it **before** the disaster, as a rehearsal.
+You do this part **one time**. It is best to do it **before** the disaster, as a rehearsal. With two servers, do steps 2, 3 and 4 on **each** server.
 
 ### 1 · Get your rights
 
-**Do:** give your administrator the table "Ask your administrator for these rights" (chapter 2). Wait until the administrator says: "Done."
+**Do:** give your administrator the table [Ask your administrator for these rights](#ask-your-administrator-for-these-rights), in [chapter 2](#2-before-you-start). Wait until the administrator says: "Done."
 
 **You should see:** nothing yet. You will see the effect in step 4, when the lights turn green.
 
@@ -177,11 +197,11 @@ pwsh -STA -File D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1 -Gui
 
 **You should see:** the console opens. It starts on the **Setup** page. Look at the **lights**. A light is a small box with a mark. A **green check** means "this is ready". A **red cross** means "this is missing".
 
-![The Setup page. Five lights: all five are green or grey. Number 1 marks the lights](images/console-setup-light.png)
+![The Setup page. Six lights: all six are green or grey. Number 1 marks the lights](images/console-setup-light.png)
 
 Here is what each light checks.
 
-![The five lights, one by one, in green](images/console-setup-lights-light.png)
+![The six lights, one by one, in green](images/console-setup-lights-light.png)
 
 | Light | In plain words |
 |---|---|
@@ -190,13 +210,14 @@ Here is what each light checks.
 | **Microsoft.Graph** | The program that reads people in Microsoft 365. |
 | **Entra Connect sync** | The way to send the changes to the cloud. Grey means "not used". |
 | **Sign-in** | How the tool signs in to Microsoft 365. |
+| **Microsoft 365 reachable** | Can this server reach Microsoft 365 through the Internet? The console tries for 3 seconds. This light shows only when the cloud programs are installed. |
 
 **If a light is red:** read the red text inside it. It says what is missing. Ask your administrator to fix it. Then press **Check again**.
 
 ![A Setup page where two lights are red because the cloud programs are not installed on this server](images/console-setup-red-light.png)
 
 > [!NOTE]
-> A red light is **not always a problem**. The big word **AD** or **Cloud** in the middle says what *this* server can do. On a server that only does the directory part, the cloud lights stay red. That is normal. You do the cloud part on the other server.
+> A red light is **not always a problem**. In the middle box, **This server can run**, a big word says what *this* server can do. **AD + Cloud** means everything. **AD** means the directory part only. **Cloud** means the cloud part only. **Nothing yet** means a light must be fixed first. The word comes from the programs installed here and from a short test of the Internet. If Microsoft 365 cannot be reached, the word is **AD**, even when every program is installed. The cloud part must then run on another machine that reaches the Internet (two servers). On the directory server, the cloud lights stay red. On the cloud server, the **RSAT ActiveDirectory** light stays red. That is normal. You do the other part on the other server.
 
 <!-- icon: cloud -->
 ## 4. A · Move mailboxes to the cloud
@@ -206,8 +227,8 @@ There are three ways. Do them in this order the first time.
 | Way | When | Go to |
 |---|---|---|
 | **Try one mailbox** | **Always first.** One person, to see that everything works. | Path 1 |
-| **Move everyone, one server** | One server does the directory part and the cloud part. | Path 2 |
-| **Move everyone, two servers** | The directory server cannot reach the cloud. | Path 3 |
+| **Move everyone, one server** | One server reaches Active Directory **and** Microsoft 365. It does both parts. | Path 2 |
+| **Move everyone, two servers** | No single server reaches both. The directory server does the directory part. The cloud server does the cloud part. | Path 3 |
 
 ### Path 1 · Try one mailbox
 
@@ -215,7 +236,7 @@ This is the safest start. One person is moved. Everybody else is left alone.
 
 ### 1 · Open the console
 
-**Do:** open the console as in step 4 of chapter 3. Make sure the lights are green. Press **Choose a task →** at the bottom right.
+**Do:** open the console as in [step 4 of chapter 3](#4--open-the-console). Make sure the lights are green. Press **Choose a task →** at the bottom right.
 
 ![The Setup page with the button Choose a task. Number 1 marks the button](images/console-setup-next-light.png)
 
@@ -233,15 +254,15 @@ This is the safest start. One person is moved. Everybody else is left alone.
 
 **Do:** keep **Single identity (test)** chosen. Click in the **Identity** box. Type the e-mail address of your test person. Then press the small button **Check**.
 
-![The Task page. Number 1: the box with the e-mail address. Number 2: the button Check. Number 3: the button Continue to verification](images/console-task-identity-light.png)
+![The Task page. Number 1: the box with the e-mail address. Number 2: the button Check. Number 3: the pill Phase: Both. Number 4: the button Continue to verification](images/console-task-identity-light.png)
 
-**You should see:** a green line under the box with the name of the person, for example *Alice Vance · alice.vance@contoso.com · User mailbox*. A line **Phase: Both** says that this server does everything alone.
+**You should see:** a green line under the box with the name of the person, for example *Alice Vance · alice.vance@contoso.com · User mailbox*. At the bottom of the page, the card **What will happen on this server** has a pink pill on its left. The pill says **Phase: Both** (number 3 in the picture). It means that this server does everything alone. On a directory server of a two-server move, it says **Phase: AD**: see Path 3. A server that cannot reach Microsoft 365 also says **Phase: AD**.
 
 **If not:** a red line says the person was not found. Check the spelling of the e-mail address. If two people match, type the exact e-mail address. If it still fails, stop and ask.
 
 ### 4 · Go to the preview
 
-**Do:** press **Continue to verification →** (number 3 in the picture above).
+**Do:** press **Continue to verification →** (number 4 in the picture above).
 
 **You should see:** the **Verify** page. It is still empty. Nothing was changed.
 
@@ -293,15 +314,15 @@ At one step the tool **waits**. It waits for the **synchronisation**: the direct
 
 ![The Next steps page. Number 1: the button Open report. Number 2: the button Open log](images/console-next-light.png)
 
-**You should see:** the word **Success** and one line for your test person. Chapter 6 explains the report.
+**You should see:** the word **Success** and one line for your test person. [Chapter 6](#6-check-a-mailbox-and-read-the-report) explains the report.
 
 **If not:** if the result says **Pending** or **Error**, read the text on the page. It says what to do. If it is not clear, stop and ask.
 
-**Now check with the test person.** Ask them to open Outlook. They should see a new, empty mailbox, and be able to send and receive. If yes, go to Path 2 or Path 3. If not, **stop and ask**. You can undo the test with chapter 5.
+**Now check with the test person.** Ask them to open Outlook. They should see a new, empty mailbox, and be able to send and receive. If yes, go to Path 2 or Path 3. If not, **stop and ask**. You can undo the test with [chapter 5](#5-b--go-back).
 
 ### Path 2 · Move everyone, one server
 
-Use this path **only after** Path 1 worked. The server does the directory part and the cloud part by itself. The steps are the same as Path 1. Only the choice of people changes.
+Use this path **only after** Path 1 worked, and only if **one server** reaches both Active Directory and Microsoft 365. The server does the directory part and the cloud part by itself. The steps are the same as Path 1. Only the choice of people changes.
 
 ### 1 · Choose the people
 
@@ -319,7 +340,7 @@ Use this path **only after** Path 1 worked. The server does the directory part a
 
 ![The Verify page with seven people in the list. Number 1: the list. Number 2: the box where you type CONVERT](images/console-verify-scope-light.png)
 
-**You should see:** a title like *6 mailboxes will be converted · nothing blocking*. A person with a shared mailbox has the word **Shared** next to the name.
+**You should see:** a title like *6 mailboxes will be converted · nothing blocking*. Look at the column **TYPE** in the list. A person shows **User**. A shared mailbox shows **Shared**. A shared mailbox is one mailbox that several people use, like `finance.shared`.
 
 **If not:** a number in red (**blocking**) means someone cannot be moved. The reason is in the list. Remove that person from the list, or stop and ask.
 
@@ -339,23 +360,38 @@ Use this path **only after** Path 1 worked. The server does the directory part a
 
 ![The Next steps page of a move on one server. Number 1 marks the button for the report](images/console-next-global-light.png)
 
-**You should see:** the report. Chapter 6 explains it. Write down the **batch ID** (eight letters and numbers, like `490cc62e`). It is the key to go back.
+**You should see:** the report. [Chapter 6](#6-check-a-mailbox-and-read-the-report) explains it. Write down the **batch ID** (eight letters and numbers, like `490cc62e`). It is the key to go back.
 
 ### Path 3 · Move everyone, two servers
 
-Use this path when the **directory server** cannot reach the Internet. Two servers work one after the other. A **single file** goes from the first server to the second one. The file is called the **transfer package**.
+Use this path when **no single server** reaches both Active Directory and Microsoft 365. Often the directory server cannot reach the Internet. Then you need a second machine for the cloud part. This machine is the **cloud server**.
+
+> [!IMPORTANT]
+> The **cloud server** is **not** a server in the cloud. It is a Windows machine of your own company. It only has to reach Microsoft 365 through the Internet. It can stand in your server room. It can be an administrator's PC. It does **not** need Active Directory.
+
+**What the cloud server needs.** Check this list before you start:
+
+- PowerShell 7.5 or newer.
+- The program **ExchangeOnlineManagement**, version 3.10 or newer.
+- The programs **Microsoft.Graph.Authentication** and **Microsoft.Graph.Users**.
+- The same signed tool folder as on the directory server, with its files unblocked.
+- A settings file with the **same** `Environment` as on the directory server.
+- A safe disk for the `Backups` folder.
+- The Microsoft 365 and Exchange Online rights of [chapter 2](#2-before-you-start). No right on Active Directory is needed.
+
+Two servers work one after the other. A **single file** goes from the first server to the second one. The tool creates this file by itself. It is called the **transfer package**.
 
 ![A picture of the two servers. The directory server writes one zip file. You carry the file to the cloud server. The cloud server finishes the work](images/readme-transfer-light.png)
 
-**Part 1 · On the directory server (the AD server).** The steps are the same as Path 2, steps 1 and 2. The page says **Phase: AD**. Then you press **Convert the mailboxes**.
+**Part 1 · On the directory server (the AD server).** The steps are the same as Path 2, steps 1 and 2. At the bottom of the **Task** page, the pink pill says **Phase: AD** (number 1 in the picture). Then you press **Convert the mailboxes**.
 
-![The Task page on the directory server. Number 1 marks the line that says what will happen on this server](images/console-task-ad-light.png)
+![The Task page on the directory server. Number 1 marks the pink pill Phase: AD, at the left of the card What will happen on this server](images/console-task-ad-light.png)
 
 **You should see:** at the end, the **Run** page lists a step **Creating the transfer package**.
 
 ![The Run page of the directory server: the last step creates the transfer package](images/console-run-package-light.png)
 
-Press **What next? →**. The page shows the **name of the package**, a file that ends with `.zip`.
+Press **What next? →**. The page shows the **name of the package**. The tool made this file by itself. It also chose the name by itself. The name looks like `PRA-PROD-Convert-490cc62e-for-Cloud.zip`. It holds your `Environment` (`PROD`), the kind of work (`Convert`), the batch ID (`490cc62e`) and the server it is for (`for-Cloud`). You never type this name. You never rename the file.
 
 ![The Next steps page of the directory server. Number 1: the name of the package. Number 2: the button Open folder. Number 3: the command for the other server](images/console-next-package-light.png)
 
@@ -367,17 +403,17 @@ Press **What next? →**. The page shows the **name of the package**, a file tha
 
 **If not:** if the page says **Pending**, this is **normal**. It means: "The directory part is done. The cloud part remains." It is not an error.
 
-**Part 2 · On the cloud server.** Open the console there. On **Setup**, a red light for **RSAT ActiveDirectory** is normal here. Press **Choose a task →**. Click **Move mailboxes to Exchange Online**. Click **Continue a batch (cloud part)**.
+**Part 2 · On the cloud server** (the machine that reaches Microsoft 365). Open the console there. On **Setup**, a red light for **RSAT ActiveDirectory** is normal here. Press **Choose a task →**. Click **Move mailboxes to Exchange Online**. Click **Continue a batch (cloud part)**.
 
 ![The Task page of the cloud server. Number 1: Continue a batch. Number 2: the button Import package. Number 3: the list that shows the package](images/console-task-continue-light.png)
 
 **Do:** press **Import package…** and pick the `.zip` file. You can also put the file in the folder `Backups\Inbox` of this server. Then it is already in the list. The package shows **Checksums verified**. Click its line.
 
-![The list with the package selected. Number 1: the line of the package. Number 2: the button to continue](images/console-task-package-selected-light.png)
+![The list with the package selected. Number 1: the line of the package. Number 2: the pink pill Phase: Cloud, in the card What will happen on this server. Number 3: the button to continue](images/console-task-package-selected-light.png)
 
-**You should see:** the line turns pink, and the page says **Phase: Cloud**.
+**You should see:** the line turns pink. At the bottom of the **Task** page, in the card **What will happen on this server**, a pink pill says **Phase: Cloud** (number 2 in the picture).
 
-**If not:** a red line **Invalid** means the file is damaged or comes from another environment. Copy it again. Check that both servers have the same `Environment` in their settings file. If it still fails, stop and ask.
+**If not:** if you see no pill, click a big card first: the card appears at the bottom after that. A red line **Invalid** means the file is damaged or comes from another environment. Copy it again. Check that both servers have the same `Environment` in their settings file. If it still fails, stop and ask.
 
 **Do:** press **Continue to verification →**, **Preview**, type **CONVERT**, and press **Convert the mailboxes**.
 
@@ -398,6 +434,14 @@ Go back only when your administrator says that the old mail servers work again. 
 
 **Rolling back** means: put each person exactly as the backup says. The tool uses the backup made when the people were moved.
 
+**Where do I do this?**
+
+- **One server:** on that same server, from the start to the end.
+- **Two servers:** in this order.
+  1. On the **directory server**: this path (Path 4).
+  2. On the **cloud server**: **Continue a rollback (cloud part)** (see the list at the start of Path 5).
+  3. Back on the **directory server**: **Complete a rollback** (Path 5), only if the cloud server wrote a Finalize package.
+
 ### 1 · Pick the rollback
 
 **Do:** open the console. Go to **Task**. Click the card **Roll back a conversion**. A list of **batches** appears. A batch is one move, with its backup. Click the line of the batch to undo.
@@ -416,7 +460,7 @@ Go back only when your administrator says that the old mail servers work again. 
 
 ![The Verify page of a rollback. Number 1 marks the box where you type RECOVER](images/console-verify-rollback-light.png)
 
-**You should see:** the **Run** page. The tool restores each person from the backup. It first removes the cloud shared mailboxes, then puts the directory back.
+**You should see:** the **Run** page. The tool restores each person from the backup. It first removes the cloud shared mailboxes, then puts the directory back. On two servers, this page is the directory part.
 
 **If not:** a red number means the tool refuses something. Read the reason. Stop and ask.
 
@@ -437,7 +481,7 @@ Go back only when your administrator says that the old mail servers work again. 
 On two servers, a rollback has three parts. Each part gives a file to the next one.
 
 1. **Directory server:** Path 4. It writes one package.
-2. **Cloud server:** open the console. **Roll back a conversion**, then **Continue a rollback (cloud part)**. Import the package. At the end, the tool writes a **Finalize package** if the directory still needs a last change.
+2. **Cloud server** (the machine that reaches Microsoft 365): open the console. Click **Roll back a conversion**, then **Continue a rollback (cloud part)**. Import the package. At the end, the tool writes a **Finalize package** if the directory still needs a last change.
 3. **Directory server:** copy the Finalize package here. Then do the steps below.
 
 ### 1 · Pick the Finalize package
@@ -452,16 +496,28 @@ On two servers, a rollback has three parts. Each part gives a file to the next o
 
 ### 2 · Preview, confirm, wait
 
-**Do:** press **Preview**. Type **FINALIZE**. Press **Finalize the rollback**. Wait for **Done**. Press **What next? →** and **Open report**.
+**Do:** press **Preview**. Read the title. Type the word **FINALIZE** in the box. Press the red button **Finalize the rollback**.
 
-**You should see:** the **global report**. Every person shows **done**.
+![The Verify page of Complete a rollback. Number 1 marks the box where you type FINALIZE. Number 2 marks the red button](images/console-verify-finalize-light.png)
+
+Wait until the title says **Done** in green. This is short: the directory server changes the one remaining object.
+
+![The Run page at the end of Complete a rollback](images/console-run-finalize-light.png)
+
+Press **What next? →**. Then press **Open global report**.
+
+![The Next steps page at the end of Complete a rollback. Number 1 marks the button for the global report](images/console-next-finalize-light.png)
+
+**You should see:** the **Verify** page with one shared mailbox, *finance.shared*. Then the **Run** page. Then the **Next steps** page with the button for the **global report**. In the report, every person shows **done**.
+
+**If not:** the red button stays grey until you did the preview **and** typed the word. A step in red means the tool stopped. Stop and ask.
 
 <!-- icon: search -->
 ## 6. Check a mailbox, and read the report
 
 ### Check one mailbox
 
-**Do:** open the console. Go to **Task**. Click **Check a mailbox**. Type the e-mail address of one person. Press **Continue to verification →**, then **Check the mailbox**.
+**Do:** open the console on a server whose cloud lights are green: the one server, or the cloud server. Go to **Task**. Click **Check a mailbox**. Type the e-mail address of one person. Press **Continue to verification →**, then **Check the mailbox**.
 
 ![The Task page, Check a mailbox. Number 1: the card. Number 2: the box for the e-mail address. Number 3: the button to continue](images/console-task-check-light.png)
 
@@ -489,7 +545,7 @@ A **warning** is an orange word. It means "done, but read this". For example: *a
 
 ![A report with a warning on one person](images/report-phase-warning-light.png)
 
-On two servers, the last server writes a **global report**. It follows each person from the first server to the last one.
+On two servers, the **last** server writes a **global report**. It follows each person from the first server to the last one. For a move, the last server is the cloud server. For a rollback, it is the directory server after **Complete a rollback**. If no Finalize package was needed, it is the cloud server.
 
 ![The global report: the times of each server, then every person from end to end](images/report-global-light.png)
 
@@ -509,18 +565,20 @@ Find what you **see** in the left column. The middle column says what it **means
 | **The red button stays grey** on **Verify** | The preview is not done, or the word is not typed. | Press **Preview**. Type the word **CONVERT**, **RECOVER** or **FINALIZE**. Spaces and capitals do not matter. |
 | *N blocking* in red after **Preview** | The tool refuses some people. | Click the line. Read the reason. Remove the person from the list, or stop and ask. |
 | An **orange triangle** (warning) | The tool can go on, but you must read. | Read the text. If you understand it, go on. If not, stop and ask. |
+| I do not see **Phase: …** on the **Task** page | You did not click a big card yet. | Click a big card. The card **What will happen on this server** appears at the bottom. The pink pill is on its left. |
 | The **wait is long** (*attempt 5 of 13*) | The directory is sending the news to the cloud. | Wait. It is normal up to **15 minutes**. The mailboxes can take up to **an hour** to appear. Do not close the window. |
 | A **step turns red** during the run | The tool stopped on purpose, at the first error. | Do not click anything. Take a photo. Stop and ask. The people already done are kept. |
 | A package line is red: **Invalid** | The file is damaged, or comes from another environment. | Copy the file again, without renaming it. Check that both servers have the same `Environment`. |
 | *Active Directory replication was NOT confirmed on …* | One directory server did not receive the change in time. | Read the **Next steps** page. It says to start the synchronisation again later. Ask your administrator. |
 | The result says **Pending** | A part remains. It is **not** an error. | Do what the **Next steps** page says. On two servers: carry the package to the other server. |
 | *Entra Connect server … is not reachable* | The tool cannot talk to the Entra Connect server. | Ask your administrator to check the name in the settings file and the remote connection. |
+| An orange line says *X500 missing in Exchange Online* | The new mailbox is ready, but it does not have an old address of the person. An answer to an **old message** could come back to the sender as an error. | Do not worry about the move: it is done. Ask your administrator to check the synchronisation, and to run a **Check** after it. |
 | Nothing in the list of batches or packages | The files are not on this server. | Copy the folder or the package here. Use **Import package…**. |
 
 <!-- icon: book -->
 ## 8. Picture dictionary
 
-![Pictures of the main words: mailbox, directory, cloud, synchronisation, backup, package, report](images/guide-dictionary-light.png)
+![Pictures of the main words: mailbox, directory, cloud, synchronisation, backup, package, report, directory server, cloud server, phase](images/guide-dictionary-light.png)
 
 | Word | What it means |
 |---|---|
@@ -535,13 +593,15 @@ Find what you **see** in the left column. The middle column says what it **means
 | **Replication** | The copy of a change to the other directory servers. |
 | **Licence group** | A group in the directory. Being in it gives a person a cloud mailbox. |
 | **Batch** | One move of many people, with its backup. It has a short **batch ID**, like `490cc62e`. |
-| **Transfer package** | One `.zip` file that carries a batch from one server to the other. |
+| **Directory server** | The server that can reach Active Directory. It has RSAT. In a two-server move, it does the directory part. |
+| **Cloud server** | Any Windows machine of your company that can reach Microsoft 365 through the Internet. It is **not** a server in the cloud. It can stand in your own server room. It does **not** need Active Directory. In a two-server move, it does the cloud part. |
+| **Transfer package** | One `.zip` file that carries a batch from one server to the other. The tool creates it and names it by itself. You never rename it. |
 | **Preview** | A trial. It shows what would happen. It changes **nothing**. |
 | **Apply** | The real run. It changes things. The tool asks you to confirm first. |
 | **Backup** | The copy of every value before a change. It is the only way back. |
 | **Roll back** | Put everything back as the backup says. |
 | **Report** | The web page that lists what was done. |
-| **Phase** | One part of the work: the directory part (**AD**), the cloud part (**Cloud**), or both together (**Both**). |
+| **Phase** | One part of the work: the directory part (**AD**), the cloud part (**Cloud**), or both together (**Both**). The **Task** page shows it in a pink pill, **Phase: …**, at the bottom, in the card **What will happen on this server**. |
 | **Console** | The window of this tool, with five pages. |
 | **PowerShell 7** | The program where you type commands, in a dark window with white letters. The tool needs version 7.5 or newer. |
 | **Certificate** | A digital key that lets a program sign in with nobody present. It has an end date. |

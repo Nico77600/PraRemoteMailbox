@@ -19,7 +19,7 @@
 #
 @{
     RootModule            = 'PraRemoteMailbox.psm1'
-    ModuleVersion         = '3.0.0'
+    ModuleVersion         = '3.1.0'
     GUID                  = '1d97585b-d077-4d74-bf10-4e36d16308b6'
     Author                = 'Nicolas Fabert'
     Description           = 'PRA Remote Mailbox: disaster-recovery tool for an Exchange hybrid environment. Converts on-premises mailboxes to remote mailboxes and back (Active Directory and Exchange Online), with a backup before every write, a proof after it, a guided console and a transfer package between the Active Directory server and the cloud server.'
@@ -33,11 +33,11 @@
         # Configuration, paths and CSV (PRA.Common)
         'Import-PraConfiguration', 'New-PraEffectiveConfiguration', 'Get-PraConfigurationDifference', 'Resolve-PraPath', 'Read-PraCsvText', 'Read-PraTargetCsv', 'Get-PraTargetOverride', 'Get-PraToolVersion', 'Get-PraValue', 'Get-PraList',
         # Ordinal helpers, JSON and native calls (PRA.Common)
-        'Test-PraOrdinalEqual', 'Test-PraOrdinalIgnoreCaseEqual', 'Test-PraOrdinalIn', 'Test-PraOrdinalIgnoreCaseIn', 'Sort-PraOrdinal', 'Get-PraOrdinalUnique', 'ConvertFrom-PraJson', 'Get-PraNativeProcessApi', 'Get-PraWin32ErrorText',
+        'Test-PraOrdinalEqual', 'Test-PraOrdinalIgnoreCaseEqual', 'Test-PraOrdinalIn', 'Test-PraOrdinalIgnoreCaseIn', 'Sort-PraOrdinal', 'Get-PraOrdinalUnique', 'Compare-PraX500Address', 'ConvertFrom-PraJson', 'Get-PraNativeProcessApi', 'Get-PraWin32ErrorText',
         # Private folders, phase data and transfer package (PRA.Common)
         'New-PraPrivateDirectorySecurity', 'Initialize-PraPrivateFolder', 'Register-PraObjectName', 'Register-PraObjectBackup', 'Save-PraPhaseData', 'Copy-PraPhaseData', 'Get-PraTransferPackageName', 'Get-PraTransferPackage', 'New-PraTransferPackage', 'Import-PraTransferPackage',
         # Active Directory, backup and proof (PRA.Directory)
-        'Initialize-PraDirectory', 'Initialize-PraPermissionCache', 'Get-PraUser', 'Get-PraTarget', 'New-PraRow', 'New-PraPlan', 'Invoke-PraAdPreview', 'Invoke-PraAdBatch', 'Invoke-PraAdReplication', 'Invoke-PraSync', 'Import-PraBackup', 'Import-PraProof', 'Assert-PraReceipt', 'Assert-PraFollowupState', 'Get-PraHash', 'Write-PraImmutableFile', 'New-PraPrivateDirectory', 'Write-PraJournal'
+        'Initialize-PraDirectory', 'Initialize-PraPermissionCache', 'Get-PraUser', 'Get-PraExpectedX500', 'Get-PraTarget', 'New-PraRow', 'New-PraPlan', 'Invoke-PraAdPreview', 'Invoke-PraAdBatch', 'Invoke-PraAdReplication', 'Invoke-PraSync', 'Import-PraBackup', 'Import-PraProof', 'Assert-PraReceipt', 'Assert-PraFollowupState', 'Get-PraHash', 'Write-PraImmutableFile', 'New-PraPrivateDirectory', 'Write-PraJournal'
     )
     CmdletsToExport       = @()
     VariablesToExport     = @()
@@ -47,8 +47,8 @@
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDmGgloN8U+nnRW
-# NMUbUIKJgvktyvutOlCdyYSHtBCdF6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDMdQ8ldjUL1nO0
+# ndxp0ENp5PQASUIHSroRS8iNuvt6v6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -125,23 +125,23 @@
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDwX0dBRPkM
-# Mlsbok6OTFQZCupCjsoPu8RUuP7RtRbYXzANBgkqhkiG9w0BAQEFAASCAgBfnoOn
-# cuQqDiCUP/y4I9WrMoVdXBP6I6ZBrg/ZtrupFARJHEYlAWnH5D48f4ghPjpv7OG/
-# PBJ8FX61ucaJNRIuSCyD0A9FpbndKh4y16DMQID5Uih87nBQv2+lTT9cY5jS7+Ou
-# +1v09cJt/0XMf0rfCqbIWmUdfz3Iogo4DBdN8murUaJE5ZHF7X1ODXyOWUqsdZPo
-# bqxYdIVtAjsfO/RggcY8CXvOoNczihNYBTIzA7nEgCgVICtHBBLHsmr1eQQd/GYy
-# vH+UfJsT7aZHLb6S6lkNDLFjUZZFcmuyhkPHnBd9ZshUIYH0x8ZciwggJhvu2qip
-# cmt6ySLsfri7WHBAGHJM7n60+zuu7Nc+VhbJLtBYVYyTrYWzTOof9Un7NkdZrZit
-# aNHIDogyyIXsR14o/AaTtzCdD79qJ8LbjFq2ftrYktd+xJ+PpbHo9W/HfC3y9Cde
-# DWowTWrH/MAVFX70BoTbeuECSlTzLcYEqu567XfStUnDOZhaUCZaCoCqbnV/52zv
-# SLP2s3/vaOJsxgNoRQVk59fSjv+NDxnE//H8zks4tb+48nvFmhe0Vd2Fm0pH6k3L
-# G18RE3sYcpSkbg4TqvObCnhrns5zt4JcOCJANLVFmcYdrPjhHdQBhEUWPB64IXP6
-# fNjtfmv7M1f9k3WkLNOY+1pXuROuHU0CnUK//aGCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAckLL5GO1N
+# uCxZbVxxsv7B1x1SsEJnh+NYrMh7ArJ5ujANBgkqhkiG9w0BAQEFAASCAgBE5Tur
+# b96109tLS68I53TryXlgpYgGpi61dV5D1SNX8YaMQbsgaiAtL8t4UUon8tesx8jG
+# sUc1nxn395KjavIAxaY8/XNS1nZC/OBgB5QFJgWudeXNO+RNxjo/kt8RwZ0LcZ0G
+# mM2ucNbONU9LXxe3fvzdYTPoNIHLqFsrsz3604NOPalDsoKt28qpiEFfQgcYJN+P
+# fuuTyJaU4+eWErr7Cj96r8h0dUlP8YroHdXsS/ZfGnhrNblYuo0GiiJ4USLSjkfG
+# +i/VJYSLMnloC90vmDu7zEifProo11GhIeQYZkFUMD30r+kjuI6TqQa3/A/dTMq+
+# gq9tsL5l7XRCuv/Tfyb2rJ/GVfBWBAgAlX5fco0zUrv5F/q+UJz96lbWsozKB288
+# Z5WFR83WIL1Hi8u86itQ5kl4ewqK91WMtJEttIIzNBY/wj9A5fPYsk0Qj2lQcGWw
+# N5/mM3Fx/ot8tF0hwwVcpLCw1GyoUcBIOgCk3Q4tKXGzNc55CpWFEOFJUFUeBYOb
+# +6YdV58AsE+oWfAtjfFebUnHbpow+ndSMmit4mRZKL0ODVdEx4BFUD53kOpF0Uh+
+# sCPcA1oqFITcZuCXaIaRg1672b1DMd/mIJO810nJOIDTlhztVITVE+5nWw1bc9MR
+# XFS+rouW0UFYVKBPAv9oCIe9GuvDoRhYqtpyraGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIBPNPpt+6/weLmThdtP/b2y71Dq5a+z2y42zH3lPB0mHAggzXis+pM0i
-# 0xgPMjAyNjExMDUwODA2NTZaMAMCAQECECl03mIIdEmmJ8ag5BX2EKugghGnMIIE
+# BAIBBQAEIMgu4XF/obt3oHPh6owaxQlqbsCfBnDg8D2X8JFyWjSMAghk6U2N/cE/
+# xhgPMjAyNjExMDYwODQwMDFaMAMCAQECEDHT0fFA4b2LjVzDQvMfg5WgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -240,13 +240,13 @@
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNTA4MDY1NlowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIAo7
-# ppdp37NHLZVUhv3zQxmoX+2I4dEzwCR676+L0yIQMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNjA4NDAwMVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIL19
+# LJIt0T9T0jq8gCr1F4y29ifClzXaxTCNrtJF6sDBMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEA7e5kiTDIC+ov52nUVFyUSndadKDxpgNphZxl/bTZsUQCIAn5
-# w8sL87b1wJjkkWKVvoNdxui9EaAMw2Vm57cCHABk
+# zj0EAwIERzBFAiEAiz5jUr0+EzaVKwN1IpzYv/KzsHgkeBO0cgi8X7ZwvosCIDVF
+# lmjROARzbAgDuTc1ICl3tOtcY3kX1l5iTuzRZwpj
 # SIG # End signature block

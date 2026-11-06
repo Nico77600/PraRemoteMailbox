@@ -27,7 +27,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0 (from the Purview DLP Report builder)
+    Version : 3.1.0 (from the Purview DLP Report builder)
     PowerShell pitfall: never name a variable $matches — every -match overwrites the automatic
     $Matches, and variable names are case-insensitive.
 #>
@@ -111,6 +111,19 @@ if ($front.Success) {
 }
 $html = (ConvertFrom-Markdown -InputObject $markdown).Html
 
+# ---- In-page links written for GitHub ("#2-before-you-start", "#4--open-the-console") -> the id this page gives the heading -----
+# GitHub keeps the chapter number and turns " · " into "--"; the ids of this page do not (and the numbers are dropped).
+$slugMap = @{}; $slugSeen = @{}
+foreach ($h in [regex]::Matches($html, '(?s)<h[1-6] id="([^"]*)">(.*?)</h[1-6]>')) {
+    $plain = [System.Net.WebUtility]::HtmlDecode(($h.Groups[2].Value -replace '<[^>]+>', ''))
+    $slug = ($plain.ToLowerInvariant() -replace '[^\p{L}\p{N}\s_-]', '').Trim() -replace '\s', '-'
+    $n = if ($slugSeen.ContainsKey($slug)) { $slugSeen[$slug] + 1 } else { 0 }
+    $slugSeen[$slug] = $n
+    $key = if ($n) { "$slug-$n" } else { $slug }
+    if (-not $slugMap.ContainsKey($key)) { $slugMap[$key] = $h.Groups[1].Value }
+}
+$html = [regex]::Replace($html, '<a href="#([^"]+)"', { param($m) $id = $slugMap[$m.Groups[1].Value]; if ($id) { '<a href="#' + $id + '"' } else { $m.Value } })
+
 # ---- Custom blocks -----------------------------------------------------------------------------------
 $html = [regex]::Replace($html, '(?s)<pre><code class="language-(cards|steps|flow|path)">(.*?)</code></pre>', {
         param($m)
@@ -185,6 +198,8 @@ $html = [regex]::Replace($html, '(?s)<pre><code(?: class="language-([\w-]+)")?>(
 
 # ---- Tables, images, links, alerts -------------------------------------------------------------------------
 $html = $html.Replace('<table>', '<div class="table-wrap"><table>').Replace('</table>', '</table></div>')
+# A picture written right after a ```path block is the Markdown (GitHub) rendering of that same diagram: show the diagram once.
+$html = [regex]::Replace($html, '(<!--/path-->)\s*<p><img src="[^"]+" alt="[^"]*" /></p>', '$1')
 $html = [regex]::Replace($html, '<p><img src="([^"]+)" alt="([^"]*)" /></p>', {
         param($m)
         $path = Join-Path $docs ([Uri]::UnescapeDataString($m.Groups[1].Value))
@@ -199,7 +214,7 @@ $html = $html -replace '<a href="(https?://[^"]+)"', '<a href="$1" target="_blan
 # chapter number and turn " — " into "--"; the ids of this page do not).
 $html = [regex]::Replace($html, '<a href="([\w.-]+)\.md(?:#([^"]*))?"', {
         param($m)
-        $anchor = ($m.Groups[2].Value -replace '^\d+-', '' -replace '-{2,}', '-')
+        $anchor = ($m.Groups[2].Value -replace '^\d+-+', '' -replace '-{2,}', '-')
         '<a href="' + $m.Groups[1].Value + '.html' + $(if ($anchor) { '#' + $anchor } else { '' }) + '"'
     })
 $html = $html -replace '<p class="markdown-alert-title"><svg viewBox="0 0 16 16"', '<p class="markdown-alert-title"><svg class="icon-sm" viewBox="0 0 16 16" fill="currentColor"'
@@ -447,7 +462,7 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--cp-bor
 <main>$hero$($body.ToString())
 <footer>$(& $enc $meta.title) $($meta.version) · $(& $enc $meta.author) · generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') from PraRemoteMailbox-Guide.md</footer></main>
 <button type="button" id="to-top" title="Back to top">$(Get-Icon 'up' 'icon-sm')</button>
-<dialog id="zoom"><img alt=""></dialog>
+<dialog id="zoom"></dialog>
 <script>
 (() => {
   "use strict";
@@ -477,7 +492,7 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--cp-bor
   }));
   // Image zoom.
   const zoom = document.getElementById("zoom");
-  document.querySelectorAll("figure img").forEach(img => img.addEventListener("click", () => { zoom.querySelector("img").src = img.src; zoom.showModal(); }));
+  document.querySelectorAll("figure img").forEach(img => img.addEventListener("click", () => { const big = new Image(); big.src = img.src; big.alt = img.alt; zoom.replaceChildren(big); zoom.showModal(); }));
   zoom.addEventListener("click", () => zoom.close());
   // Back to top.
   const top = document.getElementById("to-top");
@@ -487,5 +502,9 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--cp-bor
 </script>
 </body></html>
 "@
+# A link of the page that points nowhere is a build error.
+$ids = [Collections.Generic.HashSet[string]]::new([string[]]@([regex]::Matches($page, '\sid="([^"]*)"') | ForEach-Object { $_.Groups[1].Value }))
+$dead = @([regex]::Matches($page, '<a href="#([^"]*)"') | ForEach-Object { $_.Groups[1].Value } | Where-Object { -not $ids.Contains($_) } | Select-Object -Unique)
+if ($dead.Count) { throw "Dead in-page link(s) in ${Source}: #$($dead -join ', #')" }
 [IO.File]::WriteAllText($Destination, $page, [Text.UTF8Encoding]::new($false))
 Write-Host "Written: $Destination ($([Math]::Round((Get-Item $Destination).Length / 1KB)) KB)"

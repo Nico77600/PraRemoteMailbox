@@ -26,7 +26,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.0.0
+    Version : 3.1.0
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -62,6 +62,9 @@ $script:AttributeKinds = [ordered]@{
     mDBUseDefaults='Bool'; msExchRecipientDisplayType='Int'; msExchRecipientTypeDetails='Long'
     msExchRemoteRecipientType='Long'; targetAddress='String'; proxyAddresses='MultiString'
 }
+# Bounds of the list of X500 addresses expected in Exchange Online (record field ExpectedX500): count and length of one value.
+$script:MaxExpectedX500 = 2000
+$script:MaxExpectedX500Length = 2048
 # Display names of msExchRecipientTypeDetails values (console only).
 $script:RecipientTypeNames = @{
     '1'='UserMailbox'; '4'='SharedMailbox'; '16'='RoomMailbox'; '32'='EquipmentMailbox'; '128'='MailUser'
@@ -398,7 +401,7 @@ function Get-PraUser {
     #>
     [CmdletBinding()]
     param([hashtable]$Context, [Parameter(Mandatory)][string]$Identity, [string[]]$ExtraProperties = @(), [switch]$Capture)
-    $properties = @('memberOf','uSNChanged','DisplayName','mail','mailNickname','msExchArchiveGUID') + @($script:AttributeKinds.Keys) + $ExtraProperties
+    $properties = @('memberOf','uSNChanged','DisplayName','mail','mailNickname','msExchArchiveGUID','legacyExchangeDN') + @($script:AttributeKinds.Keys) + $ExtraProperties
     if ($Capture) { $properties += @('*','msExchMailboxSecurityDescriptor','nTSecurityDescriptor','publicDelegates') }
     $properties = @($properties | Get-PraOrdinalUnique -IgnoreCase)
     $server = $Context.Server
@@ -735,6 +738,12 @@ function Write-PraAdDelta {
         foreach ($value in $keptCloud) { Write-PraLog -Context $Context -Message ("  proxyAddresses | KEPT X500 (written back by Entra Connect) : {0}" -f (ConvertTo-PraLogText -Value $value)) -Level Detail }
         Write-PraItem -Context $Context -Status Info -Text ('{0}: {1} cloud X500 address(es) kept (written back by Entra Connect; replies to messages sent from the cloud keep working)' -f $record.SamAccountName, $keptCloud.Count)
     }
+    if ((Test-PraOrdinalIgnoreCaseEqual $Plan.Operation 'Convert')) {
+        # The cloud phase proves these addresses in Exchange Online (a reply to an old message is addressed by legacyExchangeDN); here the operator only sees how many.
+        $verifyX500 = @(if ($record.Contains('ExpectedX500')) { $record['ExpectedX500'] | Where-Object { $_ } })
+        foreach ($value in $verifyX500) { Write-PraLog -Context $Context -Message ("  X500 to verify in Exchange Online : {0}" -f (ConvertTo-PraLogText -Value $value)) -Level Detail }
+        Write-PraItem -Context $Context -Status Info -Text ('{0}: X500 to verify after the conversion: {1}{2}' -f $record.SamAccountName, $verifyX500.Count, $(if ($verifyX500.Count) { '' } else { ' (no legacyExchangeDN and no X500 address on premises)' }))
+    }
     if (-not $consoleLines.Count) { Write-PraHost @(@('         '), @('no change: the object is already in the expected state', 'DarkGray')) }
     elseif ($unchanged) { Write-PraHost @(@('         '), @(('{0} other managed attribute(s) unchanged (full values in the log)' -f $unchanged), 'DarkGray')) }
     if ($permissionText) {
@@ -811,6 +820,26 @@ function Get-PraX500Difference {
     $same = ($a.Count -eq $b.Count)
     if ($same) { for ($i = 0; $i -lt $a.Count; $i++) { if (-not (Test-PraOrdinalEqual ([string]$a[$i]) ([string]$b[$i]))) { $same = $false; break } } }
     return [pscustomobject]@{ OtherEqual = $same; Added = [string[]]$added.ToArray(); Removed = [string[]]@($removed) }
+}
+
+function Get-PraExpectedX500 {
+    <#
+    .SYNOPSIS
+        X500 addresses that the cloud mailbox must carry so that a reply to an old message, a meeting update or a cached Outlook entry (all addressed by
+        legacyExchangeDN, internally IMCEAEX) still reaches it: X500:<legacyExchangeDN> when it is not empty, then every X500 entry of the on-premises proxyAddresses.
+    .DESCRIPTION
+        Read only. Duplicates are removed (ordinal, ignoring case, on the whole value); the first spelling is kept, byte for byte. The prefix of the
+        legacyExchangeDN is written X500: (the type prefix of the other entries keeps whatever case it has on premises).
+    #>
+    [OutputType([string[]])]
+    param([AllowNull()][AllowEmptyString()][string]$LegacyExchangeDN, [AllowNull()][string[]]$ProxyAddresses)
+    $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    $list = New-Object 'Collections.Generic.List[string]'
+    if (-not [string]::IsNullOrWhiteSpace($LegacyExchangeDN)) { $value = 'X500:' + $LegacyExchangeDN; if ($seen.Add($value)) { $list.Add($value) } }
+    foreach ($address in @($ProxyAddresses)) { if (Test-PraX500Address $address) { if ($seen.Add([string]$address)) { $list.Add([string]$address) } } }
+    if ($list.Count -gt $script:MaxExpectedX500) { throw "Too many X500 addresses to verify ($($list.Count), limit $($script:MaxExpectedX500))." }
+    foreach ($value in $list) { if ($value.Length -gt $script:MaxExpectedX500Length) { throw "X500 address too long to verify ($($value.Length) characters, limit $($script:MaxExpectedX500Length))." } }
+    return [string[]]$list.ToArray()
 }
 #endregion
 
@@ -1114,10 +1143,12 @@ function New-PraPlan {
     $desired = [ordered]@{}; foreach ($name in $before.Keys) { $desired[$name] = $before[$name] }
     $permissions = @{ FullAccess=@(); SendAs=@(); SendOnBehalf=@() }
     $licensing = [ordered]@{ Enabled=$false; GroupGuid=''; GroupDN=''; WasMember=$false; DesiredMember=$false }
-    $routing = ''; $alreadyRecovered = $false; $keptX500 = @()
+    $routing = ''; $alreadyRecovered = $false; $keptX500 = @(); $expectedX500 = @()
     if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert')) {
         if (-not $user.homeMDB -or [int64]$user.msExchRecipientTypeDetails -notin @(1, 4, 16, 32)) { throw "Not an on-premises mailbox (homeMDB / msExchRecipientTypeDetails): $Identity" }
         $routing = Get-PraRoutingAddress $Context $user
+        # X500 addresses the cloud mailbox must carry (read only: legacyExchangeDN is never written, restored or modified; the control runs in the cloud phase).
+        $expectedX500 = @(Get-PraExpectedX500 -LegacyExchangeDN ([string](Get-PraValue $user 'legacyExchangeDN' '')) -ProxyAddresses @($user.proxyAddresses))
         $rrt = if ($shared) { [int64]$config.SharedMailbox.RemoteRecipientType } else { [int64]$config.Remote.RecipientType }
         if ($shared -and (Test-PraOrdinalIn $rrt @(100, 102) -IgnoreCase)) { throw "SharedMailbox.RemoteRecipientType=$rrt means an already migrated mailbox (Migrated+Shared): first provisioning refused before any change: $Identity" }
         if ($config.Remote.HandleArchives -and (Get-PraValue $user 'msExchArchiveGUID' $null)) { $rrt = $rrt -bor 2 }
@@ -1199,7 +1230,7 @@ function New-PraPlan {
         Attributes=$before; PlannedAttributes=$desired; Licensing=$licensing
         Retention=[ordered]@{ Enabled=[bool]$tagEnabled; Attribute=$tagAttr; Value=$(if ($tagEnabled) { [string]$tag.Value } else { '' }) }
         SharedPermissions=$permissions; PreserveCloudMailbox=[bool]$preserveMailbox; PreserveLicense=[bool]$preserveLicense
-        KeptX500=[string[]]@($keptX500)
+        KeptX500=[string[]]@($keptX500); ExpectedX500=[string[]]@($expectedX500)
     }
     $row = New-PraRow $Context $record
     if ($null -ne $SourceRecord) { $row.BackupRec = $SourceRecord } else { $row.BackupRec = [pscustomobject]$record }
@@ -1257,6 +1288,13 @@ function Assert-PraStoredRecord {
     # Cloud X500 addresses kept by a Recover (absent in a batch written before 3.0.0: none).
     $keptStored = Get-PraValue $Record 'KeptX500' $null
     if ($null -ne $keptStored) { foreach ($value in @($keptStored)) { if ($value -isnot [string] -or -not (Test-PraX500Address $value)) { throw 'Backup: invalid list of kept X500 addresses.' } } }
+    # X500 addresses expected in Exchange Online (absent in a batch written before 3.1.0: the control is skipped).
+    $expectedStored = Get-PraValue $Record 'ExpectedX500' $null
+    if ($null -ne $expectedStored) {
+        if ($expectedStored -isnot [string] -and $expectedStored -isnot [array]) { throw 'Backup: invalid list of expected X500 addresses.' }
+        if (@($expectedStored).Count -gt $script:MaxExpectedX500) { throw 'Backup: too many expected X500 addresses.' }
+        foreach ($value in @($expectedStored)) { if ($value -isnot [string] -or -not (Test-PraX500Address $value) -or $value.Length -gt $script:MaxExpectedX500Length) { throw 'Backup: invalid list of expected X500 addresses.' } }
+    }
     if (-not $Legacy) {
         if ($Record.CapturedUsnChanged -isnot [string] -or $Record.CapturedUsnChanged -notmatch '^[1-9][0-9]*$') { throw 'Backup: original uSNChanged missing or invalid.' }
         $null = [int64]::Parse($Record.CapturedUsnChanged, [Globalization.CultureInfo]::InvariantCulture)
@@ -1342,6 +1380,11 @@ function Assert-PraRecordMatchesPlan {
         $storedKept = @(if ($null -ne $Stored.PSObject.Properties['KeptX500']) { $Stored.KeptX500 | Where-Object { $null -ne $_ } }); $wantedKept = @($Expected['KeptX500'])
         if ($storedKept.Count -ne $wantedKept.Count) { throw 'Backup re-read: kept X500 addresses not preserved.' }
         for ($index = 0; $index -lt $wantedKept.Count; $index++) { if (-not (Test-PraOrdinalEqual ([string]$storedKept[$index]) ([string]$wantedKept[$index]))) { throw 'Backup re-read: kept X500 addresses not preserved.' } }
+    }
+    if ($Expected.Contains('ExpectedX500')) {
+        $storedExpected = @(if ($null -ne $Stored.PSObject.Properties['ExpectedX500']) { $Stored.ExpectedX500 | Where-Object { $null -ne $_ } }); $wantedExpected = @($Expected['ExpectedX500'])
+        if ($storedExpected.Count -ne $wantedExpected.Count) { throw 'Backup re-read: expected X500 addresses not preserved.' }
+        for ($index = 0; $index -lt $wantedExpected.Count; $index++) { if (-not (Test-PraOrdinalEqual ([string]$storedExpected[$index]) ([string]$wantedExpected[$index]))) { throw 'Backup re-read: expected X500 addresses not preserved.' } }
     }
     foreach ($section in @('Attributes','PlannedAttributes')) {
         $actualNames = @($Stored.$section.PSObject.Properties.Name)
@@ -1916,14 +1959,14 @@ function Invoke-PraSync {
 #endregion
 
 Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmutableFile, New-PraPrivateDirectory, Write-PraJournal,
-    Initialize-PraDirectory, Get-PraUser, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
+    Initialize-PraDirectory, Get-PraUser, Get-PraExpectedX500, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
     Import-PraProof, Invoke-PraSync, Invoke-PraAdReplication, Assert-PraReceipt, Test-PraStateEqual, Assert-PraFollowupState, Initialize-PraPermissionCache
 
 # SIG # Begin signature block
-# MIImKAYJKoZIhvcNAQcCoIImGTCCJhUCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBDCeIJDs3qkhVe
-# z1CqvgQDLN8jr/Rm/lGczmNARzv1CaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCsZyx2E51EOal+
+# o9AcTF/+qKvgY5YQnUNmFzphM3v3sqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1995,133 +2038,133 @@ Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmu
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYDzCCGAsCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBsTEC7DeXn
-# 3avmi42IDFa22szqBVz410kCF7EASb1w4jANBgkqhkiG9w0BAQEFAASCAgBRX260
-# H0x2pijivJdGV+lur8ryYwngQGP9tvlMrqdMHNQ1ZnjS06BB08LbE42EB1/d93SQ
-# xUccbSkfsQ8jiCRVt5Ri/OSEQ++Y5sVxv7d8nhsChgvfHzgXl7RR8CC8+F3d+/Q1
-# au2AYLvMhgC2DUF9cDKkOd7SZZb49iw4dwp9SmV+bpWzQ58Dsgqjxl6W9XHGX99b
-# PEagkqDGBWK46lNP1XArapHMVOXv6HDNzsm5dctULUVIWVuutyZzjkbBHcYQq93H
-# j1YrWp1xT0OzxaQYg1KLEUY6klhZsWJfd2pr7Z0/8y56QDUjj0PReJehriZy7t/a
-# Og3RaFjVIiltseGXRy7HKPp3GQgj+N94aGJ0CgvlARiVjya7UiCvaee3p42ffHLX
-# +JMGmfaBxMvHgvr05tdI3qr0MOT7Nz/KUri4cNOVRQVwffUgfQr5bDAXBLGpNsV2
-# FIEJoqR0N/ZvlKdbHQtCanlmBwprCj2ikZyWQwOFI8FI4N0Vmz9rIhtsvYq9QiQk
-# qPtt2Qr/iZ/zczuSqLF2q86tvzk0vCGDirfTVZrOyMGskDgwUWn8KiAjG2dVuvFX
-# hanpG2Ikw+wKq1jTzJDP9RTAfikL8Q04JXk9pV7XcPl4r85LOXLh9+0QDHlwzNrk
-# /zkWf/kM39Aq/Bw/T/mOzFfEeZNYNe1vV9k97aGCFMwwghTIBgorBgEEAYI3AwMB
-# MYIUuDCCFLQGCSqGSIb3DQEHAqCCFKUwghShAgEDMQ0wCwYJYIZIAWUDBAIBMIGI
-# BgsqhkiG9w0BCRABBKB5BHcwdQIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIDKfWrJ5O8xYOP08+q0tqa7kU8+COO5FwYknm7IfwNWaAgdAN5/Do924
-# GA8yMDI2MTEwNTA4MDcyMlowAwIBAQIQc6dFpkrjh3tDOljRjI+3Y6CCEacwggTz
-# MIIC26ADAgECAhBUQ/g3vVruGAGEcrhc2o7jMA0GCSqGSIb3DQEBCwUAMHIxCzAJ
-# BgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjERMA8G
-# A1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0YW1waW5nIElz
-# c3VpbmcgUlNBIENBIDIwHhcNMjYwNjEyMTcyMjQ2WhcNMzYwNjA5MTcyMjQ1WjBu
-# MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24x
-# ETAPBgNVBAoMCFNTTCBDb3JwMSowKAYDVQQDDCFTU0wuY29tIFRpbWVzdGFtcGlu
-# ZyBVbml0IDIwMjYgRTEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAToJYu4ZhMu
-# SJI48ws2yQ4G2FewiFFIDjp945DC9ItwNo2Hq/FTMEoTHUp0UFEWzs4eucf8rRUD
-# oxsNAgWlSDQ9o4IBUjCCAU4wHwYDVR0jBBgwFoAUcJplwUOAo/zpsWSJbvEwnAkh
-# yXwwTQYIKwYBBQUHAQEEQTA/MD0GCCsGAQUFBzAChjFodHRwOi8vY2VydC5zc2wu
-# Y29tL1NTTC5jb20tdGltZVN0YW1waW5nLUktUjIuY2VyMFEGA1UdIARKMEgwPAYM
-# KwYBBAGCqTABAwYBMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNzbC5jb20v
-# cmVwb3NpdG9yeTAIBgZngQwBBAIwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwQgYD
-# VR0fBDswOTA3oDWgM4YxaHR0cDovL2NybHMuc3NsLmNvbS9TU0wuY29tLXRpbWVT
-# dGFtcGluZy1JLVIyLmNybDAdBgNVHQ4EFgQUJ6wDVrooaroXO4M9QH95qCTswzww
-# DgYDVR0PAQH/BAQDAgeAMA0GCSqGSIb3DQEBCwUAA4ICAQBPdm7O/AOewhlNcGf6
-# GOa4FeDMHXZ9tjFP25h7pm+G+ltlYpzINCBpwROQ/DyTrJ6qdgJjIVnTreUw8SoC
-# EAPacwbrXhmHs+0db0Nap+yCK/Fs9gF4363tTGCRhPd7GltYx08SoG1ZXIc68twq
-# 8zGAlZ8mMA3BWTBUN+TL+Ptx/bz6KKY3w8pztL+7z8t6dFGdXZbZh+dxGeTP0J+z
-# mdEPNpmC6IeuunYbHCCc1BIfgYGMc6Xc/MuydVsahkqLhkSOBe6mziYYY4rv4YHY
-# cCVCf45L3jhweqWQfSASW3ZZ7OgI1GkQumH2prG4GeNISpdZZ+ATrIYHA7S7Eo2q
-# lZVMeYDCvpK8E+h/G5tci4Sf2K9HgIs64DFRKsnjVkGD+qobSgmMXoaREpvGrtzJ
-# ZKQRlgmGYoKDYeDl9cdqA7GLBuafkk9nW+FYKtuTe/91PHaC9Mrn56sLkf3+tNyW
-# NQjvvrJ3at+GN+Sm/ICxu1ezgPueufDyL3Civn5921FIkFXGrMubKQV+2gvRSnZD
-# 763IoJR2uJt1yesHgcpLez63cCN1xsDToMIvwaJ9CL18vTJEFE2UDijoE/5Kvvnk
-# xoI2NRFhkO8PLEkcEFPtyqNkjCyJHyz7rzrSegVsEG12B7YjDsI8L/VDfUjbuFWi
-# VLsHTJqje/xfYy1bLeaxmVdNwTCCBd0wggPFoAMCAQICCHssm9MWgDKZMA0GCSqG
-# SIb3DQEBCwUAMHwxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UE
-# BwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBvcmF0aW9uMTEwLwYDVQQDDChT
-# U0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkgUlNBMB4XDTE2MDIx
-# MjE3MzkzOVoXDTQxMDIxMjE3MzkzOVowfDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
-# BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQKDA9TU0wgQ29ycG9yYXRp
-# b24xMTAvBgNVBAMMKFNTTC5jb20gUm9vdCBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0
-# eSBSU0EwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQD5D92jK33L0Cr+
-# 7GeFpucuG7p34eP1r6Ts+kpdkcRXR2sYd2t28v2T5D0PwhaeC2bDVpSeF4OFzlbv
-# 8hb9AGL1IglU6GUXTkG54E9Gl6obyLhuYl5psV/bKgJ+/GzK80HY7dDo/D9hSO2w
-# AxQdEA5LGeC7TuyGZf82815nAgudhlVh/Xo47f7iGQC3b6FQYnV0PKD6yCWStG56
-# Isf4HqHjst2RMasrHQT/pUoEN+mFpDMr/eLWVTR8GaRKaMeyqNO3yqGTiOvBl7yM
-# +R3ZIoQkdMcEPWqpKZPM67hb4f5fJao0WMjBI1SdG5gRwzicfj2GbKUPQIZ8AvRc
-# Ak8oy65xnw86yDP+ESU16vy6xWA92XwY1bKp03V4A3IiyjrDH+8s5S6p+p4stlFG
-# /a8D1upgaOqFFjZrhekewLPdxCTcgCqBQW2UPsjgyYFBAJ5ev3/FCJiiGCxCQLP5
-# bzgnS06A9D2BR+CIfOoczrV1XFEuHCt/GnIo5wC10XTG1+SfrQeTtlM1Nfw35MP2
-# XRa+IXPekgr4oGNqvJaSaj74vGVVm971DYkmBPwlGqYlacvCbcp84llfl6zr7y7I
-# vNcbWTwrzPIZyJNrJ2MZz/zpJvjKcZt/k/40Z4ROmev8s3gJM3C6ZqZ27Rtz6xql
-# DcQiEyCUVgpOLGxOsf3PnAm6ojPthwIDAQABo2MwYTAdBgNVHQ4EFgQU3QQJB6L1
-# en1SUxKSle44gCUNplkwDwYDVR0TAQH/BAUwAwEB/zAfBgNVHSMEGDAWgBTdBAkH
-# ovV6fVJTEpKV7jiAJQ2mWTAOBgNVHQ8BAf8EBAMCAYYwDQYJKoZIhvcNAQELBQAD
-# ggIBACAYEZQp+yadHB4ecGHxlXKTcSStaJNYjjKvG7NwA/wlK3SFkD14avS5i6WX
-# O7UYkbsep/lAW5H5VZmvHhHQXB2nZuOxlAcMMjmm6huwedgdnHBE44rdxPmVH4o4
-# Qz8BhaVHpz1GsrzlImj3e5zYLD4KIcgtM6y/xYGZMXTBdXHFvrHwI0X0nWv8GWOd
-# o7wExhgLJbtTiQ+zgFDeRe5Ef6uUeGSY0/Yo3YfYcGV0+w65E+unD2GpMpbM3rvt
-# Y0wYu6lA96BUbiCIcXUY6nq0NHLgIyd3XLaQ6oYlQKvvMw/Ln4K+oiD79rUtGubC
-# hbF0D/vIZQKkUgFH3Ukiwb/Y62usft7sYzMVtyMIj8YPjUFa3Y7FuY/lRT9427rS
-# G0Cx/nFNP+CBorpetOwV4JPdCB9+4VWZCyHek54K++ajSb02MP7nd7KgdZe1LYGI
-# F2Ug99qQAJ/JUswyyjV89T0P2CvX9SZsyQY0lhbqcFkaMnl5C7aIfw9SSD2/bNii
-# RC7RTrdyWNOJE5X+RKv414sbbpy8LKBb1WoAr1834dX6EAuYnIbnJo/O8OxuilcL
-# gONOssCgY2GQulVoN3RqtpLbn6GGIrZlJw7stp9CYORnwrXaQQvE04thG7z6H5Er
-# 10QHXroprNnF6e9TSFrrgPEoWCHNsAZV+yc/U5BwqQQeVye5MIIGyzCCBLOgAwIB
-# AgIQUp27wriJh/WDgOCw66IGNjANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJV
-# UzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NT
-# TCBDb3Jwb3JhdGlvbjExMC8GA1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRp
-# b24gQXV0aG9yaXR5IFJTQTAeFw0yNjA2MTIxNjQyMTVaFw00MTAyMTIxNzM5Mzla
-# MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91c3Rv
-# bjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0YW1w
-# aW5nIElzc3VpbmcgUlNBIENBIDIwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIK
-# AoICAQCfL6vmc02QvDFGmzYHeVpQY1T3Lu9aInnTXfJ/SJfPrltB3Br1uOPyX9KR
-# 5eocap9KHYWhp77zQTyYMR/3egjCOzLYJfZxeYrGq0XwckZgHh/rJGEoQPnTCRs7
-# KwvTYhd/78RmdrjiN9+GFXPg5T+TnbFD8+ciD+4WFzZaT5Jz8IeoCv6VhWQ/PsvL
-# lGoH1/VEoav0kLftbUuBV0cLnR00h2xrdBc+GW1hm5tHeekTgFt+LSOhRbmfk7Rr
-# LB43jlH9hUvEDRgaWnU4dV9WeyperxuGfDUtziSMnpc6BeU6XD9rzN7ntO9t25mX
-# d6F7BOa87QCTL+eo5YNL0g8/F3F0bq+msFtK4eXE0A0EBsdOIWCR9mZ/R1liVP8C
-# dkigXECrQcgs+iV/g6BaARPvpKJZKWbZdhEhfBWOl6obSmW9fBEhAHNKIQmPtB5A
-# WcK8fHiBAwg283f7Ib/WvGERtqMa97S1M/eVfg884dUATRAmnhnM8jVhgmSFVGuJ
-# VXFVFTgWyDgE/A/oj5guYdvW1nhEvA4U0uH+AlgOA+UKEKjE6iAXFeDA9lmsPIRF
-# gHRp457FbQ4ppw3hFG71yoXYoq78BvkAvt5gMtUZQ+sQTJhsgwClUqql5tzT+MNC
-# eIL7euRq5ECOBVzybWKn8JCAbUPDhn26VVEBj1VHplrbouxNtQIDAQABo4IBUTCC
-# AU0wEgYDVR0TAQH/BAgwBgEB/wIBADAfBgNVHSMEGDAWgBTdBAkHovV6fVJTEpKV
-# 7jiAJQ2mWTBNBggrBgEFBQcBAQRBMD8wPQYIKwYBBQUHMAKGMWh0dHA6Ly9jZXJ0
-# LnNzbC5jb20vU1NMY29tLVJvb3RDQS1SU0EtNDA5Ni1SMS5jZXIwPwYDVR0gBDgw
-# NjA0BgRVHSAAMCwwKgYIKwYBBQUHAgEWHmh0dHBzOi8vd3d3LnNzbC5jb20vcmVw
-# b3NpdG9yeTATBgNVHSUEDDAKBggrBgEFBQcDCDBCBgNVHR8EOzA5MDegNaAzhjFo
-# dHRwOi8vY3Jscy5zc2wuY29tL1NTTGNvbS1Sb290Q0EtUlNBLTQwOTYtUjEuY3Js
-# MB0GA1UdDgQWBBRwmmXBQ4Cj/OmxZIlu8TCcCSHJfDAOBgNVHQ8BAf8EBAMCAYYw
-# DQYJKoZIhvcNAQELBQADggIBAGUUW80x6YDqIGIFijnogpCNaFa5Bpgq6jiql/Qo
-# k0REC3WDP4ewDZIvfED9X4QDxJE80/1K9fSKz7mYOymli+krJgapg/fpgVbSZsXU
-# XRm1fG6YJRQ79lXmYE0oN/lDg9jtBvR5YB6lRzSs0mv8y+flmJd8k/ENvbGZyDxp
-# EPrnb+ev46uTZQE/QTjeIl0jgsXtWzb1HdIZEthk7EzXkMjhB5uwpGXQoOV/g6Zg
-# YIpzu6ZPGJuRm03ULUpaCd/2Np1T8nCfJJpgQGDHr+/4VULpIY43OJjtNy8j0xX6
-# pjEdQ+U6boBpA/Z1LhuNZeebzqV0JtSTG04AK6ZJ9P3vTvsk2JVrs9nUgGR3/Y8T
-# UALyCztT79iTUE31dE8iLXmT+4DXEX2h557koaPKIYqSohPtbxCSBRPnN4KKcUqR
-# wpp9kxxE5JVile2a1CoYZHaDi49ionQrWGazqAlese3/finwz0+tXyg1Z7RmXUSs
-# My1ed1SDeqEkvikDdlSWjvDmUzmaX4DuKOv/caTa/hBGgN4TZKGZNd0eC2qjwv99
-# PXX2ZhwRPJwTY1gZFewGXc3SvMOwdGvw/dOumuqFGtfTiJLQ/t5D6UPGBLfKEafc
-# 7NYaEO30Z/bHWp7T+p2EUBU6RfHMxnPhRq3rGwB/NfT7+bwYQpbk6PD8dj6Qu9XD
-# NI87MYICVTCCAlECAQEwgYYwcjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFz
-# MRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDEuMCwGA1UEAwwl
-# U1NMLmNvbSBUaW1lc3RhbXBpbmcgSXNzdWluZyBSU0EgQ0EgMgIQVEP4N71a7hgB
-# hHK4XNqO4zALBglghkgBZQMEAgGgggFgMBoGCSqGSIb3DQEJAzENBgsqhkiG9w0B
-# CRABBDAcBgkqhkiG9w0BCQUxDxcNMjYxMTA1MDgwNzIyWjAoBgkqhkiG9w0BCTQx
-# GzAZMAsGCWCGSAFlAwQCAaEKBggqhkjOPQQDAjAvBgkqhkiG9w0BCQQxIgQgQPXe
-# /gUdhmcVd/vBdDPH4DrSeHfEQ5VKc5RqfCy3IO4wgcgGCyqGSIb3DQEJEAIvMYG4
-# MIG1MIGyMIGvBCBXT+oXqvpefGormwjJmLFzXkULOHPKROaiTKCTDmPzsDCBijB2
-# pHQwcjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3Vz
-# dG9uMREwDwYDVQQKDAhTU0wgQ29ycDEuMCwGA1UEAwwlU1NMLmNvbSBUaW1lc3Rh
-# bXBpbmcgSXNzdWluZyBSU0EgQ0EgMgIQVEP4N71a7hgBhHK4XNqO4zAKBggqhkjO
-# PQQDAgRGMEQCIC1Kgzl3YZgUBrS5rd9GfapXOXycCHhjoeIZA7IjamkFAiACTXz9
-# ZkxOvL7NK5SVkoyQFA0x5RcxHgyfFJdInpUYdA==
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCSUvDHAftZ
+# uL/ipI0JvmwiUqIi+3skANAn6Ck7095OSDANBgkqhkiG9w0BAQEFAASCAgAuWlqB
+# BicDICEA/7lQAHUKuE+Ti2rL0L7uva134RvvQUhTTMUKtOt/MFmvL2ehhOoAC6qQ
+# 1PVJM42943jdlOaDAmELbgOdkK7rgfUZAUEbERNnsNTIM7Qrdr+s/uT/bnvr140m
+# irNxlrLapllWOzeodGjId+tYNaztATJmBf5CYhnhrfE34OMHKiVxJ5QOcCWep7bp
+# 3LfyzBGdUXSSvuHc831ZHIzeW7qqN+ydm3SvGjWSB2g1Yl5MdlQ1HGh6yICew5C3
+# RNOs3EnW6vZHcUxSxH4oujeM+jruBMF9hpcMm135w7JXl+dJ57A0eDZLxE2fctC8
+# 0x/TFca5UUPlecG0WJsvccdUpZ5VhlWgndBISwH4+AbJYMNU5ICviTwF/UYtnmQ2
+# inzYoPhLssRHBVYdbGprcVELAqvjFjANn/FOor7pWfzfKYZwKkmsT/Dm2vBL2HhC
+# bTV7g9ranoPa72Nvs7THBIfd6byoPQ5FVaf8lPBciatFpC0ubmw2Nl4Ee6NOnYxh
+# 0gXNdVUM4ICFqy+6YCt1wHJMLbZwT6iV5EN64CeMLcypeueOji00B/YS8+IuNpaE
+# zRgHxn/dTqsSp7Bb9wwYACopccYQGIA9Q86/8g52JmNQHf69toaVMHlp7DMwa039
+# 6ylCVpYk3qUxEBomPsCt31eeqG+8zz8s7hEmOaGCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
+# BAIBBQAEIB2v2t0VkuLx0QX1YGj2/ZHoZwuO5EyTOKIa3pvultIiAggHq1/opfBv
+# xhgPMjAyNjExMDYwODQwMTVaMAMCAQECEGtAVpgDNBRFDDo52XwQH4+gghGnMIIE
+# 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
+# CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
+# BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
+# c3N1aW5nIFJTQSBDQSAyMB4XDTI2MDYxMjE3MjI0NloXDTM2MDYwOTE3MjI0NVow
+# bjELMAkGA1UEBhMCVVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9u
+# MREwDwYDVQQKDAhTU0wgQ29ycDEqMCgGA1UEAwwhU1NMLmNvbSBUaW1lc3RhbXBp
+# bmcgVW5pdCAyMDI2IEUxMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE6CWLuGYT
+# LkiSOPMLNskOBthXsIhRSA46feOQwvSLcDaNh6vxUzBKEx1KdFBRFs7OHrnH/K0V
+# A6MbDQIFpUg0PaOCAVIwggFOMB8GA1UdIwQYMBaAFHCaZcFDgKP86bFkiW7xMJwJ
+# Icl8ME0GCCsGAQUFBwEBBEEwPzA9BggrBgEFBQcwAoYxaHR0cDovL2NlcnQuc3Ns
+# LmNvbS9TU0wuY29tLXRpbWVTdGFtcGluZy1JLVIyLmNlcjBRBgNVHSAESjBIMDwG
+# DCsGAQQBgqkwAQMGATAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29t
+# L3JlcG9zaXRvcnkwCAYGZ4EMAQQCMBYGA1UdJQEB/wQMMAoGCCsGAQUFBwMIMEIG
+# A1UdHwQ7MDkwN6A1oDOGMWh0dHA6Ly9jcmxzLnNzbC5jb20vU1NMLmNvbS10aW1l
+# U3RhbXBpbmctSS1SMi5jcmwwHQYDVR0OBBYEFCesA1a6KGq6FzuDPUB/eagk7MM8
+# MA4GA1UdDwEB/wQEAwIHgDANBgkqhkiG9w0BAQsFAAOCAgEAT3ZuzvwDnsIZTXBn
+# +hjmuBXgzB12fbYxT9uYe6ZvhvpbZWKcyDQgacETkPw8k6yeqnYCYyFZ063lMPEq
+# AhAD2nMG614Zh7PtHW9DWqfsgivxbPYBeN+t7UxgkYT3expbWMdPEqBtWVyHOvLc
+# KvMxgJWfJjANwVkwVDfky/j7cf28+iimN8PKc7S/u8/LenRRnV2W2YfncRnkz9Cf
+# s5nRDzaZguiHrrp2GxwgnNQSH4GBjHOl3PzLsnVbGoZKi4ZEjgXups4mGGOK7+GB
+# 2HAlQn+OS944cHqlkH0gElt2WezoCNRpELph9qaxuBnjSEqXWWfgE6yGBwO0uxKN
+# qpWVTHmAwr6SvBPofxubXIuEn9ivR4CLOuAxUSrJ41ZBg/qqG0oJjF6GkRKbxq7c
+# yWSkEZYJhmKCg2Hg5fXHagOxiwbmn5JPZ1vhWCrbk3v/dTx2gvTK5+erC5H9/rTc
+# ljUI776yd2rfhjfkpvyAsbtXs4D7nrnw8i9wor5+fdtRSJBVxqzLmykFftoL0Up2
+# Q++tyKCUdribdcnrB4HKS3s+t3AjdcbA06DCL8GifQi9fL0yRBRNlA4o6BP+Sr75
+# 5MaCNjURYZDvDyxJHBBT7cqjZIwsiR8s+6860noFbBBtdge2Iw7CPC/1Q31I27hV
+# olS7B0yao3v8X2MtWy3msZlXTcEwggXdMIIDxaADAgECAgh7LJvTFoAymTANBgkq
+# hkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNV
+# BAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8GA1UEAwwo
+# U1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAeFw0xNjAy
+# MTIxNzM5MzlaFw00MTAyMTIxNzM5MzlaMHwxCzAJBgNVBAYTAlVTMQ4wDAYDVQQI
+# DAVUZXhhczEQMA4GA1UEBwwHSG91c3RvbjEYMBYGA1UECgwPU1NMIENvcnBvcmF0
+# aW9uMTEwLwYDVQQDDChTU0wuY29tIFJvb3QgQ2VydGlmaWNhdGlvbiBBdXRob3Jp
+# dHkgUlNBMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA+Q/doyt9y9Aq
+# /uxnhabnLhu6d+Hj9a+k7PpKXZHEV0drGHdrdvL9k+Q9D8IWngtmw1aUnheDhc5W
+# 7/IW/QBi9SIJVOhlF05BueBPRpeqG8i4bmJeabFf2yoCfvxsyvNB2O3Q6Pw/YUjt
+# sAMUHRAOSxngu07shmX/NvNeZwILnYZVYf16OO3+4hkAt2+hUGJ1dDyg+sglkrRu
+# eiLH+B6h47LdkTGrKx0E/6VKBDfphaQzK/3i1lU0fBmkSmjHsqjTt8qhk4jrwZe8
+# jPkd2SKEJHTHBD1qqSmTzOu4W+H+XyWqNFjIwSNUnRuYEcM4nH49hmylD0CGfAL0
+# XAJPKMuucZ8POsgz/hElNer8usVgPdl8GNWyqdN1eANyIso6wx/vLOUuqfqeLLZR
+# Rv2vA9bqYGjqhRY2a4XpHsCz3cQk3IAqgUFtlD7I4MmBQQCeXr9/xQiYohgsQkCz
+# +W84J0tOgPQ9gUfgiHzqHM61dVxRLhwrfxpyKOcAtdF0xtfkn60Hk7ZTNTX8N+TD
+# 9l0WviFz3pIK+KBjaryWkmo++LxlVZve9Q2JJgT8JRqmJWnLwm3KfOJZX5es6+8u
+# yLzXG1k8K8zyGciTaydjGc/86Sb4ynGbf5P+NGeETpnr/LN4CTNwumamdu0bc+sa
+# pQ3EIhMglFYKTixsTrH9z5wJuqIz7YcCAwEAAaNjMGEwHQYDVR0OBBYEFN0ECQei
+# 9Xp9UlMSkpXuOIAlDaZZMA8GA1UdEwEB/wQFMAMBAf8wHwYDVR0jBBgwFoAU3QQJ
+# B6L1en1SUxKSle44gCUNplkwDgYDVR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBCwUA
+# A4ICAQAgGBGUKfsmnRweHnBh8ZVyk3EkrWiTWI4yrxuzcAP8JSt0hZA9eGr0uYul
+# lzu1GJG7Hqf5QFuR+VWZrx4R0Fwdp2bjsZQHDDI5puobsHnYHZxwROOK3cT5lR+K
+# OEM/AYWlR6c9RrK85SJo93uc2Cw+CiHILTOsv8WBmTF0wXVxxb6x8CNF9J1r/Blj
+# naO8BMYYCyW7U4kPs4BQ3kXuRH+rlHhkmNP2KN2H2HBldPsOuRPrpw9hqTKWzN67
+# 7WNMGLupQPegVG4giHF1GOp6tDRy4CMnd1y2kOqGJUCr7zMPy5+CvqIg+/a1LRrm
+# woWxdA/7yGUCpFIBR91JIsG/2OtrrH7e7GMzFbcjCI/GD41BWt2OxbmP5UU/eNu6
+# 0htAsf5xTT/ggaK6XrTsFeCT3QgffuFVmQsh3pOeCvvmo0m9NjD+53eyoHWXtS2B
+# iBdlIPfakACfyVLMMso1fPU9D9gr1/UmbMkGNJYW6nBZGjJ5eQu2iH8PUkg9v2zY
+# okQu0U63cljTiROV/kSr+NeLG26cvCygW9VqAK9fN+HV+hALmJyG5yaPzvDsbopX
+# C4DjTrLAoGNhkLpVaDd0araS25+hhiK2ZScO7LafQmDkZ8K12kELxNOLYRu8+h+R
+# K9dEB166KazZxenvU0ha64DxKFghzbAGVfsnP1OQcKkEHlcnuTCCBsswggSzoAMC
+# AQICEFKdu8K4iYf1g4DgsOuiBjYwDQYJKoZIhvcNAQELBQAwfDELMAkGA1UEBhMC
+# VVMxDjAMBgNVBAgMBVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMRgwFgYDVQQKDA9T
+# U0wgQ29ycG9yYXRpb24xMTAvBgNVBAMMKFNTTC5jb20gUm9vdCBDZXJ0aWZpY2F0
+# aW9uIEF1dGhvcml0eSBSU0EwHhcNMjYwNjEyMTY0MjE1WhcNNDEwMjEyMTczOTM5
+# WjByMQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0
+# b24xETAPBgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFt
+# cGluZyBJc3N1aW5nIFJTQSBDQSAyMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIIC
+# CgKCAgEAny+r5nNNkLwxRps2B3laUGNU9y7vWiJ5013yf0iXz65bQdwa9bjj8l/S
+# keXqHGqfSh2Foae+80E8mDEf93oIwjsy2CX2cXmKxqtF8HJGYB4f6yRhKED50wkb
+# OysL02IXf+/EZna44jffhhVz4OU/k52xQ/PnIg/uFhc2Wk+Sc/CHqAr+lYVkPz7L
+# y5RqB9f1RKGr9JC37W1LgVdHC50dNIdsa3QXPhltYZubR3npE4Bbfi0joUW5n5O0
+# ayweN45R/YVLxA0YGlp1OHVfVnsqXq8bhnw1Lc4kjJ6XOgXlOlw/a8ze57TvbduZ
+# l3ehewTmvO0Aky/nqOWDS9IPPxdxdG6vprBbSuHlxNANBAbHTiFgkfZmf0dZYlT/
+# AnZIoFxAq0HILPolf4OgWgET76SiWSlm2XYRIXwVjpeqG0plvXwRIQBzSiEJj7Qe
+# QFnCvHx4gQMINvN3+yG/1rxhEbajGve0tTP3lX4PPOHVAE0QJp4ZzPI1YYJkhVRr
+# iVVxVRU4Fsg4BPwP6I+YLmHb1tZ4RLwOFNLh/gJYDgPlChCoxOogFxXgwPZZrDyE
+# RYB0aeOexW0OKacN4RRu9cqF2KKu/Ab5AL7eYDLVGUPrEEyYbIMApVKqpebc0/jD
+# QniC+3rkauRAjgVc8m1ip/CQgG1Dw4Z9ulVRAY9VR6Za26LsTbUCAwEAAaOCAVEw
+# ggFNMBIGA1UdEwEB/wQIMAYBAf8CAQAwHwYDVR0jBBgwFoAU3QQJB6L1en1SUxKS
+# le44gCUNplkwTQYIKwYBBQUHAQEEQTA/MD0GCCsGAQUFBzAChjFodHRwOi8vY2Vy
+# dC5zc2wuY29tL1NTTGNvbS1Sb290Q0EtUlNBLTQwOTYtUjEuY2VyMD8GA1UdIAQ4
+# MDYwNAYEVR0gADAsMCoGCCsGAQUFBwIBFh5odHRwczovL3d3dy5zc2wuY29tL3Jl
+# cG9zaXRvcnkwEwYDVR0lBAwwCgYIKwYBBQUHAwgwQgYDVR0fBDswOTA3oDWgM4Yx
+# aHR0cDovL2NybHMuc3NsLmNvbS9TU0xjb20tUm9vdENBLVJTQS00MDk2LVIxLmNy
+# bDAdBgNVHQ4EFgQUcJplwUOAo/zpsWSJbvEwnAkhyXwwDgYDVR0PAQH/BAQDAgGG
+# MA0GCSqGSIb3DQEBCwUAA4ICAQBlFFvNMemA6iBiBYo56IKQjWhWuQaYKuo4qpf0
+# KJNERAt1gz+HsA2SL3xA/V+EA8SRPNP9SvX0is+5mDsppYvpKyYGqYP36YFW0mbF
+# 1F0ZtXxumCUUO/ZV5mBNKDf5Q4PY7Qb0eWAepUc0rNJr/Mvn5ZiXfJPxDb2xmcg8
+# aRD652/nr+Ork2UBP0E43iJdI4LF7Vs29R3SGRLYZOxM15DI4QebsKRl0KDlf4Om
+# YGCKc7umTxibkZtN1C1KWgnf9jadU/JwnySaYEBgx6/v+FVC6SGONziY7TcvI9MV
+# +qYxHUPlOm6AaQP2dS4bjWXnm86ldCbUkxtOACumSfT97077JNiVa7PZ1IBkd/2P
+# E1AC8gs7U+/Yk1BN9XRPIi15k/uA1xF9oeee5KGjyiGKkqIT7W8QkgUT5zeCinFK
+# kcKafZMcROSVYpXtmtQqGGR2g4uPYqJ0K1hms6gJXrHt/34p8M9PrV8oNWe0Zl1E
+# rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
+# fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
+# 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
+# JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
+# AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwNjA4NDAxNVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIAXk
+# i037Iw7K4mY2jAe7So83HIa591lewONU/esr1dkFMIHIBgsqhkiG9w0BCRACLzGB
+# uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
+# dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
+# c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
+# YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
+# zj0EAwIERzBFAiEA4YSsj4fI8rIOhnOLqfjyvLTINZ5PZOJjJSBUWaWvpiACIGmO
+# f+Ur3cp+QGH/39DRHAkuMdOTseft8uce5ka2frR1
 # SIG # End signature block
