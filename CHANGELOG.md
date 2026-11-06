@@ -4,7 +4,7 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
-## 3.1.0 — 2026-11-05
+## 3.1.0 — 2026-11-06
 
 ### Added
 - **X500 control at Convert.** The AD phase now also reads `legacyExchangeDN` (read only, never written or restored) and
