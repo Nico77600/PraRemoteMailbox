@@ -26,6 +26,12 @@ Direct pushes, force pushes, and deletion of public main are prohibited. Do not 
 4. Create a draft release and upload all intended assets before publication. Check the tag, commit, version, asset inventory, and hashes.
 5. Publish the complete draft. Published assets are immutable; a correction requires a new version.
 6. If configured, confirm the attestation workflow succeeds for the distributed files. A source-only fallback does not attest a missing release ZIP.
+7. After publishing, add this notice at the top of the release notes of the version it replaces (the release body stays editable; its tag and assets do not change):
+
+   ```markdown
+   > [!WARNING]
+   > **This is not the latest version.** Download the current one from the [latest release](https://github.com/Nico77600/PraRemoteMailbox/releases/latest).
+   ```
 
 ## Security and recovery
 
