@@ -18,7 +18,7 @@ This folder contains everything needed to run the tool: `Invoke-PraRemoteMailbox
 ## Requirements
 
 - PowerShell 7.5 or later (`pwsh.exe`) for the operations and the window. Windows PowerShell 5.1 is refused; the 2.2.x releases are the Windows PowerShell 5.1 version. Backups written by 2.x restore unchanged.
-- RSAT `ActiveDirectory`, `ExchangeOnlineManagement` 3.10 or later, `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users`, installed for PowerShell 7.
+- RSAT `ActiveDirectory`, `ExchangeOnlineManagement` 3.10.1 or later, `Microsoft.Graph.Authentication` and `Microsoft.Graph.Users` 2.41.1 or later (both in one same version), installed for PowerShell 7.
 - A hybrid Exchange organisation synchronised by Entra Connect, and the minimum permissions listed in the [reference guide, chapter 4](docs/PraRemoteMailbox-Guide.md#4-prerequisites) (derived from the code; the plain version is in the [user guide, chapter 2](docs/PraRemoteMailbox-UserGuide.md#2-before-you-start)).
 - Windows Terminal for emoji and colours.
 - To read the HTML report: a current desktop Microsoft Edge or Google Chrome (the report is compressed and needs `DecompressionStream`; the CSV with the same name works everywhere).

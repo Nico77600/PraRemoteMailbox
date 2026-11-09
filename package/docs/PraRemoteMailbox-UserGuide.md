@@ -232,7 +232,7 @@ Here is what each light checks.
 |---|---|
 | **RSAT ActiveDirectory** | The program that talks to the company directory. |
 | **ExchangeOnlineManagement** | The program that talks to the cloud mail. |
-| **Microsoft.Graph** | The program that reads people in Microsoft 365. |
+| **Microsoft.Graph** | The program that reads people in Microsoft 365. Both parts must be in the same version, 2.41.1 or newer. If a light is red, its text gives the versions found and the command to run. |
 | **Entra Connect sync** | The way to send the changes to the cloud. Grey means "not used". When the sync is done on another server, the console tries it **with your account** (a few seconds). Orange means that it will not work: read the text, it says why. |
 | **Sign-in** | How the tool signs in to Microsoft 365. |
 | **Microsoft 365 reachable** | Can this server reach Microsoft 365 through the Internet? The console tries for 3 seconds. This light shows only when the cloud programs are installed. If the connection is blocked, the text says so in plain words (firewall or proxy) and keeps the technical message for your administrator. |
@@ -397,8 +397,8 @@ Use this path when **no single server** reaches both Active Directory and Micros
 **What the cloud server needs.** Check this list before you start:
 
 - PowerShell 7.5 or newer.
-- The program **ExchangeOnlineManagement**, version 3.10 or newer.
-- The programs **Microsoft.Graph.Authentication** and **Microsoft.Graph.Users**.
+- The program **ExchangeOnlineManagement**, version 3.10.1 or newer.
+- The programs **Microsoft.Graph.Authentication** and **Microsoft.Graph.Users**, version 2.41.1 or newer. Both must be in the same version.
 - The same signed tool folder as on the directory server, with its files unblocked.
 - A settings file with the **same** `Environment` as on the directory server.
 - A safe disk for the `Backups` folder.
@@ -651,6 +651,8 @@ Find what you **see** in the left column. The middle column says what it **means
 | A **light is red** on **Setup** | A program or a way to sign in is missing on this server. | Read the red text. Ask your administrator to fix it. Press **Check again**. If the server only does one part, a red light for the other part is normal. |
 | The button **Choose a task** is **grey** | A needed light is red, or the settings file is wrong. | Fix the red light. If a message talks about the settings file, open the file and look at the line named. |
 | The **sign-in window does not open** | The tool opens its own window for Microsoft. It may hide behind another window. | Look at the Windows taskbar for a black window named *PRA Remote Mailbox - cloud sign-in*. Click it. Sign in. Do not close it. |
+| *Microsoft Graph: found … The tool needs both in one same version 2.41.1 or later* | The Microsoft 365 programs on this server are too old, or not in the same version. **Nothing was changed.** | Ask your administrator to run the command written in the message. Press **Check again**. |
+| *Nothing was changed in AD. This account cannot write to …* | The directory server refused your account. | Run the tool on that directory server, or with an account that has the rights. The backup folder that was written is kept: it is not a batch to continue. |
 | *A Microsoft Graph session already exists in this console* | A cloud session is already open in the same window. | Close all PowerShell windows. Open a new one. Start again. |
 | **The red button stays grey** on **Verify** | The preview is not done, or the word is not typed. | Press **Preview**. Type the word **CONVERT**, **RECOVER** or **FINALIZE**. Spaces and capitals do not matter. |
 | *N blocking* in red after **Preview** | The tool refuses some people. | Click the line. Read the reason. Remove the person from the list, or stop and ask. |
@@ -664,8 +666,37 @@ Find what you **see** in the left column. The middle column says what it **means
 | *Entra Connect sync will not be possible: …* | Before it changed anything, the tool tried the Entra Connect server with your account. The server refused your account, or did not answer. **Nothing was changed.** | Read the reason in the message. Ask your administrator to give your account the right it names, or to check the server name and the remote connection. Or ask to switch the sync off (`EntraConnect.Sync`) and to start the sync by hand after the move. Then start again. |
 | The result says **Pending** and the **Next steps** begin with *AD is changed and verified. The Entra Connect sync could not start* | The people are moved in the directory and checked. The sync to the cloud could not start (for example the right was removed). The package is made anyway. | **Do not start the move again.** Start a sync on the Entra Connect server (the message gives the command), or wait about 30 minutes. Then do the next line: carry the package to the cloud server. |
 | *… is already converted by batch …* | You started the move again for a person who is already moved. **Nothing was changed.** | Do not move this person again. To finish the batch (sync and package, the directory is not changed again), use the command written in the message: `.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch <batch ID>`. |
-| An orange line says *X500 missing in Exchange Online* | The new mailbox is ready, but it does not have an old address of the person. An answer to an **old message** could come back to the sender as an error. | Do not worry about the move: it is done. Ask your administrator to check the synchronisation, and to run a **Check** after it. |
+| An orange line says *X500 missing in Exchange Online* | The new mailbox is ready and works, but it does not have an old address of the person yet. An answer to a very **old message** could come back to the sender as an error until it appears. | It is not serious: the move is done. Ask your administrator to run a sync, then a **Check**. |
+| *Scope.Mode = OU requires Scope.SearchBase: no OU is set* | You started a move, and the settings file does not say which people to take. **Nothing was changed.** | Ask your administrator to fill the setting named in the message, or give one account. A cloud server never needs it. |
 | Nothing in the list of batches or packages | The files are not on this server. | Copy the folder or the package here. Use **Import package…**. |
+
+### If the Entra Connect sync failed
+
+Sometimes the directory change is done and checked, but the sync to the cloud cannot start. The most common cause is a missing right on the Entra Connect server.
+
+**Before any change**, the tool tries the sync with your account. If it fails, the tool stops and **nothing is changed**. Ask your administrator for the right named in the message. Then start again.
+
+**After the directory change**, the run ends with **Next step required**. The package is made anyway. On the Run page, the sync step shows an orange triangle and says why.
+
+![The Run page when the sync did not start. Number 1: the steps. The step Entra Connect synchronisation has an orange triangle](images/console-run-syncfailed-light.png)
+
+The **Next steps** page tells you what to do, the sync first.
+
+![The Next steps page when the sync did not start. Number 1: the title. Number 2: the steps, with the sync first. Number 3: the package to carry](images/console-next-syncfailed-light.png)
+
+1. Do **not** move the people again. They are already moved.
+2. Ask your administrator to start a sync on the Entra Connect server, or wait about 30 minutes.
+3. Carry the package to the cloud server, as the page says.
+
+If a batch has no package, or if you want to try the sync again from this server, finish the batch:
+
+1. On the **Task** page, choose **Move mailboxes to Exchange Online**, then **Continue a batch (cloud part)**.
+2. Pick the batch marked **AD part done, sync did not run: finish it here**. The pink pill says **Phase: AD**.
+3. Click **Continue to verification**. Then preview and run as usual. The directory is **not** changed again.
+
+![The Task page with a batch to finish. Number 1: Continue a batch. Number 2: the batch to finish. Number 3: the pink pill Phase: AD. Number 4: the button to continue](images/console-task-finish-light.png)
+
+The run does three things: it opens the batch, it runs the sync again, and it makes the package.
 
 <!-- icon: book -->
 ## 8. Picture dictionary

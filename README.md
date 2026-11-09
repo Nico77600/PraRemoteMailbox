@@ -70,8 +70,8 @@ One path for everyone. Set the tool up once (**1 to 4**), then take branch **A**
 # 2 · On the server, in PowerShell 7.5+ as administrator: put the tool in its folder and unblock it.
 #     Download PraRemoteMailbox-3.1.2.zip from the latest release (under Assets, not Source code) and extract it to D:\PRA\PraRemoteMailbox
 Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File
-Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -Force
-Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllUsers -Force
+Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -Force
+Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope AllUsers -Force
 
 # 3 · Fill in the settings: scope, licence group, routing domain, Entra Connect server, tenant
 notepad D:\PRA\PraRemoteMailbox\config\PraRemoteMailbox.config.psd1
@@ -231,7 +231,7 @@ Every run writes a log, a PowerShell transcript, a CSV and an HTML report. Exit 
 |---|---|
 | Scenario | Hybrid Exchange organisation (Exchange Server + Exchange Online) synchronised by **Entra Connect**. Exchange on-premises is not needed (it is down); Active Directory and Entra Connect must work (both lost: [PRA Cloud Mailbox](https://github.com/Nico77600/PraCloudMailbox)) |
 | PowerShell | **PowerShell 7.5 or later** (`pwsh.exe`) for the operations and the window. Windows PowerShell 5.1 is refused (use the 2.2.x release there) |
-| Modules | RSAT `ActiveDirectory` (native in PowerShell 7 on Windows 10 1809+ / Windows Server 2019+), `ExchangeOnlineManagement` 3.10 or later and `Microsoft.Graph.Authentication` / `Microsoft.Graph.Users`, installed **for PowerShell 7**; `ADSync` on the Entra Connect server (loaded through the Windows PowerShell compatibility layer when used locally) |
+| Modules | RSAT `ActiveDirectory` (native in PowerShell 7 on Windows 10 1809+ / Windows Server 2019+), `ExchangeOnlineManagement` 3.10.1 or later and `Microsoft.Graph.Authentication` / `Microsoft.Graph.Users` 2.41.1 or later (both Graph modules in one same version), installed **for PowerShell 7**; `ADSync` on the Entra Connect server (loaded through the Windows PowerShell compatibility layer when used locally) |
 | Licences | A licence group that gives Exchange Online to the users (shared mailboxes need no licence) |
 | Console | Windows Terminal for emoji and colours; the classic console shows symbols |
 

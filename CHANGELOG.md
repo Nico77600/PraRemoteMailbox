@@ -8,8 +8,10 @@ a PATCH version fixes a defect. The backup formats have their own version (see t
 
 ### Fixed
 - The console no longer prints "unapproved verbs" warnings at start.
-- Entra Connect: before a conversion the tool proves that your account can use the sync, and stops with nothing changed if not. A sync that fails after the AD changes ends "Pending" with the package and the exact next steps; `-Phase AD -Batch <id>` finishes such a batch, and a repeated conversion points to it.
-- The console says in plain words when Microsoft 365 is blocked (firewall or proxy), and an error names the right object.
+- Entra Connect: before a conversion the tool proves that your account can use the sync, and stops with nothing changed if not. A sync that fails after the AD changes ends "Pending" with the package and the exact next steps; `-Phase AD -Batch <id>` (in the console: Continue a batch) finishes such a batch, and a repeated conversion points to it.
+- Minimum versions: Microsoft Graph 2.41.1 (one same version for all its modules) and ExchangeOnlineManagement 3.10.1. The tool checks them before any change and gives the exact install command, in the run and on the Setup page.
+- A phase AD that ends with a package now exits 2 ("next step required"). A domain controller that refuses the account is told plainly and its empty backup folder is marked. A missing `-Action` stops at once.
+- X500 control: the mailbox's own legacyExchangeDN is no longer reported missing, the wait says that the mailbox is ready, and the warning is simpler. Check and the cloud phases no longer need the conversion scope. A Preview started with a package prints the package in its Next steps. The console says in plain words when Microsoft 365 is blocked (firewall or proxy).
 
 ## 3.1.1 — 2026-11-09
 
