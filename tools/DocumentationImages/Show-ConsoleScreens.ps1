@@ -17,6 +17,8 @@
     twoserver the AD server of a two-server move (red lights for the cloud modules, transfer package)
     cloud     the cloud server: imports the transfer package
     rollback  Roll back a conversion on a server that runs both sides
+    rollbackad    Roll back a conversion on the AD server of a two-server rollback (phase AD, writes the Recover package)
+    rollbackcloud Continue a rollback on the cloud server of a two-server rollback (phase Cloud, writes the Finalize package)
     finalize  Complete a rollback on the AD server
     check     Check a mailbox
 .PARAMETER Repository
@@ -30,7 +32,7 @@
 param(
     [Parameter(Mandatory)][string]$Shots,
     [ValidateSet('Light', 'Dark')][string]$Theme = 'Light',
-    [ValidateSet('single', 'scope', 'twoserver', 'cloud', 'rollback', 'finalize', 'check')][string]$Scenario = 'single',
+    [ValidateSet('single', 'scope', 'twoserver', 'cloud', 'rollback', 'rollbackad', 'rollbackcloud', 'finalize', 'check')][string]$Scenario = 'single',
     [string]$Repository
 )
 $ErrorActionPreference = 'Stop'
@@ -55,7 +57,7 @@ try {
     $root = Join-Path $work 'runtime'
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     $config = Join-Path $root 'config\PraRemoteMailbox.psd1'
-    $phaseConfig = switch ($Scenario) { 'twoserver' { 'AD' } 'finalize' { 'AD' } 'cloud' { 'Cloud' } default { 'Both' } }
+    $phaseConfig = switch ($Scenario) { 'twoserver' { 'AD' } 'rollbackad' { 'AD' } 'finalize' { 'AD' } 'cloud' { 'Cloud' } 'rollbackcloud' { 'Cloud' } default { 'Both' } }
     W $config "@{Environment='LAB'; DomainController='dc01.contoso.com'; Scope=@{Mode='OU';SearchBase='OU=Wave1,DC=contoso,DC=com'}; Licensing=@{Enabled=`$false}; EntraConnect=@{Sync=`$true;Server='SRV-AADC01'}; Execution=@{Phase='$phaseConfig'}; Cloud=@{Organization='contoso.onmicrosoft.com'}}"
     W (Join-Path $root 'module\PRA.Synthetic.psm1') '# marker'
     Copy-Item (Join-Path $PSScriptRoot 'StubEngine.ps1') (Join-Path $root 'Invoke-PraRemoteMailbox.ps1')
@@ -72,13 +74,16 @@ try {
     W (Join-Path $root 'scenario.json') (ConvertTo-Json -InputObject @($listed) -Depth 4)
     if ($Scenario -in 'single', 'scope') { foreach ($flag in 'entra', 'grant') { W (Join-Path $root "hold.$flag") 'hold' } }
     # A Convert batch (with its Active Directory proof) in the backup folder.
-    $id = [guid]::NewGuid().ToString('N')
+    # The two-server rollback story moves the whole scope (batch ID 490cc62e); the other scenarios keep one test mailbox.
+    $story = $Scenario -in 'rollbackad', 'rollbackcloud'
+    $id = if ($story) { '490cc62e' + [guid]::NewGuid().ToString('N').Substring(8) } else { [guid]::NewGuid().ToString('N') }
     $folder = Join-Path $root "Backups\Batch-$id"
     $rec = @{ObjectGuid = [guid]::NewGuid().ToString(); SamAccountName = 'alice.vance'; UserPrincipalName = 'alice.vance@contoso.com'; IsShared = $false }
-    if ($Scenario -ne 'cloud') {
-        J (Join-Path $folder 'Convert-LAB-fixture.json') @{SchemaVersion = 2; Operation = 'Convert'; Environment = 'LAB'; BatchId = $id; RunId = '20261104_091200-abc'; SourceBackupHash = ''; Records = @($rec) }
+    $recs = if ($story) { @($objects | ForEach-Object { @{ObjectGuid = $_.guid; SamAccountName = $_.sam; UserPrincipalName = $_.upn; IsShared = [bool]$_.shared } }) } else { @($rec) }
+    if ($Scenario -notin 'cloud', 'rollbackcloud') {
+        J (Join-Path $folder 'Convert-LAB-fixture.json') @{SchemaVersion = 2; Operation = 'Convert'; Environment = 'LAB'; BatchId = $id; RunId = '20261104_091200-abc'; SourceBackupHash = ''; Records = $recs }
         W (Join-Path $folder 'raw.clixml') '<x/>'
-        J (Join-Path $folder "State-$id.json") @{SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'LAB'; Records = @(@{ObjectGuid = $rec.ObjectGuid; ADVerified = $true }) }
+        J (Join-Path $folder "State-$id.json") @{SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'LAB'; Records = @($recs | ForEach-Object { @{ObjectGuid = $_.ObjectGuid; ADVerified = $true } }) }
     }
     if ($Scenario -eq 'cloud') {
         # The transfer package that the AD server wrote, waiting in the Inbox of the cloud server.
@@ -88,6 +93,22 @@ try {
         $null = New-Item -ItemType Directory -Path $source -Force; [IO.File]::WriteAllBytes((Join-Path $source 'raw.clixml'), $filler)
         J (Join-Path $source "State-$id.json") @{SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'LAB'; Records = @(@{ObjectGuid = $rec.ObjectGuid; ADVerified = $true }) }
         $null = New-PraTransferPackage -Kind Convert -Environment 'LAB' -BatchId $id -Folders @($source) -OutboxFolder (Join-Path $root 'Backups\Inbox')
+    }
+    if ($Scenario -eq 'rollbackcloud') {
+        # The Recover package that the AD server wrote (the rollback batch and the original Convert batch travel together), waiting in the Inbox of the cloud server.
+        $source = Join-Path $work "source\Batch-$id"
+        $rollbackId = '5ad39f71' + [guid]::NewGuid().ToString('N').Substring(8)
+        $rolled = Join-Path $work "source\Batch-$rollbackId"
+        J (Join-Path $source 'Convert-LAB-fixture.json') @{SchemaVersion = 2; Operation = 'Convert'; Environment = 'LAB'; BatchId = $id; RunId = '20261104_091200-abc'; SourceBackupHash = ''; Records = $recs }
+        $filler = New-Object byte[] 18400000; [Random]::new(7).NextBytes($filler)
+        $null = New-Item -ItemType Directory -Path $source -Force; [IO.File]::WriteAllBytes((Join-Path $source 'raw.clixml'), $filler)
+        J (Join-Path $source "State-$id.json") @{SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'LAB'; Records = @($recs | ForEach-Object { @{ObjectGuid = $_.ObjectGuid; ADVerified = $true } }) }
+        # The Recover batch names the original Convert batch by its hash (the console checks it before a cloud rollback).
+        $convertHash = (Get-FileHash -LiteralPath (Join-Path $source 'Convert-LAB-fixture.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+        J (Join-Path $rolled 'Recover-LAB-fixture.json') @{SchemaVersion = 3; Operation = 'Recover'; Environment = 'LAB'; BatchId = $rollbackId; RunId = '20261109_101500-abc'; SourceBackupHash = $convertHash; Records = $recs }
+        W (Join-Path $rolled 'raw.clixml') '<x/>'
+        J (Join-Path $rolled "State-$rollbackId.json") @{SchemaVersion = 2; Operation = 'Recover'; Kind = 'ADVerified'; Environment = 'LAB'; Records = @($recs | ForEach-Object { @{ObjectGuid = $_.ObjectGuid; ADVerified = $true } }) }
+        $null = New-PraTransferPackage -Kind Recover -Environment 'LAB' -BatchId $rollbackId -Folders @($rolled, $source) -OutboxFolder (Join-Path $root 'Backups\Inbox')
     }
     if ($Scenario -eq 'finalize') {
         # A Finalize folder, as the cloud server of a Recover leaves it for the AD server.
@@ -109,7 +130,7 @@ try {
                 [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Fail'; Detail = 'Not installed: the Active Directory parts cannot run on this server (install the RSAT feature Active Directory module).' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Ok'; Detail = 'Installed, version 3.10.0.' },
                 [ordered]@{Name = 'Microsoft.Graph'; Status = 'Ok'; Detail = 'Installed, version 2.25.0.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'NA'; Detail = 'Not used: this server does not change Active Directory.' },
                 [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }, [ordered]@{Name = 'Microsoft 365 reachable'; Status = 'Ok'; Detail = 'Reachable from this server (login.microsoftonline.com and outlook.office365.com).' }); AD = $false; Cloud = $true; Role = 'Cloud' } }
-    $probe = switch ($Scenario) { 'twoserver' { $adProbe } 'finalize' { $adProbe } 'cloud' { $cloudProbe } default { $bothProbe } }
+    $probe = switch ($Scenario) { 'twoserver' { $adProbe } 'rollbackad' { $adProbe } 'finalize' { $adProbe } 'cloud' { $cloudProbe } 'rollbackcloud' { $cloudProbe } default { $bothProbe } }
     $identityProbe = { param($identity) [pscustomobject]@{ Success = $true; Found = $true; Count = 1; DisplayName = 'Alice Vance'; UserPrincipalName = 'alice.vance@contoso.com'; SamAccountName = 'alice.vance'; MailboxType = 'User mailbox' } }
     $toolVersion = [regex]::Match([IO.File]::ReadAllText((Join-Path $repo 'package\Invoke-PraRemoteMailbox.ps1')), '(?m)^\s*Version\s*:\s*(\d+\.\d+\.\d+)\s*$').Groups[1].Value
     $g = New-PraGuiWindow -Root $root -ConfigPath $config -Version $toolVersion -Theme $Theme -PrerequisiteProbe $probe -IdentityProbe $identityProbe
@@ -275,6 +296,36 @@ try {
             WaitRun; Pump
             Shot 'run-rollback'
             Click 'BtnNext'; Pump; Shot 'next-rollback' @(, @('BtnReport', '1'))
+        }
+        'rollbackad' {
+            GoToTask 'T_Recover'
+            if (@($g.BatchRows).Count -gt 0) { $c.BatchList.SelectedIndex = 0; Pump }
+            Shot 'task-rollback-ad' @(@('BatchList', '1'), @('PhasePill', '2'), @('BtnNext', '3'))
+            PreviewThenConfirm 'recover'
+            Click 'BtnPreview'; Pump 600; WaitRun; Pump
+            if (-not $g.Pending) { throw "no pending: $($c.SumText.Text) $($g.PreviewError)" }
+            $c.ConfirmBox.Text = 'recover'; Pump
+            Click 'BtnNext'; Pump 1200
+            WaitRun; Pump
+            $c.StepList.SelectedIndex = 5; Pump
+            Click 'BtnNext'; Pump; Shot 'next-rollback-package' @(@('PkgName', '1'), @('BtnOpenFolder', '2'), @('NextCmdBox', '3'))
+        }
+        'rollbackcloud' {
+            GoToTask 'T_Recover'
+            $c.Mode_Continue.IsChecked = $true; Pump; WaitPackages
+            Shot 'task-rollback-continue' @(@('T_Recover', '1'), @('Mode_Continue', '2'), @('BtnImport', '3'), @('BatchList', '4'))
+            if (@($g.BatchRows).Count -gt 0) { $c.BatchList.SelectedIndex = 0; Pump }
+            Shot 'task-rollback-package' @(@('BatchList', '1'), @('PhasePill', '2'), @('BtnNext', '3'))
+            PreviewThenConfirm 'recover'
+            Click 'BtnPreview'; Pump 600; WaitRun; Pump
+            if (-not $g.Pending) { throw "no pending: $($c.SumText.Text) $($g.PreviewError)" }
+            $c.ConfirmBox.Text = 'recover'; Pump
+            Shot 'verify-rollback-cloud' @(@('ConfirmBox', '1'), @('BtnNext', '2'))
+            Click 'BtnNext'; Pump 1200
+            WaitRun; Pump
+            $c.StepList.SelectedIndex = 2; Pump
+            Shot 'run-rollback-cloud' @(, @('StepList', '1'))
+            Click 'BtnNext'; Pump; Shot 'next-rollback-cloud' @(@('PkgName', '1'), @('BtnOpenFolder', '2'), @('NextCmdBox', '3'))
         }
         'finalize' {
             GoToTask 'T_Finalize'

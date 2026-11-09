@@ -21,8 +21,8 @@ function Hold($name) { $flag = Join-Path $here ('hold.' + $name); $limit = [date
 $all = @($scenario)
 $objs = if ($Identity) { @($all | Where-Object { $_.upn -eq $Identity -or $_.sam -eq $Identity } | Select-Object -First 1) } else { $all }
 if (-not $objs.Count) { $objs = @($all[0]) }
-# A rollback of the one-mailbox test batch concerns that mailbox only.
-if ($Action -eq 'Recover' -and -not $Identity) { $objs = @($all[0]) }
+# A rollback of the one-mailbox test batch concerns that mailbox only (on one server; the two-server story rolls back the whole scenario).
+if ($Action -eq 'Recover' -and -not $Identity -and $Phase -eq 'Both') { $objs = @($all[0]) }
 $apply = ($Mode -eq 'Apply')
 # The console passes -Phase AD for a Finalize; the real engine reports the phase Finalize.
 if ($Action -eq 'Finalize') { $Phase = 'Finalize' }
@@ -31,6 +31,8 @@ $steps = switch ("$Action|$Phase") {
     'Convert|Both' { @('Active Directory connection', 'Targets and planned changes', 'Exchange Online pre-check', 'Backup and Active Directory changes', 'Entra Connect synchronisation', 'Exchange Online: mailboxes, licences and permissions') }
     'Convert|AD' { @('Active Directory connection', 'Targets and planned changes', 'Backup and Active Directory changes', 'Entra Connect synchronisation', 'Creating the transfer package') }
     'Convert|Cloud' { @('Loading the batch of the AD phase', 'Exchange Online: mailboxes, licences and permissions') }
+    'Recover|AD' { @('Loading the Convert batch', 'Active Directory connection', 'Planned restore', 'Backup and Active Directory changes', 'Entra Connect synchronisation', 'Creating the transfer package') }
+    'Recover|Cloud' { @('Loading the Recover batch', 'Exchange Online: deprovisioning checks', 'Final restore of shared mailboxes and tags') }
     'Recover|Both' { @('Loading the Convert batch', 'Active Directory connection', 'Planned restore', 'Exchange Online pre-check', 'Backup and Active Directory changes', 'Entra Connect synchronisation', 'Exchange Online: deprovisioning checks') }
     'Finalize|Finalize' { @('Loading the Finalize package', 'Active Directory connection', 'Planned restore', 'Backup and Active Directory changes', 'Entra Connect synchronisation') }
     'Check|Cloud' { @('Exchange Online and Microsoft Graph', 'Mailbox check') }
@@ -40,14 +42,14 @@ $total = $steps.Count
 Ev @{kind = 'start'; title = 'PRA Remote Mailbox'; action = $Action; mode = $Mode; phase = $Phase }
 Ev @{kind = 'plan'; steps = @(for ($i = 0; $i -lt $total; $i++) { @{id = 's' + ($i + 1); label = $steps[$i]; count = $null } }) }
 $csv = Join-Path $here 'synthetic.csv'; $logPath = Join-Path $here 'logs\PRA_run.log'; $null = New-Item -ItemType Directory -Path (Split-Path $logPath) -Force; [IO.File]::WriteAllText($logPath, 'run log')
-$rows = @($objs | ForEach-Object { [pscustomobject]@{ObjectGuid = $_.guid; SamAccountName = $_.sam; UserPrincipalName = $_.upn; Action = $Action; IsShared = [bool]$_.shared; ADApplied = $apply; ADVerified = $apply; CloudStatus = $(if ($apply) { 'Success' } else { 'N/A' }); FinalStatus = $(if ($apply) { 'Success' } else { 'Planned' }); Detail = $(if ($apply) { 'Done' } else { 'Planned' }); BackupPath = $(if ($apply) { $backup } else { '' }); Warnings = $(if ($_.warning) { $_.warning } else { '' }) } })
+$rows = @($objs | ForEach-Object { [pscustomobject]@{ObjectGuid = $_.guid; SamAccountName = $_.sam; UserPrincipalName = $_.upn; Action = $Action; IsShared = [bool]$_.shared; ADApplied = $apply; ADVerified = $apply; CloudStatus = $(if ($apply) { 'Success' } else { 'N/A' }); FinalStatus = $(if ($apply) { 'Success' } else { 'Planned' }); Detail = $(if ($apply) { 'Done' } else { 'Planned' }); BackupPath = $(if ($apply) { $backup } else { '' }); Warnings = $(if ($_.warning -and -not ($Action -eq 'Recover' -and $Phase -eq 'Cloud')) { $_.warning } else { '' }) } })
 $rows | Export-Csv -LiteralPath $csv -Delimiter ';' -NoTypeInformation -Encoding UTF8
 $perObject = @('Targets and planned changes', 'Planned restore', 'Backup and Active Directory changes', 'Exchange Online: mailboxes, licences and permissions', 'Exchange Online pre-check', 'Exchange Online: deprovisioning checks', 'Mailbox check')
-$wholeBatch = @('Active Directory connection', 'Entra Connect synchronisation', 'Creating the transfer package', 'Loading the Convert batch', 'Loading the batch of the AD phase', 'Loading the Finalize package', 'Exchange Online and Microsoft Graph')
+$wholeBatch = @('Active Directory connection', 'Entra Connect synchronisation', 'Creating the transfer package', 'Loading the Convert batch', 'Loading the batch of the AD phase', 'Loading the Recover batch', 'Loading the Finalize package', 'Final restore of shared mailboxes and tags', 'Exchange Online and Microsoft Graph')
 Ev @{kind = 'count'; count = $objs.Count; stepIds = @(for ($i = 0; $i -lt $total; $i++) { if ($steps[$i] -notin $wholeBatch) { 's' + ($i + 1) } }) }
 for ($i = 0; $i -lt $total; $i++) {
     $id = 's' + ($i + 1); $label = $steps[$i]
-    if (-not $apply -and $label -in @('Exchange Online pre-check', 'Entra Connect synchronisation', 'Creating the transfer package', 'Exchange Online: mailboxes, licences and permissions', 'Backup and Active Directory changes', 'Exchange Online: deprovisioning checks')) { Ev @{kind = 'step'; index = $i + 1; total = $total; id = $id; title = $label; state = 'skipped'; startedUtc = [datetime]::UtcNow.ToString('o'); endedUtc = [datetime]::UtcNow.ToString('o') }; continue }
+    if (-not $apply -and $label -in @('Exchange Online pre-check', 'Entra Connect synchronisation', 'Creating the transfer package', 'Exchange Online: mailboxes, licences and permissions', 'Backup and Active Directory changes', 'Exchange Online: deprovisioning checks', 'Final restore of shared mailboxes and tags')) { Ev @{kind = 'step'; index = $i + 1; total = $total; id = $id; title = $label; state = 'skipped'; startedUtc = [datetime]::UtcNow.ToString('o'); endedUtc = [datetime]::UtcNow.ToString('o') }; continue }
     Ev @{kind = 'step'; index = $i + 1; total = $total; id = $id; title = $label; state = 'running'; startedUtc = [datetime]::UtcNow.ToString('o'); endedUtc = $null }
     $state = 'ok'
     if ($label -in $perObject) {
@@ -81,18 +83,29 @@ for ($i = 0; $i -lt $total; $i++) {
         Hold 'grant'
     }
     if ($label -eq 'Creating the transfer package' -and $apply) {
-        Ev @{kind = 'item'; stepId = $id; status = 'Ok'; text = 'Transfer package PRA-LAB-Convert-490cc62e-for-Cloud.zip written (18.4 MB, checksums verified)'; identity = ''; name = ''; detail = '' }
+        $written = if ($Action -eq 'Recover') { 'PRA-LAB-Recover-5ad39f71-for-Cloud.zip' } else { 'PRA-LAB-Convert-490cc62e-for-Cloud.zip' }
+        Ev @{kind = 'item'; stepId = $id; status = 'Ok'; text = "Transfer package $written written (18.4 MB, checksums verified)"; identity = ''; name = ''; detail = '' }
+    }
+    if ($label -eq 'Final restore of shared mailboxes and tags' -and $apply) {
+        # Only the shared mailbox that the cloud removed needs a last Active Directory change: it travels to the AD server in the Finalize package.
+        Ev @{kind = 'item'; stepId = $id; status = 'Info'; text = 'Cloud-only phase: final AD restoration is packaged for Finalize on the AD server.'; identity = ''; name = ''; detail = '' }
+        Ev @{kind = 'item'; stepId = $id; status = 'Ok'; text = 'Finalize package b7d41a9c written: D:\PRA\Backups\Finalize-b7d41a9c'; identity = ''; name = ''; detail = '' }
+        Ev @{kind = 'item'; stepId = $id; status = 'Ok'; text = 'Transfer package PRA-LAB-Finalize-b7d41a9c-for-AD.zip written (18.4 MB, checksums verified)'; identity = ''; name = ''; detail = '' }
     }
     Start-Sleep -Milliseconds 250
     Ev @{kind = 'step'; index = $i + 1; total = $total; id = $id; title = $label; state = $state; startedUtc = [datetime]::UtcNow.ToString('o'); endedUtc = [datetime]::UtcNow.ToString('o') }
 }
-$pkg = ''; $pkgKind = ''
-if ($apply -and $Phase -eq 'AD') { $pkg = Join-Path $here 'Backups\Outbox\PRA-LAB-Convert-490cc62e-for-Cloud.zip'; $null = New-Item -ItemType Directory -Path (Split-Path $pkg) -Force; [IO.File]::WriteAllBytes($pkg, (New-Object byte[] 18400000)); $pkgKind = 'Convert' }
+$pkg = ''; $pkgKind = ''; $pkgName = ''
+if ($apply -and $Phase -eq 'AD') { $pkgKind = $Action; $pkgName = if ($Action -eq 'Recover') { 'PRA-LAB-Recover-5ad39f71-for-Cloud.zip' } else { 'PRA-LAB-Convert-490cc62e-for-Cloud.zip' } }
+# The cloud part of a rollback hands a Finalize package to the AD server (here: the one shared mailbox that the cloud removed).
+if ($apply -and $Action -eq 'Recover' -and $Phase -eq 'Cloud') { $pkgKind = 'Finalize'; $pkgName = 'PRA-LAB-Finalize-b7d41a9c-for-AD.zip' }
+if ($pkgName) { $pkg = Join-Path $here ('Backups\Outbox\' + $pkgName); $null = New-Item -ItemType Directory -Path (Split-Path $pkg) -Force; [IO.File]::WriteAllBytes($pkg, (New-Object byte[] 18400000)) }
 $n = $objs.Count
-$globalReport = ''; if ($apply -and $Phase -in @('Both', 'Cloud', 'Finalize')) { $globalReport = Join-Path $here 'reports\PRA_global.html'; $null = New-Item -ItemType Directory -Path (Split-Path $globalReport) -Force; [IO.File]::WriteAllText($globalReport, '<html></html>') }
-$next = if ($pkg) { @('Copy PRA-LAB-Convert-490cc62e-for-Cloud.zip to the cloud server (anywhere), then run there:', ".\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch 'PRA-LAB-Convert-490cc62e-for-Cloud.zip'") }
+$globalReport = ''; if ($apply -and -not $pkg -and $Phase -in @('Both', 'Cloud', 'Finalize')) { $globalReport = Join-Path $here 'reports\PRA_global.html'; $null = New-Item -ItemType Directory -Path (Split-Path $globalReport) -Force; [IO.File]::WriteAllText($globalReport, '<html></html>') }
+$next = if ($pkgKind -eq 'Finalize') { @("Copy $pkgName to the AD server (anywhere), then run there:", ".\Invoke-PraRemoteMailbox.ps1 -Action Finalize -Mode Apply -Batch '$pkgName'") }
+elseif ($pkg) { @("Copy $pkgName to the cloud server (anywhere), then run there:", ".\Invoke-PraRemoteMailbox.ps1 -Action $pkgKind -Phase Cloud -Mode Apply -Batch '$pkgName'") }
 elseif ($apply -and $Action -eq 'Convert') { @('To roll back this batch later: .\Invoke-PraRemoteMailbox.ps1 -Action Recover -Mode Preview -Batch 490cc62e') } else { @() }
-Ev @{kind = 'result'; status = $(if ($pkg) { 'Pending' } elseif ($apply) { 'Success' } else { 'Planned' }); exitCode = $(if ($pkg) { 2 } else { 0 }); action = $Action; mode = $Mode; phase = $Phase; success = $(if ($apply -and -not $pkg) { $n } else { 0 }); error = 0; pending = $(if ($pkg) { $n } else { 0 }); skipped = 0; planned = $(if ($apply) { 0 } else { $n }); total = $n; issues = @()
+Ev @{kind = 'result'; status = $(if ($pkg) { 'Pending' } elseif ($apply) { 'Success' } else { 'Planned' }); exitCode = $(if ($pkg) { 2 } else { 0 }); action = $Action; mode = $Mode; phase = $Phase; success = $(if ($pkgKind -eq 'Finalize') { $n - 1 } elseif ($apply -and -not $pkg) { $n } else { 0 }); error = 0; pending = $(if ($pkgKind -eq 'Finalize') { 1 } elseif ($pkg) { $n } else { 0 }); skipped = 0; planned = $(if ($apply) { 0 } else { $n }); total = $n; issues = @()
     nextSteps = $next; batchId = $batchId; csvReport = $csv; logFile = ($logPath); htmlReport = $(if ($apply) { (Join-Path $here 'reports\PRA_phase.html') } else { '' }); globalReport = $globalReport; backupFiles = @($(if ($apply) { $backup })); stateFiles = @(); transferPackage = $pkg; transferPackageKind = $pkgKind; configOverrides = @() }
 if ($apply) { $null = New-Item -ItemType Directory -Path (Join-Path $here 'reports') -Force; [IO.File]::WriteAllText((Join-Path $here 'reports\PRA_phase.html'), '<html></html>') }
 exit $(if ($pkg) { 2 } else { 0 })
