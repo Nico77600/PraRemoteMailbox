@@ -442,6 +442,36 @@ function Get-PraGroup {
     return $groups[0]
 }
 
+function Find-PraConvertedBatch {
+    <#
+    .SYNOPSIS
+        The most recent Convert batch of the backup folder that holds an object and has its AD proof (State file), or $null. A hint for the operator
+        only: the batch is verified in full when it is used.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [string]$ObjectGuid)
+    try {
+        $root = [string]$Context.Config.Storage.BackupFolder
+        if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { return $null }
+        $folders = [object[]]@(Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction Stop | Where-Object { $_.Name -match '^Batch-[0-9a-f]{32}$' })
+        $ticks = [long[]]@($folders | ForEach-Object { $_.LastWriteTimeUtc.Ticks })
+        [Array]::Sort($ticks, $folders); [Array]::Reverse($folders)
+        foreach ($folder in $folders) {
+            $batchId = $folder.Name.Substring(6)
+            if (-not (Test-Path -LiteralPath (Join-Path $folder.FullName ('State-' + $batchId + '.json')) -PathType Leaf)) { continue }
+            foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter 'Convert-*.json' -ErrorAction Stop)) {
+                try { $data = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-PraJson } catch { continue }
+                if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $data 'Operation' '')) 'Convert')) { continue }
+                if (@(@($data.Records) | Where-Object { Test-PraOrdinalIgnoreCaseEqual ([string]$_.ObjectGuid) $ObjectGuid }).Count -eq 1) {
+                    return [pscustomobject]@{ BatchId = $batchId; ShortId = $batchId.Substring(0, 8); Folder = $folder.FullName }
+                }
+            }
+        }
+    }
+    catch { Write-PraLog -Context $Context -Message ('The backup folder could not be searched for a batch of this object: {0}' -f $_.Exception.Message) -Level Detail }
+    return $null
+}
+
 function Get-PraTarget {
     <#
     .SYNOPSIS
@@ -500,7 +530,18 @@ function Get-PraTarget {
         $excluded = $samName.StartsWith('HealthMailbox', [StringComparison]::OrdinalIgnoreCase) -or $samName.StartsWith('SystemMailbox', [StringComparison]::OrdinalIgnoreCase) -or
             ([string](Get-PraValue $user 'DisplayName' '')).StartsWith('Microsoft Exchange', [StringComparison]::OrdinalIgnoreCase) -or (Test-PraOrdinalIn -IgnoreCase $user.SamAccountName $scope.ExcludeSamAccountNames)
         if (-not $eligible -or $excluded) {
-            if ($explicit) { throw "Explicit target not eligible (not an on-premises mailbox of an accepted type) or excluded: $($user.SamAccountName). Nothing converted." }
+            if ($explicit) {
+                # The stop message names this object (the context still held the last object read).
+                $Context.CurrentIdentity = $samName
+                $converted = $null
+                if (-not $eligible -and -not $excluded) { $converted = Find-PraConvertedBatch $Context $id }
+                if ($null -ne $converted) {
+                    $hook = Get-PraValue $Context 'CommandLineFor' $null
+                    $command = if ($hook -is [scriptblock]) { [string](& $hook 'Convert' 'AD' $converted.ShortId) } else { '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch ' + $converted.ShortId }
+                    throw ("{0} is already converted by batch {1} (it is a remote mailbox now): nothing was changed. To continue that batch (Entra Connect sync and transfer package; AD is not changed again) run: {2}" -f $samName, $converted.ShortId, $command)
+                }
+                throw "Explicit target not eligible (not an on-premises mailbox of an accepted type) or excluded: $samName. Nothing converted."
+            }
             continue
         }
         $selected.Add($user)
@@ -1899,6 +1940,117 @@ $script:PraSyncCycle = {
     [pscustomobject]@{ Result = [string]$result.Result; Seconds = [int]$clock.Elapsed.TotalSeconds; Computer = $env:COMPUTERNAME }
 }
 
+# Read-only check of the Entra Connect synchronisation, run on EntraConnect.Server (or here): it proves that this ACCOUNT can use the ADSync module there.
+# Test-WSMan cannot prove it: it does not authenticate. Self-contained, like $script:PraSyncCycle (it also runs in the Windows PowerShell 5.1 endpoint).
+$script:PraSyncProbe = {
+    $ErrorActionPreference = 'Stop'
+    $import = @{ Name = 'ADSync'; ErrorAction = 'Stop' }
+    if ([string]::Equals([string]$PSVersionTable.PSEdition, 'Core', [StringComparison]::Ordinal)) { $import.UseWindowsPowerShell = $true }
+    Import-Module @import
+    $scheduler = Get-ADSyncScheduler -ErrorAction Stop
+    [pscustomobject]@{ Computer = $env:COMPUTERNAME; CycleEnabled = [bool]$scheduler.SyncCycleEnabled }
+}
+
+function New-PraSyncResult {
+    <# One answer of the Entra Connect check: Ok, Kind (Ok, Denied, Unreachable, NoModule, Timeout or Failed), Server, Reason (plain words, with what to do) and Technical (the raw message). #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'In-memory constructor, no change to any target or file.')]
+    [CmdletBinding()]
+    param([bool]$Ok, [string]$Kind, [string]$Server = '', [string]$Reason = '', [string]$Technical = '')
+    [pscustomobject]@{ Ok = $Ok; Kind = $Kind; Server = $Server; Reason = $Reason; Technical = $Technical }
+}
+
+function Get-PraSyncFailure {
+    <#
+    .SYNOPSIS
+        Plain words for a failed Entra Connect check or cycle: Kind (Denied, Unreachable, NoModule, Timeout or Failed), Reason (what happened and what to do)
+        and Technical (the raw message). The account that is refused is the usual cause, so it is tested first.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Failure, [string]$Server = '')
+    $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { [Exception]$Failure }
+    $technical = ([string]$exception.Message -replace '\s+', ' ').Trim()
+    $errorId = if ($Failure -is [Management.Automation.ErrorRecord]) { [string]$Failure.FullyQualifiedErrorId } else { '' }
+    $where = if ($Server) { $Server } else { 'this server' }
+    if (([int](Get-PraValue $exception 'ErrorCode' 0) -eq 5) -or $technical -match '(?i)access is denied|access denied|acc[eè]s refus|unauthorized|not authorized|logon failure|authentication|permission') {
+        $reason = if ($Server) { 'this account has no right on {0}: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncOperators)' -f $Server }
+            else { 'this account has no right to use Entra Connect on this server: it must be a member of ADSyncOperators (or Administrators)' }
+        return New-PraSyncResult -Ok $false -Kind 'Denied' -Server $Server -Reason $reason -Technical $technical
+    }
+    if ($technical -match '(?i)^Timeout:') {
+        return New-PraSyncResult -Ok $false -Kind 'Timeout' -Server $Server -Reason ('the synchronisation cycle did not finish in time on {0} (it may still be running)' -f $where) -Technical $technical
+    }
+    # The error id of a missing module does not depend on the language of Windows; the message words are the fallback.
+    if ($errorId -match 'ModuleNotFound' -or ($technical -match '(?i)ADSync' -and $technical -match '(?i)not loaded|no valid module|could not be found|not recognized|cannot find|not found|FileNotFound')) {
+        $reason = if ($Server) { '{0} answered but the ADSync module is not installed there: it is not the Entra Connect server (check EntraConnect.Server)' -f $Server } else { 'the ADSync module is not on this server' }
+        return New-PraSyncResult -Ok $false -Kind 'NoModule' -Server $Server -Reason $reason -Technical $technical
+    }
+    if ($Server -and ($exception.GetType().Name.Contains('PSRemotingTransportException') -or $technical -match '(?i)cannot connect|could not connect|cannot be resolved|cannot find the computer|no such host|network path|network name|timed out|did not respond|unreachable|WinRM|WS-Management|connection (was )?(refused|closed)|actively refused|server is unavailable')) {
+        return New-PraSyncResult -Ok $false -Kind 'Unreachable' -Server $Server -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985): check the server name in EntraConnect.Server, the network and the firewall' -f $Server) -Technical $technical
+    }
+    New-PraSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('the Entra Connect check on {0} failed ({1})' -f $where, $technical) -Technical $technical
+}
+
+function Resolve-PraSyncProbe {
+    <# Reads the answer of a check started by Start-PraSyncProbe (the job is removed). -TimedOut: the time is up and the job has not ended. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Handle, [switch]$TimedOut)
+    $server = [string]$Handle.Server
+    try {
+        if ($TimedOut -and -not $Handle.IsCompleted) {
+            Stop-Job -Job $Handle.Job -ErrorAction SilentlyContinue
+            $seconds = [int]$Handle.TimeoutSeconds
+            return New-PraSyncResult -Ok $false -Kind 'Unreachable' -Server $server -Technical ('no answer within {0} seconds' -f $seconds) `
+                -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985) within {1} seconds: check the server name in EntraConnect.Server, the network and the firewall' -f $server, $seconds)
+        }
+        $answer = Receive-Job -Job $Handle.Job -ErrorAction Stop
+        if ($null -eq $answer) { return New-PraSyncResult -Ok $false -Kind 'Failed' -Server $server -Reason ('{0} answered nothing to the Entra Connect check' -f $server) -Technical 'empty answer' }
+        New-PraSyncResult -Ok $true -Kind 'Ok' -Server $server -Reason ('{0} accepts this account and Entra Connect answers' -f $server)
+    }
+    catch { Get-PraSyncFailure $_ $server }
+    finally { Remove-Job -Job $Handle.Job -Force -ErrorAction SilentlyContinue }
+}
+
+function Start-PraSyncProbe {
+    <#
+    .SYNOPSIS
+        Starts the Entra Connect check on EntraConnect.Server as a remote job and returns at once (the window polls it). The handle has IsCompleted and
+        GetResult($timedOut); the result is the one of Test-PraSyncServer. The session has a bounded open and operation time.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Starts a read-only remote check (Get-ADSyncScheduler); nothing is changed.')]
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Server, [ValidateRange(5, 600)][int]$TimeoutSeconds = 30)
+    $option = New-PSSessionOption -OpenTimeout ($TimeoutSeconds * 1000) -OperationTimeout ($TimeoutSeconds * 1000)
+    $job = Invoke-Command -ComputerName $Server -ScriptBlock $script:PraSyncProbe -SessionOption $option -AsJob -ErrorAction Stop
+    $handle = [pscustomobject]@{ Server = $Server; TimeoutSeconds = $TimeoutSeconds; Job = $job }
+    Add-Member -InputObject $handle -MemberType ScriptProperty -Name IsCompleted -Value { -not (Test-PraOrdinalIn ([string]$this.Job.State) @('NotStarted', 'Running', 'Suspended', 'Stopping', 'Disconnected')) }
+    Add-Member -InputObject $handle -MemberType ScriptMethod -Name GetResult -Value { param([bool]$TimedOut) Resolve-PraSyncProbe -Handle $this -TimedOut:$TimedOut }
+    return $handle
+}
+
+function Test-PraSyncServer {
+    <#
+    .SYNOPSIS
+        Proves that the Entra Connect synchronisation is possible FOR THIS ACCOUNT: an authenticated, read-only call to the ADSync module of
+        EntraConnect.Server (PowerShell remoting, bounded time), or of this server when no server is given. Starts nothing, changes nothing.
+    .OUTPUTS
+        Ok, Kind (Ok, Denied, Unreachable, NoModule, Timeout or Failed), Server, Reason (plain words) and Technical (the raw message).
+    #>
+    [CmdletBinding()]
+    param([string]$Server = '', [ValidateRange(5, 600)][int]$TimeoutSeconds = 30)
+    if ($Server) {
+        try { $handle = Start-PraSyncProbe -Server $Server -TimeoutSeconds $TimeoutSeconds }
+        catch { return (Get-PraSyncFailure $_ $Server) }
+        $null = Wait-Job -Job $handle.Job -Timeout $TimeoutSeconds
+        return $handle.GetResult(-not $handle.IsCompleted)
+    }
+    if (-not @(Get-Module -ListAvailable -SkipEditionCheck ADSync).Count) {
+        return New-PraSyncResult -Ok $false -Kind 'NoModule' -Reason 'the ADSync module is not on this server (run the AD part on the Entra Connect server, or set EntraConnect.Server)' -Technical 'ADSync module not found'
+    }
+    try { $null = & $script:PraSyncProbe }
+    catch { return (Get-PraSyncFailure $_ '') }
+    New-PraSyncResult -Ok $true -Kind 'Ok' -Reason 'the ADSync module answers on this server'
+}
+
 function Invoke-PraSync {
     <#
     .SYNOPSIS
@@ -1907,9 +2059,14 @@ function Invoke-PraSync {
     .DESCRIPTION
         EntraConnect.Sync = $false: nothing is run; a warning reminds the operator to synchronise
         before the cloud part. The sync is refused if the batch is not proven in this run.
+        A cycle that fails after the AD changes were verified is NOT an error of the run: the AD part is done. The failure is recorded in
+        $Context.SyncFailure, the objects become Pending (exit code 2) and the entry script says what to do (run the sync, then go on).
+    .PARAMETER Resume
+        Continues a batch whose AD changes were made and verified by an earlier run: the AD proof loaded in this run ($Context.Proof, $Context.Source) replaces the
+        receipt of an AD write of this run.
     #>
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
-    param([hashtable]$Context)
+    param([hashtable]$Context, [switch]$Resume)
     if (-not $Context.AllowMutation -or (-not (Test-PraOrdinalIgnoreCaseEqual $Context.Mode 'Apply')) -or (-not (Test-PraOrdinalIn $Context.Action @('Convert','Recover','Finalize') -IgnoreCase)) -or $WhatIfPreference) { return }
     $settings = $Context.Config.EntraConnect
     if (-not $settings.Sync) {
@@ -1921,12 +2078,22 @@ function Invoke-PraSync {
         Write-PraItem -Context $Context -Status Skip -Text 'No AD change in this run: no synchronisation needed.'
         return
     }
-    $receipt = Get-PraValue $Context 'LastVerifiedReceipt' $null
-    if ($null -eq $receipt -or -not (Test-PraOrdinalEqual $receipt.Data.RunId $Context.RunId)) { throw 'Synchronisation refused: no verified AD batch in this run.' }
+    if (-not $Resume) {
+        $receipt = Get-PraValue $Context 'LastVerifiedReceipt' $null
+        if ($null -eq $receipt -or -not (Test-PraOrdinalEqual $receipt.Data.RunId $Context.RunId)) { throw 'Synchronisation refused: no verified AD batch in this run.' }
+    }
     if ([bool](Get-PraValue $Context 'OperationFailed' $false) -or $Context.Issues.Count -gt 0 -or @($Context.Rows | Where-Object FinalStatus -eq 'Error').Count -gt 0) { throw 'Synchronisation refused after an error in this run.' }
-    $source = if (Test-PraOrdinalEqual $receipt.Data.Operation 'Convert') { $receipt } else { Get-PraValue $Context 'Source' $null }
-    if ($null -eq $source) { throw 'Synchronisation refused: the Convert source of the batch is unknown.' }
-    $null = Import-PraProof $Context $receipt.StatePath $source $receipt.Data.Operation
+    if ($Resume) {
+        $loadedProof = Get-PraValue $Context 'Proof' $null
+        $source = Get-PraValue $Context 'Source' $null
+        if ($null -eq $loadedProof -or $null -eq $source) { throw 'Synchronisation refused: the AD proof of the batch is not loaded.' }
+        $null = Import-PraProof $Context $loadedProof.Path $source ([string]$loadedProof.Data.Operation)
+    }
+    else {
+        $source = if (Test-PraOrdinalEqual $receipt.Data.Operation 'Convert') { $receipt } else { Get-PraValue $Context 'Source' $null }
+        if ($null -eq $source) { throw 'Synchronisation refused: the Convert source of the batch is unknown.' }
+        $null = Import-PraProof $Context $receipt.StatePath $source $receipt.Data.Operation
+    }
     if (-not $Context.JournalPath -or -not (Test-Path -LiteralPath $Context.JournalPath -PathType Leaf)) { throw 'Synchronisation refused: the batch journal is missing.' }
     $target = if ($settings.Server) { $settings.Server } else { $env:COMPUTERNAME }
     $Context.CurrentOperation = 'Start-ADSyncSyncCycle'; $Context.CurrentIdentity = $target
@@ -1935,22 +2102,38 @@ function Invoke-PraSync {
     Write-PraItem -Context $Context -Status Info -Icon Sync -Text ("{0} cycle started on {1}, waiting for its end (max {2} min)..." -f $settings.PolicyType, $target, $settings.TimeoutMinutes)
     Write-PraProgress -Context $Context -Text ('Waiting for the Entra Connect {0} cycle to finish on {1} (up to {2} min)' -f $settings.PolicyType, $target, $settings.TimeoutMinutes) -Current 0 -Total ([int]$settings.TimeoutMinutes * 60)
     $timeoutSeconds = [int]$settings.TimeoutMinutes * 60
-    if ($settings.Server) {
-        # The cycle runs on the Entra Connect server as a job: this side reports a wait (attempt, next check) every 5 s until it ends.
-        $job = Invoke-Command -ComputerName $settings.Server -ScriptBlock $script:PraSyncCycle -ArgumentList $settings.PolicyType, $settings.TimeoutMinutes -AsJob -ErrorAction Stop
-        try {
-            $clock = [Diagnostics.Stopwatch]::StartNew(); $poll = 0
-            while ($null -eq (Wait-Job -Job $job -Timeout 5)) {
-                $poll++
-                Write-PraProgress -Context $Context -Text ('Entra Connect synchronisation cycle in progress on {0}' -f $target) -Current ([int]$clock.Elapsed.TotalSeconds) -Total $timeoutSeconds -Attempt $poll -MaxAttempts ([int][Math]::Ceiling($timeoutSeconds / 5.0)) -NextInSeconds 5
+    try {
+        if ($settings.Server) {
+            # The cycle runs on the Entra Connect server as a job: this side reports a wait (attempt, next check) every 5 s until it ends.
+            $job = Invoke-Command -ComputerName $settings.Server -ScriptBlock $script:PraSyncCycle -ArgumentList $settings.PolicyType, $settings.TimeoutMinutes -AsJob -ErrorAction Stop
+            try {
+                $clock = [Diagnostics.Stopwatch]::StartNew(); $poll = 0
+                while ($null -eq (Wait-Job -Job $job -Timeout 5)) {
+                    $poll++
+                    Write-PraProgress -Context $Context -Text ('Entra Connect synchronisation cycle in progress on {0}' -f $target) -Current ([int]$clock.Elapsed.TotalSeconds) -Total $timeoutSeconds -Attempt $poll -MaxAttempts ([int][Math]::Ceiling($timeoutSeconds / 5.0)) -NextInSeconds 5
+                }
+                $result = Receive-Job -Job $job -ErrorAction Stop
             }
-            $result = Receive-Job -Job $job -ErrorAction Stop
+            finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
         }
-        finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        else {
+            $report = { param($Text, $Attempt, $MaxAttempts, $Elapsed) Write-PraProgress -Context $Context -Text $Text -Current $Elapsed -Total $timeoutSeconds -Attempt $Attempt -MaxAttempts $MaxAttempts -NextInSeconds 5 }.GetNewClosure()
+            $result = & $script:PraSyncCycle $settings.PolicyType $settings.TimeoutMinutes $report
+        }
     }
-    else {
-        $report = { param($Text, $Attempt, $MaxAttempts, $Elapsed) Write-PraProgress -Context $Context -Text $Text -Current $Elapsed -Total $timeoutSeconds -Attempt $Attempt -MaxAttempts $MaxAttempts -NextInSeconds 5 }.GetNewClosure()
-        $result = & $script:PraSyncCycle $settings.PolicyType $settings.TimeoutMinutes $report
+    catch {
+        # The AD changes are made and verified: the run does not fail here. The objects wait for the synchronisation (Pending, exit code 2) and the
+        # entry script writes the next steps; the transfer package is still produced.
+        $failure = Get-PraSyncFailure $_ ([string]$settings.Server)
+        try { Write-PraJournal $Context '*' 'ADSync' 'Failed' $failure.Technical } catch { Write-PraLog -Context $Context -Message ('The journal cannot be written: {0}' -f $_.Exception.Message) -Level Detail }
+        $Context['SyncFailure'] = [pscustomobject]@{ Server = $target; Kind = $failure.Kind; Reason = $failure.Reason; Technical = $failure.Technical }
+        foreach ($row in $Context.Rows) {
+            if ((Get-PraValue $row 'ADApplied' $null) -eq $true -and (Test-PraOrdinalEqual ([string]$row.FinalStatus) 'Success')) {
+                $row.FinalStatus = 'Pending'; $row.Detail = ([string]$row.Detail + ' | AD changed and verified; the Entra Connect sync has to be run').Trim(' ', '|')
+            }
+        }
+        Write-PraItem -Context $Context -Status Warn -Icon Sync -Text ('Entra Connect sync could not run on {0}: {1}. The AD changes are already made and verified; the sync is the next step.' -f $target, $failure.Reason) -Detail $failure.Technical
+        return
     }
     Write-PraJournal $Context '*' 'ADSync' 'Completed' $target
     Write-PraProgress -Context $Context -Text ('Entra Connect cycle finished on {0}' -f $target) -Current ([int](Get-PraValue $result 'Seconds' 0)) -Total ([int]$settings.TimeoutMinutes * 60)
@@ -1960,7 +2143,7 @@ function Invoke-PraSync {
 
 Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmutableFile, New-PraPrivateDirectory, Write-PraJournal,
     Initialize-PraDirectory, Get-PraUser, Get-PraExpectedX500, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
-    Import-PraProof, Invoke-PraSync, Invoke-PraAdReplication, Assert-PraReceipt, Test-PraStateEqual, Assert-PraFollowupState, Initialize-PraPermissionCache
+    Import-PraProof, Invoke-PraSync, Test-PraSyncServer, Start-PraSyncProbe, Invoke-PraAdReplication, Assert-PraReceipt, Test-PraStateEqual, Assert-PraFollowupState, Initialize-PraPermissionCache
 
 # SIG # Begin signature block
 # MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor

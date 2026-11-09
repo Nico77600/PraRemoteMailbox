@@ -37,7 +37,7 @@
         # Private folders, phase data and transfer package (PRA.Common)
         'New-PraPrivateDirectorySecurity', 'Initialize-PraPrivateFolder', 'Register-PraObjectName', 'Register-PraObjectBackup', 'Save-PraPhaseData', 'Copy-PraPhaseData', 'Get-PraTransferPackageName', 'Get-PraTransferPackage', 'New-PraTransferPackage', 'Import-PraTransferPackage',
         # Active Directory, backup and proof (PRA.Directory)
-        'Initialize-PraDirectory', 'Initialize-PraPermissionCache', 'Get-PraUser', 'Get-PraExpectedX500', 'Get-PraTarget', 'New-PraRow', 'New-PraPlan', 'Invoke-PraAdPreview', 'Invoke-PraAdBatch', 'Invoke-PraAdReplication', 'Invoke-PraSync', 'Import-PraBackup', 'Import-PraProof', 'Assert-PraReceipt', 'Assert-PraFollowupState', 'Get-PraHash', 'Write-PraImmutableFile', 'New-PraPrivateDirectory', 'Write-PraJournal'
+        'Initialize-PraDirectory', 'Initialize-PraPermissionCache', 'Get-PraUser', 'Get-PraExpectedX500', 'Get-PraTarget', 'New-PraRow', 'New-PraPlan', 'Invoke-PraAdPreview', 'Invoke-PraAdBatch', 'Invoke-PraAdReplication', 'Invoke-PraSync', 'Test-PraSyncServer', 'Start-PraSyncProbe', 'Import-PraBackup', 'Import-PraProof', 'Assert-PraReceipt', 'Assert-PraFollowupState', 'Get-PraHash', 'Write-PraImmutableFile', 'New-PraPrivateDirectory', 'Write-PraJournal'
     )
     CmdletsToExport       = @()
     VariablesToExport     = @()

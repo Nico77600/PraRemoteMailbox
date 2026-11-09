@@ -378,6 +378,7 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
             }
         }
         if ($Case -eq 'MissingUpn') { $users[0].UserPrincipalName='' }
+        if ($Case -eq 'AlreadyConverted') { $users[0].homeMDB=$null; $users[0].msExchRecipientTypeDetails=[long]2147483648 }
         $group=[pscustomobject]@{ ObjectGUID=[guid]'10000000-0000-0000-0000-000000000001'; DistinguishedName='CN=License,OU=Tests,DC=gate,DC=invalid'; objectClass='group'; member=@() }
         if ($Preexisting) { $group.member=@($users | ForEach-Object DistinguishedName) }
         $state=@{ Case=$Case; Users=$users; Originals=([Management.Automation.PSSerializer]::Deserialize([Management.Automation.PSSerializer]::Serialize($users,30))); Group=$group; Server='dc01.gate.invalid'; BackupFolder=(Join-Path $root 'backups'); ExpectedGuids=@($users | ForEach-Object { [string]$_.ObjectGUID }); EventPath=(Join-Path $root 'events.jsonl') }
@@ -489,7 +490,18 @@ foreach (`$name in @('Microsoft.PowerShell.Utility','Microsoft.PowerShell.Manage
 function global:Invoke-WebRequest { throw 'SYNTHETIC BLOCK: network' }
 function global:Invoke-RestMethod { throw 'SYNTHETIC BLOCK: network' }
 function global:New-PSSession { throw 'SYNTHETIC BLOCK: remoting' }
-function global:Invoke-Command { throw 'SYNTHETIC BLOCK: remoting' }
+# Remoting is blocked unless the state file scripts it (RemoteSync: Ok, Denied, Unreachable, OkThenFail): then a fake job answers for EntraConnect.Server, nothing leaves the process.
+function global:Invoke-Command { [CmdletBinding()] param([string]`$ComputerName,[scriptblock]`$ScriptBlock,[object[]]`$ArgumentList,`$SessionOption,[switch]`$AsJob)
+    `$mode = if (`$global:PraGateAd.ContainsKey('RemoteSync')) { [string]`$global:PraGateAd.RemoteSync } else { 'Blocked' }
+    if (`$mode -ceq 'Blocked') { throw 'SYNTHETIC BLOCK: remoting' }
+    [pscustomobject]@{ State='Completed'; Mode=`$mode; IsCycle=`$ScriptBlock.ToString().Contains('Start-ADSyncSyncCycle'); Computer=`$ComputerName } }
+function global:Wait-Job { [CmdletBinding()] param(`$Job,`$Timeout) `$Job }
+function global:Stop-Job { [CmdletBinding()] param(`$Job) }
+function global:Remove-Job { [CmdletBinding()] param(`$Job,[switch]`$Force) }
+function global:Receive-Job { [CmdletBinding()] param(`$Job)
+    if (`$Job.Mode -ceq 'Denied' -or (`$Job.Mode -ceq 'OkThenFail' -and `$Job.IsCycle)) { throw ('Connecting to remote server ' + `$Job.Computer + ' failed with the following error message : Access is denied. For more information, see the about_Remote_Troubleshooting Help topic.') }
+    if (`$Job.Mode -ceq 'Unreachable') { throw 'The WinRM client cannot process the request because the server name cannot be resolved.' }
+    if (`$Job.IsCycle) { [pscustomobject]@{ Result='Success'; Seconds=1; Computer=`$Job.Computer } } else { [pscustomobject]@{ Computer=`$Job.Computer; CycleEnabled=`$true } } }
 function global:Connect-ExchangeOnline { throw 'SYNTHETIC BLOCK: EXO' }
 function global:Connect-MgGraph { throw 'SYNTHETIC BLOCK: Graph' }
 Import-Module ActiveDirectory -Force -Global -ErrorAction Stop
@@ -6860,6 +6872,259 @@ Describe 'Release 3.1.0 - X500 control through the real main (Check of one ident
         $run.Output | Should -Match 'X500 missing in Exchange Online'
     }
 }
+
+Describe 'Release 3.1.2 - the Entra Connect check proves the account, not the network (mocked remoting, no network)' -Tag 'Release312' {
+    BeforeEach {
+        # Real (thread) jobs stand for the remote job: the cmdlets of the module only accept a job, and nothing leaves this process.
+        $global:PraGateT312 = @{ Computer = ''; AsJob = $false; Option = $null; Script = ''; Message = ''; Stopped = 0; Removed = 0; Job = $null; Slow = $null }
+        $global:PraGateT312.Job = Start-ThreadJob -ScriptBlock { 1 }
+        $null = Wait-Job -Job $global:PraGateT312.Job
+        $global:PraGateT312.Slow = Start-ThreadJob -ScriptBlock { Start-Sleep -Seconds 120 }
+    }
+    AfterEach {
+        foreach ($job in @($global:PraGateT312.Job, $global:PraGateT312.Slow)) { if ($null -ne $job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } }
+        Remove-Variable PraGateT312 -Scope Global -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'Function:\global:Get-ADSyncScheduler' -ErrorAction SilentlyContinue
+    }
+    It 'makes an authenticated, bounded, read-only call to EntraConnect.Server and accepts a real answer only' {
+        InModuleScope PRA.Directory {
+            Mock Invoke-Command { $global:PraGateT312.Computer = $ComputerName; $global:PraGateT312.AsJob = [bool]$AsJob; $global:PraGateT312.Option = $SessionOption; $global:PraGateT312.Script = $ScriptBlock.ToString(); $global:PraGateT312.Job }
+            Mock Wait-Job { $Job }
+            Mock Receive-Job { [pscustomobject]@{ Computer = 'SRV-SYNC01'; CycleEnabled = $true } }
+            Mock Remove-Job { $global:PraGateT312.Removed++ }
+            $answer = Test-PraSyncServer -Server 'SRV-SYNC01' -TimeoutSeconds 7
+            $answer.Ok | Should -BeTrue
+            $answer.Kind | Should -BeExactly 'Ok'
+            $answer.Reason | Should -Match 'SRV-SYNC01 accepts this account'
+            $global:PraGateT312.Computer | Should -BeExactly 'SRV-SYNC01'
+            $global:PraGateT312.AsJob | Should -BeTrue
+            $global:PraGateT312.Option.OpenTimeout.TotalSeconds | Should -Be 7 -Because 'the open time of the session is bounded'
+            $global:PraGateT312.Option.OperationTimeout.TotalSeconds | Should -Be 7 -Because 'the operation time of the session is bounded'
+            $global:PraGateT312.Script | Should -Match 'Get-ADSyncScheduler'
+            $global:PraGateT312.Script | Should -Not -Match 'Start-ADSyncSyncCycle' -Because 'the check starts nothing'
+            $global:PraGateT312.Removed | Should -Be 1
+            $script:PraSyncProbe.ToString() | Should -Not -Match 'Set-|Start-|Add-|Remove-'
+        }
+        (Get-Content -LiteralPath (Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1') -Raw) | Should -Not -Match 'Test-WSMan' -Because 'Test-WSMan does not authenticate'
+    }
+    It 'says in plain words why the check failed (<Name>), with what to do' -ForEach @(
+        @{ Name = 'access denied';   Message = 'Connecting to remote server SRV-SYNC01 failed with the following error message : Access is denied. For more information, see the about_Remote_Troubleshooting Help topic.'; Kind = 'Denied';      Reason = 'this account has no right on SRV-SYNC01.*Remote Management Users or Administrators.*ADSyncOperators' }
+        @{ Name = 'access denied (French Windows)'; Message = 'Accès refusé.'; Kind = 'Denied'; Reason = 'this account has no right on SRV-SYNC01' }
+        @{ Name = 'server not reachable'; Message = 'The WinRM client cannot process the request because the server name cannot be resolved.'; Kind = 'Unreachable'; Reason = 'SRV-SYNC01 does not answer to PowerShell remoting \(WinRM, port 5985\): check the server name in EntraConnect.Server' }
+        @{ Name = 'no ADSync module there'; Message = "The specified module 'ADSync' was not loaded because no valid module file was found in any module directory."; Kind = 'NoModule'; Reason = 'SRV-SYNC01 answered but the ADSync module is not installed there: it is not the Entra Connect server' }
+        @{ Name = 'something else'; Message = 'Something unexpected happened.'; Kind = 'Failed'; Reason = 'the Entra Connect check on SRV-SYNC01 failed \(Something unexpected happened\.\)' }
+    ) {
+        $global:PraGateT312.Message = $Message; $global:PraGateT312.Kind = $Kind; $global:PraGateT312.Reason = $Reason
+        InModuleScope PRA.Directory {
+            Mock Invoke-Command { $global:PraGateT312.Job }
+            Mock Wait-Job { $Job }
+            Mock Receive-Job { throw $global:PraGateT312.Message }
+            Mock Remove-Job { $global:PraGateT312.Removed++ }
+            $answer = Test-PraSyncServer -Server 'SRV-SYNC01' -TimeoutSeconds 5
+            $answer.Ok | Should -BeFalse
+            $answer.Kind | Should -BeExactly $global:PraGateT312.Kind
+            $answer.Reason | Should -Match $global:PraGateT312.Reason
+            $answer.Technical | Should -Match ([regex]::Escape(($global:PraGateT312.Message -replace '\s+', ' ').Trim()))
+            $global:PraGateT312.Removed | Should -Be 1 -Because 'the job is always removed'
+        }
+    }
+    It 'treats an error raised while the job starts like any other failure, and a server that does not answer in time as not reachable' {
+        InModuleScope PRA.Directory {
+            Mock Invoke-Command { throw 'Access is denied' }
+            (Test-PraSyncServer -Server 'SRV-SYNC01' -TimeoutSeconds 5).Kind | Should -BeExactly 'Denied'
+        }
+        InModuleScope PRA.Directory {
+            Mock Invoke-Command { $global:PraGateT312.Slow }
+            Mock Wait-Job { $null }
+            Mock Stop-Job { $global:PraGateT312.Stopped++ }
+            Mock Receive-Job { throw 'the answer must not be read after a time out' }
+            Mock Remove-Job { $global:PraGateT312.Removed++ }
+            $answer = Test-PraSyncServer -Server 'SRV-SYNC01' -TimeoutSeconds 5
+            $answer.Ok | Should -BeFalse
+            $answer.Kind | Should -BeExactly 'Unreachable'
+            $answer.Technical | Should -BeExactly 'no answer within 5 seconds'
+            $answer.Reason | Should -Match 'within 5 seconds'
+            $global:PraGateT312.Stopped | Should -Be 1
+            $global:PraGateT312.Removed | Should -Be 1
+        }
+    }
+    It 'checks this server when no Entra Connect server is configured: the module must be there AND answer for this account' {
+        InModuleScope PRA.Directory {
+            Mock Get-Module { @() }
+            $answer = Test-PraSyncServer
+            $answer.Kind | Should -BeExactly 'NoModule'
+            $answer.Reason | Should -Match 'ADSync module is not on this server'
+        }
+        function global:Get-ADSyncScheduler { [CmdletBinding()] param() [pscustomobject]@{ SyncCycleEnabled = $true; SyncCycleInProgress = $false } }
+        InModuleScope PRA.Directory {
+            Mock Get-Module { [pscustomobject]@{ Name = 'ADSync' } }
+            Mock Import-Module { }
+            (Test-PraSyncServer).Ok | Should -BeTrue
+        }
+        function global:Get-ADSyncScheduler { [CmdletBinding()] param() throw 'Access is denied.' }
+        InModuleScope PRA.Directory {
+            Mock Get-Module { [pscustomobject]@{ Name = 'ADSync' } }
+            Mock Import-Module { }
+            $answer = Test-PraSyncServer
+            $answer.Kind | Should -BeExactly 'Denied'
+            $answer.Reason | Should -Match 'no right to use Entra Connect on this server.*ADSyncOperators'
+        }
+    }
+}
+
+Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before any write, never stuck after one' -Tag 'Release312' {
+    BeforeEach {
+        $oldEventPath = $env:PRA_EVENT_FILE
+        function script:Use-RemoteSync($Runtime, [string]$Mode) {
+            $Runtime.State.RemoteSync = $Mode
+            [IO.File]::WriteAllText($Runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($Runtime.State, 35))
+        }
+        function script:Enable-SyncConfig($Runtime) {
+            Set-GateConfigText $Runtime { param($t) $t.Replace('EntraConnect=@{Sync=$false;Server='''';', 'EntraConnect=@{Sync=$true;Server=''SRV-SYNC01'';') }
+        }
+    }
+    AfterEach { $env:PRA_EVENT_FILE = $oldEventPath }
+
+    It 'Preview reports that the sync will not be possible (<Mode>) and changes nothing' -ForEach @(
+        @{ Mode = 'Denied';      Text = 'Entra Connect sync will not be possible: this account has no right on SRV-SYNC01' }
+        @{ Mode = 'Unreachable'; Text = 'Entra Connect sync will not be possible: SRV-SYNC01 does not answer to PowerShell remoting' }
+    ) {
+        $runtime = New-GateRuntime -Name 'sync-preview'
+        Enable-SyncConfig $runtime; Use-RemoteSync $runtime $Mode
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape($Text))
+        $run.Output | Should -Match 'Either fix that, or set EntraConnect\.Sync = \$false in the configuration file and run the synchronisation yourself'
+        $run.Output | Should -Not -Match 'reachable, a Delta cycle runs'
+        $run.MainResult.WarningCount | Should -BeGreaterThan 0
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'Apply stops BEFORE any AD write when the sync cannot work for this account (<Mode>): exit 1, no backup, no write' -ForEach @(
+        @{ Mode = 'Denied' }
+        @{ Mode = 'Unreachable' }
+    ) {
+        $runtime = New-GateRuntime -Name 'sync-stop'
+        Enable-SyncConfig $runtime; Use-RemoteSync $runtime $Mode
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Match 'Entra Connect sync will not be possible'
+        $run.Output | Should -Match 'Nothing was changed\.'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'not even a backup is written'
+        [string]$run.MainResult.TransferPackage | Should -BeExactly ''
+    }
+    It 'Apply goes on when the account is accepted, and the report says so' {
+        $runtime = New-GateRuntime -Name 'sync-ok'
+        Enable-SyncConfig $runtime; Use-RemoteSync $runtime 'Ok'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'Entra Connect: SRV-SYNC01 accepts this account and Entra Connect answers, a Delta cycle runs after the AD changes'
+        $run.Output | Should -Match 'Entra Connect cycle finished on SRV-SYNC01'
+        Test-Path -LiteralPath $run.MainResult.TransferPackage -PathType Leaf | Should -BeTrue
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0
+    }
+    It 'a sync that fails AFTER the verified AD writes ends with the package, exit code 2 and plain next steps; the batch can then be finished' {
+        $runtime = New-GateRuntime -Name 'sync-after'
+        Enable-SyncConfig $runtime; Use-RemoteSync $runtime 'OkThenFail'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+        $run.MainResult.Status | Should -BeExactly 'Pending'
+        $run.MainResult.ErrorCount | Should -Be 0
+        $run.MainResult.PendingCount | Should -Be 2
+        $writes = @(Get-GateWrites $runtime).Count
+        $writes | Should -BeGreaterThan 0
+        $zip = [string]$run.MainResult.TransferPackage
+        $zip | Should -Match 'PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip$'
+        Test-Path -LiteralPath $zip -PathType Leaf | Should -BeTrue -Because 'the package is written although the sync failed'
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -Match '^AD is changed and verified\. The Entra Connect sync could not start: this account has no right on SRV-SYNC01'
+        $steps[1] | Should -BeExactly 'Run a delta sync on SRV-SYNC01 (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).'
+        ($steps -join "`n") | Should -Match 'Copy .*PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip to the cloud server'
+        $run.Output | Should -Match 'Entra Connect sync could not run on SRV-SYNC01: this account has no right'
+        $folder = @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory | Where-Object Name -Like 'Batch-*')[0].FullName
+        $journal = @(Get-Content -LiteralPath (Get-ChildItem -LiteralPath $folder -Filter 'Journal-*.jsonl')[0].FullName | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        @($journal | Where-Object { $_.Operation -ceq 'ADSync' -and $_.Status -ceq 'Failed' }).Count | Should -Be 1
+        @($journal | Where-Object { $_.Operation -ceq 'ADSync' -and $_.Status -ceq 'Started' }).Count | Should -Be 1
+
+        # The batch of the lab: no package. Finish it: Preview first (nothing written), a denied account stops, then the account is accepted.
+        Remove-Item -LiteralPath $zip, ($zip + '.sha256') -Force
+        $short = [string]$run.MainResult.BatchId
+        $short | Should -Match '^[0-9a-f]{8}$'
+        $arguments = @{Action='Convert';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$short}
+        $preview = Invoke-GateProcess $runtime (@{Mode='Preview'} + $arguments) -TimeoutSeconds 120
+        $preview.ExitCode | Should -Be 0 -Because ($preview.Output + $preview.Error)
+        $preview.Output | Should -Match 'AD changes already made and verified \(they are not changed again\)'
+        [string]$preview.MainResult.TransferPackage | Should -BeExactly ''
+        ($preview.MainResult.NextSteps -join ' ') | Should -Match "-Action Convert -Phase AD -Mode Apply -Batch $short"
+        Use-RemoteSync $runtime 'Denied'
+        $denied = Invoke-GateProcess $runtime (@{Mode='Apply'} + $arguments) -TimeoutSeconds 120
+        $denied.ExitCode | Should -Be 1
+        $denied.Output | Should -Match 'Entra Connect sync will not be possible'
+        Test-Path -LiteralPath $zip | Should -BeFalse
+        Use-RemoteSync $runtime 'Ok'
+        $finished = Invoke-GateProcess $runtime (@{Mode='Apply'} + $arguments) -TimeoutSeconds 120
+        $finished.ExitCode | Should -Be 0 -Because ($finished.Output + $finished.Error)
+        @(Get-GateWrites $runtime).Count | Should -Be $writes -Because 'AD is not changed again'
+        Test-Path -LiteralPath $finished.MainResult.TransferPackage -PathType Leaf | Should -BeTrue
+        ($finished.MainResult.NextSteps -join "`n") | Should -Match 'Copy .*for-Cloud\.zip to the cloud server'
+        $finished.Output | Should -Match 'Entra Connect cycle finished on SRV-SYNC01'
+        $journal = @(Get-Content -LiteralPath (Get-ChildItem -LiteralPath $folder -Filter 'Journal-*.jsonl')[0].FullName | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        @($journal | Where-Object { $_.Operation -ceq 'ADSync' -and $_.Status -ceq 'Completed' }).Count | Should -Be 1
+
+        # A batch without its AD proof cannot be finished from here.
+        Remove-Item -LiteralPath $finished.MainResult.TransferPackage, ($finished.MainResult.TransferPackage + '.sha256') -Force
+        Get-ChildItem -LiteralPath $folder -Filter 'State-*' | Remove-Item -Force
+        $noProof = Invoke-GateProcess $runtime (@{Mode='Apply'} + $arguments) -TimeoutSeconds 120
+        $noProof.ExitCode | Should -Be 1
+        $noProof.Output | Should -Match 'has no AD proof \(State file\).*cannot be finished from here\. Nothing was changed'
+        @(Get-GateWrites $runtime).Count | Should -Be $writes
+    }
+    It 'Phase Both with a failing sync does not start the cloud part: AD done, run the sync, then continue the batch' {
+        $runtime = New-GateRuntime -Name 'sync-both'
+        Enable-SyncConfig $runtime; Use-RemoteSync $runtime 'OkThenFail'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+        @($run.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 0 -Because 'the cloud part waits for the synchronisation'
+        # Phase Both ends the chain: the global report line comes first, then the plain steps.
+        $steps = @($run.MainResult.NextSteps | Where-Object { $_ -notmatch '^Global report' })
+        $steps[0] | Should -Match '^AD is changed and verified\. The Entra Connect sync could not start'
+        $steps[1] | Should -Match 'Run a delta sync on SRV-SYNC01'
+        $steps[2] | Should -Match '^Then continue this batch from here .*-Action Convert -Phase Cloud -Mode Apply -Batch [0-9a-f]{8}'
+        ($steps -join "`n") | Should -Not -Match 'To roll back this batch later'
+        $run.Output | Should -Match 'Not run: the Entra Connect synchronisation could not start'
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0
+    }
+    It 'refuses -Batch with Convert -Phase Both and says which command to use' {
+        $runtime = New-GateRuntime -Name 'sync-both-batch'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Preview';ConfigPath=$runtime.ConfigPath;Batch='deadbeef'} -TimeoutSeconds 60
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Match 'use -Phase AD -Batch <id>'
+    }
+    It 're-running a conversion for an object that is already converted points to its batch, and names that object' {
+        $first = New-GateRuntime -Name 'converted-a'
+        $converted = Invoke-GateProcess $first @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$first.ConfigPath} -TimeoutSeconds 120
+        $converted.ExitCode | Should -Be 0 -Because ($converted.Output + $converted.Error)
+        $short = [string]$converted.MainResult.BatchId
+        # Another run of the same lab later: the objects are remote mailboxes now (user1 is the first of the CSV), the batch folder is still there.
+        $later = New-GateRuntime -Name 'converted-b' -Case 'AlreadyConverted'
+        foreach ($folder in Get-ChildItem -LiteralPath $first.State.BackupFolder -Directory -Filter 'Batch-*') { Copy-Item -LiteralPath $folder.FullName -Destination $later.State.BackupFolder -Recurse }
+        $csv = Join-Path $later.Root 'targets.csv'
+        [IO.File]::WriteAllText($csv, "Identity`r`nuser1`r`nuser2`r`n", (New-Object Text.UTF8Encoding($true)))
+        $run = Invoke-GateProcess $later @{Action='Convert';Phase='AD';Mode='Preview';CsvPath=$csv;ConfigPath=$later.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Match "user1 is already converted by batch $short \(it is a remote mailbox now\): nothing was changed\."
+        $run.Output | Should -Match "run: \.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Batch $short"
+        $run.Output | Should -Match 'object user1\)' -Because 'the stop message names the object of the text, not the last object read'
+        $run.Output | Should -Not -Match 'object user2\)'
+        @(Get-GateWrites $later).Count | Should -Be 0
+        # Without such a batch the message stays the plain one.
+        $alone = New-GateRuntime -Name 'converted-c' -Case 'AlreadyConverted'
+        $plain = Invoke-GateProcess $alone @{Action='Convert';Phase='AD';Mode='Preview';Identity='user1';ConfigPath=$alone.ConfigPath} -TimeoutSeconds 120
+        $plain.ExitCode | Should -Be 1
+        $plain.Output | Should -Match 'Explicit target not eligible \(not an on-premises mailbox of an accepted type\) or excluded: user1\. Nothing converted\.'
+    }
+}
+
 
 AfterAll {
     $env:PSModulePath=$global:PraGate.OriginalModulePath
