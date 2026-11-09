@@ -413,8 +413,8 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--cp-bor
 </tr>
 <tr>
 <td><strong>The Entra Connect server</strong></td>
-<td>Your account in the group <strong>ADSyncOperators</strong>. If the tool runs on another server: the right to <strong>connect remotely</strong> (WinRM).</td>
-<td>The tool starts one synchronisation. It sends the changes to the cloud.</td>
+<td>Your account in the group <strong>ADSyncOperators</strong>. If the tool runs on another server: the right to <strong>connect remotely</strong> (WinRM): your account in the group <strong>Remote Management Users</strong> or <strong>Administrators</strong> of that server.</td>
+<td>The tool starts one synchronisation. It sends the changes to the cloud. Before it changes anything, it tries this with your account. If it cannot, it stops and nothing is changed.</td>
 </tr>
 <tr>
 <td><strong>Microsoft 365, sign-in by a person</strong></td>
@@ -533,7 +533,7 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--cp-bor
 </tr>
 <tr>
 <td><strong>Entra Connect sync</strong></td>
-<td>The way to send the changes to the cloud. Grey means &quot;not used&quot;.</td>
+<td>The way to send the changes to the cloud. Grey means &quot;not used&quot;. When the sync is done on another server, the console tries it <strong>with your account</strong> (a few seconds). Orange means that it will not work: read the text, it says why.</td>
 </tr>
 <tr>
 <td><strong>Sign-in</strong></td>
@@ -541,7 +541,7 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--cp-bor
 </tr>
 <tr>
 <td><strong>Microsoft 365 reachable</strong></td>
-<td>Can this server reach Microsoft 365 through the Internet? The console tries for 3 seconds. This light shows only when the cloud programs are installed.</td>
+<td>Can this server reach Microsoft 365 through the Internet? The console tries for 3 seconds. This light shows only when the cloud programs are installed. If the connection is blocked, the text says so in plain words (firewall or proxy) and keeps the technical message for your administrator.</td>
 </tr>
 </tbody>
 </table></div>
@@ -898,9 +898,19 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--cp-bor
 <td>Do what the <strong>Next steps</strong> page says. On two servers: carry the package to the other server.</td>
 </tr>
 <tr>
-<td><em>Entra Connect server … is not reachable</em></td>
-<td>The tool cannot talk to the Entra Connect server.</td>
-<td>Ask your administrator to check the name in the settings file and the remote connection.</td>
+<td><em>Entra Connect sync will not be possible: …</em></td>
+<td>Before it changed anything, the tool tried the Entra Connect server with your account. The server refused your account, or did not answer. <strong>Nothing was changed.</strong></td>
+<td>Read the reason in the message. Ask your administrator to give your account the right it names, or to check the server name and the remote connection. Or ask to switch the sync off (<code>EntraConnect.Sync</code>) and to start the sync by hand after the move. Then start again.</td>
+</tr>
+<tr>
+<td>The result says <strong>Pending</strong> and the <strong>Next steps</strong> begin with <em>AD is changed and verified. The Entra Connect sync could not start</em></td>
+<td>The people are moved in the directory and checked. The sync to the cloud could not start (for example the right was removed). The package is made anyway.</td>
+<td><strong>Do not start the move again.</strong> Start a sync on the Entra Connect server (the message gives the command), or wait about 30 minutes. Then do the next line: carry the package to the cloud server.</td>
+</tr>
+<tr>
+<td><em>… is already converted by batch …</em></td>
+<td>You started the move again for a person who is already moved. <strong>Nothing was changed.</strong></td>
+<td>Do not move this person again. To finish the batch (sync and package, the directory is not changed again), use the command written in the message: <code>.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch &lt;batch ID&gt;</code>.</td>
 </tr>
 <tr>
 <td>An orange line says <em>X500 missing in Exchange Online</em></td>
@@ -1039,7 +1049,7 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--cp-bor
 </tbody>
 </table></div>
 </div></section>
-<footer>PRA Remote Mailbox 3.1.2 · Nicolas Fabert · generated 2026-11-09 19:43 from PraRemoteMailbox-Guide.md</footer></main>
+<footer>PRA Remote Mailbox 3.1.2 · Nicolas Fabert · generated 2026-11-09 21:16 from PraRemoteMailbox-Guide.md</footer></main>
 <button type="button" id="to-top" title="Back to top"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
 <dialog id="zoom"></dialog>
 <script>

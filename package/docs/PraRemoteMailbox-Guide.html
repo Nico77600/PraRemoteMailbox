@@ -296,7 +296,7 @@ live-tenant campaign has been performed for this version (the list to replay is 
 </tr>
 <tr>
 <td><strong>Entra Connect</strong></td>
-<td>One Delta cycle, local or on <code>EntraConnect.Server</code>; the tool waits for its end.</td>
+<td>One Delta cycle, local or on <code>EntraConnect.Server</code>; the tool waits for its end. Before the first AD write the tool proves that the synchronisation is possible <strong>for the account that runs it</strong> (an authenticated, read-only call to <code>Get-ADSyncScheduler</code>): otherwise the run stops with nothing written. A cycle that fails after the verified AD writes does not fail the run: <a href="#exit-codes">Pending, exit code 2</a>.</td>
 </tr>
 <tr>
 <td><strong>Exchange Online</strong></td>
@@ -492,7 +492,7 @@ live-tenant campaign has been performed for this version (the list to replay is 
 </div>
 <div class="markdown-alert markdown-alert-note">
 <p class="markdown-alert-title"><svg class="icon-sm" viewBox="0 0 16 16" fill="currentColor" version="1.1" width="16" height="16" aria-hidden="true"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path></svg>Note</p>
-<p><strong>Nothing is automatic after an error.</strong> The first error stops the batch: no next object, no sync, no cloud write, and no automatic rollback. The journal of the batch (<code>Journal-&lt;id&gt;.jsonl</code>) says exactly which write was started, applied and verified. Read the summary, fix the cause, run the same command again: objects already done are detected (<code>AlreadyDone</code>).</p>
+<p><strong>Nothing is automatic after an error.</strong> The first error stops the batch: no next object, no sync, no cloud write, and no automatic rollback. The journal of the batch (<code>Journal-&lt;id&gt;.jsonl</code>) says exactly which write was started, applied and verified. Read the summary, fix the cause, run the same command again: objects already done are detected (<code>AlreadyDone</code>). <strong>Once the AD changes are made, a Convert is not run again:</strong> the objects are remote mailboxes, so the same command refuses them (&quot;already converted by batch ...&quot;) and names the command that finishes the batch (<code>-Phase AD -Batch</code>, see <a href="#exit-codes">Exit codes</a>). An Entra Connect sync that cannot run after the verified AD writes is not an error of the run (Pending, exit code 2, the transfer package is written).</p>
 </div>
 <div class="markdown-alert markdown-alert-tip">
 <p class="markdown-alert-title"><svg class="icon-sm" viewBox="0 0 16 16" fill="currentColor" version="1.1" width="16" height="16" aria-hidden="true"><path d="M8 1.5c-2.363 0-4 1.69-4 3.75 0 .984.424 1.625.984 2.304l.214.253c.223.264.47.556.673.848.284.411.537.896.621 1.49a.75.75 0 0 1-1.484.211c-.04-.282-.163-.547-.37-.847a8.456 8.456 0 0 0-.542-.68c-.084-.1-.173-.205-.268-.32C3.201 7.75 2.5 6.766 2.5 5.25 2.5 2.31 4.863 0 8 0s5.5 2.31 5.5 5.25c0 1.516-.701 2.5-1.328 3.259-.095.115-.184.22-.268.319-.207.245-.383.453-.541.681-.208.3-.33.565-.37.847a.751.751 0 0 1-1.485-.212c.084-.593.337-1.078.621-1.489.203-.292.45-.584.673-.848.075-.088.147-.173.213-.253.561-.679.985-1.32.985-2.304 0-2.06-1.637-3.75-4-3.75ZM5.75 12h4.5a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5ZM6 15.25a.75.75 0 0 1 .75-.75h2.5a.75.75 0 0 1 0 1.5h-2.5a.75.75 0 0 1-.75-.75Z"></path></svg>Tip</p>
@@ -654,16 +654,22 @@ dsacls 'DC=contoso,DC=com' /G &quot;${who}:CA;Replication synchronization&quot;
 </thead>
 <tbody>
 <tr>
+<td>Checks, before the first AD write, that the account can use the synchronisation (read only, nothing is started)</td>
+<td><code>Get-ADSyncScheduler</code> (module <code>ADSync</code>), locally or through <code>Invoke-Command</code> (bounded time)</td>
+<td>The same rights as the line below</td>
+<td><code>PRA.Directory.psm1</code>: <code>Test-PraSyncServer</code></td>
+</tr>
+<tr>
 <td>Waits for a running cycle, starts <strong>one</strong> cycle, waits for its end</td>
 <td><code>Get-ADSyncScheduler</code>, <code>Start-ADSyncSyncCycle -PolicyType Delta</code> (module <code>ADSync</code>)</td>
 <td>Member of the local group <strong>ADSyncOperators</strong> (or local administrator) of the Entra Connect server</td>
-<td><code>PRA.Directory.psm1:1753</code>, <code>:1759</code>, <code>:1763</code></td>
+<td><code>PRA.Directory.psm1</code>: <code>$script:PraSyncCycle</code>, <code>Invoke-PraSync</code></td>
 </tr>
 <tr>
 <td>Does the same <strong>remotely</strong> (<code>EntraConnect.Server</code>)</td>
 <td><code>Invoke-Command -ComputerName &lt;server&gt;</code> (a job in the Windows PowerShell 5.1 endpoint)</td>
 <td>The above, <strong>plus</strong> the right to open a remote session on that server: member of the local group <strong>Remote Management Users</strong> or of <strong>Administrators</strong>; WinRM (TCP 5985) reachable</td>
-<td><code>:1810</code></td>
+<td><code>PRA.Directory.psm1</code>: <code>Invoke-PraSync</code>, <code>Start-PraSyncProbe</code></td>
 </tr>
 </tbody>
 </table></div>
@@ -991,11 +997,11 @@ dsacls 'DC=contoso,DC=com' /G &quot;${who}:CA;Replication synchronization&quot;
 <tbody>
 <tr>
 <td><code>EntraConnect.Sync</code></td>
-<td><code>$true</code>: after the AD writes, run one cycle and wait for its end. Checked <strong>before</strong> the first AD write. <code>$false</code>: the operator synchronises.</td>
+<td><code>$true</code>: after the AD writes, run one cycle and wait for its end. Checked <strong>before</strong> the first AD write, <strong>with the account that runs the tool</strong>: an authenticated, read-only call to the ADSync module of the server (<code>Test-WSMan</code> is not used: it does not authenticate). If the check fails, Apply stops with &quot;Entra Connect sync will not be possible: ...&quot; (the reason and what to do), before the confirmation, with no backup and no write; Preview reports the same text as a warning. <code>$false</code>: the operator synchronises.</td>
 </tr>
 <tr>
 <td><code>EntraConnect.Server</code></td>
-<td>Entra Connect server reached by PowerShell remoting; empty = this server (ADSync module).</td>
+<td>Entra Connect server reached by PowerShell remoting (bounded time); empty = this server (ADSync module). The console tries it too, in the background, and shows the answer on the Entra Connect light of the Setup page.</td>
 </tr>
 <tr>
 <td><code>EntraConnect.PolicyType</code>, <code>TimeoutMinutes</code></td>
@@ -1182,7 +1188,7 @@ $r.BatchId      # keep it: Recover -Batch &lt;id&gt;
 <tr>
 <td><code>-Batch</code></td>
 <td>batch ID (8 characters), path of the batch JSON, or <strong>a transfer package <code>.zip</code></strong> (path, or the name of a file in <code>Backups\Inbox</code>, <code>Backups\Outbox</code> or the current folder)</td>
-<td>Recover, <code>-Phase Cloud</code>, Finalize; optional for Check. A package is verified, then extracted (<a href="#files-batches-proofs-and-packages">chapter 10</a>)</td>
+<td>Recover, <code>-Phase Cloud</code>, Finalize; optional for Check. Also accepted by <code>Convert -Phase AD</code> to finish a batch left without its synchronisation or package (no AD write, see <a href="#exit-codes">Exit codes</a>). A package is verified, then extracted (<a href="#files-batches-proofs-and-packages">chapter 10</a>)</td>
 </tr>
 <tr>
 <td><code>-Identity</code></td>
@@ -1551,7 +1557,7 @@ required when the result supplies a Finalize package (deferred shared attributes
 <tr>
 <td>1</td>
 <td>Failed — see <code>Error</code> in the summary</td>
-<td>fix the cause, run the same command again</td>
+<td>fix the cause, run the same command again — <strong>only if nothing was changed yet</strong> (the summary says so; the Entra Connect check, the backup and the first error all stop before or at the first write). After the AD changes, go on with the batch (see below)</td>
 </tr>
 <tr>
 <td>2</td>
@@ -1560,6 +1566,11 @@ required when the result supplies a Finalize package (deferred shared attributes
 </tr>
 </tbody>
 </table></div>
+<p><strong>The Entra Connect sync could not run after the AD changes.</strong> The AD part is made and verified, so the run does not fail: the objects are <strong>Pending</strong> (exit code 2), the transfer package is still written (phase AD) and the Next steps say it plainly: <em>AD is changed and verified. The Entra Connect sync could not start: reason. Run a delta sync on the server (<code>Start-ADSyncSyncCycle -PolicyType Delta</code>) or wait for the next automatic cycle (about 30 minutes)</em>, then carry the package to the cloud server. With phase Both the cloud part is <strong>not</strong> started (the mailboxes would not appear): run the sync, then continue the batch with <code>-Action Convert -Phase Cloud -Batch &lt;id&gt;</code> (it waits for the mailboxes, up to <code>Polling.TimeoutMinutes</code>). The journal of the batch has a line <code>ADSync</code> / <code>Failed</code>.</p>
+<p><strong>Finish the AD side of a batch (<code>-Phase AD -Batch</code>).</strong> For a batch whose AD changes are made and verified (it has its <code>State-&lt;id&gt;.json</code> proof) but that has no package or no synchronisation, for instance after a run of an older version that stopped at the sync:</p>
+<div class="code"><div class="code-head"><span>PowerShell</span><button type="button" class="copy"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 0 0-1-1H5a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3"/></svg><span>Copy</span></button></div><pre><code>.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch 490cc62e
+</code></pre></div>
+<p>The batch, its backup and its proof are checked in full; the Entra Connect check is made as for a conversion (it stops with nothing written if it fails); the synchronisation runs again; the transfer package is written. <strong>Active Directory is not written</strong> and the same objects are not converted twice. A Preview shows what would be done. A batch without proof is refused (&quot;cannot be finished from here&quot;). The same command is printed when a conversion is started again for an object that is already converted.</p>
 </div></section><section class="section" id="reading-the-results"><div class="section-head"><div class="section-icon"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 20h18"/><path d="M6 16v-5M11 16V6M16 16v-8"/></svg></div><div><div class="section-eyebrow">Chapter 9</div><h2>Reading the results</h2></div></div><div class="section-body">
 <blockquote>
 <p><strong>In short:</strong> Every run writes a report that opens in a browser. Read the result, then the warnings, then the line of each person.</p>
@@ -1948,9 +1959,29 @@ pwsh -NoProfile -File .\tools\Build-Documentation.ps1       # only the HTML guid
 <td>set <code>EntraConnect.Server</code>, or run on the Entra Connect server, or <code>Sync = $false</code></td>
 </tr>
 <tr>
-<td><code>Entra Connect server X is not reachable with PowerShell remoting</code></td>
-<td>WinRM / rights</td>
-<td><code>Test-WSMan X</code>; the account must be admin or <code>ADSyncOperators</code> on X</td>
+<td><code>Entra Connect sync will not be possible: this account has no right on X ...</code></td>
+<td>the check made before the first AD write was refused: the account cannot open a remote session on X, or cannot use <code>ADSync</code> there</td>
+<td>give the account <strong>Remote Management Users</strong> (or <strong>Administrators</strong>) and <strong>ADSyncOperators</strong> on X, or set <code>EntraConnect.Sync = $false</code> and synchronise by hand. Nothing was changed</td>
+</tr>
+<tr>
+<td><code>Entra Connect sync will not be possible: X does not answer to PowerShell remoting</code></td>
+<td>wrong name in <code>EntraConnect.Server</code>, WinRM (TCP 5985) closed, firewall</td>
+<td>fix the name or the access (<code>Test-WSMan X</code> shows the network part only). Nothing was changed</td>
+</tr>
+<tr>
+<td><code>AD is changed and verified. The Entra Connect sync could not start: ...</code> (Pending, exit code 2)</td>
+<td>the check passed, then the cycle failed (right removed, server down, timeout)</td>
+<td>do not convert again: run a delta sync on the Entra Connect server, then carry the package (or <code>-Phase Cloud -Batch &lt;id&gt;</code>) as the Next steps say</td>
+</tr>
+<tr>
+<td><code>&lt;account&gt; is already converted by batch &lt;id&gt; (it is a remote mailbox now)</code></td>
+<td>a Convert was started again for an object that the batch <code>&lt;id&gt;</code> already converted</td>
+<td>nothing is converted. To finish that batch (sync + package) run the command in the message: <code>-Action Convert -Phase AD -Mode Apply -Batch &lt;id&gt;</code></td>
+</tr>
+<tr>
+<td><code>This batch has no AD proof (State file) ... cannot be finished from here</code></td>
+<td><code>-Phase AD -Batch</code> on a batch whose AD changes were not verified</td>
+<td>use the cloud phase only for a batch with a proof; otherwise run a Preview of a new Convert</td>
 </tr>
 <tr>
 <td><code>An Exchange Online session already exists in this console</code></td>
@@ -2403,7 +2434,7 @@ $app                                               # -&gt; Cloud.AppId
 </table></div>
 <p>No defect was found in the backup, receipt and proof engine; its logic is unchanged in 2.0.0 and covered by the gate.</p>
 </div></section>
-<footer>PRA Remote Mailbox 3.1.2 · Nicolas Fabert · generated 2026-11-09 19:43 from PraRemoteMailbox-Guide.md</footer></main>
+<footer>PRA Remote Mailbox 3.1.2 · Nicolas Fabert · generated 2026-11-09 21:16 from PraRemoteMailbox-Guide.md</footer></main>
 <button type="button" id="to-top" title="Back to top"><svg class="icon-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 14 6-6 6 6"/></svg></button>
 <dialog id="zoom"></dialog>
 <script>

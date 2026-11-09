@@ -109,7 +109,7 @@ cloud | Exchange Online | mailbox, licence, permissions
 | **Exchange Online pre-check** | (Apply, phase Both) sign-in, every target and every permission holder resolved in Exchange Online — before any AD write. |
 | **Backup** | One private folder `Backups\Batch-<id>`: the typed values to restore (JSON), every AD value (CLIXML), their SHA-256, then everything is **re-read and compared** with the plan. |
 | **AD changes** | Per object: current state re-checked, `Set-ADUser`, AD re-read, licence group, AD re-read. The **first error stops the batch**. |
-| **Entra Connect** | One Delta cycle, local or on `EntraConnect.Server`; the tool waits for its end. |
+| **Entra Connect** | One Delta cycle, local or on `EntraConnect.Server`; the tool waits for its end. Before the first AD write the tool proves that the synchronisation is possible **for the account that runs it** (an authenticated, read-only call to `Get-ADSyncScheduler`): otherwise the run stops with nothing written. A cycle that fails after the verified AD writes does not fail the run: [Pending, exit code 2](#exit-codes). |
 | **Exchange Online** | The tool waits (up to `Polling.TimeoutMinutes`) for the mailboxes and the licences, then grants FullAccess / SendAs / SendOnBehalf on the shared mailboxes and checks each grant. |
 | **X500 control** | For each mailbox that is ready, the tool proves that it carries the X500 addresses recorded by the AD phase (next section). A missing one is a warning; the conversion stays done. |
 
@@ -223,7 +223,7 @@ check | Done | on-premises again
 > **The cloud X500 address is kept.** While an object is a remote mailbox, Entra Connect (Exchange hybrid writeback) adds an `X500:` address of the cloud mailbox to `proxyAddresses` and sets `msDS-ExternalDirectoryObjectId`. A Recover restores `proxyAddresses` as captured before the Convert **plus every `X500:` address that is on the object at that moment and was not in the original list**: nothing else is kept, the routing `smtp:` address added by Convert is still removed, no `X500:` is invented, and an address that was already original is not duplicated. Without it, a reply to a message sent from the cloud during the disaster, or a cached Outlook address, would bounce after the rollback. The Preview says *N cloud X500 address(es) kept*, and the batch records the list (`KeptX500`; a batch written before 3.0.0 has none).
 
 > [!NOTE]
-> **Nothing is automatic after an error.** The first error stops the batch: no next object, no sync, no cloud write, and no automatic rollback. The journal of the batch (`Journal-<id>.jsonl`) says exactly which write was started, applied and verified. Read the summary, fix the cause, run the same command again: objects already done are detected (`AlreadyDone`).
+> **Nothing is automatic after an error.** The first error stops the batch: no next object, no sync, no cloud write, and no automatic rollback. The journal of the batch (`Journal-<id>.jsonl`) says exactly which write was started, applied and verified. Read the summary, fix the cause, run the same command again: objects already done are detected (`AlreadyDone`). **Once the AD changes are made, a Convert is not run again:** the objects are remote mailboxes, so the same command refuses them ("already converted by batch ...") and names the command that finishes the batch (`-Phase AD -Batch`, see [Exit codes](#exit-codes)). An Entra Connect sync that cannot run after the verified AD writes is not an error of the run (Pending, exit code 2, the transfer package is written).
 
 > [!TIP]
 > **Two servers are supported.** If no single server reaches both Active Directory and Microsoft 365 (for example an AD server on an isolated network), run the AD part with `-Phase AD` on the AD server, copy the **one transfer package** it writes (`Backups\Outbox\*.zip`, [chapter 10](#10-files-batches-proofs-and-packages)), and run `-Phase Cloud -Batch <package.zip>` on the **cloud server**. That is not a server hosted in the cloud: it is any Windows machine of the organisation that reaches Microsoft 365 through the Internet (server room or administrator workstation), with no access to AD. The summary of each step prints the command of the next one.
@@ -312,8 +312,9 @@ dsacls 'DC=contoso,DC=com' /G "${who}:CA;Replication synchronization"
 
 | What the tool does | Cmdlet | Minimum right | Code |
 |---|---|---|---|
-| Waits for a running cycle, starts **one** cycle, waits for its end | `Get-ADSyncScheduler`, `Start-ADSyncSyncCycle -PolicyType Delta` (module `ADSync`) | Member of the local group **ADSyncOperators** (or local administrator) of the Entra Connect server | `PRA.Directory.psm1:1753`, `:1759`, `:1763` |
-| Does the same **remotely** (`EntraConnect.Server`) | `Invoke-Command -ComputerName <server>` (a job in the Windows PowerShell 5.1 endpoint) | The above, **plus** the right to open a remote session on that server: member of the local group **Remote Management Users** or of **Administrators**; WinRM (TCP 5985) reachable | `:1810` |
+| Checks, before the first AD write, that the account can use the synchronisation (read only, nothing is started) | `Get-ADSyncScheduler` (module `ADSync`), locally or through `Invoke-Command` (bounded time) | The same rights as the line below | `PRA.Directory.psm1`: `Test-PraSyncServer` |
+| Waits for a running cycle, starts **one** cycle, waits for its end | `Get-ADSyncScheduler`, `Start-ADSyncSyncCycle -PolicyType Delta` (module `ADSync`) | Member of the local group **ADSyncOperators** (or local administrator) of the Entra Connect server | `PRA.Directory.psm1`: `$script:PraSyncCycle`, `Invoke-PraSync` |
+| Does the same **remotely** (`EntraConnect.Server`) | `Invoke-Command -ComputerName <server>` (a job in the Windows PowerShell 5.1 endpoint) | The above, **plus** the right to open a remote session on that server: member of the local group **Remote Management Users** or of **Administrators**; WinRM (TCP 5985) reachable | `PRA.Directory.psm1`: `Invoke-PraSync`, `Start-PraSyncProbe` |
 
 #### Microsoft Graph
 
@@ -443,8 +444,8 @@ Everything is set in `config\PraRemoteMailbox.config.psd1` — the command line 
 
 | Setting | Meaning |
 |---|---|
-| `EntraConnect.Sync` | `$true`: after the AD writes, run one cycle and wait for its end. Checked **before** the first AD write. `$false`: the operator synchronises. |
-| `EntraConnect.Server` | Entra Connect server reached by PowerShell remoting; empty = this server (ADSync module). |
+| `EntraConnect.Sync` | `$true`: after the AD writes, run one cycle and wait for its end. Checked **before** the first AD write, **with the account that runs the tool**: an authenticated, read-only call to the ADSync module of the server (`Test-WSMan` is not used: it does not authenticate). If the check fails, Apply stops with "Entra Connect sync will not be possible: ..." (the reason and what to do), before the confirmation, with no backup and no write; Preview reports the same text as a warning. `$false`: the operator synchronises. |
+| `EntraConnect.Server` | Entra Connect server reached by PowerShell remoting (bounded time); empty = this server (ADSync module). The console tries it too, in the background, and shows the answer on the Entra Connect light of the Setup page. |
 | `EntraConnect.PolicyType`, `TimeoutMinutes` | `Delta` (default) or `Initial`; how long to wait for the cycle. |
 
 ### Active Directory replication (optional)
@@ -529,7 +530,7 @@ Everything else comes from the configuration file; the command line only says **
 | `-Action` | `Convert`, `Recover`, `Finalize`, `Check` | required for command-line operations; mutually exclusive with `-Gui`. The value is **case-insensitive** for `-Action`, `-Mode`, `-Phase`, `-Scope` and `-Expect` (`convert`, `CLOUD`, `apply`): the script rewrites them to their official spelling before anything else, and the strict comparisons of the proofs and batches stay case-sensitive |
 | `-Mode` | `Preview` (default), `Apply` | `Apply` writes, after one confirmation |
 | `-Phase` | `Both`, `AD`, `Cloud` | Convert / Recover on two servers; default `Execution.Phase` |
-| `-Batch` | batch ID (8 characters), path of the batch JSON, or **a transfer package `.zip`** (path, or the name of a file in `Backups\Inbox`, `Backups\Outbox` or the current folder) | Recover, `-Phase Cloud`, Finalize; optional for Check. A package is verified, then extracted ([chapter 10](#10-files-batches-proofs-and-packages)) |
+| `-Batch` | batch ID (8 characters), path of the batch JSON, or **a transfer package `.zip`** (path, or the name of a file in `Backups\Inbox`, `Backups\Outbox` or the current folder) | Recover, `-Phase Cloud`, Finalize; optional for Check. Also accepted by `Convert -Phase AD` to finish a batch left without its synchronisation or package (no AD write, see [Exit codes](#exit-codes)). A package is verified, then extracted ([chapter 10](#10-files-batches-proofs-and-packages)) |
 | `-Identity` | UPN, sAMAccountName, DN or GUID | one object only |
 | `-SearchBase` | OU distinguished name | Convert AD/Both only; run-specific OU + child OUs, without changing configuration |
 | `-CsvPath` | path of an Identity CSV | Convert AD/Both only; run-specific comma/semicolon list, without changing configuration |
@@ -800,8 +801,18 @@ required when the result supplies a Finalize package (deferred shared attributes
 | Code | Meaning | What to do |
 |---|---|---|
 | 0 | Done (or preview without error) | nothing |
-| 1 | Failed — see `Error` in the summary | fix the cause, run the same command again |
+| 1 | Failed — see `Error` in the summary | fix the cause, run the same command again — **only if nothing was changed yet** (the summary says so; the Entra Connect check, the backup and the first error all stop before or at the first write). After the AD changes, go on with the batch (see below) |
 | 2 | Done, but objects are **Pending** | run the next step printed in the summary |
+
+**The Entra Connect sync could not run after the AD changes.** The AD part is made and verified, so the run does not fail: the objects are **Pending** (exit code 2), the transfer package is still written (phase AD) and the Next steps say it plainly: *AD is changed and verified. The Entra Connect sync could not start: reason. Run a delta sync on the server (`Start-ADSyncSyncCycle -PolicyType Delta`) or wait for the next automatic cycle (about 30 minutes)*, then carry the package to the cloud server. With phase Both the cloud part is **not** started (the mailboxes would not appear): run the sync, then continue the batch with `-Action Convert -Phase Cloud -Batch <id>` (it waits for the mailboxes, up to `Polling.TimeoutMinutes`). The journal of the batch has a line `ADSync` / `Failed`.
+
+**Finish the AD side of a batch (`-Phase AD -Batch`).** For a batch whose AD changes are made and verified (it has its `State-<id>.json` proof) but that has no package or no synchronisation, for instance after a run of an older version that stopped at the sync:
+
+```powershell
+.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch 490cc62e
+```
+
+The batch, its backup and its proof are checked in full; the Entra Connect check is made as for a conversion (it stops with nothing written if it fails); the synchronisation runs again; the transfer package is written. **Active Directory is not written** and the same objects are not converted twice. A Preview shows what would be done. A batch without proof is refused ("cannot be finished from here"). The same command is printed when a conversion is started again for an object that is already converted.
 
 <!-- icon: chart -->
 ## 9. Reading the results
@@ -1081,7 +1092,11 @@ After a change of the engine, repeat the campaign of [annex B](#annex-b--lab-tes
 | `The Convert batch used by this Recover is not in ...` | cloud phase of a Recover without the original Convert batch | copy the `Batch-<convert id>` folder too |
 | `Batch ... is a Convert batch: the cloud phase of a Recover needs the batch printed by its AD phase` | wrong ID | use the ID printed by `Recover -Phase AD` |
 | `EntraConnect.Sync = $true but the ADSync module is not on this server` | AD part not on the Entra Connect server | set `EntraConnect.Server`, or run on the Entra Connect server, or `Sync = $false` |
-| `Entra Connect server X is not reachable with PowerShell remoting` | WinRM / rights | `Test-WSMan X`; the account must be admin or `ADSyncOperators` on X |
+| `Entra Connect sync will not be possible: this account has no right on X ...` | the check made before the first AD write was refused: the account cannot open a remote session on X, or cannot use `ADSync` there | give the account **Remote Management Users** (or **Administrators**) and **ADSyncOperators** on X, or set `EntraConnect.Sync = $false` and synchronise by hand. Nothing was changed |
+| `Entra Connect sync will not be possible: X does not answer to PowerShell remoting` | wrong name in `EntraConnect.Server`, WinRM (TCP 5985) closed, firewall | fix the name or the access (`Test-WSMan X` shows the network part only). Nothing was changed |
+| `AD is changed and verified. The Entra Connect sync could not start: ...` (Pending, exit code 2) | the check passed, then the cycle failed (right removed, server down, timeout) | do not convert again: run a delta sync on the Entra Connect server, then carry the package (or `-Phase Cloud -Batch <id>`) as the Next steps say |
+| `<account> is already converted by batch <id> (it is a remote mailbox now)` | a Convert was started again for an object that the batch `<id>` already converted | nothing is converted. To finish that batch (sync + package) run the command in the message: `-Action Convert -Phase AD -Mode Apply -Batch <id>` |
+| `This batch has no AD proof (State file) ... cannot be finished from here` | `-Phase AD -Batch` on a batch whose AD changes were not verified | use the cloud phase only for a batch with a proof; otherwise run a Preview of a new Convert |
 | `An Exchange Online session already exists in this console` | the console was used for EXO before | open a new PowerShell 7 window |
 | `Microsoft Graph cannot load in this console (assembly conflict ...)` | Exchange Online was used earlier in the same window (for example Recover, then Check): its assemblies stay loaded and Microsoft Graph cannot load next to them | open a new PowerShell 7 window for each run that needs Microsoft Graph (Check, Convert of users) |
 | `Exchange Online session: wrong tenant (...)` | signed in to another tenant, or `Cloud.Organization` wrong | fix `Cloud.TenantId` / `Cloud.Organization` |

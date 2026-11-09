@@ -151,7 +151,7 @@ You do not need to understand this list. Give it to your administrator. Each lin
 |---|---|---|
 | **The company directory** (Active Directory) | The right to **change about eleven attributes of the people** to move. The right to **add and remove members of one group** (the licence group). The right to **read** the people and their security lists. | The tool rewrites a few lines on each person. It adds each person to the group that gives a cloud mailbox. |
 | **The directory, only if you tick "Replicate Active Directory"** | One extra right on the domain: **Replication synchronization**. | The tool pushes each change to the other directory servers before the sync. |
-| **The Entra Connect server** | Your account in the group **ADSyncOperators**. If the tool runs on another server: the right to **connect remotely** (WinRM). | The tool starts one synchronisation. It sends the changes to the cloud. |
+| **The Entra Connect server** | Your account in the group **ADSyncOperators**. If the tool runs on another server: the right to **connect remotely** (WinRM): your account in the group **Remote Management Users** or **Administrators** of that server. | The tool starts one synchronisation. It sends the changes to the cloud. Before it changes anything, it tries this with your account. If it cannot, it stops and nothing is changed. |
 | **Microsoft 365, sign-in by a person** | Permission **User.Read.All** for the sign-in window (an administrator accepts it once). A role that can read users, for example **Global Reader**. | The tool reads each person to check the licence and the new mailbox. |
 | **Exchange Online, sign-in by a person** | The role **Exchange Recipient Administrator** (or the role group **Recipient Management**). | The tool reads the mailboxes. It gives people access to shared mailboxes. |
 | **Exchange Online and Microsoft 365, no person present** | An **application** with a **certificate**. Application permissions **User.Read.All** (Graph) and **Exchange.ManageAsApp**, accepted by an administrator. The role **Exchange Recipient Administrator** for the application. | Same work, without a person at the keyboard. [Annex C of the reference guide](PraRemoteMailbox-Guide.md#annex-c--certificate-sign-in-application) shows the commands. |
@@ -233,9 +233,9 @@ Here is what each light checks.
 | **RSAT ActiveDirectory** | The program that talks to the company directory. |
 | **ExchangeOnlineManagement** | The program that talks to the cloud mail. |
 | **Microsoft.Graph** | The program that reads people in Microsoft 365. |
-| **Entra Connect sync** | The way to send the changes to the cloud. Grey means "not used". |
+| **Entra Connect sync** | The way to send the changes to the cloud. Grey means "not used". When the sync is done on another server, the console tries it **with your account** (a few seconds). Orange means that it will not work: read the text, it says why. |
 | **Sign-in** | How the tool signs in to Microsoft 365. |
-| **Microsoft 365 reachable** | Can this server reach Microsoft 365 through the Internet? The console tries for 3 seconds. This light shows only when the cloud programs are installed. |
+| **Microsoft 365 reachable** | Can this server reach Microsoft 365 through the Internet? The console tries for 3 seconds. This light shows only when the cloud programs are installed. If the connection is blocked, the text says so in plain words (firewall or proxy) and keeps the technical message for your administrator. |
 
 **If a light is red:** read the red text inside it. It says what is missing. Ask your administrator to fix it. Then press **Check again**.
 
@@ -661,7 +661,9 @@ Find what you **see** in the left column. The middle column says what it **means
 | A package line is red: **Invalid** | The file is damaged, or comes from another environment. | Copy the file again, without renaming it. Check that both servers have the same `Environment`. |
 | *Active Directory replication was NOT confirmed on …* | One directory server did not receive the change in time. | Read the **Next steps** page. It says to start the synchronisation again later. Ask your administrator. |
 | The result says **Pending** | A part remains. It is **not** an error. | Do what the **Next steps** page says. On two servers: carry the package to the other server. |
-| *Entra Connect server … is not reachable* | The tool cannot talk to the Entra Connect server. | Ask your administrator to check the name in the settings file and the remote connection. |
+| *Entra Connect sync will not be possible: …* | Before it changed anything, the tool tried the Entra Connect server with your account. The server refused your account, or did not answer. **Nothing was changed.** | Read the reason in the message. Ask your administrator to give your account the right it names, or to check the server name and the remote connection. Or ask to switch the sync off (`EntraConnect.Sync`) and to start the sync by hand after the move. Then start again. |
+| The result says **Pending** and the **Next steps** begin with *AD is changed and verified. The Entra Connect sync could not start* | The people are moved in the directory and checked. The sync to the cloud could not start (for example the right was removed). The package is made anyway. | **Do not start the move again.** Start a sync on the Entra Connect server (the message gives the command), or wait about 30 minutes. Then do the next line: carry the package to the cloud server. |
+| *… is already converted by batch …* | You started the move again for a person who is already moved. **Nothing was changed.** | Do not move this person again. To finish the batch (sync and package, the directory is not changed again), use the command written in the message: `.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch <batch ID>`. |
 | An orange line says *X500 missing in Exchange Online* | The new mailbox is ready, but it does not have an old address of the person. An answer to an **old message** could come back to the sender as an error. | Do not worry about the move: it is done. Ask your administrator to check the synchronisation, and to run a **Check** after it. |
 | Nothing in the list of batches or packages | The files are not on this server. | Copy the folder or the package here. Use **Import package…**. |
 

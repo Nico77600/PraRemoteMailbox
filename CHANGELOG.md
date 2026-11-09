@@ -8,6 +8,8 @@ a PATCH version fixes a defect. The backup formats have their own version (see t
 
 ### Fixed
 - The console no longer prints "unapproved verbs" warnings at start.
+- Entra Connect: before a conversion the tool proves that your account can use the sync, and stops with nothing changed if not. A sync that fails after the AD changes ends "Pending" with the package and the exact next steps; `-Phase AD -Batch <id>` finishes such a batch, and a repeated conversion points to it.
+- The console says in plain words when Microsoft 365 is blocked (firewall or proxy), and an error names the right object.
 
 ## 3.1.1 — 2026-11-09
 
