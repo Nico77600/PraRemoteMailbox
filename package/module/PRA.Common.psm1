@@ -190,6 +190,82 @@ function Compare-PraX500Address {
 }
 #endregion
 
+# Minimum versions of the cloud modules (owner's decision). Microsoft Graph modules must be loaded in ONE version for all of them: two versions of
+# Microsoft.Graph.Authentication / Microsoft.Graph.Users in one session fail with an opaque "assembly with same name is already loaded".
+$script:PraMinGraphVersion = '2.41.1'
+$script:PraMinExoVersion = '3.10.1'
+
+function Get-PraCloudModuleReport {
+    <#
+    .SYNOPSIS
+        What the cloud part needs from this server, in plain words: ExchangeOnlineManagement at the minimum version or later, and ONE version of Microsoft.Graph.Authentication
+        and Microsoft.Graph.Users (the same for both, minimum version or later). Reads the installed modules only; nothing is imported or connected.
+    .DESCRIPTION
+        Graph: the highest version that exists for BOTH modules and is at least the minimum. If a Microsoft Graph module is already loaded in this session, only that
+        version is acceptable (another one cannot be loaded next to it). A set that does not exist, or a conflicting loaded version, gives a message with the versions
+        found, the minimum and the exact Install-Module command. Used by the entry script (Preview and Apply, before any write), by the cloud module (the versions
+        it imports) and by the window (the lights).
+    .PARAMETER Available
+        The installed modules (Get-Module -ListAvailable); read here when not given.
+    .PARAMETER Loaded
+        The modules already loaded in this session (Get-Module); read here when not given.
+    .OUTPUTS
+        Ok, Messages (one per problem), Graph (Ok, Version, Message) and Exo (Ok, Version, Message).
+    #>
+    [CmdletBinding()]
+    param([string]$MinGraph = $script:PraMinGraphVersion, [string]$MinExo = $script:PraMinExoVersion, [object[]]$Available, [object[]]$Loaded)
+    if (-not $PSBoundParameters.ContainsKey('Available')) {
+        $Available = @(Get-Module -ListAvailable -Name 'Microsoft.Graph.Authentication', 'Microsoft.Graph.Users', 'ExchangeOnlineManagement' -SkipEditionCheck -ErrorAction SilentlyContinue)
+    }
+    if (-not $PSBoundParameters.ContainsKey('Loaded')) { $Loaded = @(Get-Module -Name 'Microsoft.Graph.*' -ErrorAction SilentlyContinue) }
+    $minGraphVersion = [version]$MinGraph; $minExoVersion = [version]$MinExo
+    $versionsOf = {
+        param([object[]]$Modules, [string]$Name)
+        $found = New-Object 'Collections.Generic.List[version]'
+        foreach ($module in @($Modules)) {
+            if ($null -eq $module -or -not (Test-PraOrdinalEqual ([string]$module.Name) $Name)) { continue }
+            $version = [version]$module.Version
+            if (-not $found.Contains($version)) { $found.Add($version) }
+        }
+        $found.Sort(); $found.Reverse()
+        return , $found
+    }
+    $texts = { param($List) if ($List.Count) { ($List | ForEach-Object { $_.ToString() }) -join ', ' } else { 'not installed' } }
+    # Microsoft Graph.
+    $auth = & $versionsOf $Available 'Microsoft.Graph.Authentication'
+    $users = & $versionsOf $Available 'Microsoft.Graph.Users'
+    $coherent = New-Object 'Collections.Generic.List[version]'
+    foreach ($version in $auth) { if ($version -ge $minGraphVersion -and $users.Contains($version)) { $coherent.Add($version) } }
+    $graphCommand = 'Install-Module Microsoft.Graph.Authentication,Microsoft.Graph.Users -MinimumVersion {0} -Scope AllUsers' -f $MinGraph
+    $graph = [ordered]@{ Ok = $false; Version = ''; Message = '' }
+    $loadedVersions = New-Object 'Collections.Generic.List[version]'
+    foreach ($module in @($Loaded)) {
+        if ($null -eq $module -or -not ([string]$module.Name).StartsWith('Microsoft.Graph.', [StringComparison]::Ordinal)) { continue }
+        if (-not $loadedVersions.Contains([version]$module.Version)) { $loadedVersions.Add([version]$module.Version) }
+    }
+    if ($loadedVersions.Count -gt 1) {
+        $graph.Message = 'Microsoft Graph: several versions are loaded in this PowerShell session ({0}). Close this window and start the tool in a new PowerShell 7 window.' -f (& $texts $loadedVersions)
+    }
+    elseif ($loadedVersions.Count -eq 1 -and -not $coherent.Contains($loadedVersions[0])) {
+        $graph.Message = 'Microsoft Graph {0} is already loaded in this PowerShell session, but the tool needs Microsoft.Graph.Authentication and Microsoft.Graph.Users in one same version {1} or later (found: Authentication {2}; Users {3}). Close this window, install the modules if needed ({4}) and start the tool in a new PowerShell 7 window.' -f
+            $loadedVersions[0], $MinGraph, (& $texts $auth), (& $texts $users), $graphCommand
+    }
+    elseif ($loadedVersions.Count -eq 1) { $graph.Ok = $true; $graph.Version = $loadedVersions[0].ToString() }
+    elseif ($coherent.Count) { $graph.Ok = $true; $graph.Version = $coherent[0].ToString() }
+    else {
+        $graph.Message = 'Microsoft Graph: found Microsoft.Graph.Authentication {0}; Microsoft.Graph.Users {1}. The tool needs both in one same version {2} or later. Run: {3}' -f (& $texts $auth), (& $texts $users), $MinGraph, $graphCommand
+    }
+    # Exchange Online.
+    $exoVersions = & $versionsOf $Available 'ExchangeOnlineManagement'
+    $exo = [ordered]@{ Ok = $false; Version = ''; Message = '' }
+    if ($exoVersions.Count -and $exoVersions[0] -ge $minExoVersion) { $exo.Ok = $true; $exo.Version = $exoVersions[0].ToString() }
+    else {
+        $exo.Message = 'ExchangeOnlineManagement: {0}; the tool needs {1} or later. Run: Install-Module ExchangeOnlineManagement -MinimumVersion {1} -Scope AllUsers' -f $(if ($exoVersions.Count) { 'found ' + (& $texts $exoVersions) } else { 'not installed' }), $MinExo
+    }
+    $messages = @(@($graph.Message, $exo.Message) | Where-Object { $_ })
+    return [pscustomobject]@{ Ok = ($graph.Ok -and $exo.Ok); Messages = $messages; Graph = [pscustomobject]$graph; Exo = [pscustomobject]$exo }
+}
+
 function Get-PraToolVersion {
     <# The tool version (single source: $script:ToolVersion of this module). #>
     [CmdletBinding()]
@@ -997,7 +1073,7 @@ function Get-PraDefaultConfiguration {
             TenantId=''; Organization=''; AppId=''; CertificateThumbprint=''; UserPrincipalName=''
             CheckMailbox=$true; CheckLicense=$true; MailboxCheckVia='Exo'; RequiredSkuPartNumber=''
         }
-        Exo = @{ MinModuleVersion='3.10.0'; UseSubprocess=$false; DisableWAM=$false; GrantVerifyAttempts=13; GrantVerifyDelaySeconds=10 }
+        Exo = @{ MinModuleVersion='3.10.1'; UseSubprocess=$false; DisableWAM=$false; GrantVerifyAttempts=13; GrantVerifyDelaySeconds=10 }
         Polling = @{ IntervalMinutes=1; TimeoutMinutes=60 }
         Retention = @{ Enabled=$true; PolicyName='PRA-Converted-Retention'; PolicyGuid=''; UseComplianceSession=$false; Tag=@{ Enabled=$true; Attribute='extensionAttribute1'; Value='Converted' } }
         Execution = @{ Phase='Both' }
@@ -1040,6 +1116,20 @@ function Read-PraTargetCsv {
     }
 }
 
+function Test-PraScopeConfiguration {
+    <#
+    .SYNOPSIS
+        Checks that the configuration says which mailboxes a CONVERSION takes (Scope.Mode with its SearchBase, GroupDN or CsvPath), and says plainly what to fill in when it does not.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Config)
+    $scope = $Config.Scope
+    $how = 'Fill it in the configuration file, or give -Identity (one account), -CsvPath (a CSV file with an Identity column) or -SearchBase (an OU) for this run' + $(if (Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Auto') { '.' } else { ', or set Scope.Mode = Auto to take every mailbox of the domain.' })
+    if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'OU') -and -not $scope.SearchBase) { throw ('Configuration: Scope.Mode = OU requires Scope.SearchBase: no OU is set, so the tool does not know which mailboxes to convert. ' + $how) }
+    if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Group') -and -not $scope.GroupDN) { throw ('Configuration: Scope.Mode = Group requires Scope.GroupDN: no group is set, so the tool does not know which mailboxes to convert. ' + $how) }
+    if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Csv') -and -not $scope.CsvPath) { throw ('Configuration: Scope.Mode = Csv requires Scope.CsvPath: no CSV file is set, so the tool does not know which mailboxes to convert. ' + $how) }
+}
+
 function Import-PraConfiguration {
     <#
     .SYNOPSIS
@@ -1053,7 +1143,7 @@ function Import-PraConfiguration {
         SharedMailbox.CsvPath, Storage.ForbiddenBackupRoots) are returned as full paths.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root, [hashtable]$ScopeOverride = @{})
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Root, [hashtable]$ScopeOverride = @{}, [switch]$DeferScopeCheck)
     $file = Resolve-PraPath $Path 'ConfigPath' $Root
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Configuration file not found: $file" }
     $config = Import-PowerShellDataFile -LiteralPath $file -ErrorAction Stop
@@ -1067,9 +1157,9 @@ function Import-PraConfiguration {
     if ($config.DomainController -and $config.DomainController -notmatch '^[A-Za-z0-9.-]+\z') { throw 'Configuration: DomainController must be a host name.' }
     $scope = $config.Scope
     if (-not (Test-PraOrdinalIn $scope.Mode @('Auto','OU','Group','Csv'))) { throw 'Configuration: Scope.Mode must be Auto, OU, Group or Csv.' }
-    if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'OU') -and -not $scope.SearchBase) { throw 'Configuration: Scope.Mode = OU requires Scope.SearchBase (a search of the whole domain needs Mode = Auto).' }
-    if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Group') -and -not $scope.GroupDN) { throw 'Configuration: Scope.Mode = Group requires Scope.GroupDN.' }
-    if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Csv') -and -not $scope.CsvPath) { throw 'Configuration: Scope.Mode = Csv requires Scope.CsvPath.' }
+    # The mailboxes to convert are only needed by a conversion (Convert, phase AD or Both): the entry script checks them then (Test-PraScopeConfiguration). A Check, a cloud
+    # phase, a Recover or a Finalize on a server without that setting must not fail on it; -DeferScopeCheck leaves the check to the caller.
+    if (-not $DeferScopeCheck) { Test-PraScopeConfiguration -Config $config }
     if ((-not (Test-PraOrdinalIn ($config.Remote.RecipientType) @(1,3) -IgnoreCase))) { throw 'Configuration: Remote.RecipientType must be 1 (provision a mailbox) or 3 (mailbox + archive).' }
     if ($config.Routing.RoutingDomain -and $config.Routing.RoutingDomain -notmatch '^[A-Za-z0-9.-]+\.[A-Za-z]{2,}\z') { throw 'Configuration: Routing.RoutingDomain must be a domain name (tenant.mail.onmicrosoft.com).' }
     if ($config.Licensing.Enabled -and -not $config.Licensing.GroupDN) { throw 'Configuration: Licensing.Enabled requires Licensing.GroupDN.' }
@@ -1102,7 +1192,7 @@ function Import-PraConfiguration {
     if ($exo.GrantVerifyAttempts -lt 1 -or $exo.GrantVerifyAttempts -gt 60 -or $exo.GrantVerifyDelaySeconds -lt 1 -or $exo.GrantVerifyDelaySeconds -gt 30) {
         throw 'Configuration: Exo.GrantVerifyAttempts must be 1..60 and Exo.GrantVerifyDelaySeconds 1..30.'
     }
-    try { $null = [version]$exo.MinModuleVersion } catch { throw 'Configuration: Exo.MinModuleVersion must be a version number (3.10.0).' }
+    try { $null = [version]$exo.MinModuleVersion } catch { throw 'Configuration: Exo.MinModuleVersion must be a version number (3.10.1).' }
     if ($config.Polling.IntervalMinutes -lt 1 -or $config.Polling.TimeoutMinutes -lt 1) { throw 'Configuration: Polling.IntervalMinutes and Polling.TimeoutMinutes must be at least 1.' }
     $retention = $config.Retention
     if ($retention.Tag.Attribute -notmatch '^extensionAttribute([1-9]|1[0-5])\z') { throw 'Configuration: Retention.Tag.Attribute must be extensionAttribute1 to extensionAttribute15.' }
@@ -2230,7 +2320,7 @@ function New-PraEffectiveConfiguration {
             [void]$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($sid)), [Security.AccessControl.FileSystemRights]::FullControl, [Security.AccessControl.AccessControlType]::Allow)))
         }
         [IO.FileSystemAclExtensions]::SetAccessControl((New-Object IO.FileInfo $target), $acl)
-        $loaded = Import-PraConfiguration -Path $target -Root $Root
+        $loaded = Import-PraConfiguration -Path $target -Root $Root -DeferScopeCheck
         $expected = $config.Environment
         if (-not (Test-PraOrdinalEqual $loaded.Environment $expected)) { throw 'The effective configuration does not round-trip.' }
         $hashStream = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -2562,9 +2652,20 @@ function Get-PraGlobalModel {
     }
     # Objects.
     $mainPhases = @($ordered | Where-Object { (Test-PraOrdinalEqual $_.Role 'Main') -and $_.Available })
+    # A side that ran twice (a synchronisation redone with -Phase AD -Batch, a cloud phase repeated) is ONE stage of each object: the last run gives the status,
+    # the steps of the earlier run stay in front of it. Both runs stay in the timeline.
+    $stagePhases = New-Object 'Collections.Generic.List[object]'
+    $lastByLabel = New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::Ordinal)
+    $positionByLabel = New-Object 'Collections.Generic.Dictionary[string,int]' -ArgumentList ([StringComparer]::Ordinal)
+    foreach ($phase in $mainPhases) {
+        $position = 0
+        if ($positionByLabel.TryGetValue([string]$phase.Label, [ref]$position)) { $stagePhases[$position] = $phase } else { $positionByLabel[[string]$phase.Label] = $stagePhases.Count; $stagePhases.Add($phase) }
+        $lastByLabel[[string]$phase.Label] = $phase
+    }
     $byKey = New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::Ordinal)
     $objects = New-Object 'Collections.Generic.List[object]'
     foreach ($phase in $mainPhases) {
+        $stagePhase = $lastByLabel[[string]$phase.Label]
         foreach ($item in @(Get-PraList $phase.Record 'Objects')) {
             $guid = [string](Get-PraValue $item 'ObjectGuid' ''); $name = [string](Get-PraValue $item 'Name' '')
             $key = if ($guid) { $guid.ToLowerInvariant() } else { $name.ToLowerInvariant() }
@@ -2577,7 +2678,16 @@ function Get-PraGlobalModel {
             }
             $backup = [string](Get-PraValue $item 'BackupPath' '')
             if ($backup -and -not $entry.Backup) { $entry.Backup = $backup }
-            [void]$entry.Stages.Add([pscustomobject]@{ Phase = $phase; Present = $true; HandedOverTo = ''; StatusDisplay = ''; Status = [string](Get-PraValue $item 'FinalStatus' ''); Detail = [string](Get-PraValue $item 'Detail' ''); Warnings = [string](Get-PraValue $item 'Warnings' '')
+            $same = @($entry.Stages | Where-Object { [object]::ReferenceEquals($_.Phase, $stagePhase) })
+            if ($same.Count) {
+                $stage = $same[0]
+                $earlierResult = [ordered]@{ Time = ''; Step = 'Earlier run'; Status = 'Info'; Text = (Limit-PraText (('{0} - {1}' -f $stage.Status, $stage.Detail).Trim(' ', '-')) 300) }
+                $warnings = (@($stage.Warnings, [string](Get-PraValue $item 'Warnings' '')) | Where-Object { $_ } | Get-PraOrdinalUnique) -join ' | '
+                $stage.Status = [string](Get-PraValue $item 'FinalStatus' ''); $stage.Detail = [string](Get-PraValue $item 'Detail' ''); $stage.Warnings = $warnings
+                $stage.Steps = @(@($stage.Steps) + @($earlierResult) + @(Get-PraList $item 'Steps'))
+                continue
+            }
+            [void]$entry.Stages.Add([pscustomobject]@{ Phase = $stagePhase; Present = $true; HandedOverTo = ''; StatusDisplay = ''; Status = [string](Get-PraValue $item 'FinalStatus' ''); Detail = [string](Get-PraValue $item 'Detail' ''); Warnings = [string](Get-PraValue $item 'Warnings' '')
                     Steps = @(Get-PraList $item 'Steps') })
         }
     }
@@ -2585,7 +2695,7 @@ function Get-PraGlobalModel {
     foreach ($entry in $objects) {
         # One stage per main phase, in order; a phase that does not list the object leaves an explicit gap.
         $staged = New-Object 'Collections.Generic.List[object]'
-        foreach ($phase in $mainPhases) {
+        foreach ($phase in $stagePhases) {
             $stage = @($entry.Stages | Where-Object { [object]::ReferenceEquals($_.Phase, $phase) })
             if ($stage.Count) { $staged.Add($stage[0]) } else { $staged.Add([pscustomobject]@{ Phase = $phase; Present = $false; HandedOverTo = ''; StatusDisplay = ''; Status = ''; Detail = ''; Warnings = ''; Steps = @() }) }
         }
@@ -2828,8 +2938,8 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
-    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor

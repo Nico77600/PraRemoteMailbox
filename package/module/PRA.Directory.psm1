@@ -460,7 +460,7 @@ function Find-PraConvertedBatch {
             $batchId = $folder.Name.Substring(6)
             if (-not (Test-Path -LiteralPath (Join-Path $folder.FullName ('State-' + $batchId + '.json')) -PathType Leaf)) { continue }
             foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter 'Convert-*.json' -ErrorAction Stop)) {
-                try { $data = [IO.File]::ReadAllText($file.FullName) | ConvertFrom-PraJson } catch { continue }
+                try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson } catch { continue }
                 if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $data 'Operation' '')) 'Convert')) { continue }
                 if (@(@($data.Records) | Where-Object { Test-PraOrdinalIgnoreCaseEqual ([string]$_.ObjectGuid) $ObjectGuid }).Count -eq 1) {
                     return [pscustomobject]@{ BatchId = $batchId; ShortId = $batchId.Substring(0, 8); Folder = $folder.FullName }
@@ -537,6 +537,10 @@ function Get-PraTarget {
                 if (-not $eligible -and -not $excluded) { $converted = Find-PraConvertedBatch $Context $id }
                 if ($null -ne $converted) {
                     $hook = Get-PraValue $Context 'CommandLineFor' $null
+                    # Started from the window (it sets PRA_EVENT_FILE) the operator has no command line: the way is the Task page.
+                    if ($env:PRA_EVENT_FILE) {
+                        throw ("{0} is already converted by batch {1} (it is a remote mailbox now): nothing was changed. To continue that batch (Entra Connect sync and transfer package; AD is not changed again), go to the Task page, choose Move mailboxes to Exchange Online, then Continue a batch, and pick batch {1}." -f $samName, $converted.ShortId)
+                    }
                     $command = if ($hook -is [scriptblock]) { [string](& $hook 'Convert' 'AD' $converted.ShortId) } else { '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch ' + $converted.ShortId }
                     throw ("{0} is already converted by batch {1} (it is a remote mailbox now): nothing was changed. To continue that batch (Entra Connect sync and transfer package; AD is not changed again) run: {2}" -f $samName, $converted.ShortId, $command)
                 }
@@ -1588,6 +1592,17 @@ function Invoke-PraAdPreview {
     }
 }
 
+function Test-PraAdAccessDenied {
+    <# True when an Active Directory error is a refusal of the account: UnauthorizedAccessException, the directory error 8344 (insufficient access rights) or 5 (access denied) in the error id (they do not depend on the language of Windows), or the English words. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Failure)
+    $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { [Exception]$Failure }
+    $errorId = if ($Failure -is [Management.Automation.ErrorRecord]) { [string]$Failure.FullyQualifiedErrorId } else { '' }
+    $cursor = $exception
+    while ($null -ne $cursor) { if ($cursor -is [UnauthorizedAccessException]) { return $true }; $cursor = $cursor.InnerException }
+    return ($errorId -match 'ActiveDirectoryServer:(8344|5)\b' -or [string]$exception.Message -match '(?i)insufficient access rights|access is denied')
+}
+
 function Invoke-PraAdBatch {
     <#
     .SYNOPSIS
@@ -1606,6 +1621,7 @@ function Invoke-PraAdBatch {
     if ([bool](Get-PraValue $Context 'OperationFailed' $false) -or $Context.Issues.Count -gt 0 -or @($Context.Rows | Where-Object FinalStatus -eq 'Error').Count -gt 0) { throw 'No new batch after an error in this run.' }
     if (-not $Plans.Count) { Write-PraItem -Context $Context -Status Skip -Text 'Nothing to do.'; return $null }
     foreach ($plan in $Plans) { if (-not $Context.Rows.Contains($plan.Row)) { $Context.Rows.Add($plan.Row) } }
+    $receipt = $null
     try {
         foreach ($plan in $Plans) { if (-not [bool](Get-PraValue $plan 'Previewed' $false)) { Write-PraAdDelta -Context $Context -Plan $plan -Stage Planned } }
         if (-not $Context.AllowMutation -or (-not (Test-PraOrdinalIgnoreCaseEqual $Context.Mode 'Apply')) -or (Test-PraOrdinalIgnoreCaseEqual $Context.Action 'Check') -or $WhatIfPreference) {
@@ -1676,6 +1692,22 @@ function Invoke-PraAdBatch {
     catch {
         $Context.OperationFailed = $true; $Context.LastVerifiedReceipt = $null
         $failure = $_
+        # The account is refused by the domain controller and NOTHING was written: say it in plain words, and mark the folder of the backup (written before the first write) as a
+        # batch that changed nothing, so that nobody takes it for a batch to continue or to roll back. It is not deleted: the backup is the only record of what was read.
+        $written = @($Plans | Where-Object { (Get-PraValue $_.Row 'ADApplied' $null) -eq $true }).Count
+        if ($null -ne $receipt -and $written -eq 0 -and (Test-PraAdAccessDenied $failure)) {
+            $plain = 'Nothing was changed in AD. This account cannot write to {0}: run the tool on that domain controller, or with an account that has the rights (see Prerequisites). Detail: {1}' -f $Context.Server, ([string]$failure.Exception.Message -replace '\s+', ' ').Trim()
+            try {
+                $folder = Split-Path $receipt.Path -Parent
+                Write-PraImmutableFile (Join-Path $folder 'NOT-APPLIED.txt') ("Nothing was written to Active Directory by this batch (run {0}): the account was refused by {1}.`r`nThe backup in this folder is complete and was never used. This folder is NOT a batch to continue and NOT a batch to roll back.`r`n" -f $Context.RunId, $Context.Server)
+                Write-PraJournal $Context '*' 'ADBatch' 'NotApplied' 'access refused before the first write; nothing was changed in AD'
+                $Context.StateFiles.Add((Join-Path $folder 'NOT-APPLIED.txt'))
+            }
+            catch { Write-PraLog -Context $Context -Message ('The folder of the backup could not be marked as not applied: {0}' -f $_.Exception.Message) -Level Detail }
+            try { Write-PraLog -Context $Context -Message $plain -Level Error }
+            catch { $Context.Issues.Add([pscustomobject]@{ Message = $plain; Source = 'ADBatch' }) }
+            throw $plain
+        }
         try { Write-PraLog -Context $Context -Message "AD batch stopped: $($failure.Exception.Message). No further write in this run." -Level Error }
         catch { $Context.Issues.Add([pscustomobject]@{ Message=$failure.Exception.Message; Source='ADBatch' }) }
         throw $failure
@@ -2071,6 +2103,8 @@ function Invoke-PraSync {
     $settings = $Context.Config.EntraConnect
     if (-not $settings.Sync) {
         Write-PraItem -Context $Context -Status Warn -Text 'EntraConnect.Sync = $false: run a delta synchronisation on the Entra Connect server now (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the scheduled one.'
+        # The synchronisation is left to the operator: the Next steps say so, before the hand-over of the package.
+        if (@($Context.Rows | Where-Object { (Get-PraValue $_ 'ADApplied' $null) -eq $true }).Count) { $Context['SyncNotRun'] = [pscustomobject]@{ Server = $(if ($settings.Server) { [string]$settings.Server } else { [string]$env:COMPUTERNAME }) } }
         return
     }
     if (-not $PSCmdlet.ShouldProcess($(if ($settings.Server) { $settings.Server } else { $env:COMPUTERNAME }), 'Start an Entra Connect synchronisation cycle')) { return }

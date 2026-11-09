@@ -31,7 +31,7 @@
         # Console, log, audit and run result (PRA.Common)
         'Write-PraBanner', 'Write-PraStep', 'Write-PraItem', 'Write-PraHost', 'Write-PraLog', 'Write-PraEvent', 'Write-PraProgress', 'Initialize-PraAudit', 'Complete-PraRun',
         # Configuration, paths and CSV (PRA.Common)
-        'Import-PraConfiguration', 'New-PraEffectiveConfiguration', 'Get-PraConfigurationDifference', 'Resolve-PraPath', 'Read-PraCsvText', 'Read-PraTargetCsv', 'Get-PraTargetOverride', 'Get-PraToolVersion', 'Get-PraValue', 'Get-PraList',
+        'Import-PraConfiguration', 'Test-PraScopeConfiguration', 'New-PraEffectiveConfiguration', 'Get-PraConfigurationDifference', 'Resolve-PraPath', 'Read-PraCsvText', 'Read-PraTargetCsv', 'Get-PraTargetOverride', 'Get-PraToolVersion', 'Get-PraCloudModuleReport', 'Get-PraValue', 'Get-PraList',
         # Ordinal helpers, JSON and native calls (PRA.Common)
         'Test-PraOrdinalEqual', 'Test-PraOrdinalIgnoreCaseEqual', 'Test-PraOrdinalIn', 'Test-PraOrdinalIgnoreCaseIn', 'Get-PraOrdinalSorted', 'Get-PraOrdinalUnique', 'Compare-PraX500Address', 'ConvertFrom-PraJson', 'Get-PraNativeProcessApi', 'Get-PraWin32ErrorText',
         # Private folders, phase data and transfer package (PRA.Common)

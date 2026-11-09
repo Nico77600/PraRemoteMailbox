@@ -236,6 +236,8 @@ function Set-ADUser {
     param([object]$Identity,[hashtable]$Replace,[string[]]$Clear,[string]$Server)
     Assert-GateServer $Server
     Assert-GateBackupBarrier
+    # A refusal of the domain controller, in another language than English: the engine must still tell it from any other error.
+    if ($global:PraGateAd.Case -eq 'AccessDenied') { throw [UnauthorizedAccessException]::new('Droits d''acces insuffisants pour executer l''operation.') }
     Write-GateEvent 'Set-ADUser' $Identity $Server @{Replace=$Replace;Clear=$Clear}
     $user=@($global:PraGateAd.Users | Where-Object ObjectGUID -eq ([string]$Identity))[0]
     if ($null -ne $Replace) { foreach ($key in $Replace.Keys) { $user.$key=$Replace[$key] } }
@@ -364,6 +366,10 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         $modules=Join-Path $root 'modules'; $package=Join-Path $root 'package'
         foreach ($path in @($root,$modules,$package,(Join-Path $package 'module'),(Join-Path $package 'templates'),(Join-Path $root 'backups'),(Join-Path $root 'logs'),(Join-Path $root 'reports'))) { $null=New-Item -ItemType Directory -Path $path -Force }
         foreach ($name in @('ActiveDirectory','ADSync')) { $null=New-Item -ItemType Directory -Path (Join-Path $modules $name) -Force }
+        foreach ($pair in @(@('Microsoft.Graph.Authentication','2.41.1'),@('Microsoft.Graph.Users','2.41.1'),@('ExchangeOnlineManagement','3.10.1'))) {
+            $moduleFolder=Join-Path $modules $pair[0]; $null=New-Item -ItemType Directory -Path $moduleFolder -Force
+            [IO.File]::WriteAllText((Join-Path $moduleFolder ($pair[0]+'.psd1')),"@{ ModuleVersion='$($pair[1])'; GUID='$([guid]::NewGuid())'; Author='SYNTHETIC'; Description='Synthetic fixture: a module version for the detection, never loaded.' }",(New-Object Text.UTF8Encoding($true)))
+        }
         [IO.File]::WriteAllText((Join-Path $modules 'ActiveDirectory\ActiveDirectory.psm1'),$global:PraGate.AdSource,(New-Object Text.UTF8Encoding($true)))
         [IO.File]::WriteAllText((Join-Path $modules 'ADSync\ADSync.psm1'),$global:PraGate.SyncSource,(New-Object Text.UTF8Encoding($true)))
         Copy-Item -Path (Join-Path $global:PraGate.Package '*') -Destination $package -Recurse -Force
@@ -2969,6 +2975,7 @@ Export-ModuleMember -Function Get-ConnectionInformation,Get-EXORecipient,Get-EXO
                 # Only external module discovery/import is replaced. Exact loaded fixture metadata
                 # remains real for every Session/Get-Command provenance guard in the native worker.
                 $script:GateNativeGetModule=Get-Command Get-Module -CommandType Cmdlet
+                Mock Get-PraCloudModuleReport { [pscustomobject]@{ Ok=$true; Messages=@(); Graph=[pscustomobject]@{Ok=$true;Version='2.41.1';Message=''}; Exo=[pscustomobject]@{Ok=$true;Version='3.10.1';Message=''} } }
                 Mock Get-Module {
                     param($Name,[switch]$ListAvailable)
                     if ($ListAvailable) {
@@ -3284,7 +3291,7 @@ Describe 'Batch resolution diagnostics - complete synthetic main invocations' -T
         { Invoke-GateProcess $runtime @{'ConfigPath;exit73'='not-code'} -ExplicitArguments } | Should -Throw '*argument name refused*'
         { Invoke-GateProcess $runtime @{ConfigPath=@('not','a','string')} -ExplicitArguments } | Should -Throw '*argument type refused*'
         $run=Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;Confirm=$false;ConfigPath=$literalConfig;Batch=$bundles.Source} -ExplicitArguments
-        $run.ExitCode | Should -Be 0
+        $run.ExitCode | Should -Be 2 -Because 'a phase AD that ends with a package is done, next step required'
         $run.MainResult.ErrorCount | Should -Be 0
         $run.MainResult.TotalCount | Should -Be 2
         @($run.Events | Where-Object Operation -eq 'Get-ADUser').Count | Should -BeGreaterThan 0
@@ -3296,7 +3303,7 @@ Describe 'Batch resolution diagnostics - complete synthetic main invocations' -T
         $batchValue=if ($Kind -eq 'ShortId') { $sourceId.Substring(0,8) } else { $bundles.Source }
         $run=Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$batchValue} -ExplicitArguments:($Invocation -eq 'Explicit')
         $run.WatchdogStopped | Should -BeNullOrEmpty
-        $run.ExitCode | Should -Be 0
+        $run.ExitCode | Should -Be 2
         $run.MainResult.ErrorCount | Should -Be 0
         $run.MainResult.BackupFiles.Count | Should -Be 1
         $saved=Import-PraBackup $context $run.MainResult.BackupFiles[0]
@@ -3374,7 +3381,7 @@ Describe 'Whole main in an isolated PowerShell 7 process' {
         $runtime=New-GateRuntime -Name 'oom-main-fixed-volume' -Shared13 -TrusteeCount 500 -AclCount 100
         Set-GateConfigText $runtime { param($t) $t.Replace('Report=@{Enabled=$true;', 'Report=@{Enabled=$false;') }
         $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 180 -MemoryLimitMB 512
-        $run.ExitCode | Should -Be 0 -Because ('bounded synthetic child evidence '+(Split-Path $runtime.Root -Leaf))
+        $run.ExitCode | Should -Be 2 -Because ('bounded synthetic child evidence '+(Split-Path $runtime.Root -Leaf))
         $run.MainResult.TotalCount | Should -Be 13
         $run.MemorySamples | Should -BeGreaterThan 0
         $run.PeakPrivateBytes | Should -BeGreaterThan 0
@@ -3501,7 +3508,7 @@ Describe 'Whole main in an isolated PowerShell 7 process' {
     It 'applies two synthetic targets with a full pre-mutation backup barrier' -Tag 'Delta' {
         $runtime=New-GateRuntime -Name 'main-apply'
         $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath}
-        $run.ExitCode | Should -Be 0 -Because ('the synthetic process must return the expected code; evidence case '+(Split-Path $runtime.Root -Leaf))
+        $run.ExitCode | Should -Be 2 -Because ('the synthetic process must return the expected code (a phase AD that ends with a package: next step required); evidence case '+(Split-Path $runtime.Root -Leaf))
         $run.Output | Should -Match 'RESULT: PASS'
         ($run.MainResult.NextSteps -join ' ') | Should -Match '-Phase Cloud'
         ($run.MainResult.NextSteps -join ' ') | Should -Not -Match '-ConfigPath'
@@ -4863,7 +4870,6 @@ Describe 'Release 3.0.0 - ordinal string comparison under .NET ICU (helpers and 
         $script:OrdFiles = @('Invoke-PraRemoteMailbox.ps1','PraRemoteMailbox.psm1','module\PRA.Common.psm1','module\PRA.Directory.psm1','module\PRA.Backup.psm1','module\PRA.Cloud.psm1','module\PRA.Gui.psm1','module\PRA.Gui.Directory.ps1','module\Test-PackageIntegrity.ps1')
         # Commands that compare or order strings with the culture collation. Each exception needs a justification; a stale entry fails the test.
         $script:OrdAllowList = @{
-            'module\PRA.Cloud.psm1|Sort-Object Version -Descending' = 'Orders [version] objects of the installed modules; no string is compared.'
             'module\PRA.Gui.Directory.ps1|Sort-Object DistinguishedName' = 'Display order of the OU picker; nothing is decided from it.'
         }
         # Files exempted from the operator and switch checks: none (the window is checked like the others).
@@ -6634,13 +6640,65 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgU
         $context.Warnings | Should -Be 1
         $warnings=@(Get-PraList $context 'WarningList')
         $warnings.Count | Should -Be 1
-        $warnings[0].Message | Should -BeExactly ('user1@gate.invalid: X500 missing in Exchange Online: '+$global:PraGate.X500Oldest+'. Replies to old messages and meeting updates to this mailbox can bounce (IMCEAEX NDR). Check that Entra Connect syncs proxyAddresses and legacyExchangeDN for this object, run a sync, then run -Action Check.')
+        $warnings[0].Message | Should -BeExactly ('user1@gate.invalid: X500 missing in Exchange Online: '+$global:PraGate.X500Oldest+'. Not serious: the mailbox works. Until this address appears, a reply to a very old message could bounce. To fix it, run an Entra Connect sync, then run -Action Check.')
         $row.Warnings | Should -Match ([regex]::Escape($global:PraGate.X500Oldest))
         $row.CloudDetail | Should -Match 'X500:missing=1/3'
         @(Get-PraList $context 'X500Missing') | Should -BeExactly @('user1@gate.invalid')
         @(Get-PraList $context 'Journey' | Where-Object { $_.Status -eq 'Warn' -and $_.Text -match 'X500 missing' }).Count | Should -Be 1
         Get-X500Log | Should -Match '\[WARN  \] user1@gate.invalid: X500 missing in Exchange Online'
         Get-X500Log | Should -Match ([regex]::Escape('user1@gate.invalid | X500 missing in Exchange Online : '+$global:PraGate.X500Oldest))
+    }
+    It 'the LegacyExchangeDN of the cloud mailbox itself counts as the X500 address it carries (Exchange Online never lists it in EmailAddresses): no false warning' {
+        $own='/o=Synthetic/ou=Gate/cn=Recipients/cn=user1'
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Older)
+        # EmailAddresses has the older address only; the mailbox's own LegacyExchangeDN is its own property (another case: the comparison ignores it).
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid',$global:PraGate.X500Older);LegacyExchangeDN=$own.ToUpperInvariant()}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { param($Filter,$Properties,$ResultSize) $global:PraGate.X500Calls++; $global:PraGate.X500Props=@($Properties); $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.X500Props | Should -Contain 'LegacyExchangeDN' -Because 'the property is asked for'
+        $row=$global:PraGate.CloudRow
+        $row.CloudDetail | Should -Match 'X500:present=2/2'
+        $row.Warnings | Should -BeNullOrEmpty
+        $global:PraGate.CloudContext.Warnings | Should -Be 0
+        $global:PraGate.X500Calls | Should -Be 1 -Because 'one read is enough'
+        # The LegacyExchangeDN of ANOTHER object is not the one of this mailbox: it does not count.
+        $global:PraGate.X500Calls=0
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy)
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid');LegacyExchangeDN='/o=Synthetic/ou=Gate/cn=Recipients/cn=somebody-else'}
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.CloudRow.CloudDetail | Should -Match 'X500:missing=1/1'
+        $global:PraGate.CloudContext.Warnings | Should -Be 1
+    }
+    It 'while only the X500 addresses are awaited the log says that the mailbox is ready (not "Not ready yet"), counts the checks, and never waits more than two more checks' {
+        $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Oldest)
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid',$global:PraGate.X500Legacy)}
+        $global:PraGate.CloudContext.IntervalMinutes=1; $global:PraGate.CloudContext.TimeoutMinutes=60
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { $global:PraGate.X500Slept++ }
+            Mock Get-EXOMailbox { $global:PraGate.X500Calls++; $global:PraGate.X500Reply }
+            $global:PraGate.X500Slept=0
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $log=Get-X500Log
+        $log | Should -Match ([regex]::Escape('user1@gate.invalid: mailbox ready; X500 addresses not all visible yet, check 2 of 3 in 60 s'))
+        $log | Should -Match ([regex]::Escape('user1@gate.invalid: mailbox ready; X500 addresses not all visible yet, check 3 of 3 in 60 s'))
+        $log | Should -Not -Match 'Not ready yet' -Because 'the mailbox is ready: only the X500 addresses are awaited'
+        $global:PraGate.X500Calls | Should -Be 3
+        $global:PraGate.X500Slept | Should -Be 2 -Because 'two waits only, whatever the 60 minutes of Polling.TimeoutMinutes'
+        $global:PraGate.CloudContext.Warnings | Should -Be 1
     }
     It 'a value that lags one synchronisation: missing at the first read, present at the second: Ok after the re-read, progress events sent' {
         $global:PraGate.CloudRow=New-X500Row -Expected @($global:PraGate.X500Legacy,$global:PraGate.X500Older)
@@ -7017,7 +7075,8 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         $runtime = New-GateRuntime -Name 'sync-ok'
         Enable-SyncConfig $runtime; Use-RemoteSync $runtime 'Ok'
         $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
-        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error + ' (a hand-over to the cloud server is "done, next step required")')
+        $run.MainResult.Status | Should -BeExactly 'Pending'
         $run.Output | Should -Match 'Entra Connect: SRV-SYNC01 accepts this account and Entra Connect answers, a Delta cycle runs after the AD changes'
         $run.Output | Should -Match 'Entra Connect cycle finished on SRV-SYNC01'
         Test-Path -LiteralPath $run.MainResult.TransferPackage -PathType Leaf | Should -BeTrue
@@ -7063,7 +7122,7 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         Test-Path -LiteralPath $zip | Should -BeFalse
         Use-RemoteSync $runtime 'Ok'
         $finished = Invoke-GateProcess $runtime (@{Mode='Apply'} + $arguments) -TimeoutSeconds 120
-        $finished.ExitCode | Should -Be 0 -Because ($finished.Output + $finished.Error)
+        $finished.ExitCode | Should -Be 2 -Because ($finished.Output + $finished.Error)
         @(Get-GateWrites $runtime).Count | Should -Be $writes -Because 'AD is not changed again'
         Test-Path -LiteralPath $finished.MainResult.TransferPackage -PathType Leaf | Should -BeTrue
         ($finished.MainResult.NextSteps -join "`n") | Should -Match 'Copy .*for-Cloud\.zip to the cloud server'
@@ -7078,6 +7137,44 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         $noProof.ExitCode | Should -Be 1
         $noProof.Output | Should -Match 'has no AD proof \(State file\).*cannot be finished from here\. Nothing was changed'
         @(Get-GateWrites $runtime).Count | Should -Be $writes
+    }
+    It 'the global report shows one line per object after a batch was finished: the two AD runs are one stage, nothing is lost' {
+        $runtime = New-GateRuntime -Name 'sync-global'
+        Enable-SyncConfig $runtime; Use-RemoteSync $runtime 'OkThenFail'
+        $first = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $first.ExitCode | Should -Be 2 -Because ($first.Output + $first.Error)
+        Remove-Item -LiteralPath $first.MainResult.TransferPackage, ($first.MainResult.TransferPackage + '.sha256') -Force
+        Use-RemoteSync $runtime 'Ok'
+        $second = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=[string]$first.MainResult.BatchId} -TimeoutSeconds 120
+        $second.ExitCode | Should -Be 2 -Because ($second.Output + $second.Error)
+        $zip = [string]$second.MainResult.TransferPackage
+        Test-Path -LiteralPath $zip -PathType Leaf | Should -BeTrue
+        # The cloud server: another machine, nothing but the package; it writes the global report.
+        $cloud = New-GateRuntime -Name 'sync-global-cloud'
+        $drop = Join-Path $cloud.Root 'dropped'; $null = New-Item -ItemType Directory -Path $drop
+        Copy-Item -LiteralPath $zip, ($zip + '.sha256') -Destination $drop
+        $third = Invoke-GateProcess $cloud @{Action='Convert';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$cloud.ConfigPath;Batch=(Join-Path $drop ([IO.Path]::GetFileName($zip)))} -TimeoutSeconds 120
+        $third.ExitCode | Should -BeIn @(0, 2) -Because ($third.Output + $third.Error)
+        $csvPath = [string]$third.MainResult.GlobalCsvReport
+        $htmlPath = [string]$third.MainResult.GlobalHtmlReport
+        Test-Path -LiteralPath $csvPath | Should -BeTrue -Because ($third.Output + $third.Error)
+        $lines = @(Import-Csv -LiteralPath $csvPath -Delimiter ';' -Encoding utf8BOM)
+        $lines.Count | Should -Be 2 -Because 'one line per object, not one per run'
+        @($lines | ForEach-Object UserPrincipalName | Sort-Object -Unique).Count | Should -Be 2
+        $dot = [string][char]0x00B7
+        foreach ($line in $lines) {
+            @([regex]::Matches($line.Sides, "Convert $dot AD:")).Count | Should -Be 1 -Because 'the AD side is a single stage'
+            $line.Sides | Should -Match "^Convert $dot AD: (Success|Handed over)? ?"
+            $line.Sides | Should -Match "Convert $dot Cloud:"
+            $line.Journey | Should -Match 'Earlier run' -Because 'the first AD run stays in the journey of the object'
+            $line.Journey | Should -Match 'not changed again' -Because 'the second run says it did not write AD'
+        }
+        # Both runs stay in the timeline of the batch.
+        $html = [IO.File]::ReadAllText($htmlPath)
+        $timeline = [regex]::Match($html, '(?s)Batch timeline</h2>.*?</table>').Value
+        $timeline | Should -Not -BeNullOrEmpty
+        @([regex]::Matches($timeline, '<tr><td>Convert &#183; AD</td>')).Count | Should -Be 2 -Because 'the two AD runs are two lines of the timeline'
+        $html | Should -Match '<div class="tile-label">Objects</div><div class="tile-value">2</div>'
     }
     It 'Phase Both with a failing sync does not start the cloud part: AD done, run the sync, then continue the batch' {
         $runtime = New-GateRuntime -Name 'sync-both'
@@ -7103,7 +7200,7 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
     It 're-running a conversion for an object that is already converted points to its batch, and names that object' {
         $first = New-GateRuntime -Name 'converted-a'
         $converted = Invoke-GateProcess $first @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$first.ConfigPath} -TimeoutSeconds 120
-        $converted.ExitCode | Should -Be 0 -Because ($converted.Output + $converted.Error)
+        $converted.ExitCode | Should -Be 2 -Because ($converted.Output + $converted.Error)
         $short = [string]$converted.MainResult.BatchId
         # Another run of the same lab later: the objects are remote mailboxes now (user1 is the first of the CSV), the batch folder is still there.
         $later = New-GateRuntime -Name 'converted-b' -Case 'AlreadyConverted'
@@ -7117,6 +7214,13 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         $run.Output | Should -Match 'object user1\)' -Because 'the stop message names the object of the text, not the last object read'
         $run.Output | Should -Not -Match 'object user2\)'
         @(Get-GateWrites $later).Count | Should -Be 0
+        # Started from the window (it sets PRA_EVENT_FILE) there is no command line: the message points to the Task page.
+        $env:PRA_EVENT_FILE = Join-Path $later.Root 'engine.events.jsonl'
+        $window = Invoke-GateProcess $later @{Action='Convert';Phase='AD';Mode='Preview';CsvPath=$csv;ConfigPath=$later.ConfigPath} -TimeoutSeconds 120
+        $window.ExitCode | Should -Be 1
+        $window.Output | Should -Match "user1 is already converted by batch $short \(it is a remote mailbox now\): nothing was changed\. To continue that batch .*go to the Task page, choose Move mailboxes to Exchange Online, then Continue a batch, and pick batch $short\."
+        $window.Output | Should -Not -Match 'run: \.\\Invoke-PraRemoteMailbox'
+        $env:PRA_EVENT_FILE = $oldEventPath
         # Without such a batch the message stays the plain one.
         $alone = New-GateRuntime -Name 'converted-c' -Case 'AlreadyConverted'
         $plain = Invoke-GateProcess $alone @{Action='Convert';Phase='AD';Mode='Preview';Identity='user1';ConfigPath=$alone.ConfigPath} -TimeoutSeconds 120
@@ -7125,6 +7229,284 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
     }
 }
 
+
+Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused write, missing -Action' -Tag 'Release312' {
+    BeforeEach { $global:PraGateT312 = @{ Avail = @(); Loaded = @() } }
+    AfterEach { Remove-Variable PraGateT312 -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'chooses ONE Microsoft Graph version for every module, at the minimum or later (<Name>)' -ForEach @(
+        @{ Name = 'the highest version that exists for both modules'; Auth = '2.42.0,2.41.1,2.40.0'; Users = '2.41.1,2.35.1'; Version = '2.41.1' }
+        @{ Name = 'the same version for both when both are recent'; Auth = '2.41.1'; Users = '2.41.1'; Version = '2.41.1' }
+        @{ Name = 'a later version when both have it'; Auth = '2.43.0,2.41.1'; Users = '2.43.0,2.41.1'; Version = '2.43.0' }
+    ) {
+        $global:PraGateT312.Avail = @(
+            @($Auth.Split(',') | ForEach-Object { [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]$_ } }) +
+            @($Users.Split(',') | ForEach-Object { [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]$_ } }) +
+            @([pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' }))
+        $report = InModuleScope PRA.Common {
+            Mock Get-Module { param($Name, [switch]$ListAvailable) if ($ListAvailable) { $global:PraGateT312.Avail } else { $global:PraGateT312.Loaded } }
+            Get-PraCloudModuleReport
+        }
+        $report.Ok | Should -BeTrue -Because ($report.Messages -join ' ')
+        $report.Graph.Version | Should -BeExactly $Version
+        $report.Exo.Version | Should -BeExactly '3.10.1'
+        @($report.Messages).Count | Should -Be 0
+    }
+    It 'refuses a set of Graph modules that is not complete in one version, and says what was found, the minimum and the command (<Name>)' -ForEach @(
+        @{ Name = 'the lab: Authentication 2.40.0, Users 2.35.1'; Auth = '2.40.0,2.35.1'; Users = '2.35.1'; Found = 'Microsoft.Graph.Authentication 2.40.0, 2.35.1; Microsoft.Graph.Users 2.35.1' }
+        @{ Name = 'Users one version behind'; Auth = '2.41.1'; Users = '2.41.0'; Found = 'Microsoft.Graph.Authentication 2.41.1; Microsoft.Graph.Users 2.41.0' }
+        @{ Name = 'too old'; Auth = '2.35.1'; Users = '2.35.1'; Found = 'Microsoft.Graph.Authentication 2.35.1; Microsoft.Graph.Users 2.35.1' }
+        @{ Name = 'Users missing'; Auth = '2.41.1'; Users = ''; Found = 'Microsoft.Graph.Authentication 2.41.1; Microsoft.Graph.Users not installed' }
+    ) {
+        $global:PraGateT312.Avail = @(
+            @($Auth.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]$_ } }) +
+            @($Users.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]$_ } }) +
+            @([pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' }))
+        $report = InModuleScope PRA.Common {
+            Mock Get-Module { param($Name, [switch]$ListAvailable) if ($ListAvailable) { $global:PraGateT312.Avail } else { $global:PraGateT312.Loaded } }
+            Get-PraCloudModuleReport
+        }
+        $report.Ok | Should -BeFalse
+        $report.Graph.Ok | Should -BeFalse
+        $report.Exo.Ok | Should -BeTrue
+        $report.Graph.Message | Should -Match ([regex]::Escape($Found))
+        $report.Graph.Message | Should -Match 'one same version 2\.41\.1 or later'
+        $report.Graph.Message | Should -Match ([regex]::Escape('Run: Install-Module Microsoft.Graph.Authentication,Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope AllUsers'))
+    }
+    It 'refuses an ExchangeOnlineManagement that is too old or missing, with the exact command' -ForEach @(
+        @{ Found = '3.10.0'; Text = 'found 3.10.0; the tool needs 3.10.1 or later' }
+        @{ Found = '3.9.0,3.8.0'; Text = 'found 3.9.0, 3.8.0; the tool needs 3.10.1 or later' }
+        @{ Found = ''; Text = 'not installed; the tool needs 3.10.1 or later' }
+    ) {
+        $global:PraGateT312.Avail = @(
+            @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.41.1' }) +
+            @($Found.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]$_ } }))
+        $report = InModuleScope PRA.Common { Mock Get-Module { param($Name, [switch]$ListAvailable) if ($ListAvailable) { $global:PraGateT312.Avail } else { $global:PraGateT312.Loaded } }; Get-PraCloudModuleReport }
+        $report.Ok | Should -BeFalse
+        $report.Graph.Ok | Should -BeTrue
+        $report.Exo.Message | Should -Match ([regex]::Escape('ExchangeOnlineManagement: ' + $Text))
+        $report.Exo.Message | Should -Match ([regex]::Escape('Run: Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers'))
+    }
+    It 'refuses another Graph version that is already loaded in the session, and accepts the one that is loaded when it is complete' {
+        $installed = @(
+            [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.41.1' },
+            [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.43.0' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.43.0' },
+            [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' })
+        $global:PraGateT312.Avail = $installed
+        # An older Graph is loaded: it cannot be replaced in the session.
+        $global:PraGateT312.Loaded = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.40.0' })
+        $report = InModuleScope PRA.Common { Mock Get-Module { param($Name, [switch]$ListAvailable) if ($ListAvailable) { $global:PraGateT312.Avail } else { $global:PraGateT312.Loaded } }; Get-PraCloudModuleReport }
+        $report.Graph.Ok | Should -BeFalse
+        $report.Graph.Message | Should -Match 'Microsoft Graph 2\.40\.0 is already loaded in this PowerShell session.*one same version 2\.41\.1 or later.*new PowerShell 7 window'
+        # A complete version is loaded: the same one is used (not the highest).
+        $global:PraGateT312.Loaded = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.41.1' })
+        $report = InModuleScope PRA.Common { Mock Get-Module { param($Name, [switch]$ListAvailable) if ($ListAvailable) { $global:PraGateT312.Avail } else { $global:PraGateT312.Loaded } }; Get-PraCloudModuleReport }
+        $report.Graph.Ok | Should -BeTrue
+        $report.Graph.Version | Should -BeExactly '2.41.1'
+        # Two versions loaded together: a state the tool cannot repair.
+        $global:PraGateT312.Loaded = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.43.0' })
+        $report = InModuleScope PRA.Common { Mock Get-Module { param($Name, [switch]$ListAvailable) if ($ListAvailable) { $global:PraGateT312.Avail } else { $global:PraGateT312.Loaded } }; Get-PraCloudModuleReport }
+        $report.Graph.Ok | Should -BeFalse
+        $report.Graph.Message | Should -Match 'several versions are loaded in this PowerShell session \(2\.41\.1, 2\.43\.0\)'
+    }
+    It 'imports every Graph module with the SAME required version, and refuses before importing when no complete set exists' {
+        $text = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Cloud.psm1'))
+        $text | Should -Match 'Import-Module Microsoft\.Graph\.Authentication -RequiredVersion \$graphVersion'
+        $text | Should -Match 'Import-Module Microsoft\.Graph\.Users -RequiredVersion \$graphVersion'
+        $text | Should -Match 'if \(-not \$modules\.Graph\.Ok\) \{ throw \$modules\.Graph\.Message \}'
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'config\PraRemoteMailbox.config.psd1')) | Should -Match "MinModuleVersion\s*=\s*'3\.10\.1'"
+    }
+    It 'the window shows the same answer on the Graph and Exchange Online lights' {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Gui.psm1') -Force
+        $old = & (Get-Module PRA.Gui) {
+            $script:GuiCloudModules = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.40.0' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.35.1' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.0' })
+            Get-PraGuiPrerequisite -Signin Wam -SyncEnabled $false
+        }
+        $graph = $old.Lights | Where-Object Name -eq 'Microsoft.Graph'; $exo = $old.Lights | Where-Object Name -eq 'ExchangeOnlineManagement'
+        $graph.Status | Should -BeExactly 'Fail'
+        $graph.Detail | Should -Match 'found Microsoft.Graph.Authentication 2\.40\.0; Microsoft.Graph.Users 2\.35\.1.*2\.41\.1 or later.*Install-Module Microsoft\.Graph\.Authentication,Microsoft\.Graph\.Users -MinimumVersion 2\.41\.1 -Scope AllUsers'
+        $exo.Status | Should -BeExactly 'Fail'
+        $exo.Detail | Should -Match 'found 3\.10\.0; the tool needs 3\.10\.1 or later.*Install-Module ExchangeOnlineManagement -MinimumVersion 3\.10\.1 -Scope AllUsers'
+        $old.Cloud | Should -BeFalse
+        $good = & (Get-Module PRA.Gui) {
+            $script:GuiCloudModules = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' })
+            Get-PraGuiPrerequisite -Signin Wam -SyncEnabled $false
+        }
+        ($good.Lights | Where-Object Name -eq 'Microsoft.Graph').Status | Should -BeExactly 'Ok'
+        ($good.Lights | Where-Object Name -eq 'ExchangeOnlineManagement').Detail | Should -BeExactly 'Installed, version 3.10.1.'
+    }
+
+    It 'Apply with phase Both stops before any write when no complete Graph set is installed; Preview only warns; a phase Cloud Preview stops too' {
+        $runtime = New-GateRuntime -Name 'modules-graph'
+        # The lab: Authentication 2.40.0 (the most recent), Users 2.35.1 (the only one).
+        Remove-Item -LiteralPath (Join-Path $runtime.Modules 'Microsoft.Graph.Authentication'), (Join-Path $runtime.Modules 'Microsoft.Graph.Users') -Recurse -Force
+        foreach ($pair in @(@('Microsoft.Graph.Authentication', '2.40.0'), @('Microsoft.Graph.Users', '2.35.1'))) {
+            $folder = Join-Path $runtime.Modules $pair[0]; $null = New-Item -ItemType Directory -Path $folder -Force
+            [IO.File]::WriteAllText((Join-Path $folder ($pair[0] + '.psd1')), "@{ ModuleVersion='$($pair[1])'; GUID='$([guid]::NewGuid())'; Author='SYNTHETIC' }", (New-Object Text.UTF8Encoding($true)))
+        }
+        $apply = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $apply.ExitCode | Should -Be 1
+        $apply.Output | Should -Match 'The cloud part cannot run on this server\. Microsoft Graph: found Microsoft\.Graph\.Authentication 2\.40\.0; Microsoft\.Graph\.Users 2\.35\.1\.'
+        $apply.Output | Should -Match ([regex]::Escape('Run: Install-Module Microsoft.Graph.Authentication,Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope AllUsers'))
+        $apply.Output | Should -Match 'Nothing was changed\.'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'no backup either'
+        @($apply.Events | Where-Object Operation -Match 'CloudPreflight|CloudPhase').Count | Should -Be 0
+        $preview = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $preview.ExitCode | Should -Be 0 -Because ($preview.Output + $preview.Error)
+        $preview.Output | Should -Match 'The cloud part will not be possible on this server\. Microsoft Graph: found'
+        $preview.MainResult.WarningCount | Should -BeGreaterThan 0
+        $cloud = Invoke-GateProcess $runtime @{Action='Check';Identity='user1@gate.invalid';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $cloud.ExitCode | Should -Be 1
+        $cloud.Output | Should -Match 'The cloud part cannot run on this server\. Microsoft Graph: found'
+        # A phase AD run never needs the cloud modules.
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $ad.ExitCode | Should -Be 0 -Because ($ad.Output + $ad.Error)
+        $ad.Output | Should -Not -Match 'Microsoft Graph: found'
+    }
+    It 'Apply with an old ExchangeOnlineManagement stops before any write, and a server with the minimum versions goes on' {
+        $runtime = New-GateRuntime -Name 'modules-exo'
+        [IO.File]::WriteAllText((Join-Path $runtime.Modules 'ExchangeOnlineManagement\ExchangeOnlineManagement.psd1'), "@{ ModuleVersion='3.9.0'; GUID='$([guid]::NewGuid())'; Author='SYNTHETIC' }", (New-Object Text.UTF8Encoding($true)))
+        $stopped = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $stopped.ExitCode | Should -Be 1
+        $stopped.Output | Should -Match ([regex]::Escape('ExchangeOnlineManagement: found 3.9.0; the tool needs 3.10.1 or later. Run: Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers'))
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        $good = New-GateRuntime -Name 'modules-ok'
+        $ran = Invoke-GateProcess $good @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$good.ConfigPath} -TimeoutSeconds 120
+        $ran.ExitCode | Should -BeIn @(0, 2) -Because ($ran.Output + $ran.Error)
+        $ran.Output | Should -Match 'Cloud modules: Microsoft Graph 2\.41\.1 \(Authentication and Users\), ExchangeOnlineManagement 3\.10\.1'
+        @(Get-GateWrites $good).Count | Should -BeGreaterThan 0
+    }
+
+    It 'a phase AD run that ends with a package exits 2 (done, next step required), and the Next steps put the sync before the package when the tool did not run it' {
+        $runtime = New-GateRuntime -Name 'handover-code'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+        $run.MainResult.Status | Should -BeExactly 'Pending'
+        $run.MainResult.ErrorCount | Should -Be 0
+        $run.MainResult.PendingCount | Should -Be 2
+        $run.MainResult.SuccessCount | Should -Be 0
+        $steps = @($run.MainResult.NextSteps)
+        # EntraConnect.Sync = $false in this configuration: the sync is the first of the numbered steps, then the copy of the package.
+        $steps[0] | Should -Match '^Run a delta sync on \S+ \(Start-ADSyncSyncCycle -PolicyType Delta\) or wait for the next automatic cycle \(about 30 minutes\)\.$'
+        $steps[1] | Should -Match '^Copy .*for-Cloud\.zip to the cloud server'
+        $steps.Count | Should -Be 3
+        # Preview: nothing is pending, nothing to do on the other server yet.
+        $preview = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $preview.ExitCode | Should -Be 0
+        # A run that does everything on one server ends with 0 (nothing left to do).
+        $both = New-GateRuntime -Name 'handover-both'
+        $done = Invoke-GateProcess $both @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$both.ConfigPath} -TimeoutSeconds 120
+        $done.MainResult.Status | Should -BeIn @('Success', 'Pending') -Because 'the synthetic cloud barrier decides the end of a phase Both'
+        ($done.MainResult.NextSteps -join ' ') | Should -Not -Match 'Run a delta sync on'
+    }
+
+    It 'a domain controller that refuses the account before the first write: plain message, nothing changed in AD, the backup folder is marked and not deleted' {
+        $runtime = New-GateRuntime -Name 'access-denied' -Case 'AccessDenied'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Match 'Nothing was changed in AD\. This account cannot write to dc01\.gate\.invalid: run the tool on that domain controller, or with an account that has the rights \(see Prerequisites\)\.'
+        $run.Output | Should -Not -Match 'AD batch stopped'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        [string]$run.MainResult.TransferPackage | Should -BeExactly ''
+        $folder = @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory | Where-Object Name -Like 'Batch-*')
+        $folder.Count | Should -Be 1 -Because 'the backup is kept'
+        Test-Path -LiteralPath (Join-Path $folder[0].FullName 'NOT-APPLIED.txt') | Should -BeTrue
+        [IO.File]::ReadAllText((Join-Path $folder[0].FullName 'NOT-APPLIED.txt')) | Should -Match 'NOT a batch to continue and NOT a batch to roll back'
+        @(Get-ChildItem -LiteralPath $folder[0].FullName -Filter 'Convert-*.json').Count | Should -Be 1
+        @(Get-ChildItem -LiteralPath $folder[0].FullName -Filter 'State-*').Count | Should -Be 0 -Because 'no AD proof: nothing was verified'
+        $journal = @(Get-Content -LiteralPath (Get-ChildItem -LiteralPath $folder[0].FullName -Filter 'Journal-*.jsonl')[0].FullName | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
+        @($journal | Where-Object { $_.Operation -ceq 'ADBatch' -and $_.Status -ceq 'NotApplied' }).Count | Should -Be 1
+        # Any other error keeps the old message.
+        $other = New-GateRuntime -Name 'other-error' -Case 'SecondMutationFailure'
+        $failed = Invoke-GateProcess $other @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$other.ConfigPath} -TimeoutSeconds 120
+        $failed.ExitCode | Should -Be 1
+        $failed.Output | Should -Match 'AD batch stopped: '
+        $failed.Output | Should -Not -Match 'Nothing was changed in AD\. This account cannot write'
+        @(Get-ChildItem -LiteralPath $other.State.BackupFolder -Recurse -Filter 'NOT-APPLIED.txt').Count | Should -Be 0
+    }
+
+    It 'a missing -Action stops at once with the usage, even when nobody can answer a prompt' {
+        $runtime = New-GateRuntime -Name 'no-action'
+        $start = New-Object Diagnostics.ProcessStartInfo
+        $start.FileName = (Join-Path $PSHOME 'pwsh.exe')
+        $start.Arguments = '-NoLogo -NoProfile -File "' + (Join-Path $runtime.Package 'Invoke-PraRemoteMailbox.ps1') + '"'
+        $start.UseShellExecute = $false; $start.CreateNoWindow = $true; $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true; $start.RedirectStandardInput = $true
+        $process = [Diagnostics.Process]::Start($start)
+        try {
+            $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+            $process.WaitForExit(60000) | Should -BeTrue -Because 'the script must not wait for an answer'
+            $process.ExitCode | Should -Be 1
+            $text = ($out.Result + $err.Result) -replace '\s+', ' '
+            $text | Should -Match '-Action is missing: nothing was done\. Give the task: -Action Convert, Recover, Finalize or Check'
+            $text | Should -Match 'Example: \.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Mode Preview'
+        } finally { if (-not $process.HasExited) { $process.Kill() }; $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.1.2 - the Next steps of a package Preview, and the scope that only a conversion needs' -Tag 'Release312' {
+    It 'a Preview started with a package names the package in its Next steps (nothing was extracted to the backup folder)' {
+        $ad = New-GateRuntime -Name 'preview-zip-ad'
+        $made = Invoke-GateProcess $ad @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$ad.ConfigPath} -TimeoutSeconds 120
+        $zip = [string]$made.MainResult.TransferPackage
+        Test-Path -LiteralPath $zip -PathType Leaf | Should -BeTrue -Because ($made.Output + $made.Error)
+        $cloud = New-GateRuntime -Name 'preview-zip-cloud'
+        $drop = Join-Path $cloud.Root 'dropped'; $null = New-Item -ItemType Directory -Path $drop
+        Copy-Item -LiteralPath $zip, ($zip + '.sha256') -Destination $drop
+        $target = Join-Path $drop ([IO.Path]::GetFileName($zip))
+        $preview = Invoke-GateProcess $cloud @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$cloud.ConfigPath;Batch=$target} -TimeoutSeconds 120
+        $preview.ExitCode | Should -BeIn @(0, 2) -Because ($preview.Output + $preview.Error)
+        $next = @($preview.MainResult.NextSteps) -join "`n"
+        $next | Should -Match ([regex]::Escape("-Action Convert -Phase Cloud -Mode Apply -Batch '" + $target + "'")) -Because 'the exact Apply command, with the package'
+        $next | Should -Not -Match '-Batch [0-9a-f]{8,32}\b' -Because 'a batch ID would not be found: the Preview extracted nothing into the backup folder'
+        @(Get-ChildItem -LiteralPath $cloud.State.BackupFolder -Directory -ErrorAction SilentlyContinue | Where-Object Name -Like 'Batch-*').Count | Should -Be 0
+        # The same Preview from a bare file name (the package is in the Inbox of the cloud server): the command repeats what was typed.
+        $inbox = Join-Path $cloud.State.BackupFolder 'Inbox'; $null = New-Item -ItemType Directory -Path $inbox -Force
+        Copy-Item -LiteralPath $zip, ($zip + '.sha256') -Destination $inbox
+        $named = Invoke-GateProcess $cloud @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$cloud.ConfigPath;Batch=[IO.Path]::GetFileName($zip)} -TimeoutSeconds 120
+        (@($named.MainResult.NextSteps) -join "`n") | Should -Match ([regex]::Escape("-Batch '" + [IO.Path]::GetFileName($zip) + "'"))
+        # Every other command of the script that a package Preview can print uses the same value.
+        $text = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'))
+        ([regex]::Matches($text, '\$script:PreviewPackage')).Count | Should -BeGreaterOrEqual 8
+    }
+    It 'Check and the cloud phases do not need the conversion scope; a conversion without any source says what to fill in' {
+        $runtime = New-GateRuntime -Name 'scope-empty'
+        # The default configuration of the package: Scope.Mode = OU without Scope.SearchBase.
+        Set-GateConfigText $runtime { param($t) $t.Replace("Mode='Auto';SearchBase='OU=Tests,DC=gate,DC=invalid'", "Mode='OU';SearchBase=''") }
+        $check = Invoke-GateProcess $runtime @{Action='Check';Identity='user1@gate.invalid';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $check.ExitCode | Should -Be 0 -Because ($check.Output + $check.Error)
+        $check.Output | Should -Not -Match 'Scope\.SearchBase'
+        $single = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Identity='user1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $single.ExitCode | Should -Be 0 -Because 'one named account does not need a scope'
+        $readsBefore = @(Get-GateEvents $runtime | Where-Object Operation -Match '^Get-AD').Count
+        $none = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $none.ExitCode | Should -Be 1
+        $none.Output | Should -Match 'Configuration: Scope\.Mode = OU requires Scope\.SearchBase: no OU is set, so the tool does not know which mailboxes to convert\.'
+        $none.Output | Should -Match 'Fill it in the configuration file, or give -Identity \(one account\), -CsvPath \(a CSV file with an Identity column\) or -SearchBase \(an OU\) for this run, or set Scope\.Mode = Auto'
+        @(Get-GateEvents $runtime | Where-Object Operation -Match '^Get-AD').Count | Should -Be $readsBefore -Because 'the run stops before it reads Active Directory'
+        $override = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';SearchBase='OU=Tests,DC=gate,DC=invalid';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $override.ExitCode | Should -Be 0 -Because ($override.Output + $override.Error)
+        # A Recover does not read the scope either.
+        $made = New-GateRuntime -Name 'scope-recover'
+        $first = Invoke-GateProcess $made @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$made.ConfigPath} -TimeoutSeconds 120
+        Set-GateConfigText $made { param($t) $t.Replace("Mode='Auto';SearchBase='OU=Tests,DC=gate,DC=invalid'", "Mode='OU';SearchBase=''") }
+        $recover = Invoke-GateProcess $made @{Action='Recover';Phase='AD';Mode='Preview';ConfigPath=$made.ConfigPath;Batch=[string]$first.MainResult.BatchId} -TimeoutSeconds 120
+        $recover.Output | Should -Not -Match 'Scope\.SearchBase'
+    }
+    It 'Import-PraConfiguration leaves the scope to the caller with -DeferScopeCheck, and Test-PraScopeConfiguration says what to fill in for each mode' {
+        $runtime = New-GateRuntime -Name 'scope-unit'
+        Set-GateConfigText $runtime { param($t) $t.Replace("Mode='Auto';SearchBase='OU=Tests,DC=gate,DC=invalid'", "Mode='OU';SearchBase=''") }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package } | Should -Throw '*Scope.Mode = OU requires Scope.SearchBase*'
+        $config = Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck
+        { Test-PraScopeConfiguration -Config $config } | Should -Throw '*Scope.Mode = OU requires Scope.SearchBase: no OU is set*'
+        $config.Scope.Mode = 'Group'; $config.Scope.GroupDN = ''
+        { Test-PraScopeConfiguration -Config $config } | Should -Throw '*Scope.Mode = Group requires Scope.GroupDN: no group is set*'
+        $config.Scope.Mode = 'Csv'; $config.Scope.CsvPath = ''
+        { Test-PraScopeConfiguration -Config $config } | Should -Throw '*Scope.Mode = Csv requires Scope.CsvPath: no CSV file is set*'
+        $config.Scope.Mode = 'Auto'
+        { Test-PraScopeConfiguration -Config $config } | Should -Not -Throw
+    }
+}
 
 AfterAll {
     $env:PSModulePath=$global:PraGate.OriginalModulePath

@@ -94,7 +94,8 @@ function New-PraGuiRequest {
         [ValidateSet('All','UsersOnly','SharedOnly')][string]$Scope = 'All',
         [int]$MaxObjects = 0,
         [ValidateSet('Provisioned','Deprovisioned','Retained')][string]$Expect = 'Provisioned',
-        [bool]$Once = $false
+        [bool]$Once = $false,
+        [bool]$Finish = $false
     )
     # ValidateSet is a culture comparison: 'Convert<U+0001>' would be accepted and bound as typed. The value is matched ordinally (any letter
     # case, as before) and replaced by the official spelling; a value without an ordinal match is refused.
@@ -107,7 +108,10 @@ function New-PraGuiRequest {
         if ($value -match '[\x00-\x1f]') { throw 'Selection contains a control character.' }
     }
     if ($MaxObjects -lt 0) { throw 'MaxObjects must be zero or positive.' }
-    if ((Test-GuiOrdinal $Action 'Convert' -IgnoreCase) -and (-not (Test-GuiOrdinal $Phase 'Cloud' -IgnoreCase)) -and $Batch) { throw 'Convert AD/Both must not receive a batch: Apply creates a NEW Convert batch.' }
+    # Only the window's "finish it here" (Continue a batch whose AD part is done without its sync or package) sends a batch with Convert -Phase AD: the engine runs the
+    # synchronisation again and writes the package, and does not write AD.
+    if ($Finish -and -not ((Test-GuiOrdinal $Action 'Convert' -IgnoreCase) -and (Test-GuiOrdinal $Phase 'AD' -IgnoreCase) -and $Batch)) { throw 'Finishing a batch needs a Convert batch and the AD phase.' }
+    if ((Test-GuiOrdinal $Action 'Convert' -IgnoreCase) -and (-not (Test-GuiOrdinal $Phase 'Cloud' -IgnoreCase)) -and $Batch -and -not $Finish) { throw 'Convert AD/Both must not receive a batch: Apply creates a NEW Convert batch.' }
     if (((Test-GuiOrdinalIn $Action @('Recover','Finalize') -IgnoreCase) -or ((Test-GuiOrdinal $Action 'Convert' -IgnoreCase) -and (Test-GuiOrdinal $Phase 'Cloud' -IgnoreCase))) -and -not $Batch) {
         throw ('A {0} batch is required.' -f (Get-PraGuiBatchType $Action $Phase))
     }
@@ -215,7 +219,7 @@ function Read-PraGuiBatch {
 function Read-PraGuiState {
     param([string]$Root, [string]$ConfigPath, [hashtable]$ScopeOverride=@{})
     $state = [pscustomobject]@{ Root=$Root; ConfigPath=$ConfigPath; Config=$null; ConfigError=''; Batches=@(); OtherEnvironment=@(); BatchError='' }
-    try { $state.Config = Import-PraConfiguration -Path $ConfigPath -Root $Root -ScopeOverride $ScopeOverride }
+    try { $state.Config = Import-PraConfiguration -Path $ConfigPath -Root $Root -ScopeOverride $ScopeOverride -DeferScopeCheck }
     catch { $state.ConfigError=$_.Exception.Message; return $state }
     $folder = [string]$state.Config.Storage.BackupFolder
     if (-not (Test-Path -LiteralPath $folder)) { $state.BatchError='Backup folder not present yet: '+$folder; return $state }
@@ -723,6 +727,16 @@ function Get-PraGuiHighestModule {
     return $best
 }
 
+$script:GuiCloudModules = $null
+function Get-PraGuiCloudModuleReport {
+    <# The report of the cloud modules (PRA.Common). The list of the installed modules is kept until -Refresh; nothing is loaded here. #>
+    param([string]$MinExo, [switch]$Refresh)
+    if ($Refresh -or $null -eq $script:GuiCloudModules) {
+        $script:GuiCloudModules=@(Get-Module -ListAvailable -Name 'Microsoft.Graph.Authentication','Microsoft.Graph.Users','ExchangeOnlineManagement' -SkipEditionCheck -ErrorAction SilentlyContinue)
+    }
+    return (Get-PraCloudModuleReport -MinExo $MinExo -Available $script:GuiCloudModules -Loaded @())
+}
+
 function Get-PraGuiPrerequisite {
     <#
     .SYNOPSIS
@@ -732,23 +746,19 @@ function Get-PraGuiPrerequisite {
         Lights (Name, Status Ok/Warn/Fail, Detail), AD and Cloud capabilities and the Role (Both, AD, Cloud, None).
     #>
     [CmdletBinding()]
-    param([string]$MinExoVersion='3.10.0', [bool]$DisableWam=$false, [bool]$SyncEnabled=$true, [string]$SyncServer='', [ValidateSet('Cert','Wam')][string]$Signin='Wam', [string]$Thumbprint='', [switch]$Refresh)
+    param([string]$MinExoVersion='3.10.1', [bool]$DisableWam=$false, [bool]$SyncEnabled=$true, [string]$SyncServer='', [ValidateSet('Cert','Wam')][string]$Signin='Wam', [string]$Thumbprint='', [switch]$Refresh)
     $lights=New-Object 'Collections.Generic.List[object]'
     $light={ param($Name,$Status,$Detail) $lights.Add([ordered]@{ Name=$Name; Status=$Status; Detail=$Detail }) }
     $ad=Get-PraGuiHighestModule @('ActiveDirectory') -Refresh:$Refresh
     if ($ad) { & $light 'RSAT ActiveDirectory' 'Ok' ('Installed, version {0}.' -f $ad.Version) }
     else { & $light 'RSAT ActiveDirectory' 'Fail' 'Not installed: the Active Directory parts cannot run on this server (install the RSAT feature Active Directory module).' }
-    $exo=Get-PraGuiHighestModule @('ExchangeOnlineManagement') -Refresh:$Refresh
-    $minimum=[version]'0.0'; [void][version]::TryParse($MinExoVersion,[ref]$minimum)
-    $exoOk=$false
-    if (-not $exo) { & $light 'ExchangeOnlineManagement' 'Fail' ('Not installed (version {0} or later needed): Install-Module ExchangeOnlineManagement.' -f $MinExoVersion) }
-    elseif ($exo.Version -lt $minimum) { & $light 'ExchangeOnlineManagement' 'Fail' ('Version {0} is too old: {1} or later is needed.' -f $exo.Version,$MinExoVersion) }
-    else { $exoOk=$true; & $light 'ExchangeOnlineManagement' 'Ok' ('Installed, version {0}.' -f $exo.Version) }
-    $graph=Get-PraGuiHighestModule @('Microsoft.Graph.Authentication') -Refresh:$Refresh
-    $graphUsers=Get-PraGuiHighestModule @('Microsoft.Graph.Users') -Refresh:$Refresh
-    $graphOk=$false
-    if ($graph -and $graphUsers) { $graphOk=$true; & $light 'Microsoft.Graph' 'Ok' ('Installed, version {0}.' -f $graph.Version) }
-    else { & $light 'Microsoft.Graph' 'Fail' 'Not installed (Authentication and Users): the cloud parts and Check cannot run on this server (Install-Module Microsoft.Graph).' }
+    # The same report as the engine (Get-PraCloudModuleReport): the minimum versions, and ONE version of the Graph modules for all of them. The scan is slow: kept until -Refresh.
+    # The engine runs in a fresh process, so no module is loaded there yet.
+    $report=Get-PraGuiCloudModuleReport -MinExo $MinExoVersion -Refresh:$Refresh
+    $exoOk=[bool]$report.Exo.Ok
+    if ($exoOk) { & $light 'ExchangeOnlineManagement' 'Ok' ('Installed, version {0}.' -f $report.Exo.Version) } else { & $light 'ExchangeOnlineManagement' 'Fail' $report.Exo.Message }
+    $graphOk=[bool]$report.Graph.Ok
+    if ($graphOk) { & $light 'Microsoft.Graph' 'Ok' ('Installed, version {0} (Authentication and Users).' -f $report.Graph.Version) } else { & $light 'Microsoft.Graph' 'Fail' $report.Graph.Message }
     if (-not $SyncEnabled) { & $light 'Entra Connect sync' 'NA' 'Not used: EntraConnect.Sync is off in the configuration.' }
     elseif ($SyncServer) { & $light 'Entra Connect sync' 'Ok' ('The synchronisation is started on {0}.' -f $SyncServer) }
     elseif (Get-PraGuiHighestModule @('ADSync') -Refresh:$Refresh) { & $light 'Entra Connect sync' 'Ok' 'ADSync module found on this server.' }
@@ -1099,6 +1109,14 @@ function Get-PraGuiSettingsProblem {
     return ''
 }
 
+function Test-PraGuiFinishRow {
+    <# True for the row of a batch that is finished on this server (the flag is absent from the other rows). #>
+    param($Row)
+    if ($null -eq $Row) { return $false }
+    $table=$Row -as [Collections.Generic.IDictionary[string,object]]
+    return ($null -ne $table -and $table.ContainsKey('Finish') -and [bool]$table['Finish'])
+}
+
 function Get-PraGuiPhase {
     <# The phase of the run, inferred from what the operator picked (the Expert mode can force it). #>
     $g=$script:Gui
@@ -1109,7 +1127,11 @@ function Get-PraGuiPhase {
         'Recover' { }
         default { return '' }
     }
-    if ((Test-GuiOrdinal $g.Mode 'Continue' -IgnoreCase)) { return 'Cloud' }
+    if ((Test-GuiOrdinal $g.Mode 'Continue' -IgnoreCase)) {
+        # A Convert batch whose AD part is done but whose sync did not run, or that has no package on a server that cannot do the cloud part, is finished here (AD side again, AD not written).
+        if ((Test-GuiOrdinal $g.Action 'Convert' -IgnoreCase) -and (Test-PraGuiFinishRow $g.SelectedBatch)) { return 'AD' }
+        return 'Cloud'
+    }
     $forced=Get-PraGuiField 'ExpPhase'
     if ((-not (Test-GuiOrdinal $forced 'Auto' -IgnoreCase))) { return $forced }
     # A server that can run both sides runs the whole batch in one go (no transfer package). The AD phase and its package are only for a server that
@@ -1129,7 +1151,7 @@ function Get-PraGuiBlocker {
     $g=$script:Gui
     if (-not $g.Action -or -not $g.Detect) { return '' }
     $phase=Get-PraGuiPhase
-    $needAd=(Test-GuiOrdinal $g.Action 'Finalize' -IgnoreCase) -or ((Test-GuiOrdinalIn $g.Action @('Convert','Recover') -IgnoreCase) -and (Test-GuiOrdinalIn $phase @('AD','Both') -IgnoreCase))
+    $needAd=(Test-GuiOrdinal $g.Action 'Finalize' -IgnoreCase) -or ((Test-GuiOrdinalIn $g.Action @('Convert','Recover') -IgnoreCase) -and (Test-GuiOrdinalIn $phase @('AD','Both') -IgnoreCase) -and -not (Test-PraGuiFinishRow $g.SelectedBatch))
     if ($needAd -and -not $g.Detect.AD) { return 'This server cannot do the Active Directory part yet: RSAT ActiveDirectory is not installed. Install it, or run this on the AD server.' }
     if ((Test-PraGuiNeedsCloud) -and $g.Detect.Cloud -and (Test-PraGuiNetworkDown) -and -not (Test-PraGuiPhaseForced)) {
         $net=@($g.Detect.Lights | Where-Object { Test-GuiOrdinal $_.Name $script:GuiNetLight })
@@ -1169,8 +1191,10 @@ $script:GuiStepInfo = @{
 
 function Get-PraGuiPlanTitle {
     <# The steps the engine announces for an action and a phase (kept in line with the main script; the run itself shows the real plan event). #>
-    param([string]$Action, [string]$Phase)
-    $titles=@(Get-PraGuiBasePlanTitle $Action $Phase)
+    param([string]$Action, [string]$Phase, [string]$Batch='')
+    $titles=@(Get-PraGuiBasePlanTitle $Action $Phase $Batch)
+    # Finishing a batch has no replication step: AD is not written.
+    if ((Test-GuiOrdinal $Action 'Convert' -IgnoreCase) -and (Test-GuiOrdinal $Phase 'AD' -IgnoreCase) -and $Batch) { return $titles }
     $replicate=$false
     if ($script:Gui -and $script:Gui.Controls -and $script:Gui.Controls.ContainsKey('F_Repl')) { $replicate=[bool](Get-PraGuiField 'Repl') }
     if (-not $replicate -or (Test-GuiOrdinal $Action 'Check' -IgnoreCase) -or (Test-GuiOrdinal $Phase 'Cloud' -IgnoreCase)) { return $titles }
@@ -1183,10 +1207,11 @@ function Get-PraGuiPlanTitle {
 }
 
 function Get-PraGuiBasePlanTitle {
-    param([string]$Action, [string]$Phase)
+    param([string]$Action, [string]$Phase, [string]$Batch='')
     switch ($Action) {
         'Convert' {
             if ((Test-GuiOrdinal $Phase 'Cloud' -IgnoreCase)) { return @('Loading the batch of the AD phase','Exchange Online: mailboxes, licences and permissions') }
+            if ((Test-GuiOrdinal $Phase 'AD' -IgnoreCase) -and $Batch) { return @('Loading the batch of the AD phase','Entra Connect synchronisation','Creating the transfer package') }
             return @('Active Directory connection','Targets and planned changes') + $(if ((Test-GuiOrdinal $Phase 'Both' -IgnoreCase)) { @('Exchange Online pre-check') } else { @() }) +
                 @('Backup and Active Directory changes','Entra Connect synchronisation') + $(if ((Test-GuiOrdinal $Phase 'Both' -IgnoreCase)) { @('Exchange Online: mailboxes, licences and permissions') } else { @('Creating the transfer package') })
         }
@@ -1217,6 +1242,7 @@ function Get-PraGuiPhaseText {
         'Finalize' { return 'This server applies the last Active Directory attributes of a rollback. It never calls the cloud.' }
         'Convert' {
             if ((Test-GuiOrdinal $phase 'Cloud' -IgnoreCase)) { return 'This server checks the package brought from the AD server, then converts the mailboxes in Exchange Online.' }
+            if ((Test-PraGuiFinishRow $g.SelectedBatch)) { return 'The directory part of this batch is already made and verified: Active Directory is NOT changed again. This server runs the Entra Connect synchronisation again, then writes ONE transfer package for the cloud server.' }
             if ((Test-GuiOrdinal $phase 'Both' -IgnoreCase)) { return 'This server backs up and changes the Active Directory objects, synchronises, then completes the mailboxes in Exchange Online, all in one run. Everything is done here: no transfer package is needed.' }
             return ('This server backs up and changes the Active Directory objects, then writes ONE transfer package. The cloud part is done afterwards, on the cloud server.' + (Get-PraGuiNetworkPhaseNote))
         }
@@ -1273,6 +1299,33 @@ function Format-PraGuiDate {
     return $When.ToString('d MMM yyyy HH:mm',[Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Test-PraGuiBatchSyncFailed {
+    <# True when the journal of the batch ends its Entra Connect entries with a failure (the sync was started and did not end well). #>
+    param([string]$Folder, [string]$BatchId)
+    $journal=Join-Path $Folder ('Journal-'+$BatchId+'.jsonl')
+    if (-not (Test-Path -LiteralPath $journal -PathType Leaf)) { return $false }
+    $last=''
+    try { foreach ($line in [IO.File]::ReadLines($journal)) { if ($line.Contains('"Operation":"ADSync"')) { $last=$line } } } catch { return $false }
+    return $last.Contains('"Status":"Failed"')
+}
+
+function Get-PraGuiFinishReason {
+    <#
+    .SYNOPSIS
+        Why a Convert batch whose AD part is done is finished on this server (its Entra Connect sync did not end, or it has no package and this server
+        cannot do the cloud part), or '' when the cloud part is the next step.
+    #>
+    param($Item)
+    $g=$script:Gui
+    if (Test-PraGuiBatchSyncFailed $Item.Folder $Item.BatchId) { return 'AD part done, sync did not run: finish it here' }
+    $package=''
+    try { $package=Get-PraTransferPackageName -Kind Convert -Environment ([string]$Item.Environment) -BatchId ([string]$Item.BatchId) } catch { return '' }
+    $outbox=Join-Path $g.State.Config.Storage.BackupFolder 'Outbox'
+    $cloudHere=(-not $g.Detect) -or ([bool]$g.Detect.Cloud -and -not (Test-PraGuiNetworkDown))
+    if (-not $cloudHere -and -not (Test-Path -LiteralPath (Join-Path $outbox $package) -PathType Leaf)) { return 'AD part done, no package yet: finish it here' }
+    return ''
+}
+
 function Get-PraGuiBatchEntry {
     <#
     .SYNOPSIS
@@ -1311,17 +1364,23 @@ function Get-PraGuiBatchEntry {
         $shared=@($records | Where-Object { [bool](Get-PraGuiValue $_ 'IsShared' $false) }).Count
         $proofPath=Join-Path $item.Folder ('State-'+$item.BatchId+'.json')
         $hasProof=Test-Path -LiteralPath $proofPath -PathType Leaf
-        $state_='Ready'; $level='Ok'; $selectable=$true
+        $state_='Ready'; $level='Ok'; $selectable=$true; $finish=$false
+        $notApplied=Test-Path -LiteralPath (Join-Path $item.Folder 'NOT-APPLIED.txt') -PathType Leaf
         switch ($item.Operation) {
-            'Convert' { if ($needsProof) { if ($hasProof) { $state_='AD part done, cloud part to do' } else { $state_='No AD proof'; $level='Warn'; $selectable=$false } } else { $state_='Can be rolled back' } }
+            'Convert' { if ($needsProof) { if ($hasProof) {
+                        $state_='AD part done, cloud part to do'
+                        $why=Get-PraGuiFinishReason $item
+                        if ($why) { $state_=$why; $level='Warn'; $finish=$true }
+                    } else { $state_='No AD proof'; $level='Warn'; $selectable=$false } } else { $state_='Can be rolled back' } }
             'Recover' { if ($hasProof) { $state_='AD rollback done, cloud part to do' } else { $state_='No AD proof'; $level='Warn'; $selectable=$false } }
             'RecoverFinalize' { $state_='Ready to finalize' }
         }
+        if ($notApplied -and (Test-GuiOrdinalIn $item.Operation @('Convert','Recover'))) { $state_='Nothing was written to AD: not a batch to continue'; $level='Warn'; $selectable=$false; $finish=$false }
         $glyph=switch ($item.Operation) { 'Convert' { [string][char]0xE753 } 'Recover' { [string][char]0xE7A7 } default { [string][char]0xE930 } }
         $label=if (Test-GuiOrdinal $item.Operation 'RecoverFinalize') { 'Finalize' } else { [string]$item.Operation }
         $sub='{0}, {1} shared · environment {2} · {3}' -f (ConvertTo-PraGuiPlural $records.Count 'mailbox' 'mailboxes'),$shared,$item.Environment,(Split-Path $item.Folder -Leaf)
         $rows.Add((New-PraGuiRow @{ Title=('{0} · {1}' -f $label,(Format-PraGuiDate (Get-PraGuiBatchCreated $item))); Sub=$sub; State=$state_; Level=$level; Selectable=$selectable; Glyph=$glyph
-            Package=$false; Path=$item.Path; Environment=$item.Environment; BatchId=$item.BatchId; Operation=[string]$item.Operation }))
+            Package=$false; Path=$item.Path; Environment=$item.Environment; BatchId=$item.BatchId; Operation=[string]$item.Operation; Finish=$finish }))
     }
     # Transfer packages waiting in the Inbox.
     if ($kind -and (Get-Command Get-PraTransferPackage -ErrorAction SilentlyContinue)) {
@@ -1468,18 +1527,19 @@ function Get-PraGuiWindowRequest {
     if (-not $action) { throw 'Choose a task first.' }
     $phase=Get-PraGuiPhase
     $limit=0
-    if ((Test-GuiOrdinal $action 'Convert' -IgnoreCase) -and (-not (Test-GuiOrdinal $phase 'Cloud' -IgnoreCase))) {
+    $finish=(Test-GuiOrdinal $action 'Convert' -IgnoreCase) -and (Test-GuiOrdinal $g.Mode 'Continue' -IgnoreCase) -and (Test-PraGuiFinishRow $g.SelectedBatch)
+    if ((Test-GuiOrdinal $action 'Convert' -IgnoreCase) -and (-not (Test-GuiOrdinal $phase 'Cloud' -IgnoreCase)) -and -not $finish) {
         if (-not [int]::TryParse((Get-PraGuiField 'ExpMax'),[ref]$limit) -or $limit -lt 0) { throw 'MaxObjects must be a whole number, 0 or more.' }
     }
     $batch=''
     $row=$g.SelectedBatch
-    if ((Test-GuiOrdinal $action 'Finalize' -IgnoreCase) -or (Test-GuiOrdinal $action 'Recover' -IgnoreCase) -or ((Test-GuiOrdinal $action 'Convert' -IgnoreCase) -and (Test-GuiOrdinal $phase 'Cloud' -IgnoreCase))) {
+    if ((Test-GuiOrdinal $action 'Finalize' -IgnoreCase) -or (Test-GuiOrdinal $action 'Recover' -IgnoreCase) -or ((Test-GuiOrdinal $action 'Convert' -IgnoreCase) -and (Test-GuiOrdinal $phase 'Cloud' -IgnoreCase)) -or $finish) {
         if (-not $row) { throw 'Pick the batch (or the transfer package) first.' }
         $batch=[string]$row.Path
     }
     $identity=''; $ou=''; $csv=''
     if ((Test-GuiOrdinal $action 'Check' -IgnoreCase)) { $identity=Get-PraGuiField 'CheckUpn' }
-    elseif ((Test-GuiOrdinal $action 'Convert' -IgnoreCase) -and (Test-GuiOrdinalIn $phase @('AD','Both') -IgnoreCase)) {
+    elseif ((Test-GuiOrdinal $action 'Convert' -IgnoreCase) -and (Test-GuiOrdinalIn $phase @('AD','Both') -IgnoreCase) -and -not $finish) {
         switch (Get-PraGuiField 'Source') {
             'Single' { $identity=Get-PraGuiField 'Identity'; if (-not $identity) { throw 'Type the identity of the account to process.' } }
             'Ou' { $ou=Get-PraGuiField 'Ou'; if (-not $ou) { throw 'Pick or type the distinguished name of the OU.' } }
@@ -1488,7 +1548,7 @@ function Get-PraGuiWindowRequest {
     }
     $once=[bool](Get-PraGuiField 'ExpOnce') -and ((Test-GuiOrdinal $action 'Check' -IgnoreCase) -or ((Test-GuiOrdinalIn $action @('Convert','Recover') -IgnoreCase) -and (-not (Test-GuiOrdinal $phase 'AD' -IgnoreCase))))
     $pass=if ((Test-GuiOrdinal $action 'Finalize' -IgnoreCase)) { 'AD' } else { $phase }
-    return New-PraGuiRequest -Action $action -Mode $Mode -Phase $pass -Batch $batch -Identity $identity -SearchBase $ou -CsvPath $csv -Scope (Get-PraGuiField 'Scope') -MaxObjects $limit -Expect (Get-PraGuiField 'ExpExpect') -Once $once
+    return New-PraGuiRequest -Action $action -Mode $Mode -Phase $pass -Batch $batch -Identity $identity -SearchBase $ou -CsvPath $csv -Scope (Get-PraGuiField 'Scope') -MaxObjects $limit -Expect (Get-PraGuiField 'ExpExpect') -Once $once -Finish $finish
 }
 
 function Test-PraGuiTaskReady {
@@ -1569,7 +1629,7 @@ function Update-PraGuiTaskView {
         $c.SourceInfo.Text=$(if ((Test-GuiOrdinal $source 'Csv' -IgnoreCase) -and (Get-PraGuiField 'Csv')) { $text[1] } else { '' })
     }
     $c.BatchHelp.Text=switch ($action) {
-        'Convert' { 'Batches and packages found for this environment folder. Pick the one to continue; greyed ones have nothing to do in the cloud.' }
+        'Convert' { 'Batches and packages found for this environment folder. Pick the one to continue; greyed ones have nothing to do in the cloud. A batch marked "finish it here" is missing its sync or its package: it is finished on this server, and the directory is not changed again.' }
         'Recover' { if ((Test-GuiOrdinal $g.Mode 'New' -IgnoreCase)) { 'Pick the conversion batch to roll back.' } else { 'Pick the rollback to continue in the cloud.' } }
         'Finalize' { 'Pick the Finalize package to complete. A package appears when the cloud part of a rollback asks for a final AD restore.' }
         default { '' }
@@ -1607,7 +1667,7 @@ function Update-PraGuiVerifyView {
         $(if ($changed) { "`n`n" + (ConvertTo-PraGuiPlural $changed 'value differs' 'values differ') + ' from the configuration file, for this run only.' } else { '' })
     $phase=Get-PraGuiPhase
     if (-not ($g.Run -and (Test-GuiOrdinal $g.Run.Request.Mode 'Preview' -IgnoreCase))) {
-        $titles=@(Get-PraGuiPlanTitle $action $phase)
+        $titles=@(Get-PraGuiPlanTitle $action $phase $(if (Test-PraGuiFinishRow $g.SelectedBatch) { [string]$g.SelectedBatch.Path } else { '' }))
         $plan=New-Object 'Collections.ObjectModel.ObservableCollection[object]'
         for ($i=0; $i -lt $titles.Count; $i++) { $plan.Add((New-PraGuiRow @{ N=[string]($i+1); Title=$titles[$i]; What=[string]$script:GuiStepInfo[$titles[$i]] })) }
         $c.PlanList.ItemsSource=$plan
@@ -1831,7 +1891,7 @@ function Initialize-PraGuiRunModel {
     $g=$script:Gui; $c=$g.Controls
     $steps=New-Object 'Collections.ObjectModel.ObservableCollection[object]'
     $model=@{ Steps=$steps; ById=@{}; Objects=@{}; Messages=@{}; Raw=@{}; Current=''; Follow=$true; Dirty=$true; Selected=$null; Info=@{}; BatchBackup='' }
-    $titles=@(Get-PraGuiPlanTitle $Request.Action $Request.Phase)
+    $titles=@(Get-PraGuiPlanTitle $Request.Action $Request.Phase ([string](Get-PraGuiValue $Request 'Batch' '')))
     for ($i=0; $i -lt $titles.Count; $i++) {
         $row=New-PraGuiStepRow ('s'+($i+1)) ($i+1) $titles[$i]
         $steps.Add($row); $model.ById[$row.Id]=$row
@@ -2588,6 +2648,8 @@ function Update-PraGuiNext {
     $hostText=$env:COMPUTERNAME
     $time=$last.StartedAt.ToString('HH:mm',[Globalization.CultureInfo]::InvariantCulture)
     $steps=@(Get-PraGuiValue $r 'nextSteps' @())
+    $syncLines=@($steps | Where-Object { ([string]$_).StartsWith('AD is changed and verified.',[StringComparison]::Ordinal) -or ([string]$_).StartsWith('Run a delta sync on ',[StringComparison]::Ordinal) })
+    $syncFailed=@($steps | Where-Object { ([string]$_).StartsWith('AD is changed and verified.',[StringComparison]::Ordinal) }).Count -gt 0
     $commands=@($steps | Where-Object { ([string]$_).Contains('Invoke-PraRemoteMailbox') })
     if ($commands.Count) { $c.NextCmd.Text=[string]$commands[$commands.Count-1]; $c.NextCmdBox.Visibility='Visible' }
     if (-not $last.Valid) {
@@ -2622,9 +2684,16 @@ function Update-PraGuiNext {
         $inbox=Join-Path $g.State.Config.Storage.BackupFolder 'Inbox'
         $taskName=switch ($kind) { 'Convert' { "'Move mailboxes to Exchange Online'" } 'Recover' { "'Roll back a conversion'" } default { "'Complete a rollback'" } }
         $continue=if (Test-GuiOrdinal $kind 'Finalize') { "click 'Import package...' and pick the file" } else { "choose 'Continue an existing batch', click 'Import package...' and pick the file" }
-        Add-PraGuiNextStep 1 "Copy this one file to the $target server, anywhere you like. It carries everything the next part needs, with its checksums."
-        Add-PraGuiNextStep 2 "On the $target server, open this console (Invoke-PraRemoteMailbox.ps1 -Gui)."
-        Add-PraGuiNextStep 3 "Choose $taskName, $continue. Or drop the file in $inbox : it is listed by itself."
+        # The Entra Connect sync could not start after the AD changes: the package is written all the same, but the sync comes first (the engine says why and what to run).
+        if ($syncLines.Count) {
+            if ($syncFailed) { $c.NextTitle.Text='The Active Directory part is done, but the sync did not start' }
+            $c.NextLead.Text="Run the sync first (see the steps below), then copy ONE file to the $target server: $(Split-Path $package -Leaf)"
+        }
+        $stepNumber=0
+        foreach ($line in $syncLines) { $stepNumber++; Add-PraGuiNextStep $stepNumber ([string]$line) }
+        Add-PraGuiNextStep ($stepNumber+1) "Copy this one file to the $target server, anywhere you like. It carries everything the next part needs, with its checksums."
+        Add-PraGuiNextStep ($stepNumber+2) "On the $target server, open this console (Invoke-PraRemoteMailbox.ps1 -Gui)."
+        Add-PraGuiNextStep ($stepNumber+3) "Choose $taskName, $continue. Or drop the file in $inbox : it is listed by itself."
         $timelineKind=$kind
     } else {
         $pendingCount=[int](Get-PraGuiValue $r 'pending' 0)
@@ -2636,6 +2705,7 @@ function Update-PraGuiNext {
             default { if ($pendingCount -le 0) { $c.NextTitle.Text='The run is complete'; $c.NextLead.Text=$(if ((Test-GuiOrdinal $action 'Convert' -IgnoreCase)) { 'Nothing else to do. Keep the batch folder: it is needed if you ever roll this batch back.' } else { 'Nothing else to do for this part.' }) } }
         }
         if ($pendingCount -gt 0) { $c.NextLead.Text='Read the steps below, then run the command they give.' }
+        if ($syncFailed) { $c.NextTitle.Text='The Active Directory part is done, but the sync did not start' }
         $number=0
         foreach ($line in $steps) { $number++; Add-PraGuiNextStep $number ([string]$line) }
         if ((Test-GuiOrdinal $action 'Check' -IgnoreCase)) { Add-PraGuiNextStep 1 "Optional: run 'Check a mailbox' again later to see the cloud settle." }
@@ -2657,6 +2727,7 @@ function Update-PraGuiNext {
         'Finalize' { Add-PraGuiTimeline 'Active Directory' 'Done earlier' 'Ok' $false; Add-PraGuiTimeline 'Cloud' 'Done earlier' 'Ok' $false; Add-PraGuiTimeline 'Finalize' "Done $time, verified" 'Ok' $true }
         default { Add-PraGuiTimeline 'Active Directory' 'Read, see the report' 'Ok' $false; Add-PraGuiTimeline 'Cloud' 'Read, see the report' 'Ok' $false; Add-PraGuiTimeline 'Finalize' 'Not part of a check' 'Skip' $true }
     }
+    if ($syncLines.Count -and $g.TimelineRows.Count) { Set-PraGuiRow $g.TimelineRows[0] @{ Caption="Done $time on $hostText; the sync is still to run"; Status='Wait' } }
 }
 #endregion
 

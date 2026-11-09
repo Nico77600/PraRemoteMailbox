@@ -38,6 +38,10 @@ $steps = switch ("$Action|$Phase") {
     'Check|Cloud' { @('Exchange Online and Microsoft Graph', 'Mailbox check') }
     default { @('Loading the batch of the AD phase', 'Exchange Online: mailboxes, licences and permissions') }
 }
+# Finishing a batch whose AD part is done (Convert -Phase AD -Batch): the sync again, then the package; Active Directory is not written.
+if ($Action -eq 'Convert' -and $Phase -eq 'AD' -and $Batch) { $steps = @('Loading the batch of the AD phase', 'Entra Connect synchronisation', 'Creating the transfer package') }
+# A file syncfail.flag makes the sync of a new conversion fail after the AD changes, as it does when the account has no right on the Entra Connect server.
+$syncFailed = (Test-Path (Join-Path $here 'syncfail.flag')) -and -not $Batch
 $total = $steps.Count
 Ev @{kind = 'start'; title = 'PRA Remote Mailbox'; action = $Action; mode = $Mode; phase = $Phase }
 Ev @{kind = 'plan'; steps = @(for ($i = 0; $i -lt $total; $i++) { @{id = 's' + ($i + 1); label = $steps[$i]; count = $null } }) }
@@ -71,7 +75,11 @@ for ($i = 0; $i -lt $total; $i++) {
             Start-Sleep -Milliseconds 400
         }
     }
-    if ($label -eq 'Entra Connect synchronisation' -and $apply) {
+    if ($label -eq 'Entra Connect synchronisation' -and $apply -and $syncFailed) {
+        Ev @{kind = 'item'; stepId = $id; status = 'Warn'; text = 'Entra Connect sync could not run on SRV-AADC01: this account has no right on SRV-AADC01: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncOperators). The AD changes are already made and verified; the sync is the next step.'; identity = ''; name = ''; detail = '' }
+        $state = 'warn'
+    }
+    elseif ($label -eq 'Entra Connect synchronisation' -and $apply) {
         Ev @{kind = 'item'; stepId = $id; status = 'Info'; text = 'Delta cycle started on SRV-AADC01, waiting for its end (max 15 min)...'; identity = ''; name = ''; detail = '' }
         foreach ($a in 1..3) { Ev @{kind = 'progress'; stepId = $id; current = $a * 10; total = 900; attempt = $a; maxAttempts = 13; nextInSeconds = 10; text = 'Entra Connect synchronisation cycle in progress on SRV-AADC01' }; Start-Sleep -Milliseconds 300 }
         Hold 'entra'
@@ -103,6 +111,7 @@ if ($pkgName) { $pkg = Join-Path $here ('Backups\Outbox\' + $pkgName); $null = N
 $n = $objs.Count
 $globalReport = ''; if ($apply -and -not $pkg -and $Phase -in @('Both', 'Cloud', 'Finalize')) { $globalReport = Join-Path $here 'reports\PRA_global.html'; $null = New-Item -ItemType Directory -Path (Split-Path $globalReport) -Force; [IO.File]::WriteAllText($globalReport, '<html></html>') }
 $next = if ($pkgKind -eq 'Finalize') { @("Copy $pkgName to the AD server (anywhere), then run there:", ".\Invoke-PraRemoteMailbox.ps1 -Action Finalize -Mode Apply -Batch '$pkgName'") }
+elseif ($pkg -and $syncFailed) { @('AD is changed and verified. The Entra Connect sync could not start: this account has no right on SRV-AADC01: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncOperators).', 'Run a delta sync on SRV-AADC01 (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).', "Copy $pkgName to the cloud server (anywhere), then run there:", ".\Invoke-PraRemoteMailbox.ps1 -Action $pkgKind -Phase Cloud -Mode Apply -Batch '$pkgName'") }
 elseif ($pkg) { @("Copy $pkgName to the cloud server (anywhere), then run there:", ".\Invoke-PraRemoteMailbox.ps1 -Action $pkgKind -Phase Cloud -Mode Apply -Batch '$pkgName'") }
 elseif ($apply -and $Action -eq 'Convert') { @('To roll back this batch later: .\Invoke-PraRemoteMailbox.ps1 -Action Recover -Mode Preview -Batch 490cc62e') } else { @() }
 Ev @{kind = 'result'; status = $(if ($pkg) { 'Pending' } elseif ($apply) { 'Success' } else { 'Planned' }); exitCode = $(if ($pkg) { 2 } else { 0 }); action = $Action; mode = $Mode; phase = $Phase; success = $(if ($pkgKind -eq 'Finalize') { $n - 1 } elseif ($apply -and -not $pkg) { $n } else { 0 }); error = 0; pending = $(if ($pkgKind -eq 'Finalize') { 1 } elseif ($pkg) { $n } else { 0 }); skipped = 0; planned = $(if ($apply) { 0 } else { $n }); total = $n; issues = @()

@@ -1637,6 +1637,177 @@ try {
     }
 }
 
+Describe 'Release 3.1.2 - the console finishes a Convert batch whose AD part is done without its sync or package (mocked probes, no engine)' -Tag 'Release312' {
+    It 'refuses a batch with Convert -Phase AD unless the window finishes a batch, and builds the engine command of the finish' {
+        { & (Get-Module PRA.Gui) { New-PraGuiRequest -Action Convert -Phase AD -Batch 'C:\x\Convert-1.json' } } | Should -Throw '*must not receive a batch*'
+        { & (Get-Module PRA.Gui) { New-PraGuiRequest -Action Convert -Phase Both -Batch 'C:\x\Convert-1.json' -Finish $true } } | Should -Throw '*needs a Convert batch and the AD phase*'
+        { & (Get-Module PRA.Gui) { New-PraGuiRequest -Action Recover -Phase AD -Batch 'C:\x\Convert-1.json' -Finish $true } } | Should -Throw '*needs a Convert batch and the AD phase*'
+        $request = & (Get-Module PRA.Gui) { New-PraGuiRequest -Action Convert -Mode Apply -Phase AD -Batch 'C:\x\Convert-1.json' -Finish $true }
+        $request.Phase | Should -BeExactly 'AD'
+        $request.Batch | Should -BeExactly 'C:\x\Convert-1.json'
+        $command = Get-PraGuiCommand -Root 'C:\x' -ConfigPath 'C:\x\c.psd1' -Request $request
+        ($command.Tokens -join ' ') | Should -Match '-Action Convert -Mode Apply .*-Phase AD -Batch C:\\x\\Convert-1\.json'
+        $command.NeedsCloudWindow | Should -BeFalse -Because 'finishing the AD side never signs in to the cloud'
+        ($command.Tokens -join ' ') | Should -Not -Match '-Identity|-SearchBase|-CsvPath'
+        (& (Get-Module PRA.Gui) { Get-PraGuiPlanTitle 'Convert' 'AD' 'C:\x\Convert-1.json' }) -join '|' | Should -BeExactly 'Loading the batch of the AD phase|Entra Connect synchronisation|Creating the transfer package'
+        (& (Get-Module PRA.Gui) { Get-PraGuiPlanTitle 'Convert' 'AD' '' }).Count | Should -BeGreaterThan 4
+    }
+    It 'marks the batches to finish in Continue a batch, plans them as AD-side steps, and leaves the other batches to the cloud part' {
+        $runtime = New-GuiTestRoot
+        $outbox = Join-Path $runtime.Root 'Backups\Outbox'
+        $syncFailed = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $syncFailed.Folder ('Journal-' + $syncFailed.Id + '.jsonl')) ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Failed`"}`r`n")
+        $done = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $done.Folder ('Journal-' + $done.Id + '.jsonl')) ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Completed`"}`r`n")
+        $orphan = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $orphan.Folder 'NOT-APPLIED.txt') 'Nothing was written to Active Directory by this batch.'
+        $packaged = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $outbox ('PRA-GuiSynthetic-Convert-' + $packaged.Id.Substring(0, 8) + '-for-Cloud.zip')) 'x'
+        $probe = Join-Path $runtime.Root 'wpf-probe-finish.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$SyncFailedId,$DoneId,$PackagedId,$OrphanId)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+function RowOf($Window,[string]$Id){ return ,@($Window.BatchRows | Where-Object { $_.BatchId -ceq $Id })[0] }
+$script:HasCloud=$true
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$script:HasCloud; Role=$(if($script:HasCloud){'Both'}else{'AD'}) } }
+function New-FinishWindow([bool]$Cloud){
+  $script:HasCloud=$Cloud
+  $window=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect
+  $window.Form.Show()
+  Click $window 'BtnNext'
+  $window.Controls['T_Convert'].IsChecked=$true; Pump 80
+  $window.Controls['Mode_Continue'].IsChecked=$true; Pump 80
+  Click $window 'BtnReload'; Pump 80
+  return $window
+}
+
+# --- A: a server that does both sides: only the batch whose sync failed is finished here; the others go on with the cloud part
+$g=New-FinishWindow $true
+try {
+ $c=$g.Controls
+ $failed=RowOf $g $SyncFailedId; $complete=RowOf $g $DoneId; $packaged=RowOf $g $PackagedId
+ if(-not $failed -or -not $complete -or -not $packaged){throw ('Batches not listed: '+$g.BatchRows.Count)}
+ if($failed.State -cne 'AD part done, sync did not run: finish it here' -or $failed.Level -cne 'Warn' -or -not $failed.Selectable -or -not $failed.Finish){throw ('Sync failed row: '+$failed.State+' / '+$failed.Level+' / '+$failed.Finish)}
+ if($complete.State -cne 'AD part done, cloud part to do' -or $complete.Finish){throw ('Done row: '+$complete.State)}
+ if($packaged.State -cne 'AD part done, cloud part to do' -or $packaged.Finish){throw ('Packaged row: '+$packaged.State)}
+ if($c.BatchHelp.Text -cnotmatch 'finish it here'){throw 'The list help does not explain "finish it here"'}
+ $orphanRow=RowOf $g $OrphanId
+ if(-not $orphanRow -or $orphanRow.Selectable -or $orphanRow.Finish -or $orphanRow.State -cne 'Nothing was written to AD: not a batch to continue' -or $orphanRow.Level -cne 'Warn'){throw ('A folder marked not applied is not a batch to continue: '+$orphanRow.State)}
+ $c.BatchList.SelectedItem=$failed; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: AD'){throw ('Finish phase pill: '+$c.PhasePillText.Text)}
+ if($c.PhaseText.Text -cnotmatch 'Active Directory is NOT changed again.*Entra Connect synchronisation again.*ONE transfer package'){throw ('Finish phase text: '+$c.PhaseText.Text)}
+ if($c.CmdLine.Text -cnotmatch "'-Phase' 'AD'" -or $c.CmdLine.Text -cnotmatch "'-Batch' '[^']+\.json'" -or $c.CmdLine.Text -cmatch "'-Identity'|'-SearchBase'|'-CsvPath'"){throw ('Finish command: '+$c.CmdLine.Text)}
+ if(-not $c.BtnNext.IsEnabled -or $c.BlockBox.Visibility -ne 'Collapsed'){throw 'A batch to finish must be startable'}
+ $request=& (Get-Module PRA.Gui) { Get-PraGuiWindowRequest 'Preview' }
+ if($request.Phase -cne 'AD' -or $request.Action -cne 'Convert' -or -not $request.Batch.EndsWith('.json') -or $request.MaxObjects -ne 0 -or $request.Identity -or $request.SearchBase -or $request.CsvPath){throw ('Finish request: '+($request | ConvertTo-Json -Compress))}
+ Click $g 'BtnNext'
+ if($g.Page -ne 3){throw 'Verify page not reached'}
+ $titles=@($c.PlanList.Items | ForEach-Object Title)
+ if(($titles -join '|') -cne 'Loading the batch of the AD phase|Entra Connect synchronisation|Creating the transfer package'){throw ('Finish plan: '+($titles -join '|'))}
+ & (Get-Module PRA.Gui) { Show-PraGuiPage 2 }
+ Pump 80
+ $complete=RowOf $g $DoneId
+ $c.BatchList.SelectedItem=$complete; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: Cloud'){throw ('A completed batch continues in the cloud: '+$c.PhasePillText.Text)}
+ $request=& (Get-Module PRA.Gui) { Get-PraGuiWindowRequest 'Preview' }
+ if($request.Phase -cne 'Cloud'){throw 'A batch with its sync done is a cloud request'}
+} finally { $g.Form.Close() }
+
+# --- B: a server that cannot do the cloud part: a batch with no package is finished here; a packaged one is not
+$g=New-FinishWindow $false
+try {
+ $c=$g.Controls
+ $complete=RowOf $g $DoneId; $packaged=RowOf $g $PackagedId; $failed=RowOf $g $SyncFailedId
+ if($complete.State -cne 'AD part done, no package yet: finish it here' -or -not $complete.Finish){throw ('AD-only server, no package: '+$complete.State)}
+ if($packaged.Finish -or $packaged.State -cne 'AD part done, cloud part to do'){throw ('AD-only server, package present: '+$packaged.State+' / '+$packaged.Finish)}
+ if($failed.State -cne 'AD part done, sync did not run: finish it here'){throw ('AD-only server, sync failed: '+$failed.State)}
+ $c.BatchList.SelectedItem=$complete; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: AD' -or $c.BlockBox.Visibility -ne 'Collapsed'){throw ('AD-only finish: '+$c.PhasePillText.Text+' / '+$c.BlockBox.Visibility)}
+ $c.BatchList.SelectedItem=$packaged; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: Cloud' -or $c.BlockBox.Visibility -ne 'Visible'){throw 'A packaged batch still waits for the cloud server (blocked here)'}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('FINISH-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config,
+            '-SyncFailedId', $syncFailed.Id, '-DoneId', $done.Id, '-PackagedId', $packaged.Id, '-OrphanId', $orphan.Id)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(120000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'FINISH-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.1.2 - the Next steps page puts the sync first when it could not start after the AD changes' -Tag 'Release312' {
+    It 'shows the reason and the sync before the copy of the package, and keeps the normal page when the sync ran' {
+        $runtime = New-GuiTestRoot
+        $package = Join-Path $runtime.Root 'PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip'
+        Write-GuiTestFile $package 'x'
+        $probe = Join-Path $runtime.Root 'wpf-probe-next.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$Package)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$false; Role='AD' } }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect
+$g.Form.Show()
+function Show-Next([string[]]$Steps){
+  $result=[pscustomobject]@{ kind='result'; status='Pending'; exitCode=2; action='Convert'; mode='Apply'; phase='AD'; success=0; error=0; pending=2; skipped=0; planned=0; total=2; issues=@(); batchId='490cc62e'
+    nextSteps=$Steps; transferPackage=$Package; transferPackageKind='Convert'; logFile=''; htmlReport=''; globalReport='' }
+  $g.LastResult=$result
+  $g.LastRun=[pscustomobject]@{ Result=$result; Request=[ordered]@{Action='Convert';Phase='AD'}; StartedAt=[datetime]::Now; Valid=$true; Issue=''; ExitCode=2; Base='' }
+  & (Get-Module PRA.Gui) { Update-PraGuiNext }
+}
+try {
+ $c=$g.Controls
+ $copy='Copy PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip to the cloud server (anywhere), then run there:'
+ $command='.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch ''PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip'''
+ Show-Next @('AD is changed and verified. The Entra Connect sync could not start: this account has no right on SRV-AADC01.','Run a delta sync on SRV-AADC01 (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).',$copy,$command)
+ if($c.NextTitle.Text -cne 'The Active Directory part is done, but the sync did not start'){throw ('Title: '+$c.NextTitle.Text)}
+ if($c.NextLead.Text -cnotmatch '^Run the sync first \(see the steps below\), then copy ONE file to the cloud server: PRA-GuiSynthetic-Convert-490cc62e-for-Cloud\.zip'){throw ('Lead: '+$c.NextLead.Text)}
+ $rows=@($g.NextRows)
+ if($rows.Count -ne 5){throw ('Steps: '+$rows.Count)}
+ if($rows[0].Text -cnotmatch '^AD is changed and verified\. The Entra Connect sync could not start' -or $rows[0].N -cne '1'){throw ('Step 1: '+$rows[0].Text)}
+ if($rows[1].Text -cnotmatch '^Run a delta sync on SRV-AADC01 \(Start-ADSyncSyncCycle -PolicyType Delta\)' -or $rows[1].N -cne '2'){throw ('Step 2: '+$rows[1].Text)}
+ if($rows[2].Text -cnotmatch '^Copy this one file to the cloud server' -or $rows[2].N -cne '3'){throw ('Step 3: '+$rows[2].Text)}
+ if($c.NextCmdBox.Visibility -ne 'Visible' -or $c.NextCmd.Text -cne $command){throw 'The command for the cloud server must stay visible'}
+ $first=@($g.TimelineRows)[0]
+ if($first.Status -cne 'Wait' -or $first.Caption -cnotmatch 'the sync is still to run'){throw ('Timeline: '+$first.Status+' / '+$first.Caption)}
+ Show-Next @($copy,$command)
+ if($c.NextTitle.Text -cne 'The Active Directory part is done' -or @($g.NextRows).Count -ne 3 -or @($g.NextRows)[0].Text -cnotmatch '^Copy this one file'){throw ('Normal page: '+$c.NextTitle.Text+' / '+@($g.NextRows).Count)}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('NEXT-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config, '-Package', $package)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(120000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'NEXT-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
 AfterAll {
     if($script:GuiEvidence -and (Test-Path -LiteralPath $script:GuiEvidence)) {
         # A child of a test may still be closing its files for a moment: bounded retries, then the error is raised (never swallowed).

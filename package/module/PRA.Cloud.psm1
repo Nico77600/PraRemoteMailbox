@@ -181,7 +181,7 @@ $script:PraExoWorker = {
     }
     function Mailbox {
         param([string]$Upn,[switch]$Hold)
-        $grantParameters = @{ Filter=(ExactFilter $Upn); Properties=@('RecipientTypeDetails','EmailAddresses'); ResultSize='Unlimited' }
+        $grantParameters = @{ Filter=(ExactFilter $Upn); Properties=@('RecipientTypeDetails','EmailAddresses','LegacyExchangeDN'); ResultSize='Unlimited' }
         if ($Hold) { $grantParameters.Properties += @('IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled') }
         $items = @(Get-EXOMailbox @grantParameters -ErrorAction Stop)
         if ($Hold -and $items.Count -eq 0) { $items = @(Get-EXOMailbox @grantParameters -InactiveMailboxOnly -ErrorAction Stop) }
@@ -193,9 +193,14 @@ $script:PraExoWorker = {
         # EmailAddresses (every proxy address of the mailbox, X500 included): whether Exchange Online returned the property at all is kept apart from "empty".
         $hasAddresses = if ($m -is [System.Collections.IDictionary]) { $m.Contains('EmailAddresses') } else { $null -ne $m.PSObject.Properties['EmailAddresses'] }
         $rawAddresses = V -Object $m -Name 'EmailAddresses' -Default @()
+        # Exchange Online never lists the LegacyExchangeDN of a mailbox in its own EmailAddresses, but Entra Connect may have written it on premises as an X500 address
+        # while the object was still a MailUser: the mailbox counts as carrying X500:<its own LegacyExchangeDN> (the whole value is compared ignoring case, like every X500).
+        $ownDn = [string](V -Object $m -Name 'LegacyExchangeDN' -Default '')
+        $addressList = @($rawAddresses | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        if ($ownDn -and -not (InSetIgnoreCase ('X500:' + $ownDn) $addressList)) { $addressList += ('X500:' + $ownDn) }
         return @{ Found=$true; Type=$type; Holds=@($holds | Where-Object { $null -ne $_ }); IsInactive=[bool](V -Object $m -Name 'IsInactiveMailbox' -Default $false)
             Litigation=[bool](V -Object $m -Name 'LitigationHoldEnabled' -Default $false); RetentionHold=[bool](V -Object $m -Name 'RetentionHoldEnabled' -Default $false)
-            HasAddresses=[bool]$hasAddresses; Addresses=[string[]]@($rawAddresses | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) }
+            HasAddresses=[bool]$hasAddresses; Addresses=[string[]]$addressList }
     }
     function NormalizeAcl {
         param([object[]]$Entries,[string]$Right,$Target)
@@ -592,8 +597,12 @@ function Connect-PraCloudSession {
     # Removing a module cannot repair an already-loaded conflicting assembly.
     if ($NeedGraph -and -not $s.Graph) {
         $Context.CurrentOperation='Connect-MgGraph'
-        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-        Import-Module Microsoft.Graph.Users -ErrorAction Stop
+        # ONE version of every Graph module (the highest that exists for all, at the minimum or later): two versions in one session fail with an opaque assembly error.
+        $modules = Get-PraCloudModuleReport -MinExo ([string](Get-PraValue (Get-PraValue $Context.Config 'Exo' @{}) 'MinModuleVersion' '3.10.1'))
+        if (-not $modules.Graph.Ok) { throw $modules.Graph.Message }
+        $graphVersion = [version]$modules.Graph.Version
+        Import-Module Microsoft.Graph.Authentication -RequiredVersion $graphVersion -ErrorAction Stop
+        Import-Module Microsoft.Graph.Users -RequiredVersion $graphVersion -ErrorAction Stop
         if ($null -ne (Get-MgContext -ErrorAction Stop)) { throw 'A Microsoft Graph session already exists in this console: run the tool in a new PowerShell 7 window.' }
         $connect=@{ TenantId=$tenant; ContextScope='Process'; NoWelcome=$true; ErrorAction='Stop' }
         if ($app) { $connect.ClientId=$app; $connect.CertificateThumbprint=$thumb } else { $connect.Scopes=@('User.Read.All') }
@@ -614,10 +623,10 @@ function Connect-PraCloudSession {
     if ($NeedExo -and -not $s.Exo) {
         $Context.CurrentOperation='Connect-ExchangeOnline'
         $exo = Get-PraValue $Context.Config 'Exo' @{}
-        $min = [version][string](Get-PraValue $exo 'MinModuleVersion' '3.10.0')
-        $installed = @(Get-Module ExchangeOnlineManagement -ListAvailable | Sort-Object Version -Descending)
-        if ($installed.Count -eq 0) { throw 'ExchangeOnlineManagement module not found (Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -Force); the tool never installs modules.' }
-        $s.Subprocess = [bool](Get-PraValue $exo 'UseSubprocess' $false) -or $installed[0].Version -lt $min
+        $min = [version][string](Get-PraValue $exo 'MinModuleVersion' '3.10.1')
+        $modules = Get-PraCloudModuleReport -MinExo ([string]$min)
+        if (-not $modules.Exo.Ok) { throw ($modules.Exo.Message + ' The tool never installs modules.') }
+        $s.Subprocess = [bool](Get-PraValue $exo 'UseSubprocess' $false)
         if ($s.Subprocess) {
             if (-not $app) { throw 'Exchange Online child process required (Exo.UseSubprocess or old module): certificate sign-in is mandatory.' }
             $s.Exo=$true
@@ -933,7 +942,7 @@ function Complete-PraX500Check {
         $row.CloudDetail = ([string]$row.CloudDetail + ' | X500:present=' + $last.Total + '/' + $last.Total).Trim(' ', '|')
         return
     }
-    $advice = 'Replies to old messages and meeting updates to this mailbox can bounce (IMCEAEX NDR). Check that Entra Connect syncs proxyAddresses and legacyExchangeDN for this object, run a sync, then run -Action Check.'
+    $advice = 'Not serious: the mailbox works. Until this address appears, a reply to a very old message could bounce. To fix it, run an Entra Connect sync, then run -Action Check.'
     if ($failure) {
         $text = '{0}: X500 could not be verified in Exchange Online ({1}). {2}' -f $State.Upn, $failure, $advice
         $row.CloudDetail = ([string]$row.CloudDetail + ' | X500:not verified').Trim(' ', '|')
@@ -1104,7 +1113,10 @@ function Invoke-PraCloudPhase {
             $pending=@($states | Where-Object { -not $_.Done })
             if (-not $pending.Count -or $Context.Once -or $clock.Elapsed.TotalSeconds -ge $timeout) { break }
             $seconds=[Math]::Min([Math]::Max(1,([double]$Context.IntervalMinutes*60)),[Math]::Max(0,($timeout-$clock.Elapsed.TotalSeconds)))
-            $null=Write-PraLog -Context $Context -Message ("Not ready yet: {0} - next check in {1:0} s (waiting up to {2} min in total)" -f (($pending | ForEach-Object { $_.Upn }) -join ', '), $seconds, $Context.TimeoutMinutes) -Level Sub
+            # A mailbox that is ready and only waits for its X500 addresses is not "not ready": its own message, and the wait is at most two more checks.
+            $notReady=@($pending | Where-Object { -not $_.CoreDone })
+            if ($notReady.Count) { $null=Write-PraLog -Context $Context -Message ("Not ready yet: {0} - next check in {1:0} s (waiting up to {2} min in total)" -f (($notReady | ForEach-Object { $_.Upn }) -join ', '), $seconds, $Context.TimeoutMinutes) -Level Sub }
+            foreach ($s in @($pending | Where-Object { $_.CoreDone })) { $null=Write-PraLog -Context $Context -Message ("{0}: mailbox ready; X500 addresses not all visible yet, check {1} of {2} in {3:0} s" -f $s.Upn, ([int]$s.X500Reads + 1), $x500MaxReads, $seconds) -Level Sub }
             foreach ($s in $pending) { $null=Write-PraLog -Context $Context -Message ("{0} | {1}" -f $s.Upn, $s.Row.CloudDetail) -Level Detail }
             $intervalSeconds=[Math]::Max(1,([double]$Context.IntervalMinutes*60))
             $waitText=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { 'Waiting for Exchange Online to finish deprovisioning' } elseif ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { 'Waiting for the mailbox and licence to appear in Exchange Online' } else { 'Waiting for Exchange Online' }
