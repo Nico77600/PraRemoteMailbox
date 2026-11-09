@@ -1,9 +1,9 @@
 ﻿---
 title: PRA Remote Mailbox
 subtitle: User guide
-version: 3.1.0
+version: 3.1.1
 author: Nicolas Fabert
-updated: 2026-11-04
+updated: 2026-11-09
 runtime: PowerShell 7.5+ (engine and window)
 safety: Backup before every change
 ---

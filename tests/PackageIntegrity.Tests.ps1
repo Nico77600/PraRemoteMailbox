@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Package integrity tests for PRA Remote Mailbox 3.1.0 (offline; no AD, Exchange, Graph, signing key or network).
+    Package integrity tests for PRA Remote Mailbox 3.1.1 (offline; no AD, Exchange, Graph, signing key or network).
 .DESCRIPTION
     Three kinds of evidence, never mixed up:
       * Static: bootstrap identity and order, exact inventory, git attributes, no bypass, no private data.
@@ -12,7 +12,7 @@
         assertion depends on the observed signature state, so it is never skipped and never weakened.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.0
+    Version : 3.1.1
 #>
 #Requires -Version 7.5
 

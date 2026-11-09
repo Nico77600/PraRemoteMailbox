@@ -26,7 +26,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.0
+    Version : 3.1.1
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'

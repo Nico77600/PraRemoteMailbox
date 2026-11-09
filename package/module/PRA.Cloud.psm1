@@ -37,7 +37,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.0
+    Version : 3.1.1
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest

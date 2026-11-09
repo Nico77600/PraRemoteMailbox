@@ -19,7 +19,7 @@
 #
 @{
     RootModule            = 'PraRemoteMailbox.psm1'
-    ModuleVersion         = '3.1.0'
+    ModuleVersion         = '3.1.1'
     GUID                  = '1d97585b-d077-4d74-bf10-4e36d16308b6'
     Author                = 'Nicolas Fabert'
     Description           = 'PRA Remote Mailbox: disaster-recovery tool for an Exchange hybrid environment. Converts on-premises mailboxes to remote mailboxes and back (Active Directory and Exchange Online), with a backup before every write, a proof after it, a guided console and a transfer package between the Active Directory server and the cloud server.'
