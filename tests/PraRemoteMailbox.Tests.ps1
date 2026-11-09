@@ -4899,7 +4899,7 @@ Describe 'Release 3.0.0 - ordinal string comparison under .NET ICU (helpers and 
         }
     }
     It 'exports the ordinal helpers from PRA.Common' {
-        foreach ($name in 'Test-PraOrdinalEqual','Test-PraOrdinalIgnoreCaseEqual','Test-PraOrdinalIn','Test-PraOrdinalIgnoreCaseIn','Sort-PraOrdinal','Get-PraOrdinalUnique') {
+        foreach ($name in 'Test-PraOrdinalEqual','Test-PraOrdinalIgnoreCaseEqual','Test-PraOrdinalIn','Test-PraOrdinalIgnoreCaseIn','Get-PraOrdinalSorted','Get-PraOrdinalUnique') {
             (Get-Command $name -ErrorAction Stop).ModuleName | Should -BeExactly 'PRA.Common'
         }
     }
@@ -4918,7 +4918,7 @@ Describe 'Release 3.0.0 - ordinal string comparison under .NET ICU (helpers and 
             Test-PraOrdinalIgnoreCaseIn $plain @($other) | Should -BeFalse
             @($plain, $other | Get-PraOrdinalUnique).Count | Should -Be 2
             @($plain, $other | Get-PraOrdinalUnique -IgnoreCase).Count | Should -Be 2
-            @($other, $plain | Sort-PraOrdinal -Unique).Count | Should -Be 2
+            @($other, $plain | Get-PraOrdinalSorted -Unique).Count | Should -Be 2
         }
         # The exact same text still matches (case rules unchanged).
         Test-PraOrdinalEqual $tail ('abc' + $Char) | Should -BeTrue
@@ -4934,11 +4934,11 @@ Describe 'Release 3.0.0 - ordinal string comparison under .NET ICU (helpers and 
         Test-PraOrdinalIgnoreCaseEqual 7 '7' | Should -BeTrue
         Test-PraOrdinalIn 'a' $null | Should -BeFalse
         Test-PraOrdinalIn 'a' @() | Should -BeFalse
-        (@('b','A','a','B') | Sort-PraOrdinal) -join ',' | Should -BeExactly 'A,B,a,b'
-        (@('b','A','a','B') | Sort-PraOrdinal -Descending) -join ',' | Should -BeExactly 'b,a,B,A'
-        (@('b','A','a','B') | Sort-PraOrdinal -IgnoreCase | ForEach-Object { $_.ToLowerInvariant() }) -join ',' | Should -BeExactly 'a,a,b,b'
-        (@([pscustomobject]@{N='z'},[pscustomobject]@{N='Y'},[pscustomobject]@{N='a'}) | Sort-PraOrdinal -Property N | ForEach-Object N) -join ',' | Should -BeExactly 'Y,a,z'
-        @() | Sort-PraOrdinal | Should -BeNullOrEmpty
+        (@('b','A','a','B') | Get-PraOrdinalSorted) -join ',' | Should -BeExactly 'A,B,a,b'
+        (@('b','A','a','B') | Get-PraOrdinalSorted -Descending) -join ',' | Should -BeExactly 'b,a,B,A'
+        (@('b','A','a','B') | Get-PraOrdinalSorted -IgnoreCase | ForEach-Object { $_.ToLowerInvariant() }) -join ',' | Should -BeExactly 'a,a,b,b'
+        (@([pscustomobject]@{N='z'},[pscustomobject]@{N='Y'},[pscustomobject]@{N='a'}) | Get-PraOrdinalSorted -Property N | ForEach-Object N) -join ',' | Should -BeExactly 'Y,a,z'
+        @() | Get-PraOrdinalSorted | Should -BeNullOrEmpty
         (@('x','y','x','X') | Get-PraOrdinalUnique) -join ',' | Should -BeExactly 'x,y,X'
     }
     It 'Get-PraValue finds a key by ordinal, case-insensitive match only' {
@@ -5249,7 +5249,7 @@ Describe 'Release 3.0.0 - transfer package: verification, extraction and refusal
         try {
             $names = @($zip.Entries.FullName)
             $names[0] | Should -BeExactly 'transfer.json'
-            (@($names[1..($names.Count - 1)]) -join '|') | Should -BeExactly ((@($names[1..($names.Count - 1)]) | Sort-PraOrdinal) -join '|')
+            (@($names[1..($names.Count - 1)]) -join '|') | Should -BeExactly ((@($names[1..($names.Count - 1)]) | Get-PraOrdinalSorted) -join '|')
             @($zip.Entries.LastWriteTime | ForEach-Object { $_.Year } | Get-PraOrdinalUnique) | Should -Be @('2000')
         } finally { $zip.Dispose() }
         $info = Get-PraTransferPackage -Path $made.Path -Environment LAB
@@ -5261,7 +5261,7 @@ Describe 'Release 3.0.0 - transfer package: verification, extraction and refusal
         $info.EntryCount | Should -Be (3 * $Folders.Count)
         $info.ToolVersion | Should -BeExactly '3.0.0'
         $info.NextCommand | Should -Match '-Batch'
-        @($info.Folders | Sort-PraOrdinal) -join '|' | Should -BeExactly ((@($Folders) | Sort-PraOrdinal) -join '|')
+        @($info.Folders | Get-PraOrdinalSorted) -join '|' | Should -BeExactly ((@($Folders) | Get-PraOrdinalSorted) -join '|')
         $info.SizeBytes | Should -Be ((Get-Item -LiteralPath $made.Path).Length)
         $imported = Import-PraTransferPackage -Path $made.Path -BackupFolder $w.Backups -Environment LAB
         $imported.Kind | Should -BeExactly $Kind
@@ -5763,7 +5763,7 @@ Describe 'Release 3.0.0 - effective run configuration' -Tag 'EffectiveConfig' {
         $made = New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Environment = 'LAB_RUN'; DomainController = 'dc02.gate.invalid'; Cloud = @{ TenantId = '20000000-0000-0000-0000-000000000002'; Organization = 'gate.onmicrosoft.com' }; Scope = @{ IncludeShared = $true } } -Destination $dest
         $made.Path | Should -BeExactly $dest
         $made.Hash | Should -BeExactly (Get-FileHash -LiteralPath $dest).Hash.ToLowerInvariant()
-        @($made.Keys | Sort-PraOrdinal) -join ',' | Should -BeExactly 'Cloud.Organization,Cloud.TenantId,DomainController,Environment,Scope.IncludeShared'
+        @($made.Keys | Get-PraOrdinalSorted) -join ',' | Should -BeExactly 'Cloud.Organization,Cloud.TenantId,DomainController,Environment,Scope.IncludeShared'
         (Get-FileHash -LiteralPath $runtime.ConfigPath).Hash | Should -BeExactly $baseHash
         $base = Import-PraConfiguration -Path $runtime.ConfigPath -Root $global:PraGate.Package
         $effective = Import-PraConfiguration -Path $dest -Root $global:PraGate.Package
@@ -5772,7 +5772,7 @@ Describe 'Release 3.0.0 - effective run configuration' -Tag 'EffectiveConfig' {
         $effective.Cloud.TenantId | Should -BeExactly '20000000-0000-0000-0000-000000000002'
         $effective.Scope.IncludeShared | Should -BeTrue
         $differences = @(Get-PraConfigurationDifference -Base $base -Effective $effective)
-        @($differences.Key | Sort-PraOrdinal) -join ',' | Should -BeExactly 'Cloud.Organization,Cloud.TenantId,DomainController,Environment,Scope.IncludeShared'
+        @($differences.Key | Get-PraOrdinalSorted) -join ',' | Should -BeExactly 'Cloud.Organization,Cloud.TenantId,DomainController,Environment,Scope.IncludeShared'
         ($differences | Where-Object Key -eq 'Environment').Text | Should -BeExactly 'Environment: SYNTHETIC_GATE -> LAB_RUN'
         # Everything that is not overridden is identical to the base (the difference lists exactly the overridden keys, asserted above).
         [IO.File]::ReadAllText($dest) | Should -Match 'never edit - the base file is unchanged'
@@ -5782,8 +5782,8 @@ Describe 'Release 3.0.0 - effective run configuration' -Tag 'EffectiveConfig' {
         $null = New-PraEffectiveConfiguration -BasePath $runtime.ConfigPath -Root $global:PraGate.Package -Overrides @{ Environment = 'LAB_RUN' } -Destination $dest
         $acl = [IO.FileSystemAclExtensions]::GetAccessControl((New-Object IO.FileInfo $dest))
         $acl.AreAccessRulesProtected | Should -BeTrue
-        $sids = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Get-PraOrdinalUnique -IgnoreCase | Sort-PraOrdinal)
-        $expected = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544' | Get-PraOrdinalUnique -IgnoreCase | Sort-PraOrdinal)
+        $sids = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Get-PraOrdinalUnique -IgnoreCase | Get-PraOrdinalSorted)
+        $expected = @([Security.Principal.WindowsIdentity]::GetCurrent().User.Value, 'S-1-5-18', 'S-1-5-32-544' | Get-PraOrdinalUnique -IgnoreCase | Get-PraOrdinalSorted)
         $sids -join ',' | Should -BeExactly ($expected -join ',')
     }
     It 'refuses an unknown key, a wrong type, a section mismatch, an existing destination and an invalid value, leaving no file' {
@@ -5823,7 +5823,7 @@ Describe 'Release 3.0.0 - effective run configuration' -Tag 'EffectiveConfig' {
             $run1.ExitCode | Should -Be 0 -Because ($run1.Output + $run1.Error)
             $events = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
             $result = @($events | Where-Object kind -eq 'result')[0]
-            @($result.configOverrides | Sort-PraOrdinal) -join '|' | Should -BeExactly 'Cloud.Organization: (empty) -> gate.onmicrosoft.com|Polling.TimeoutMinutes: 60 -> 30'
+            @($result.configOverrides | Get-PraOrdinalSorted) -join '|' | Should -BeExactly 'Cloud.Organization: (empty) -> gate.onmicrosoft.com|Polling.TimeoutMinutes: 60 -> 30'
             $texts = @($events | Where-Object { $_.kind -eq 'item' -and $_.text -like 'Run setting:*' })
             $texts.Count | Should -Be 2
             ($texts | ForEach-Object status | Get-PraOrdinalUnique) | Should -BeExactly 'Info'
@@ -5846,7 +5846,7 @@ Describe 'Release 3.0.0 - native process binding: SetLastError on every import, 
 
     It 'returns the existing tables and the new STARTUPINFOEXW with the methods of a handle-list launch' {
         $native = Get-PraNativeProcessApi
-        (@($native.Keys) | Sort-PraOrdinal) -join ',' | Should -BeExactly 'Api,ProcessInformation,StartupInfo,StartupInfoEx'
+        (@($native.Keys) | Get-PraOrdinalSorted) -join ',' | Should -BeExactly 'Api,ProcessInformation,StartupInfo,StartupInfoEx'
         foreach ($name in 'CreateProcessW', 'CreateProcessEx', 'InitializeProcThreadAttributeList', 'UpdateProcThreadAttribute', 'DeleteProcThreadAttributeList', 'GetExitCodeProcess', 'CloseHandle') {
             $native.Api.GetMethod($name) | Should -Not -BeNullOrEmpty -Because $name
         }

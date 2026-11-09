@@ -534,7 +534,7 @@ function Get-PraAttributeState {
         if ($present) {
             switch ($Kinds[$name]) {
                 String { $value = [string]$raw }
-                MultiString { $value = [string[]]@($raw | Sort-PraOrdinal) }
+                MultiString { $value = [string[]]@($raw | Get-PraOrdinalSorted) }
                 Bytes { $value = [Convert]::ToBase64String([byte[]]$raw) }
                 Bool { $value = [bool]$raw }
                 Int { $value = ([int]$raw).ToString([Globalization.CultureInfo]::InvariantCulture) }
@@ -579,7 +579,7 @@ function Test-PraStateEqual {
     if ([bool]$Left.Present -ne [bool]$Right.Present -or -not (Test-PraOrdinalEqual $Left.Kind $Right.Kind)) { return $false }
     if (-not $Left.Present) { return $true }
     if (Test-PraOrdinalEqual $Left.Kind 'MultiString') {
-        $a = @($Left.Value | Sort-PraOrdinal); $b = @($Right.Value | Sort-PraOrdinal)
+        $a = @($Left.Value | Get-PraOrdinalSorted); $b = @($Right.Value | Get-PraOrdinalSorted)
         if ($a.Count -ne $b.Count) { return $false }
         for ($i = 0; $i -lt $a.Count; $i++) { if (-not (Test-PraOrdinalEqual ([string]$a[$i]) ([string]$b[$i]))) { return $false } }
         return $true
@@ -816,7 +816,7 @@ function Get-PraX500Difference {
     $added = New-Object 'Collections.Generic.List[string]'
     foreach ($value in $nowX) { if (-not (Test-PraOrdinalIn $value $wasX -IgnoreCase) -and -not (Test-PraOrdinalIn $value $added.ToArray() -IgnoreCase)) { $added.Add([string]$value) } }
     $removed = @($wasX | Where-Object { -not (Test-PraOrdinalIn $_ $nowX -IgnoreCase) })
-    $a = @($now | Where-Object { -not (Test-PraX500Address $_) } | Sort-PraOrdinal); $b = @($was | Where-Object { -not (Test-PraX500Address $_) } | Sort-PraOrdinal)
+    $a = @($now | Where-Object { -not (Test-PraX500Address $_) } | Get-PraOrdinalSorted); $b = @($was | Where-Object { -not (Test-PraX500Address $_) } | Get-PraOrdinalSorted)
     $same = ($a.Count -eq $b.Count)
     if ($same) { for ($i = 0; $i -lt $a.Count; $i++) { if (-not (Test-PraOrdinalEqual ([string]$a[$i]) ([string]$b[$i]))) { $same = $false; break } } }
     return [pscustomobject]@{ OtherEqual = $same; Added = [string[]]$added.ToArray(); Removed = [string[]]@($removed) }
@@ -859,7 +859,7 @@ function Get-PraPermissionCache {
     <# Bounded cache (groups, trustees) shared by the shared mailboxes of one batch. #>
     [CmdletBinding()]
     param([hashtable]$Context)
-    $policy = (@($Context.Config.SharedMailbox.ExcludeTrusteeSamAccountNames | Sort-PraOrdinal) -join "`n")
+    $policy = (@($Context.Config.SharedMailbox.ExcludeTrusteeSamAccountNames | Get-PraOrdinalSorted) -join "`n")
     $cache = $null
     if ($script:PermissionCaches.TryGetValue($Context, [ref]$cache)) {
         if ((Test-PraOrdinalIgnoreCaseEqual $cache.Server $Context.Server) -and (Test-PraOrdinalEqual $cache.Policy $policy)) { return $cache }
@@ -927,7 +927,7 @@ function Expand-PraTrustee {
             }
         }
     }
-    $result = [string[]]@($upns | Sort-PraOrdinal -IgnoreCase)
+    $result = [string[]]@($upns | Get-PraOrdinalSorted -IgnoreCase)
     # An enumeration error never reaches this point: a partial expansion is never cached.
     Add-PraPermissionCache -Context $Context -Key $key -Upns $result
     Write-PraLog -Context $Context -Message ("PERMISSIONS GROUP END | unique members=$($seen.Count) | unique UPN=$($result.Count)") -Level Debug
@@ -1079,7 +1079,7 @@ function Get-PraSharedPermission {
     Write-PraMemoryStage -Context $Context -Stage 'PERMISSIONS CAPTURED' -Identity ([string]$User.ObjectGUID) -Detail ("FullAccess=$($full.Count) SendAs=$($send.Count) SendOnBehalf=$($behalf.Count)")
     $ignored = @(@($unknownFullAccess | ForEach-Object { "FullAccess $_" }) + @($unknownSendAs | ForEach-Object { "SendAs $_" }))
     if ($ignored.Count) { $Context['_PraIgnoredTrustees'][([guid]$User.ObjectGUID).ToString()] = [string[]]$ignored }
-    return @{ FullAccess=@($full | Sort-PraOrdinal -IgnoreCase); SendAs=@($send | Sort-PraOrdinal -IgnoreCase); SendOnBehalf=@($behalf | Sort-PraOrdinal -IgnoreCase) }
+    return @{ FullAccess=@($full | Get-PraOrdinalSorted -IgnoreCase); SendAs=@($send | Get-PraOrdinalSorted -IgnoreCase); SendOnBehalf=@($behalf | Get-PraOrdinalSorted -IgnoreCase) }
 }
 #endregion
 
@@ -1200,7 +1200,7 @@ function New-PraPlan {
         if ($x500.Added.Count) {
             $originalValues = if ([bool]$originalProxies.Present) { @([string[]]@($originalProxies.Value)) } else { @() }
             $keptX500 = @($x500.Added)
-            $desired.proxyAddresses = @{ Present=$true; Kind='MultiString'; Value=[string[]]@(@($originalValues) + @($keptX500) | Sort-PraOrdinal) }
+            $desired.proxyAddresses = @{ Present=$true; Kind='MultiString'; Value=[string[]]@(@($originalValues) + @($keptX500) | Get-PraOrdinalSorted) }
         }
         $sourceGroup = Get-PraValue $SourceRecord 'Licensing' $null
         if ($null -ne $sourceGroup -and $sourceGroup.Enabled) {

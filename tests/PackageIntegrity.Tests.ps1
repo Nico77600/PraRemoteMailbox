@@ -249,6 +249,33 @@ Describe 'Module manifest - PraRemoteMailbox.psd1 and its root module' {
         foreach ($name in $script:ManifestData.FunctionsToExport) { $exported -ccontains $name | Should -BeTrue -Because $name }
         [regex]::Match($result.Text, '(?m)^PARTS=(.*)$').Groups[1].Value.Trim() | Should -BeExactly 'PRA.Backup,PRA.Common,PRA.Directory'
     }
+    It 'exports only approved verbs and prints no warning when the manifest and every module are imported (the console start shows none)' {
+        $paths = @("'$(Join-Path $script:Fixture 'PraRemoteMailbox.psd1')'") + @(Get-ChildItem -LiteralPath (Join-Path $script:Fixture 'module') -Filter '*.psm1' | Sort-Object Name | ForEach-Object { "'$($_.FullName)'" })
+        $command = @(
+            'try {'
+            '$warned = New-Object ''Collections.Generic.List[string]'''
+            "foreach (`$path in @($($paths -join ','))) {"
+            '$module = Import-Module -Name $path -Force -PassThru -ErrorAction Stop -WarningVariable captured'
+            'foreach ($item in @($captured)) { $warned.Add([string]$item) }'
+            'foreach ($name in $module.ExportedCommands.Keys) { ''COMMAND='' + $module.Name + '':'' + $name }'
+            '}'
+            '''WARNINGS='' + $warned.Count'
+            '} catch { [Console]::Error.WriteLine($_.Exception.Message); exit 1 }'
+        ) -join "`n"
+        $result = Invoke-Pwsh -Arguments @('-Command', $command)
+        $result.Code | Should -Be 0 -Because $result.Text
+        [regex]::Match($result.Text, '(?m)^WARNINGS=(.*)$').Groups[1].Value.Trim() | Should -BeExactly '0' -Because $result.Text
+        $result.Text | Should -Not -Match '(?m)^WARNING:' -Because 'a warning text would be printed at the console start'
+        $verbs = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([string[]]@(Get-Verb | ForEach-Object Verb)), ([StringComparer]::Ordinal)
+        $commands = @([regex]::Matches($result.Text, '(?m)^COMMAND=(?<Module>[^:]+):(?<Name>\S+)\s*$') | ForEach-Object { [pscustomobject]@{ Module = $_.Groups['Module'].Value; Name = $_.Groups['Name'].Value } })
+        $commands.Count | Should -BeGreaterThan 100
+        foreach ($module in 'PraRemoteMailbox', 'PRA.Common', 'PRA.Directory', 'PRA.Backup', 'PRA.Cloud', 'PRA.Gui') {
+            @($commands | Where-Object { $_.Module -ceq $module }).Count | Should -BeGreaterThan 0 -Because $module
+        }
+        foreach ($command in $commands) {
+            $verbs.Contains($command.Name.Split('-')[0]) | Should -BeTrue -Because "$($command.Name) (exported by $($command.Module)) must use a verb from Get-Verb"
+        }
+    }
     It 'is refused by Windows PowerShell 5.1 with the minimum version in the message' {
         $command = "try { Import-Module -Name '$(Join-Path $script:Fixture 'PraRemoteMailbox.psd1')' -Force -ErrorAction Stop; 'LOADED' } catch { [Console]::Error.WriteLine(`$_.Exception.Message); exit 1 }"
         $output = & $script:Ps51 -NoLogo -NoProfile -NonInteractive -Command $command 2>&1 | ForEach-Object { [string]$_ }

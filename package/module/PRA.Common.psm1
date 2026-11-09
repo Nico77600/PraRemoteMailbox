@@ -131,7 +131,7 @@ function Test-PraOrdinalIgnoreCaseIn {
     return (Test-PraOrdinalIn -Value $Value -Set $Set -IgnoreCase)
 }
 
-function Sort-PraOrdinal {
+function Get-PraOrdinalSorted {
     <#
     .SYNOPSIS
         Sorts strings (or objects by one string property) by UTF-16 code unit: the culture-free, reproducible order that canonical forms
@@ -1874,7 +1874,7 @@ function Invoke-PraTransferPackage {
         }
         if ($expected.Count -ne $files.Count) { throw 'Transfer package: an entry listed in transfer.json is missing from the package.' }
         $prefix = $script:PraTransferKinds[$kind].Prefix
-        $folders = @($files | ForEach-Object { ([string]$_.FullName).Split('/')[0] } | Get-PraOrdinalUnique | Sort-PraOrdinal)
+        $folders = @($files | ForEach-Object { ([string]$_.FullName).Split('/')[0] } | Get-PraOrdinalUnique | Get-PraOrdinalSorted)
         foreach ($folder in $folders) { if (-not $folder.StartsWith($prefix, [StringComparison]::Ordinal)) { throw ("Transfer package: a {0} package holds {1}* folders only." -f $kind, $prefix) } }
         if (-not (Test-PraOrdinalIn ($prefix + $batchId) $folders -IgnoreCase)) { throw 'Transfer package: the folder of the batch named in transfer.json is not in the package.' }
         # Content: hash of every entry, from the stream, with a hard bound on the bytes actually produced. Nothing is written yet.
@@ -2063,7 +2063,7 @@ function New-PraTransferPackage {
     }
     if (-not $items.Count) { throw 'Transfer package: the folders hold no file.' }
     if ($items.Count -gt $limits.MaxEntries) { throw 'Transfer package: too many files.' }
-    $ordered = @($items | Sort-PraOrdinal -Property Name)
+    $ordered = @($items | Get-PraOrdinalSorted -Property Name)
     $names = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
     foreach ($item in $ordered) { if (-not $names.Add($item.Name)) { throw ("Transfer package: duplicate file name '{0}'." -f $item.Name) } }
     $manifest = [ordered]@{
@@ -2129,7 +2129,7 @@ function ConvertTo-PraDataLiteral {
         return "'" + $escaped + "'"
     }
     if ($Value -is [Collections.IDictionary]) {
-        $keys = @($Value.Keys | ForEach-Object { [string]$_ } | Sort-PraOrdinal)
+        $keys = @($Value.Keys | ForEach-Object { [string]$_ } | Get-PraOrdinalSorted)
         if (-not $keys.Count) { return '@{}' }
         $lines = foreach ($key in $keys) {
             if ($key -notmatch '\A[A-Za-z][A-Za-z0-9_]{0,63}\z') { throw "Configuration key '$key' is not valid." }
@@ -2148,7 +2148,7 @@ function ConvertTo-PraDataLiteral {
 function Get-PraConfigurationFlat {
     <# Dotted key -> text, for every leaf of a configuration (lists are joined with ', '); '_Path' is not a setting. #>
     param([Parameter(Mandatory)][Collections.IDictionary]$Configuration, [string]$Prefix = '')
-    foreach ($key in @($Configuration.Keys | ForEach-Object { [string]$_ } | Sort-PraOrdinal)) {
+    foreach ($key in @($Configuration.Keys | ForEach-Object { [string]$_ } | Get-PraOrdinalSorted)) {
         if ($key.StartsWith('_', [StringComparison]::Ordinal)) { continue }
         $value = $Configuration[$key]
         if ($value -is [Collections.IDictionary]) { Get-PraConfigurationFlat -Configuration $value -Prefix ($Prefix + $key + '.') }
@@ -2175,7 +2175,7 @@ function Get-PraConfigurationDifference {
 function Get-PraOverrideKey {
     <# Dotted names of the leaves of an overrides table. #>
     param([Collections.IDictionary]$Overrides, [string]$Prefix = '')
-    foreach ($key in @($Overrides.Keys | ForEach-Object { [string]$_ } | Sort-PraOrdinal)) {
+    foreach ($key in @($Overrides.Keys | ForEach-Object { [string]$_ } | Get-PraOrdinalSorted)) {
         $value = $Overrides[$key]
         if ($value -is [Collections.IDictionary]) { Get-PraOverrideKey -Overrides $value -Prefix ($Prefix + $key + '.') } else { $Prefix + $key }
     }
@@ -2828,7 +2828,7 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Sort-PraOrdinal, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
