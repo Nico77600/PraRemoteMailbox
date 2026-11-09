@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # window, run context, report, audit). The literal comments "Version : x.y.z" of the file headers cannot be
 # computed (the signature and the manifest hash the exact bytes): they are listed in the guide, annex D, and
 # checked against this value by the tests. tools\New-PraPackage.ps1 reads the version from this line.
-$script:ToolVersion = '3.1.1'
+$script:ToolVersion = '3.1.2'
 $script:TranscriptOwner = $null
 $script:PraNativePath = $null
 $script:PraNativeProcess = $null
@@ -560,7 +560,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v3.1.1 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v3.1.2 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)

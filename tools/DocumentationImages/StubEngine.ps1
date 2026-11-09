@@ -9,7 +9,7 @@
     Nothing here reads Active Directory, Exchange Online, Microsoft Graph or Entra Connect.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
     Part of : PRA Remote Mailbox (repository tool, not in the package)
 #>
 param($Action, $Mode, $ConfigPath, $Scope, $Phase, $Identity, $MaxObjects, $SearchBase, $CsvPath, $Batch, $BaseConfigPath, $Expect, [switch]$Once, [switch]$Force)

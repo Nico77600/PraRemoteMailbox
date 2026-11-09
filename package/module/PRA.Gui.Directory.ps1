@@ -4,7 +4,7 @@
     Reads the OU list for the WPF selector on the configured writable DC. No directory writes.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
 #>
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$ConfigPath, [Parameter(Mandatory)][string]$ResultPath, [string]$Identity = '', [string]$PackagePath = '', [string]$Environment = '', [string]$BackupFolder = '', [switch]$Import)

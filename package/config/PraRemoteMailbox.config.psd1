@@ -2,7 +2,7 @@
 #  PRA Remote Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 3.1.1
+#  Version : 3.1.2
 #
 #  This file is read by Invoke-PraRemoteMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.

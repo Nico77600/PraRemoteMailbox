@@ -8,7 +8,7 @@
     nothing else (no directory read).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
     Part of : PRA Remote Mailbox (repository tool, not in the package)
 #>
 param([string]$ConfigPath, [string]$ResultPath, [string]$Identity = '', [string]$PackagePath = '', [string]$Environment = '', [string]$BackupFolder = '', [switch]$Import)

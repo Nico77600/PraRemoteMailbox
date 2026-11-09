@@ -1,5 +1,7 @@
-﻿# PRA Remote Mailbox 3.1.1 - authenticated package integrity manifest
+﻿# PRA Remote Mailbox 3.1.2 - authenticated package integrity manifest
 # Generated only after the final stable-file signatures and timestamps.
+# DRAFT FOR 3.1.2 (unsigned): the SHA256 of the non-PowerShell files are current; the SHA256 of the PowerShell files and this
+# file's signature are NOT regenerated. The owner signs the PowerShell files, then regenerates and signs this manifest.
 @{
     SchemaVersion = 1
     Algorithm = 'SHA256'
@@ -16,15 +18,15 @@
         @{ Path = 'module\PRA.Gui.Directory.ps1'; Sha256 = 'BAAEF3DA87298C5557653AAB2B6C1CB8A0F2E027B61BB9A028411B0EFE5CB26B' }
         @{ Path = 'module\Test-PackageIntegrity.ps1'; Sha256 = 'E28EA67BE7806D16F3D36846C9B67E6E54105CD5ADD2A685D39DE08F255178E9' }
         @{ Path = 'module\PRA.Gui.xaml'; Sha256 = 'D392FF147CB10F853387BFA58F1330D974C2CCA309DFC2278051654AA06719FD' }
-        @{ Path = 'templates\Report.template.html'; Sha256 = 'DF102677910353421E60C0EC551B1F937FAFD7AED82718FEBE489DDD9988D1A6' }
+        @{ Path = 'templates\Report.template.html'; Sha256 = 'BC9F3246EAD4B9DB12309F73CD2596FBD814DE9A779BCB1BDD75B5C4687670EC' }
         @{ Path = 'config\Targets.sample.csv'; Sha256 = '564C746AFDE5A5EADEBFD4449A7BB372B4D63E8B7C8352ACF825458650A458EF' }
         @{ Path = 'config\SharedPermissions.sample.csv'; Sha256 = '7838261190B01E705505EAE8C1664FCFD9143E4E3F39D3E0968A02A0B7951B5F' }
-        @{ Path = 'README.md'; Sha256 = 'C88076428F2E0F86F26D799C5BC61FEBC8B2BD290E6FF19018C9922527DB36D4' }
+        @{ Path = 'README.md'; Sha256 = '37BE8A7553A8D6A2135F59558DDD2F043264422C45D0A08DE57A41885818FC64' }
         @{ Path = 'LICENSE'; Sha256 = 'A91A28EED601C15D06E439F83666F0EBE1AA7897DE37D350108147C7804FD94B' }
-        @{ Path = 'docs\PraRemoteMailbox-Guide.html'; Sha256 = 'BEED6E7D79365E5F03F44AB5539D6F2E75AA7E0F86E761358289E728E022970C' }
-        @{ Path = 'docs\PraRemoteMailbox-Guide.md'; Sha256 = '699D2659252122D91C5174E799FC2C47CEC21D90A64AE14AD9811A302AD6CE00' }
-        @{ Path = 'docs\PraRemoteMailbox-UserGuide.html'; Sha256 = 'B79F52F7B44BE72765B0E1285ADE3FE9A8CB28946DA4D8DAFBF64EDED4173319' }
-        @{ Path = 'docs\PraRemoteMailbox-UserGuide.md'; Sha256 = 'A3D3CD43D7DCBAD308EC8288E50922FE933B623198BAEC5BA8603F738F613E94' }
+        @{ Path = 'docs\PraRemoteMailbox-Guide.html'; Sha256 = '862D9919E8B2872B981EDABB563AC64EBC5F249364D918865D98ACC6D8ACD46B' }
+        @{ Path = 'docs\PraRemoteMailbox-Guide.md'; Sha256 = 'B81E6B5260C93DF8254F79937A4A81DEDFC7B9716EBF67E3ECCF07E8EA4B41FC' }
+        @{ Path = 'docs\PraRemoteMailbox-UserGuide.html'; Sha256 = '5500C645D47DF19AF0D95107BD4973D456162CFEDEABE1D778D17024EF1E7E36' }
+        @{ Path = 'docs\PraRemoteMailbox-UserGuide.md'; Sha256 = '48307BB4E5A69D21E11798357A3A7A7542C14A4A34DB19AB30209B1B560CFCC4' }
         @{ Path = 'docs\images\console-next-cloud-light.png'; Sha256 = '71F1828DE23288E41A65850B702BC7AC364308E9C023AFB8F86014565BEBAC01' }
         @{ Path = 'docs\images\console-next-finalize-light.png'; Sha256 = '3337D271231C52739DAC067C0A52788D6E921B3A08D8ACC9895F6B662C95852A' }
         @{ Path = 'docs\images\console-next-global-light.png'; Sha256 = '87111B9A401A97788F138C18E5E514369DA725AC91E237803A681DFC7EE13A3E' }
@@ -72,8 +74,8 @@
         @{ Path = 'docs\images\console-verify-rollback-light.png'; Sha256 = '91846AC0A6480E95D5A1C7F8D2643B06AD61DF8260853FD1DBD8CBACB841165A' }
         @{ Path = 'docs\images\console-verify-scope-light.png'; Sha256 = 'B4BB47C7BA8334B2C03D4427FB91FE1D3041007E3697A9BEAB4C461DCD970281' }
         @{ Path = 'docs\images\guide-dictionary-light.png'; Sha256 = 'E186BE9EC2E1E121503D4B86C67761AA1ABCD63C7D79827C1DB7E019851D6BD9' }
-        @{ Path = 'docs\images\readme-banner-dark.png'; Sha256 = '83DFE7FAF4407AAAAFADA79448DA4C22ADAF2C24574A7F2AD7D89DCF9DA9681D' }
-        @{ Path = 'docs\images\readme-banner-light.png'; Sha256 = 'A86C5FA6C8CA38DA9807EA34F01CF415DB7B65A965B4A6051F15DD7A0273EA1A' }
+        @{ Path = 'docs\images\readme-banner-dark.png'; Sha256 = '11B93190CCEAD066DCB11701789598B74BC5A848583E5DC38114581FC998CFBB' }
+        @{ Path = 'docs\images\readme-banner-light.png'; Sha256 = '2EC554756EC77EF7D0D3DC5D03827E4733CDA689E16C4A1862695E679E0A0FE4' }
         @{ Path = 'docs\images\readme-flows-dark.png'; Sha256 = '5506575A6FA0729673A8C4FB5C1852D39E449B49104706C563E752DAE21D2EA4' }
         @{ Path = 'docs\images\readme-flows-light.png'; Sha256 = '169597ED1DB78B467B727C762D2E5022CFC67C355FED405B529F49C9CCC7C081' }
         @{ Path = 'docs\images\readme-how-dark.png'; Sha256 = 'D294589619F38AE783DE83F64E84F27475367D17F1C1CEE4FDD08E80F5D7E807' }
@@ -94,7 +96,7 @@
         @{ Path = 'docs\images\report-global-recover-light.png'; Sha256 = 'B17E6B7F06B438C2D22F43D0B1542341253AD2DA6586F2E51442ABD458BFD7E8' }
         @{ Path = 'docs\images\report-phase-light.png'; Sha256 = '4F62AAFF87FC0C7E7DFF38032F8FDC4BBA6A6FC0373611A01C54AD8603D4CA93' }
         @{ Path = 'docs\images\report-phase-warning-light.png'; Sha256 = 'DA0622931FC47CACC1388E378D569BB7D64B1FCE1279EDDD0F95ECCB9DEC41A1' }
-        @{ Path = 'CHANGELOG.md'; Sha256 = 'B9786DB44462BB35FD552389665938635223377DF286703625D030D3BE6BB9C4' }
+        @{ Path = 'CHANGELOG.md'; Sha256 = 'D746A3CBF9DD7FCA216D6C36E7FED341991A0BE630A6E1F51B6DA50D290D5AAF' }
     )
 }
 

@@ -25,7 +25,7 @@
     Root of the repository (default: two folders above this script).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
     Part of : PRA Remote Mailbox (repository tool, not in the package)
 #>
 #Requires -Version 7.5
