@@ -79,6 +79,31 @@ Not sure? Ask your administrator this one question. Do not guess.
 >
 > With one server, the same machine is both.
 
+### The whole journey
+
+This is the whole story on one page. First you move the mailboxes to the cloud. Weeks later, you go back. With two servers, one file goes from one server to the other each time.
+
+![Two servers, one file. Move the mailboxes: the directory server writes one zip file, you carry it, the cloud server finishes and writes the global report. Go back: the directory server, then the cloud server, then the directory server again, with a Recover package and a Finalize package](images/readme-transfer-light.png)
+
+Read the table from the top. Each row is one step. Do the steps in this order.
+
+| Step | Server | What you click | The tool writes | You copy it to |
+|---|---|---|---|---|
+| **1 · Move, directory part** | Directory server | **Move mailboxes to Exchange Online**, then **Start a new batch (Active Directory part)**. The pill says **Phase: AD**. | `PRA-PROD-Convert-490cc62e-for-Cloud.zip` | The cloud server |
+| **2 · Move, cloud part** | Cloud server | **Move mailboxes to Exchange Online**, then **Continue a batch (cloud part)**, then **Import package…** | The global report | Nowhere. The move is done. |
+| **Wait** | Both servers | Nothing. Keep the `Backups` folder. Write down the batch ID. | Nothing | Nowhere |
+| **3 · Roll back, directory part** | Directory server | **Roll back a conversion**. Pick the batch of the move. | `PRA-PROD-Recover-5ad39f71-for-Cloud.zip` | The cloud server |
+| **4 · Roll back, cloud part** | Cloud server | **Roll back a conversion**, then **Continue a rollback (cloud part)**, then **Import package…** | `PRA-PROD-Finalize-b7d41a9c-for-AD.zip`, only if something remains for the directory | The directory server |
+| **5 · Complete the rollback** | Directory server | **Complete a rollback**, then **Import package…** | The global report | Nowhere. The rollback is done. |
+
+Step 5 exists only if step 4 wrote a Finalize package. Shared mailboxes need it. So do mailboxes with a retention tag. If step 4 writes no package, it ends with the global report. The rollback is then done.
+
+With **one server**, there is no file to carry. Steps 1 and 2 are one run on the same machine: see [Path 2](#path-2--move-everyone-one-server). Steps 3 and 4 are one run too: see [Path 4](#path-4--roll-back).
+
+**The batch ID links the move to its rollback.** The move gets a short ID, like `490cc62e`. You see it in the report and on the **Next steps** page. Write it down. Weeks later, you pick the move in the list of the rollback. The list shows the folder name. It starts with `Batch-` and the ID. The rollback and the Finalize package get **new** IDs of their own, like `5ad39f71` and `b7d41a9c`. They are in the file names. You do not need to write them down.
+
+**Keep the `Backups` folder** on both servers until the rollback is done. Do not delete, rename or edit anything in it. The directory server needs it to start the rollback. The cloud server keeps its own record of the move there.
+
 ### The example in this guide
 
 The pictures and the commands use one example. Read the names in the right column. Replace them with your own names.
@@ -381,7 +406,7 @@ Use this path when **no single server** reaches both Active Directory and Micros
 
 Two servers work one after the other. A **single file** goes from the first server to the second one. The tool creates this file by itself. It is called the **transfer package**.
 
-![A picture of the two servers. The directory server writes one zip file. You carry the file to the cloud server. The cloud server finishes the work](images/readme-transfer-light.png)
+The [whole journey](#the-whole-journey), in the first chapter, shows both servers and each file on one page.
 
 **Part 1 · On the directory server (the AD server).** The steps are the same as Path 2, steps 1 and 2. At the bottom of the **Task** page, the pink pill says **Phase: AD** (number 1 in the picture). Then you press **Convert the mailboxes**.
 
@@ -438,9 +463,9 @@ Go back only when your administrator says that the old mail servers work again. 
 
 - **One server:** on that same server, from the start to the end.
 - **Two servers:** in this order.
-  1. On the **directory server**: this path (Path 4).
-  2. On the **cloud server**: **Continue a rollback (cloud part)** (see the list at the start of Path 5).
-  3. Back on the **directory server**: **Complete a rollback** (Path 5), only if the cloud server wrote a Finalize package.
+  1. On the **directory server**: this path (Path 4). It writes the Recover package.
+  2. On the **cloud server**: **Continue a rollback (cloud part)**. See [Part 2 of Path 5](#path-5--complete-the-rollback-two-servers).
+  3. Back on the **directory server**: **Complete a rollback** (Part 3 of Path 5), only if the cloud server wrote a Finalize package.
 
 ### 1 · Pick the rollback
 
@@ -452,6 +477,10 @@ Go back only when your administrator says that the old mail servers work again. 
 
 ![The batch selected. Number 1 marks the line. Number 2 marks the button to continue](images/console-task-rollback-selected-light.png)
 
+On a directory server of a two-server rollback, the pink pill at the bottom says **Phase: AD** (number 2 in the next picture). It means that this server does the directory part and then writes one file for the cloud server. A server that does both parts says **Phase: Both**.
+
+![The Task page of the directory server. Number 1: the batch. Number 2: the pink pill Phase: AD. Number 3: the button to continue](images/console-task-rollback-ad-light.png)
+
 **If not:** if the list is empty, the backup folder is not on this server. Copy the folder `Batch-…` back to `D:\PRA\Backups`, or use **Import package…** on a two-server move. If you cannot, stop and ask.
 
 ### 2 · Preview and confirm
@@ -460,7 +489,7 @@ Go back only when your administrator says that the old mail servers work again. 
 
 ![The Verify page of a rollback. Number 1 marks the box where you type RECOVER](images/console-verify-rollback-light.png)
 
-**You should see:** the **Run** page. The tool restores each person from the backup. It first removes the cloud shared mailboxes, then puts the directory back. On two servers, this page is the directory part.
+**You should see:** the **Run** page. The tool restores each person from the backup. For a shared mailbox, the directory first tells the cloud to take its mailbox back. The last directory change for it comes later. On two servers, this page is the directory part.
 
 **If not:** a red number means the tool refuses something. Read the reason. Stop and ask.
 
@@ -474,15 +503,76 @@ Go back only when your administrator says that the old mail servers work again. 
 
 **You should see:** each person with **Success**. People come back to the old servers when Exchange works again.
 
-**If not:** on **two servers**, the result may say **Pending**. It is normal. The directory server did its part. Do the cloud server next, then **Complete the rollback**.
+**If not:** on **two servers**, the result says **Pending**. It is normal. The directory server did its part. Do the cloud server next: see [Part 2 of Path 5](#path-5--complete-the-rollback-two-servers).
+
+**On two servers,** the last step of the **Run** page is *Creating the transfer package*. Press **What next? →**. The page shows the name of the **Recover package**. It looks like `PRA-PROD-Recover-5ad39f71-for-Cloud.zip`. The ID in it is new. It is not the ID of the move. You never type this name. You never rename the file.
+
+![The Next steps page of the directory server after a rollback. Number 1: the name of the Recover package. Number 2: the button Open folder. Number 3: the command for the cloud server](images/console-next-rollback-package-light.png)
+
+**Do:** press **Open folder**. **Copy this one file** to the cloud server. Keep the file. Do not delete it on this server.
 
 ### Path 5 · Complete the rollback (two servers)
 
 On two servers, a rollback has three parts. Each part gives a file to the next one.
 
-1. **Directory server:** Path 4. It writes one package.
-2. **Cloud server** (the machine that reaches Microsoft 365): open the console. Click **Roll back a conversion**, then **Continue a rollback (cloud part)**. Import the package. At the end, the tool writes a **Finalize package** if the directory still needs a last change.
-3. **Directory server:** copy the Finalize package here. Then do the steps below.
+1. **Part 1 · Directory server:** [Path 4](#path-4--roll-back). It writes the **Recover package**.
+2. **Part 2 · Cloud server** (the machine that reaches Microsoft 365): the next section. It checks that the cloud mailboxes are gone. It writes a **Finalize package** if the directory still needs a last change.
+3. **Part 3 · Directory server:** copy the Finalize package here. Then do the steps of Part 3 below.
+
+**Part 2 · On the cloud server.** You need the Recover package that Part 1 wrote. Its name looks like `PRA-PROD-Recover-5ad39f71-for-Cloud.zip`. This server needs the same signed tool folder as the directory server. It needs the same `Environment` in its settings file. It needs no right on Active Directory.
+
+**Do:** open the console on the cloud server, as in [step 4 of chapter 3](#4--open-the-console). On **Setup**, a red light for **RSAT ActiveDirectory** is normal here. This server does not use Active Directory. Press **Choose a task →**.
+
+**You should see:** the **Task** page, with big cards.
+
+**Do:** click the card **Roll back a conversion**. Then click **Continue a rollback (cloud part)**.
+
+![The Task page of the cloud server. Number 1: the card. Number 2: Continue a rollback. Number 3: the button Import package. Number 4: the list that shows the package](images/console-task-rollback-continue-light.png)
+
+The **Next steps** page of the directory server told you to choose *Continue an existing batch*. On the cloud server, this choice is called **Continue a rollback (cloud part)**.
+
+**Do:** press **Import package…** and pick the Recover package. You can also put the file in the folder `Backups\Inbox` of this server. Then it is already in the list. The package shows **Checksums verified**. Click its line.
+
+![The list with the Recover package selected. Number 1: the line of the package. Number 2: the pink pill Phase: Cloud. Number 3: the button to continue](images/console-task-rollback-package-light.png)
+
+**You should see:** the line turns pink. The pink pill says **Phase: Cloud** (number 2 in the picture). The card **What will happen on this server** says that this server checks the rollback in the cloud. It also says that this server never writes to Active Directory.
+
+**If not:** a Convert package does not show in this list. Only a Recover package does. A red line **Invalid** means the file is damaged or comes from another environment. Copy it again. Check that both servers have the same `Environment`. If the list is empty, the file is not in `Backups\Inbox`. If it still fails, stop and ask.
+
+**Do:** press **Continue to verification →**, then **Preview**. A black window may ask you to sign in to Microsoft. Sign in with your own account. Read the title: *… will be rolled back*. Is it the right number of people? Type the word **RECOVER**. Press the red button **Roll back the mailboxes**.
+
+![The Verify page of the cloud server. Number 1: the box where you type RECOVER. Number 2: the red button](images/console-verify-rollback-cloud-light.png)
+
+**You should see:** the **Run** page starts at once. The preview changed nothing.
+
+**If not:** the red button stays grey until you did the preview **and** typed the word. A red number (**blocking**) means the tool refuses something. Read the reason. Stop and ask.
+
+**Do:** wait for **Done**. Do not close the window. This part changes nothing in Exchange Online and nothing in Active Directory. The directory part already asked the cloud to take the mailboxes back. This part waits until Exchange Online has done it. Then it checks each mailbox. It looks every minute, for up to an hour.
+
+![The Run page of the cloud server at the end. Number 1 marks the three steps](images/console-run-rollback-cloud-light.png)
+
+**You should see:** three green steps: *Loading the Recover batch*, *Exchange Online: deprovisioning checks* and *Final restore of shared mailboxes and tags*. The last step packs the Finalize package when the directory still needs one.
+
+**If not:** the page may say *Waiting for Exchange Online to finish deprovisioning*. This is **normal**. Wait. If a step turns **red**, the tool stopped on purpose. Nothing was changed here. Take a photo. Stop and ask.
+
+**Do:** press **What next? →**. Two cases are possible.
+
+**First case: a Finalize package was written.** The page says **The cloud part of the rollback is done**. It asks you to copy one file to the AD server. The name looks like `PRA-PROD-Finalize-b7d41a9c-for-AD.zip`. Its ID is new too. It is not the ID of the move.
+
+![The Next steps page of the cloud server. Number 1: the name of the Finalize package. Number 2: the button Open folder. Number 3: the command for the directory server](images/console-next-rollback-cloud-light.png)
+
+**Do:**
+
+1. Press **Open folder**. The folder with the file opens.
+2. **Copy this one file** to the directory server. Do not rename it.
+3. Keep the file. Do not delete it on this server.
+4. Go to Part 3 on the directory server.
+
+**Second case: no package was written.** The page says **The run is complete**. It shows the button **Open global report**. Nothing remains for the directory. The rollback is **finished**. Press **Open global report** to read it. There is no Part 3.
+
+**If not:** in the first case the result says **Pending**. This is **normal**: a part remains. It is not an error.
+
+**Part 3 · On the directory server.** Copy the Finalize package to this server. Then follow the two steps below.
 
 ### 1 · Pick the Finalize package
 

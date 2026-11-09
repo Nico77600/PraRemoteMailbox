@@ -132,9 +132,10 @@ In the console, the same path is five pages: **Setup**, **Task** (*Move mailboxe
 .\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 490cc62e -Mode Apply
 
 # 6 · Two servers only: Recover on the AD server, then on the cloud server (it writes a Finalize package), then Finalize on the AD server
+#     Each package has its own ID: the one of the Convert batch is only used to pick the batch to roll back
 .\Invoke-PraRemoteMailbox.ps1 -Action Recover -Phase AD -Batch 490cc62e -Mode Apply
-.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Phase Cloud -Batch 'PRA-PROD-Recover-490cc62e-for-Cloud.zip' -Mode Apply
-.\Invoke-PraRemoteMailbox.ps1 -Action Finalize -Batch 'PRA-PROD-Finalize-490cc62e-for-AD.zip' -Mode Apply
+.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Phase Cloud -Batch 'PRA-PROD-Recover-5ad39f71-for-Cloud.zip' -Mode Apply
+.\Invoke-PraRemoteMailbox.ps1 -Action Finalize -Batch 'PRA-PROD-Finalize-b7d41a9c-for-AD.zip' -Mode Apply
 
 # 7 · Read the report; check a mailbox at any time
 .\Invoke-PraRemoteMailbox.ps1 -Action Check -Identity alice.vance@contoso.com
@@ -163,7 +164,7 @@ Keep the `Backups` folder on a durable, protected volume: the backups are the on
 
 ### Two servers, one file
 
-Between two servers, an Apply writes **one transfer package** (`Backups\Outbox\PRA-<Env>-<Kind>-<id8>-for-<Cloud|AD>.zip` with its checksum file). Copy that single file to the other server and use **Import package...** (or `-Batch <package.zip>`): the package is verified completely, including every entry hash, before anything is written. The last server writes **one global report** that follows each object from the first server to the last.
+Between two servers, an Apply writes **one transfer package** (`Backups\Outbox\PRA-<Env>-<Kind>-<id8>-for-<Cloud|AD>.zip` with its checksum file). Copy that single file to the other server and use **Import package...** (or `-Batch <package.zip>`): the package is verified completely, including every entry hash, before anything is written. The last server writes **one global report** that follows each object from the first server to the last. The [user guide](package/docs/PraRemoteMailbox-UserGuide.md#the-whole-journey) shows the whole journey, move then rollback, on one or two servers: what to click, which file the tool writes and where to copy it.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/readme-transfer-dark.png">

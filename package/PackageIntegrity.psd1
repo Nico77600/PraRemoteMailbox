@@ -23,16 +23,18 @@
         @{ Path = 'config\SharedPermissions.sample.csv'; Sha256 = '7838261190B01E705505EAE8C1664FCFD9143E4E3F39D3E0968A02A0B7951B5F' }
         @{ Path = 'README.md'; Sha256 = 'C88076428F2E0F86F26D799C5BC61FEBC8B2BD290E6FF19018C9922527DB36D4' }
         @{ Path = 'LICENSE'; Sha256 = 'A91A28EED601C15D06E439F83666F0EBE1AA7897DE37D350108147C7804FD94B' }
-        @{ Path = 'docs\PraRemoteMailbox-Guide.html'; Sha256 = 'E76498D5C5A89AA4EC6A4BC9776C887165E8575AB2DAE00CEED3D24BEFBA6166' }
+        @{ Path = 'docs\PraRemoteMailbox-Guide.html'; Sha256 = 'BEED6E7D79365E5F03F44AB5539D6F2E75AA7E0F86E761358289E728E022970C' }
         @{ Path = 'docs\PraRemoteMailbox-Guide.md'; Sha256 = '699D2659252122D91C5174E799FC2C47CEC21D90A64AE14AD9811A302AD6CE00' }
-        @{ Path = 'docs\PraRemoteMailbox-UserGuide.html'; Sha256 = '4972FE36A630D6F2A91A131BAB3EAAE008913427120FDE700ADBA7C18D5F5457' }
-        @{ Path = 'docs\PraRemoteMailbox-UserGuide.md'; Sha256 = 'A6F9A310F927A362C77ED95FA54ACB42142F5D5FF476CC5CAC1AED910D33906C' }
+        @{ Path = 'docs\PraRemoteMailbox-UserGuide.html'; Sha256 = 'B79F52F7B44BE72765B0E1285ADE3FE9A8CB28946DA4D8DAFBF64EDED4173319' }
+        @{ Path = 'docs\PraRemoteMailbox-UserGuide.md'; Sha256 = 'A3D3CD43D7DCBAD308EC8288E50922FE933B623198BAEC5BA8603F738F613E94' }
         @{ Path = 'docs\images\console-next-cloud-light.png'; Sha256 = '71F1828DE23288E41A65850B702BC7AC364308E9C023AFB8F86014565BEBAC01' }
         @{ Path = 'docs\images\console-next-finalize-light.png'; Sha256 = '3337D271231C52739DAC067C0A52788D6E921B3A08D8ACC9895F6B662C95852A' }
         @{ Path = 'docs\images\console-next-global-light.png'; Sha256 = '87111B9A401A97788F138C18E5E514369DA725AC91E237803A681DFC7EE13A3E' }
         @{ Path = 'docs\images\console-next-light.png'; Sha256 = '04E05E676652C46595868C23E9E02F65CC9D224EC6D1F3A1917258887E3F23A6' }
         @{ Path = 'docs\images\console-next-package-light.png'; Sha256 = '8E44533D46635054B67F281A99F7A0278FEC099D36B10BE51B39D713CF72AB7A' }
+        @{ Path = 'docs\images\console-next-rollback-cloud-light.png'; Sha256 = 'FE356017382C8EB4EE727237E09704214BC7717840A6D3962B90281E7D46F2DD' }
         @{ Path = 'docs\images\console-next-rollback-light.png'; Sha256 = '92C5876B2767F38F1629F54A25F61EADC778B46439B557902D3CD09EAC6E8E6D' }
+        @{ Path = 'docs\images\console-next-rollback-package-light.png'; Sha256 = '758EF6355635B279D83DFEEB8F60E43B7240324846AA3D8D218C8749E40AA209' }
         @{ Path = 'docs\images\console-run-cloud-light.png'; Sha256 = '0BAC232097FB2679C9A2FABB959336258DDC6C62D652C2DE6E54F9147C28E5D4' }
         @{ Path = 'docs\images\console-run-early-light.png'; Sha256 = '543304CEB625A8644BC69BB4509D77C44FE856FF0BE7E9A6CF056C0E85B6B180' }
         @{ Path = 'docs\images\console-run-finalize-light.png'; Sha256 = '3156987545CC888DC2F48F518F042593FD5A22518F571570AED299A7870E1C6B' }
@@ -40,6 +42,7 @@
         @{ Path = 'docs\images\console-run-finished-light.png'; Sha256 = '4D8E6A8C1CF311A6F7E10ED65B9655FE57B31E1CAEB7F74583BF09FD2A4F575B' }
         @{ Path = 'docs\images\console-run-grant-light.png'; Sha256 = '55D81968BB96FCF111C7D6B81DAC1FFA89AE48C7F174A4DE007810A0F6C2CFBF' }
         @{ Path = 'docs\images\console-run-package-light.png'; Sha256 = '62F5525ED5E757A0B31BEFA5F1F1A138A52142AEB4F85EF6D9CCA746C4B6B3B0' }
+        @{ Path = 'docs\images\console-run-rollback-cloud-light.png'; Sha256 = 'B5085373F5DD00D958404DE99B3431D286F9DBEB88582ED8ED2842776B05E668' }
         @{ Path = 'docs\images\console-run-rollback-light.png'; Sha256 = 'FB3FB4489C7F30AEA36584CDC6407B716E819381BDD5EC70B141909B16A7EB1D' }
         @{ Path = 'docs\images\console-run-waiting-light.png'; Sha256 = '3659DA4B35C0906F7CCF5EB2D2D5C147CA0F5ADB6918355ADB08E83B88D1351D' }
         @{ Path = 'docs\images\console-settings-light.png'; Sha256 = 'EF2ADC1BDB99DC35C99FB30E954C4D28DB7E426187F064D435C4EB40F2B3AF96' }
@@ -56,7 +59,10 @@
         @{ Path = 'docs\images\console-task-identity-light.png'; Sha256 = '4DCFFA042D02F3AE923A69E4B8BE9ED7669F752EF38B4DE6BD3439214F3790F1' }
         @{ Path = 'docs\images\console-task-light.png'; Sha256 = '23650ABDFB8D3BA91CAD3703F4D58BD79E576AF8C38D236F7E4F7CD430D9E7A9' }
         @{ Path = 'docs\images\console-task-package-selected-light.png'; Sha256 = 'E9900979521E46D15D7487A06CA7238381018CDF03D662F5C8D571A331E877CC' }
+        @{ Path = 'docs\images\console-task-rollback-ad-light.png'; Sha256 = 'EC4D2D1D89E41B3426355741B955A68FF4C5EBF17B155272BC60197717CFFD66' }
+        @{ Path = 'docs\images\console-task-rollback-continue-light.png'; Sha256 = 'CF5340C0C4C522F77A27D2C06513B270A6FA20827B4A0D697129DCC7F1F86BC6' }
         @{ Path = 'docs\images\console-task-rollback-light.png'; Sha256 = '8FF49197F729FE886387B9AC458EB52B499AABC8810C3B7ED260330B2BC45348' }
+        @{ Path = 'docs\images\console-task-rollback-package-light.png'; Sha256 = 'CC74FE63FDA5E8B99351F48A5CACB2B0C53454248C2289FE66CA8A7D90F2C437' }
         @{ Path = 'docs\images\console-task-rollback-selected-light.png'; Sha256 = '3F399794A3E69E91C11ABD8EAB2A42301DAAAF819508B5169192DB78B6149F1B' }
         @{ Path = 'docs\images\console-task-scope-light.png'; Sha256 = '2734D2EC782656B99A8997959E765E5A1D22DF84D532C0D8A53CEEB338556657' }
         @{ Path = 'docs\images\console-verify-before-light.png'; Sha256 = '94F68BF22C6EF8A2FB2E3AD3B9C716FB569EDA02835C1220945E245AEDCD818D' }
@@ -64,6 +70,7 @@
         @{ Path = 'docs\images\console-verify-cloud-light.png'; Sha256 = '8AE953ECA3A6FD5448902805A049235CB784CDC44E6796520D4615651FAAB520' }
         @{ Path = 'docs\images\console-verify-finalize-light.png'; Sha256 = '831FEBA0F5AA2669E1344068BADEC88B1B288588817F5141666B550AB2B47068' }
         @{ Path = 'docs\images\console-verify-light.png'; Sha256 = '7448AB5E1124C08FBA26BA55CCBED8108DD7AA0D43EA0787670C52917F568A8F' }
+        @{ Path = 'docs\images\console-verify-rollback-cloud-light.png'; Sha256 = '3A052D4F6DD52BE2EFA09E6EF2A0CB1ADF8D22C6296E646D4FA381683AD1051F' }
         @{ Path = 'docs\images\console-verify-rollback-light.png'; Sha256 = '91846AC0A6480E95D5A1C7F8D2643B06AD61DF8260853FD1DBD8CBACB841165A' }
         @{ Path = 'docs\images\console-verify-scope-light.png'; Sha256 = 'B4BB47C7BA8334B2C03D4427FB91FE1D3041007E3697A9BEAB4C461DCD970281' }
         @{ Path = 'docs\images\guide-dictionary-light.png'; Sha256 = 'E186BE9EC2E1E121503D4B86C67761AA1ABCD63C7D79827C1DB7E019851D6BD9' }

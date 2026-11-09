@@ -78,7 +78,7 @@ Describe 'Static package contract' {
         $required = @($assignment.Right.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object Value)
         $expected = @(Get-PraExpectedInventory | Where-Object { $_ -ne 'CHANGELOG.md' })
         (($required | Sort-Object) -join '|') | Should -BeExactly (($expected | Sort-Object) -join '|')
-        $expected.Count | Should -Be 82
+        $expected.Count | Should -Be 89
         $text = [IO.File]::ReadAllText((Join-Path $script:Source 'module\Test-PackageIntegrity.ps1'))
         $text | Should -Match "\`$distributionOnly = @\('CHANGELOG\.md'\)"
     }
