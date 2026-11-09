@@ -34,7 +34,9 @@ package/docs/images/console-next-finalize-light.png -text
 package/docs/images/console-next-global-light.png -text
 package/docs/images/console-next-light.png -text
 package/docs/images/console-next-package-light.png -text
+package/docs/images/console-next-rollback-cloud-light.png -text
 package/docs/images/console-next-rollback-light.png -text
+package/docs/images/console-next-rollback-package-light.png -text
 package/docs/images/console-run-cloud-light.png -text
 package/docs/images/console-run-early-light.png -text
 package/docs/images/console-run-finalize-light.png -text
@@ -42,6 +44,7 @@ package/docs/images/console-run-finished-dark.png -text
 package/docs/images/console-run-finished-light.png -text
 package/docs/images/console-run-grant-light.png -text
 package/docs/images/console-run-package-light.png -text
+package/docs/images/console-run-rollback-cloud-light.png -text
 package/docs/images/console-run-rollback-light.png -text
 package/docs/images/console-run-waiting-light.png -text
 package/docs/images/console-settings-light.png -text
@@ -58,7 +61,10 @@ package/docs/images/console-task-finalize-light.png -text
 package/docs/images/console-task-identity-light.png -text
 package/docs/images/console-task-light.png -text
 package/docs/images/console-task-package-selected-light.png -text
+package/docs/images/console-task-rollback-ad-light.png -text
+package/docs/images/console-task-rollback-continue-light.png -text
 package/docs/images/console-task-rollback-light.png -text
+package/docs/images/console-task-rollback-package-light.png -text
 package/docs/images/console-task-rollback-selected-light.png -text
 package/docs/images/console-task-scope-light.png -text
 package/docs/images/console-verify-before-light.png -text
@@ -66,6 +72,7 @@ package/docs/images/console-verify-check-light.png -text
 package/docs/images/console-verify-cloud-light.png -text
 package/docs/images/console-verify-finalize-light.png -text
 package/docs/images/console-verify-light.png -text
+package/docs/images/console-verify-rollback-cloud-light.png -text
 package/docs/images/console-verify-rollback-light.png -text
 package/docs/images/console-verify-scope-light.png -text
 package/docs/images/guide-dictionary-light.png -text

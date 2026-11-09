@@ -4,6 +4,15 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
+## 3.1.1 — 2026-11-09
+
+Documentation only: no change to the tool itself.
+
+### Changed
+- User guide: the whole journey on one or two servers in one place (what to click, which file the tool writes, where to copy it),
+  and how the batch ID links a move to its rollback weeks later.
+- User guide: the cloud part of a two-server rollback, step by step with pictures.
+
 ## 3.1.0 — 2026-11-06
 
 ### Added
