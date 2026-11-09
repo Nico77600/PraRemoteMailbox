@@ -750,7 +750,7 @@ function Get-PraGuiPrerequisite {
     if ($graph -and $graphUsers) { $graphOk=$true; & $light 'Microsoft.Graph' 'Ok' ('Installed, version {0}.' -f $graph.Version) }
     else { & $light 'Microsoft.Graph' 'Fail' 'Not installed (Authentication and Users): the cloud parts and Check cannot run on this server (Install-Module Microsoft.Graph).' }
     if (-not $SyncEnabled) { & $light 'Entra Connect sync' 'NA' 'Not used: EntraConnect.Sync is off in the configuration.' }
-    elseif ($SyncServer) { & $light 'Entra Connect sync' 'Ok' ('The synchronisation is started on {0} (reachability is checked when the run starts).' -f $SyncServer) }
+    elseif ($SyncServer) { & $light 'Entra Connect sync' 'Ok' ('The synchronisation is started on {0}.' -f $SyncServer) }
     elseif (Get-PraGuiHighestModule @('ADSync') -Refresh:$Refresh) { & $light 'Entra Connect sync' 'Ok' 'ADSync module found on this server.' }
     else { & $light 'Entra Connect sync' 'Warn' 'No ADSync module here and no Entra Connect server in the configuration: an Active Directory run that synchronises will refuse to start.' }
     $signinOk=$false
@@ -807,6 +807,24 @@ function Start-PraGuiHttpsProbe {
     }
     $request=New-Object Net.Http.HttpRequestMessage([Net.Http.HttpMethod]::Head,('https://{0}/' -f $HostName))
     return $script:GuiNetHttp.SendAsync($request,[Net.Http.HttpCompletionOption]::ResponseHeadersRead)
+}
+
+function Get-PraGuiNetworkWhy {
+    <# Why a request failed: plain words first when the cause is known (a blocked or refused connection, a name that is not found), then the technical message for the network administrator. #>
+    param([Exception]$Exception)
+    $raw=[string]$Exception.GetBaseException().Message
+    # The socket error is the cause of the request error (the HTTP exception holds it as its inner exception): look for it down the chain.
+    $socket=$null; $cursor=$Exception
+    while ($cursor -and -not $socket) { if ($cursor -is [Net.Sockets.SocketException]) { $socket=$cursor } else { $cursor=$cursor.InnerException } }
+    if ($socket) {
+        $code=[int]$socket.SocketErrorCode
+        $plain=''
+        if ($code -eq 10013) { $plain='blocked on this server (firewall, proxy or security software)' }
+        elseif ($code -eq 10061) { $plain='refused by the network (firewall or proxy)' }
+        elseif ($code -eq 11001 -or $code -eq 11004) { $plain='the name cannot be resolved (DNS)' }
+        if ($plain) { return ('{0}: {1}' -f $plain,$raw) }
+    }
+    return $raw
 }
 
 function Get-PraGuiNetworkVerdict {
@@ -868,7 +886,7 @@ function Complete-PraGuiNetworkCheck {
         if (-not $target.Task) { $why=[string]$target.Failure }
         elseif (-not $target.Task.IsCompleted) { $why=('no answer within {0} seconds' -f $g.NetSeconds) }
         elseif ($target.Task.IsCanceled) { $why=('no answer within {0} seconds' -f $g.NetSeconds) }
-        elseif ($target.Task.IsFaulted) { $why=[string]$target.Task.Exception.GetBaseException().Message }
+        elseif ($target.Task.IsFaulted) { $why=Get-PraGuiNetworkWhy $target.Task.Exception }
         else {
             $ok=$true
             $response=$target.Task.Result
@@ -885,6 +903,65 @@ function Complete-PraGuiNetworkCheck {
     Invoke-PraGuiDetection
     Update-PraGuiView
 }
+
+#region Entra Connect: can THIS account use the synchronisation server? (asynchronous, like the Microsoft 365 test)
+# Without this test the light only repeats the configuration. The check is the one of the run (Test-PraSyncServer): an authenticated read-only call to the ADSync
+# module of EntraConnect.Server, started as a remote job and polled by the window timer, so the window never waits. It is made only when this server can do the
+# Active Directory part, where the synchronisation is started. A test or a screenshot passes -SyncProbe (a handle with IsCompleted and GetResult) and no remoting is used.
+$script:GuiSyncLight = 'Entra Connect sync'
+
+function Stop-PraGuiSyncCheck {
+    $g=$script:Gui
+    $g.SyncJob=$null; $g.SyncResult=$null
+}
+
+function Start-PraGuiSyncCheck {
+    <# Starts the check and returns at once; Complete-PraGuiSyncCheck (window timer) reads the answer. #>
+    param([string]$Server)
+    $g=$script:Gui
+    $g.SyncResult=$null
+    $handle=$null; $failure=''
+    try { $handle=& $g.SyncProbe $Server $g.SyncSeconds } catch { $failure=$_.Exception.Message }
+    $g.SyncJob=@{ Server=$Server; Handle=$handle; Failure=$failure; Clock=[Diagnostics.Stopwatch]::StartNew() }
+    $g.Timer.Start()
+}
+
+function Complete-PraGuiSyncCheck {
+    <# Called by the window timer: does nothing until the answer is in or the time is up (a server that did not answer in time is not reachable). #>
+    $g=$script:Gui; $job=$g.SyncJob
+    if (-not $job) { return }
+    $handle=$job.Handle
+    $expired=$job.Clock.Elapsed.TotalSeconds -ge $g.SyncSeconds
+    if ($handle -and -not $handle.IsCompleted -and -not $expired) { return }
+    try {
+        if ($handle) { $answer=$handle.GetResult([bool](-not $handle.IsCompleted)) }
+        else { $answer=[pscustomobject]@{ Ok=$false; Kind='Failed'; Server=$job.Server; Reason=('the check could not start: '+$job.Failure); Technical=[string]$job.Failure } }
+    } catch { $answer=[pscustomobject]@{ Ok=$false; Kind='Failed'; Server=$job.Server; Reason=('the check failed: '+$_.Exception.Message); Technical=$_.Exception.Message } }
+    $g.SyncJob=$null
+    $g.SyncResult=[pscustomobject]@{ Server=$job.Server; Answer=$answer }
+    Sync-PraGuiTimer
+    Add-PraGuiLine ('Entra Connect check from this server. '+$(if ($answer.Ok) { [string]$answer.Reason } else { 'The synchronisation will not be possible: '+[string]$answer.Reason })) $(if ($answer.Ok) { 'Info' } else { 'Warn' })
+    Invoke-PraGuiDetection
+    Update-PraGuiView
+}
+
+function Add-PraGuiSyncLight {
+    <# Replaces the Entra Connect light by the real answer (checking, ready, or why the synchronisation will not be possible). Nothing is blocked: the engine stops by itself before any AD change. #>
+    $g=$script:Gui; $d=$g.Detect
+    if (-not $g.SyncProbe -or -not $d -or -not $d.AD -or -not $g.State -or -not $g.State.Config) { return }
+    $settings=$g.State.Config.EntraConnect
+    $server=[string]$settings.Server
+    if (-not [bool]$settings.Sync -or -not $server) { Stop-PraGuiSyncCheck; return }
+    if (($g.SyncJob -and -not (Test-GuiOrdinal $g.SyncJob.Server $server -IgnoreCase)) -or ($g.SyncResult -and -not (Test-GuiOrdinal $g.SyncResult.Server $server -IgnoreCase))) { Stop-PraGuiSyncCheck }
+    if (-not $g.SyncResult -and -not $g.SyncJob) { Start-PraGuiSyncCheck $server }
+    if ($g.SyncJob) { $status='Info'; $detail=('Checking that this account can use the Entra Connect server {0} (a few seconds)...' -f $server) }
+    elseif ($g.SyncResult.Answer.Ok) { $status='Ok'; $detail=('{0}.' -f [string]$g.SyncResult.Answer.Reason) }
+    else { $status='Warn'; $detail=('Entra Connect sync will not be possible: {0}. Either fix that, or set EntraConnect.Sync to $false in the configuration file and run the synchronisation yourself. A run that synchronises stops before any change.' -f [string]$g.SyncResult.Answer.Reason) }
+    $light=[ordered]@{ Name=$script:GuiSyncLight; Status=$status; Detail=$detail }
+    $lights=@(foreach ($item in @($d.Lights)) { if (Test-GuiOrdinal ([string]$item.Name) $script:GuiSyncLight) { $light } else { $item } })
+    Add-Member -InputObject $d -NotePropertyName Lights -NotePropertyValue $lights -Force
+}
+#endregion
 
 function Add-PraGuiNetworkLight {
     <# Adds the Microsoft 365 light and settles the role, once the programs are installed (the light is absent when the cloud cannot run anyway: the page stays short). #>
@@ -1288,9 +1365,10 @@ function Invoke-PraGuiDetection {
         $request.MinExoVersion=[string]$cfg.Exo.MinModuleVersion; $request.DisableWam=[bool]$cfg.Exo.DisableWAM
         $request.SyncEnabled=[bool]$cfg.EntraConnect.Sync; $request.SyncServer=[string]$cfg.EntraConnect.Server
     }
-    if ($Refresh) { $request.Refresh=$true; Stop-PraGuiNetworkCheck }
+    if ($Refresh) { $request.Refresh=$true; Stop-PraGuiNetworkCheck; Stop-PraGuiSyncCheck }
     $g.Detect=& $g.Probe $request
     Add-PraGuiNetworkLight
+    Add-PraGuiSyncLight
     $g.LightRows.Clear()
     foreach ($light in @($g.Detect.Lights)) { $g.LightRows.Add((New-PraGuiRow @{ Name=[string]$light.Name; Status=[string]$light.Status; Detail=[string]$light.Detail })) }
 }
@@ -2325,6 +2403,7 @@ function Invoke-PraGuiTick {
     $g=$script:Gui
     if (-not $g -or $g.InTick) { return }
     if ($g.NetJob) { Complete-PraGuiNetworkCheck }
+    if ($g.SyncJob) { Complete-PraGuiSyncCheck }
     if ($g.PkgJob) { Complete-PraGuiPackageJob }
     if ($g.OuLookup) { Complete-PraGuiOuLookup; return }
     if ($g.IdLookup) { Complete-PraGuiIdentityLookup }
@@ -2382,7 +2461,7 @@ function Get-PraGuiPackageCommand {
 function Sync-PraGuiTimer {
     <# The window timer runs while something is running or waiting (engine, lookups, package checks) and stops when nothing is. #>
     $g=$script:Gui
-    if ($g.Run -or $g.OuLookup -or $g.IdLookup -or $g.NetJob -or $g.PkgJob -or $g.PkgQueue.Count) { $g.Timer.Start() } else { $g.Timer.Stop() }
+    if ($g.Run -or $g.OuLookup -or $g.IdLookup -or $g.NetJob -or $g.SyncJob -or $g.PkgJob -or $g.PkgQueue.Count) { $g.Timer.Start() } else { $g.Timer.Stop() }
 }
 
 function Start-PraGuiNextPackageJob {
@@ -2921,9 +3000,9 @@ function New-PraGuiXmlNamespace {
 }
 
 function New-PraGuiWindow {
-    <# Constructs and binds the window without ShowDialog and without starting an operation. -PrerequisiteProbe replaces the real detection (tests, screenshots); with it, Microsoft 365 is not tested unless -NetworkProbe (a task per host) is given too. #>
+    <# Constructs and binds the window without ShowDialog and without starting an operation. -PrerequisiteProbe replaces the real detection (tests, screenshots); with it, Microsoft 365 is not tested unless -NetworkProbe (a task per host) is given too; the Entra Connect check is likewise made only with -SyncProbe. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Root, [string]$ConfigPath='', [string]$Version='', [ValidateSet('System','Light','Dark')][string]$Theme='System', [scriptblock]$PrerequisiteProbe, [scriptblock]$IdentityProbe, [scriptblock]$NetworkProbe, [double]$NetworkSeconds=3)
+    param([Parameter(Mandatory)][string]$Root, [string]$ConfigPath='', [string]$Version='', [ValidateSet('System','Light','Dark')][string]$Theme='System', [scriptblock]$PrerequisiteProbe, [scriptblock]$IdentityProbe, [scriptblock]$NetworkProbe, [double]$NetworkSeconds=3, [scriptblock]$SyncProbe, [double]$SyncSeconds=20)
     if ((-not (Test-GuiOrdinal ([Threading.Thread]::CurrentThread.GetApartmentState()) 'STA' -IgnoreCase))) { throw 'WPF requires an STA host (pwsh.exe -STA).' }
     if ($script:Gui -and $script:Gui.Run) { throw 'Cannot replace a window while its engine is running.' }
     if ($script:Gui -and $script:Gui.Form.IsVisible) { throw 'A PRA window is already open in this host.' }
@@ -2943,11 +3022,13 @@ function New-PraGuiWindow {
     $timer.Interval=[timespan]::FromMilliseconds(250)
     $probe=if ($PrerequisiteProbe) { $PrerequisiteProbe } else { { param($Request) Get-PraGuiPrerequisite @Request } }
     $netProbe=if ($NetworkProbe) { $NetworkProbe } elseif ($PrerequisiteProbe) { $null } else { { param($HostName,$Seconds) Start-PraGuiHttpsProbe $HostName $Seconds } }
+    $syncProbe=if ($SyncProbe) { $SyncProbe } elseif ($PrerequisiteProbe) { $null } else { { param($Server,$Seconds) Start-PraSyncProbe -Server $Server -TimeoutSeconds ([int][Math]::Max(5,[Math]::Ceiling($Seconds))) } }
     $script:Gui=@{
         Form=$form; Controls=$controls; Timer=$timer; Root=[IO.Path]::GetFullPath($Root); ConfigPath=$ConfigPath; InitialConfigPath=$ConfigPath
         PkgCache=@{}; PkgQueue=(New-Object 'Collections.Generic.List[object]'); PkgJob=$null
         State=$null; Run=$null; OuLookup=$null; IdLookup=$null; IdentityProbe=$IdentityProbe; Pending=$null; LastResult=$null; LastRun=$null; Model=$null; Updating=1; InTick=$false; Page=1
         Action=''; Mode='New'; SelectedBatch=$null; EnvLock=$null; EnvSaved=$null; Defaults=$null; Detect=$null; Probe=$probe; NetProbe=$netProbe; NetSeconds=$NetworkSeconds; NetJob=$null; NetResult=$null
+        SyncProbe=$syncProbe; SyncSeconds=$SyncSeconds; SyncJob=$null; SyncResult=$null
         Previewed=$false; PreviewError=''; Filter='All'; HasFinalize=$false; KnownEnvironments=@()
         Lines=(New-Object 'Collections.ObjectModel.ObservableCollection[object]')
         LightRows=(New-Object 'Collections.ObjectModel.ObservableCollection[object]'); BatchRows=(New-Object 'Collections.ObjectModel.ObservableCollection[object]')
@@ -3020,7 +3101,7 @@ function New-PraGuiWindow {
             Add-PraGuiLine ($windowControl.Title+': closing refused, an atomic action is running. Wait for it to end; do not kill the engine.') 'Warn'
         }
     })
-    $form.Add_Closed({ $script:Gui.Timer.Stop(); $script:Gui.Pending=$null; $script:Gui.NetJob=$null; if ($script:GuiNetHttp) { $script:GuiNetHttp.Dispose(); $script:GuiNetHttp=$null } })
+    $form.Add_Closed({ $script:Gui.Timer.Stop(); $script:Gui.Pending=$null; $script:Gui.NetJob=$null; $script:Gui.SyncJob=$null; if ($script:GuiNetHttp) { $script:GuiNetHttp.Dispose(); $script:GuiNetHttp=$null } })
     $g.HandlerNames+=@('BatchList.SelectionChanged','StepList.SelectionChanged','DetObjList.SelectionChanged','ConfirmBox.TextChanged','F_ExpOnce.Checked','F_ExpOnce.Unchecked','Timer.Tick','Form.Closing','Form.Closed')
     foreach ($name in @('System','Light','Dark')) { $c['Th_'+$name].IsChecked=((Test-GuiOrdinal $name $Theme -IgnoreCase)) }
     $c.Nav1.IsChecked=$true

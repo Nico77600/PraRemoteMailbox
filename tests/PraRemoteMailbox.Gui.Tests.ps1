@@ -1499,6 +1499,144 @@ try { Pump 100; if($g.NetJob -or $g.Controls.RoleName.Text -cnotmatch 'AD \+ Clo
     }
 }
 
+Describe 'Release 3.1.2 - the console says plainly why Microsoft 365 or Entra Connect cannot be used (mocked probes, no network)' -Tag 'Release312' {
+    It 'puts a plain sentence before the technical message of a blocked connection, and leaves other errors as they are' {
+        $why = { param($Exception) Get-PraGuiNetworkWhy $Exception }
+        $blocked = [Net.Sockets.SocketException]::new(10013)
+        $wrapped = [AggregateException]::new([Net.Http.HttpRequestException]::new($blocked.Message, $blocked))
+        $text = & (Get-Module PRA.Gui) $why $wrapped
+        $text | Should -BeExactly ('blocked on this server (firewall, proxy or security software): ' + $blocked.Message)
+        $text | Should -Match ([regex]::Escape($blocked.Message)) -Because 'the technical detail is kept'
+        (& (Get-Module PRA.Gui) $why ([AggregateException]::new([Net.Http.HttpRequestException]::new('x', [Net.Sockets.SocketException]::new(10061))))) | Should -Match '^refused by the network \(firewall or proxy\): '
+        (& (Get-Module PRA.Gui) $why ([AggregateException]::new([Net.Http.HttpRequestException]::new('x', [Net.Sockets.SocketException]::new(11001))))) | Should -Match '^the name cannot be resolved \(DNS\): '
+        (& (Get-Module PRA.Gui) $why ([AggregateException]::new([Net.Http.HttpRequestException]::new('No such host is known.')))) | Should -BeExactly 'No such host is known.'
+    }
+    It 'checks the Entra Connect server with the account (asynchronously), never blocks, and shows the plain reason in the Microsoft 365 log line' {
+        $runtime = New-GuiTestRoot
+        $syncConfig = Join-Path $runtime.Root 'sync.psd1'
+        Write-GuiTestFile $syncConfig "@{Environment='GuiSynthetic'; Scope=@{Mode='Auto'}; Licensing=@{Enabled=`$false}; EntraConnect=@{Sync=`$true;Server='SRV-SYNC01'}; Execution=@{Phase='AD'}}"
+        $probe = Join-Path $runtime.Root 'wpf-probe-sync.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$SyncConfig)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+function SettleSync($Window,[int]$Seconds=10){ $end=[datetime]::UtcNow.AddSeconds($Seconds); while($Window.SyncJob -and [datetime]::UtcNow -lt $end){ Pump 50 }; if($Window.SyncJob){throw 'The Entra Connect check never ended'}; Pump 80 }
+function Settle($Window,[int]$Seconds=10){ $end=[datetime]::UtcNow.AddSeconds($Seconds); while($Window.NetJob -and [datetime]::UtcNow -lt $end){ Pump 50 }; if($Window.NetJob){throw 'The Microsoft 365 check never ended'}; Pump 80 }
+function SyncLight($Window){ return ,@($Window.LightRows | Where-Object Name -ceq 'Entra Connect sync')[0] }
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'},[ordered]@{Name='ExchangeOnlineManagement';Status='Ok';Detail='synthetic'},[ordered]@{Name='Entra Connect sync';Status='Ok';Detail='The synchronisation is started on SRV-SYNC01.'}); AD=$true; Cloud=$true; Role='Both' } }
+$script:Calls=New-Object 'Collections.Generic.List[string]'
+$script:Answer=$null; $script:Done=$false; $script:Boom=$false
+$syncProbe={ param($Server,$Seconds)
+  $script:Calls.Add($Server+'/'+$Seconds)
+  if($script:Boom){ throw 'boom' }
+  $handle=[pscustomobject]@{ Done=$false; Answer=$script:Answer }
+  Add-Member -InputObject $handle -MemberType ScriptProperty -Name IsCompleted -Value { $this.Done }
+  Add-Member -InputObject $handle -MemberType ScriptMethod -Name GetResult -Value { param([bool]$TimedOut) $this.Answer }
+  $script:Handle=$handle
+  $handle }
+$denied=[pscustomobject]@{ Ok=$false; Kind='Denied'; Server='SRV-SYNC01'; Reason='this account has no right on SRV-SYNC01: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncOperators)'; Technical='Access is denied' }
+$accepted=[pscustomobject]@{ Ok=$true; Kind='Ok'; Server='SRV-SYNC01'; Reason='SRV-SYNC01 accepts this account and Entra Connect answers'; Technical='' }
+function New-SyncWindow($Answer,[string]$ConfigPath){
+  $script:Answer=$Answer; $script:Calls.Clear(); $script:Boom=$false
+  $window=New-PraGuiWindow -Root $Root -ConfigPath $ConfigPath -Version 'Synthetic' -PrerequisiteProbe $detect -SyncProbe $syncProbe -SyncSeconds 6
+  $window.Form.Show(); return $window
+}
+
+# --- A: the check runs in the background (the window stays usable), then the light says why the sync will not be possible
+$g=New-SyncWindow $denied $SyncConfig
+try {
+ $c=$g.Controls
+ if(-not $g.SyncJob){throw 'The Entra Connect check did not start in the background'}
+ if($script:Calls.Count -ne 1 -or $script:Calls[0] -cne 'SRV-SYNC01/6'){throw ('The check is made once, on the configured server: '+($script:Calls -join ','))}
+ $light=SyncLight $g
+ if($light.Status -cne 'Info' -or $light.Detail -cnotmatch 'Checking that this account can use the Entra Connect server SRV-SYNC01'){throw ('While checking: '+$light.Status+' / '+$light.Detail)}
+ if(-not $c.BtnNext.IsEnabled){throw 'The window must stay usable while the Entra Connect check is pending'}
+ Pump 150
+ if(-not $g.SyncJob){throw 'The check must still be pending while the answer is not in'}
+ $script:Handle.Done=$true
+ SettleSync $g
+ $light=SyncLight $g
+ if($light.Status -cne 'Warn' -or $light.Detail -cnotmatch '^Entra Connect sync will not be possible: this account has no right on SRV-SYNC01: it must be allowed to open a remote session there \(member of Remote Management Users or Administrators\) and to use Entra Connect \(member of ADSyncOperators\)\. Either fix that, or set EntraConnect\.Sync to \$false in the configuration file and run the synchronisation yourself\.'){throw ('After the answer: '+$light.Status+' / '+$light.Detail)}
+ if(@($g.Lines | Where-Object { [string]$_.Text -cmatch 'Entra Connect check from this server\. The synchronisation will not be possible: this account has no right' }).Count -ne 1){throw 'The answer is not written in the activity log'}
+ if(-not $c.BtnNext.IsEnabled){throw 'A refused account must not block the window: the engine stops by itself before any change'}
+ # Detecting again (a setting typed, a page change) does not ask the server again; Check again does.
+ & (Get-Module PRA.Gui) { Invoke-PraGuiDetection }
+ if($script:Calls.Count -ne 1 -or $g.SyncJob){throw 'A new detection must reuse the answer'}
+ Click $g 'BtnRecheck'
+ if($script:Calls.Count -ne 2 -or -not $g.SyncJob){throw 'Check again must ask the server again'}
+ $script:Handle.Done=$true; SettleSync $g
+} finally { $g.Form.Close() }
+
+# --- B: the account is accepted
+$g=New-SyncWindow $accepted $SyncConfig
+try {
+ $script:Handle.Done=$true; SettleSync $g
+ $light=SyncLight $g
+ if($light.Status -cne 'Ok' -or $light.Detail -cne 'SRV-SYNC01 accepts this account and Entra Connect answers.'){throw ('Accepted: '+$light.Status+' / '+$light.Detail)}
+} finally { $g.Form.Close() }
+
+# --- C: no answer in time (the handle never completes): not reachable, said plainly; a probe that throws is a failure, not a crash
+$timedOut=[pscustomobject]@{ Ok=$false; Kind='Unreachable'; Server='SRV-SYNC01'; Reason='SRV-SYNC01 does not answer to PowerShell remoting (WinRM, port 5985) within 6 seconds: check the server name in EntraConnect.Server, the network and the firewall'; Technical='no answer within 6 seconds' }
+$script:Answer=$timedOut; $script:Calls.Clear()
+$g=New-PraGuiWindow -Root $Root -ConfigPath $SyncConfig -Version 'Synthetic' -PrerequisiteProbe $detect -SyncProbe $syncProbe -SyncSeconds 0.8
+$g.Form.Show()
+try {
+ SettleSync $g
+ $light=SyncLight $g
+ if($light.Status -cne 'Warn' -or $light.Detail -cnotmatch 'Entra Connect sync will not be possible: SRV-SYNC01 does not answer to PowerShell remoting'){throw ('Time out: '+$light.Status+' / '+$light.Detail)}
+} finally { $g.Form.Close() }
+$script:Boom=$true
+$g=New-PraGuiWindow -Root $Root -ConfigPath $SyncConfig -Version 'Synthetic' -PrerequisiteProbe $detect -SyncProbe $syncProbe -SyncSeconds 2
+$g.Form.Show()
+try {
+ SettleSync $g
+ $light=SyncLight $g
+ if($light.Status -cne 'Warn' -or $light.Detail -cnotmatch 'the check could not start: boom'){throw ('Throwing probe: '+$light.Status+' / '+$light.Detail)}
+} finally { $g.Form.Close() }
+
+# --- D: synchronisation off in the configuration, or no probe given: no call at all, the light is the one of the detection
+$script:Boom=$false
+$g=New-SyncWindow $accepted $Config
+try { Pump 150; if($script:Calls.Count -ne 0 -or $g.SyncJob){throw 'EntraConnect.Sync is off: nothing may be asked'} } finally { $g.Form.Close() }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $SyncConfig -Version 'Synthetic' -PrerequisiteProbe $detect
+$g.Form.Show()
+try { Pump 150; if($g.SyncJob -or (SyncLight $g).Detail -cne 'The synchronisation is started on SRV-SYNC01.'){throw 'A probe-only window must not ask the Entra Connect server'} } finally { $g.Form.Close() }
+
+# --- E: a blocked connection to Microsoft 365 reads in plain words in the activity log, the technical message stays
+$rawBlocked=[Net.Sockets.SocketException]::new(10013).Message
+$net={ param($HostName,$Seconds) [Threading.Tasks.Task]::FromException([Net.Http.HttpRequestException]::new($rawBlocked,[Net.Sockets.SocketException]::new(10013))) }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect -NetworkProbe $net -NetworkSeconds 3
+$g.Form.Show()
+try {
+ Settle $g
+ $line=@($g.Lines | Where-Object { [string]$_.Text -cmatch '^Microsoft 365 check from this server' })
+ if($line.Count -ne 1 -or $line[0].Text -cnotmatch ('login\.microsoftonline\.com: not reachable \(blocked on this server \(firewall, proxy or security software\): '+[regex]::Escape($rawBlocked))){throw ('Blocked connection: '+($line | ForEach-Object Text))}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('SYNC-LIGHT-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config, '-SyncConfig', $syncConfig)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(120000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'SYNC-LIGHT-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
 AfterAll {
     if($script:GuiEvidence -and (Test-Path -LiteralPath $script:GuiEvidence)) {
         # A child of a test may still be closing its files for a moment: bounded retries, then the error is raised (never swallowed).
