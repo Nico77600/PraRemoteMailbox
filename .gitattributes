@@ -37,6 +37,7 @@ package/docs/images/console-next-package-light.png -text
 package/docs/images/console-next-rollback-cloud-light.png -text
 package/docs/images/console-next-rollback-light.png -text
 package/docs/images/console-next-rollback-package-light.png -text
+package/docs/images/console-next-syncfailed-light.png -text
 package/docs/images/console-run-cloud-light.png -text
 package/docs/images/console-run-early-light.png -text
 package/docs/images/console-run-finalize-light.png -text
@@ -46,6 +47,7 @@ package/docs/images/console-run-grant-light.png -text
 package/docs/images/console-run-package-light.png -text
 package/docs/images/console-run-rollback-cloud-light.png -text
 package/docs/images/console-run-rollback-light.png -text
+package/docs/images/console-run-syncfailed-light.png -text
 package/docs/images/console-run-waiting-light.png -text
 package/docs/images/console-settings-light.png -text
 package/docs/images/console-setup-dark.png -text
@@ -58,6 +60,7 @@ package/docs/images/console-task-ad-light.png -text
 package/docs/images/console-task-check-light.png -text
 package/docs/images/console-task-continue-light.png -text
 package/docs/images/console-task-finalize-light.png -text
+package/docs/images/console-task-finish-light.png -text
 package/docs/images/console-task-identity-light.png -text
 package/docs/images/console-task-light.png -text
 package/docs/images/console-task-package-selected-light.png -text

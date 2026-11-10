@@ -21,18 +21,20 @@
     rollbackcloud Continue a rollback on the cloud server of a two-server rollback (phase Cloud, writes the Finalize package)
     finalize  Complete a rollback on the AD server
     check     Check a mailbox
+    finish    Continue a batch on the AD server whose Entra Connect sync did not run: the batch to finish is marked and selected
+    syncfailed A conversion on the AD server whose sync fails after the AD changes (the package is written, the sync comes first)
 .PARAMETER Repository
     Root of the repository (default: two folders above this script).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
     Part of : PRA Remote Mailbox (repository tool, not in the package)
 #>
 #Requires -Version 7.5
 param(
     [Parameter(Mandatory)][string]$Shots,
     [ValidateSet('Light', 'Dark')][string]$Theme = 'Light',
-    [ValidateSet('single', 'scope', 'twoserver', 'cloud', 'rollback', 'rollbackad', 'rollbackcloud', 'finalize', 'check')][string]$Scenario = 'single',
+    [ValidateSet('single', 'scope', 'twoserver', 'cloud', 'rollback', 'rollbackad', 'rollbackcloud', 'finalize', 'check', 'finish', 'syncfailed')][string]$Scenario = 'single',
     [string]$Repository
 )
 $ErrorActionPreference = 'Stop'
@@ -57,7 +59,7 @@ try {
     $root = Join-Path $work 'runtime'
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     $config = Join-Path $root 'config\PraRemoteMailbox.psd1'
-    $phaseConfig = switch ($Scenario) { 'twoserver' { 'AD' } 'rollbackad' { 'AD' } 'finalize' { 'AD' } 'cloud' { 'Cloud' } 'rollbackcloud' { 'Cloud' } default { 'Both' } }
+    $phaseConfig = switch ($Scenario) { 'twoserver' { 'AD' } 'rollbackad' { 'AD' } 'finalize' { 'AD' } 'finish' { 'AD' } 'syncfailed' { 'AD' } 'cloud' { 'Cloud' } 'rollbackcloud' { 'Cloud' } default { 'Both' } }
     W $config "@{Environment='LAB'; DomainController='dc01.contoso.com'; Scope=@{Mode='OU';SearchBase='OU=Wave1,DC=contoso,DC=com'}; Licensing=@{Enabled=`$false}; EntraConnect=@{Sync=`$true;Server='SRV-AADC01'}; Execution=@{Phase='$phaseConfig'}; Cloud=@{Organization='contoso.onmicrosoft.com'}}"
     W (Join-Path $root 'module\PRA.Synthetic.psm1') '# marker'
     Copy-Item (Join-Path $PSScriptRoot 'StubEngine.ps1') (Join-Path $root 'Invoke-PraRemoteMailbox.ps1')
@@ -75,7 +77,7 @@ try {
     if ($Scenario -in 'single', 'scope') { foreach ($flag in 'entra', 'grant') { W (Join-Path $root "hold.$flag") 'hold' } }
     # A Convert batch (with its Active Directory proof) in the backup folder.
     # The two-server rollback story moves the whole scope (batch ID 490cc62e); the other scenarios keep one test mailbox.
-    $story = $Scenario -in 'rollbackad', 'rollbackcloud'
+    $story = $Scenario -in 'rollbackad', 'rollbackcloud', 'finish'
     $id = if ($story) { '490cc62e' + [guid]::NewGuid().ToString('N').Substring(8) } else { [guid]::NewGuid().ToString('N') }
     $folder = Join-Path $root "Backups\Batch-$id"
     $rec = @{ObjectGuid = [guid]::NewGuid().ToString(); SamAccountName = 'alice.vance'; UserPrincipalName = 'alice.vance@contoso.com'; IsShared = $false }
@@ -84,6 +86,10 @@ try {
         J (Join-Path $folder 'Convert-LAB-fixture.json') @{SchemaVersion = 2; Operation = 'Convert'; Environment = 'LAB'; BatchId = $id; RunId = '20261104_091200-abc'; SourceBackupHash = ''; Records = $recs }
         W (Join-Path $folder 'raw.clixml') '<x/>'
         J (Join-Path $folder "State-$id.json") @{SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'LAB'; Records = @($recs | ForEach-Object { @{ObjectGuid = $_.ObjectGuid; ADVerified = $true } }) }
+    }
+    if ($Scenario -eq 'finish') {
+        # The run that left this batch: the AD changes are verified, the Entra Connect sync failed, no package was written.
+        W (Join-Path $folder "Journal-$id.jsonl") ("{`"RunId`":`"20261109_091200-abc`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"20261109_091200-abc`",`"Operation`":`"ADSync`",`"Status`":`"Failed`"}`r`n")
     }
     if ($Scenario -eq 'cloud') {
         # The transfer package that the AD server wrote, waiting in the Inbox of the cloud server.
@@ -120,20 +126,25 @@ try {
     # The probes stand in for the whole detection, the Microsoft 365 test included: a server with the programs of its side also shows the light *Microsoft 365 reachable*.
     $bothProbe = { param($r) [pscustomobject]@{ Lights = @(
                 [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Ok'; Detail = 'Installed, version 1.0.1.0.' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Ok'; Detail = 'Installed, version 3.10.0.' },
-                [ordered]@{Name = 'Microsoft.Graph'; Status = 'Ok'; Detail = 'Installed, version 2.25.0.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01 (reachability is checked when the run starts).' },
+                [ordered]@{Name = 'Microsoft.Graph'; Status = 'Ok'; Detail = 'Installed, version 2.25.0.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01.' },
                 [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }, [ordered]@{Name = 'Microsoft 365 reachable'; Status = 'Ok'; Detail = 'Reachable from this server (login.microsoftonline.com and outlook.office365.com).' }); AD = $true; Cloud = $true; Role = 'Both' } }
     $adProbe = { param($r) [pscustomobject]@{ Lights = @(
                 [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Ok'; Detail = 'Installed, version 1.0.1.0.' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Fail'; Detail = 'Not installed (version 3.10.0 or later needed): Install-Module ExchangeOnlineManagement.' },
-                [ordered]@{Name = 'Microsoft.Graph'; Status = 'Fail'; Detail = 'Not installed (Authentication and Users): the cloud parts and Check cannot run on this server.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01 (reachability is checked when the run starts).' },
+                [ordered]@{Name = 'Microsoft.Graph'; Status = 'Fail'; Detail = 'Not installed (Authentication and Users): the cloud parts and Check cannot run on this server.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01.' },
                 [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }); AD = $true; Cloud = $false; Role = 'AD' } }
     $cloudProbe = { param($r) [pscustomobject]@{ Lights = @(
                 [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Fail'; Detail = 'Not installed: the Active Directory parts cannot run on this server (install the RSAT feature Active Directory module).' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Ok'; Detail = 'Installed, version 3.10.0.' },
                 [ordered]@{Name = 'Microsoft.Graph'; Status = 'Ok'; Detail = 'Installed, version 2.25.0.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'NA'; Detail = 'Not used: this server does not change Active Directory.' },
                 [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }, [ordered]@{Name = 'Microsoft 365 reachable'; Status = 'Ok'; Detail = 'Reachable from this server (login.microsoftonline.com and outlook.office365.com).' }); AD = $false; Cloud = $true; Role = 'Cloud' } }
-    $probe = switch ($Scenario) { 'twoserver' { $adProbe } 'rollbackad' { $adProbe } 'finalize' { $adProbe } 'cloud' { $cloudProbe } 'rollbackcloud' { $cloudProbe } default { $bothProbe } }
+    $probe = switch ($Scenario) { 'twoserver' { $adProbe } 'rollbackad' { $adProbe } 'finalize' { $adProbe } 'finish' { $adProbe } 'syncfailed' { $adProbe } 'cloud' { $cloudProbe } 'rollbackcloud' { $cloudProbe } default { $bothProbe } }
+    # The Entra Connect check of the window: a server that accepts this account (nothing leaves the process).
+    $syncProbe = { param($server, $seconds) $handle = [pscustomobject]@{ Done = $true }
+        Add-Member -InputObject $handle -MemberType ScriptProperty -Name IsCompleted -Value { $true }
+        Add-Member -InputObject $handle -MemberType ScriptMethod -Name GetResult -Value { param([bool]$TimedOut) [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = 'SRV-AADC01'; Reason = 'SRV-AADC01 accepts this account and Entra Connect answers'; Technical = '' } }
+        $handle }
     $identityProbe = { param($identity) [pscustomobject]@{ Success = $true; Found = $true; Count = 1; DisplayName = 'Alice Vance'; UserPrincipalName = 'alice.vance@contoso.com'; SamAccountName = 'alice.vance'; MailboxType = 'User mailbox' } }
     $toolVersion = [regex]::Match([IO.File]::ReadAllText((Join-Path $repo 'package\Invoke-PraRemoteMailbox.ps1')), '(?m)^\s*Version\s*:\s*(\d+\.\d+\.\d+)\s*$').Groups[1].Value
-    $g = New-PraGuiWindow -Root $root -ConfigPath $config -Version $toolVersion -Theme $Theme -PrerequisiteProbe $probe -IdentityProbe $identityProbe
+    $g = New-PraGuiWindow -Root $root -ConfigPath $config -Version $toolVersion -Theme $Theme -PrerequisiteProbe $probe -IdentityProbe $identityProbe -SyncProbe $syncProbe
 
     function Pump($ms = 120) { $f = New-Object Windows.Threading.DispatcherFrame; $t = New-Object Windows.Threading.DispatcherTimer; $t.Interval = [timespan]::FromMilliseconds($ms); $t.Tag = $f; $t.Add_Tick({ param($s) $s.Tag.Continue = $false; $s.Stop() }); $t.Start(); [Windows.Threading.Dispatcher]::PushFrame($f) }
     $syntheticRoot = 'D:\PRA\PraRemoteMailbox'
@@ -341,6 +352,27 @@ try {
             WaitRun; Pump
             Shot 'run-finalize'
             Click 'BtnNext'; Pump; Shot 'next-finalize' @(, @('BtnReport', '1'))
+        }
+        'finish' {
+            GoToTask 'T_Convert'
+            $c.Mode_Continue.IsChecked = $true; Pump; WaitPackages
+            if (@($g.BatchRows).Count -gt 0) { $c.BatchList.SelectedIndex = 0; Pump }
+            if (-not (@($g.BatchRows)[0].Finish)) { throw 'The batch to finish is not marked' }
+            Shot 'task-finish' @(@('Mode_Continue', '1'), @('BatchList', '2'), @('PhasePill', '3'), @('BtnNext', '4'))
+        }
+        'syncfailed' {
+            W (Join-Path $root 'syncfail.flag') 'x'
+            GoToTask 'T_Convert'
+            $c.S_Source_Scope.IsChecked = $true; Pump
+            PreviewThenConfirm $word
+            Click 'BtnPreview'; Pump 600; WaitRun; Pump
+            if (-not $g.Pending) { throw "no pending: $($c.SumText.Text) $($g.PreviewError)" }
+            $c.ConfirmBox.Text = $word; Pump
+            Click 'BtnNext'; Pump 1200
+            WaitRun; Pump
+            $c.StepList.SelectedIndex = 3; Pump
+            Shot 'run-syncfailed' @(, @('StepList', '1'))
+            Click 'BtnNext'; Pump; Shot 'next-syncfailed' @(@('NextTitle', '1'), @('NextSteps', '2'), @('PkgName', '3'))
         }
         'check' {
             GoToTask 'T_Check'

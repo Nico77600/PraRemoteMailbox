@@ -2,7 +2,7 @@
 #  PRA Remote Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 3.1.1
+#  Version : 3.1.2
 #
 #  This file is read by Invoke-PraRemoteMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -151,7 +151,7 @@
 
     # Exchange Online module.
     Exo = @{
-        MinModuleVersion        = '3.10.0'   # older = child process isolation (certificate sign-in only)
+        MinModuleVersion        = '3.10.1'   # the module must be at least this version (the tool stops before any change otherwise)
         UseSubprocess           = $false     # $true = every Exchange Online call in a child PowerShell
         DisableWAM              = $false     # $false (default) = interactive sign-in through the Windows broker (WAM); $true = browser sign-in instead
         GrantVerifyAttempts     = 13         # re-reads after ONE grant (never retried)

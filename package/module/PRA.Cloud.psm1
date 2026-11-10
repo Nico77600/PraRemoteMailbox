@@ -37,7 +37,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -181,7 +181,7 @@ $script:PraExoWorker = {
     }
     function Mailbox {
         param([string]$Upn,[switch]$Hold)
-        $grantParameters = @{ Filter=(ExactFilter $Upn); Properties=@('RecipientTypeDetails','EmailAddresses'); ResultSize='Unlimited' }
+        $grantParameters = @{ Filter=(ExactFilter $Upn); Properties=@('RecipientTypeDetails','EmailAddresses','LegacyExchangeDN'); ResultSize='Unlimited' }
         if ($Hold) { $grantParameters.Properties += @('IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled') }
         $items = @(Get-EXOMailbox @grantParameters -ErrorAction Stop)
         if ($Hold -and $items.Count -eq 0) { $items = @(Get-EXOMailbox @grantParameters -InactiveMailboxOnly -ErrorAction Stop) }
@@ -193,9 +193,14 @@ $script:PraExoWorker = {
         # EmailAddresses (every proxy address of the mailbox, X500 included): whether Exchange Online returned the property at all is kept apart from "empty".
         $hasAddresses = if ($m -is [System.Collections.IDictionary]) { $m.Contains('EmailAddresses') } else { $null -ne $m.PSObject.Properties['EmailAddresses'] }
         $rawAddresses = V -Object $m -Name 'EmailAddresses' -Default @()
+        # Exchange Online never lists the LegacyExchangeDN of a mailbox in its own EmailAddresses, but Entra Connect may have written it on premises as an X500 address
+        # while the object was still a MailUser: the mailbox counts as carrying X500:<its own LegacyExchangeDN> (the whole value is compared ignoring case, like every X500).
+        $ownDn = [string](V -Object $m -Name 'LegacyExchangeDN' -Default '')
+        $addressList = @($rawAddresses | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        if ($ownDn -and -not (InSetIgnoreCase ('X500:' + $ownDn) $addressList)) { $addressList += ('X500:' + $ownDn) }
         return @{ Found=$true; Type=$type; Holds=@($holds | Where-Object { $null -ne $_ }); IsInactive=[bool](V -Object $m -Name 'IsInactiveMailbox' -Default $false)
             Litigation=[bool](V -Object $m -Name 'LitigationHoldEnabled' -Default $false); RetentionHold=[bool](V -Object $m -Name 'RetentionHoldEnabled' -Default $false)
-            HasAddresses=[bool]$hasAddresses; Addresses=[string[]]@($rawAddresses | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }) }
+            HasAddresses=[bool]$hasAddresses; Addresses=[string[]]$addressList }
     }
     function NormalizeAcl {
         param([object[]]$Entries,[string]$Right,$Target)
@@ -592,8 +597,12 @@ function Connect-PraCloudSession {
     # Removing a module cannot repair an already-loaded conflicting assembly.
     if ($NeedGraph -and -not $s.Graph) {
         $Context.CurrentOperation='Connect-MgGraph'
-        Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-        Import-Module Microsoft.Graph.Users -ErrorAction Stop
+        # ONE version of every Graph module (the highest that exists for all, at the minimum or later): two versions in one session fail with an opaque assembly error.
+        $modules = Get-PraCloudModuleReport -MinExo ([string](Get-PraValue (Get-PraValue $Context.Config 'Exo' @{}) 'MinModuleVersion' '3.10.1'))
+        if (-not $modules.Graph.Ok) { throw $modules.Graph.Message }
+        $graphVersion = [version]$modules.Graph.Version
+        Import-Module Microsoft.Graph.Authentication -RequiredVersion $graphVersion -ErrorAction Stop
+        Import-Module Microsoft.Graph.Users -RequiredVersion $graphVersion -ErrorAction Stop
         if ($null -ne (Get-MgContext -ErrorAction Stop)) { throw 'A Microsoft Graph session already exists in this console: run the tool in a new PowerShell 7 window.' }
         $connect=@{ TenantId=$tenant; ContextScope='Process'; NoWelcome=$true; ErrorAction='Stop' }
         if ($app) { $connect.ClientId=$app; $connect.CertificateThumbprint=$thumb } else { $connect.Scopes=@('User.Read.All') }
@@ -614,10 +623,10 @@ function Connect-PraCloudSession {
     if ($NeedExo -and -not $s.Exo) {
         $Context.CurrentOperation='Connect-ExchangeOnline'
         $exo = Get-PraValue $Context.Config 'Exo' @{}
-        $min = [version][string](Get-PraValue $exo 'MinModuleVersion' '3.10.0')
-        $installed = @(Get-Module ExchangeOnlineManagement -ListAvailable | Sort-Object Version -Descending)
-        if ($installed.Count -eq 0) { throw 'ExchangeOnlineManagement module not found (Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -Force); the tool never installs modules.' }
-        $s.Subprocess = [bool](Get-PraValue $exo 'UseSubprocess' $false) -or $installed[0].Version -lt $min
+        $min = [version][string](Get-PraValue $exo 'MinModuleVersion' '3.10.1')
+        $modules = Get-PraCloudModuleReport -MinExo ([string]$min)
+        if (-not $modules.Exo.Ok) { throw ($modules.Exo.Message + ' The tool never installs modules.') }
+        $s.Subprocess = [bool](Get-PraValue $exo 'UseSubprocess' $false)
         if ($s.Subprocess) {
             if (-not $app) { throw 'Exchange Online child process required (Exo.UseSubprocess or old module): certificate sign-in is mandatory.' }
             $s.Exo=$true
@@ -933,7 +942,7 @@ function Complete-PraX500Check {
         $row.CloudDetail = ([string]$row.CloudDetail + ' | X500:present=' + $last.Total + '/' + $last.Total).Trim(' ', '|')
         return
     }
-    $advice = 'Replies to old messages and meeting updates to this mailbox can bounce (IMCEAEX NDR). Check that Entra Connect syncs proxyAddresses and legacyExchangeDN for this object, run a sync, then run -Action Check.'
+    $advice = 'Not serious: the mailbox works. Until this address appears, a reply to a very old message could bounce. To fix it, run an Entra Connect sync, then run -Action Check.'
     if ($failure) {
         $text = '{0}: X500 could not be verified in Exchange Online ({1}). {2}' -f $State.Upn, $failure, $advice
         $row.CloudDetail = ([string]$row.CloudDetail + ' | X500:not verified').Trim(' ', '|')
@@ -1104,7 +1113,10 @@ function Invoke-PraCloudPhase {
             $pending=@($states | Where-Object { -not $_.Done })
             if (-not $pending.Count -or $Context.Once -or $clock.Elapsed.TotalSeconds -ge $timeout) { break }
             $seconds=[Math]::Min([Math]::Max(1,([double]$Context.IntervalMinutes*60)),[Math]::Max(0,($timeout-$clock.Elapsed.TotalSeconds)))
-            $null=Write-PraLog -Context $Context -Message ("Not ready yet: {0} - next check in {1:0} s (waiting up to {2} min in total)" -f (($pending | ForEach-Object { $_.Upn }) -join ', '), $seconds, $Context.TimeoutMinutes) -Level Sub
+            # A mailbox that is ready and only waits for its X500 addresses is not "not ready": its own message, and the wait is at most two more checks.
+            $notReady=@($pending | Where-Object { -not $_.CoreDone })
+            if ($notReady.Count) { $null=Write-PraLog -Context $Context -Message ("Not ready yet: {0} - next check in {1:0} s (waiting up to {2} min in total)" -f (($notReady | ForEach-Object { $_.Upn }) -join ', '), $seconds, $Context.TimeoutMinutes) -Level Sub }
+            foreach ($s in @($pending | Where-Object { $_.CoreDone })) { $null=Write-PraLog -Context $Context -Message ("{0}: mailbox ready; X500 addresses not all visible yet, check {1} of {2} in {3:0} s" -f $s.Upn, ([int]$s.X500Reads + 1), $x500MaxReads, $seconds) -Level Sub }
             foreach ($s in $pending) { $null=Write-PraLog -Context $Context -Message ("{0} | {1}" -f $s.Upn, $s.Row.CloudDetail) -Level Detail }
             $intervalSeconds=[Math]::Max(1,([double]$Context.IntervalMinutes*60))
             $waitText=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { 'Waiting for Exchange Online to finish deprovisioning' } elseif ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { 'Waiting for the mailbox and licence to appear in Exchange Online' } else { 'Waiting for Exchange Online' }
@@ -1214,10 +1226,10 @@ function Invoke-PraRetentionCheck {
 Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,Invoke-PraRetentionCheck,Close-PraCloudSession
 
 # SIG # Begin signature block
-# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCTh0IHbtQSFrdm
-# mc/ISAccaJ7oRrhjSY2eDxvz7F3wX6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBuk2+Au1Hz+cFK
+# X0Ax6iz9SHrq6g2j4Ew7vBBSbyH1MKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1289,28 +1301,28 @@ Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCXsw3rUEz8
-# zO9Qot9oExLQ8qxSN8pPnTE173uuyRQYOzANBgkqhkiG9w0BAQEFAASCAgAkj9Lk
-# 1iRsdORBEuvjq+oPKaQybE3rzUE8D1PpkJGb+raXs/XNSN9GJoAQeLIi9j5woGtB
-# 0SMD1MtZ0jy+QdMgMEtNlOlVmx61ITieWT3ZV22W/zRxG2nkLMtF94qSCmWHOwjs
-# EpY1x5DERU97VACdfKf4HhDXVofcb02+uKeE0lbfwJgEbr90/1xmSFfShz1xHJkp
-# OXTaD8ZS+UX/wUkPIM5kpZPfTn4cyWkL5rrVdwPFqHtw5qUrE0I2xX4z7aU42QHZ
-# w6NyZWp4VJz7r9U3bwRh+1+cxUItp9OJwv+FoR76PB1zqbtydeZGSZZ92YaDNGKA
-# 2RL7Swb0xuywdC8RNhwPVTW2xQHCBKwf5zcOMD15PAA+09YZM10oQ746BMiE3xyA
-# ai8tsG9sBQYrjjiq/gq0ynVyILnvr6eEgobX+BKLfb5IwY7EbVDer4Xi87yx3nTY
-# eMNiSz84rR/G3N1Gf2IyjELaGw8gRJ9rxJl/gl9x0Zk7tkbPbtTZWMm5CLfprBT4
-# SGdJnkHBZQW5JyEDlWwT+5lbsofdtbPA2o/RpDUNfyfxRWydQAewHjcu8VVkAAFa
-# /MvQWAAFPSXQyAnr9mde1mL+1xgoX8hCIHXIbIIltU7Owv3+Tee3Jf6jD66RZ+K3
-# 2xKFysKv5+8mDbqA92SC402/f8jb35BgvLvlAaGCFM8wghTLBgorBgEEAYI3AwMB
-# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCC3NJvdPH4T
+# gx5HbAn5pMGP0+td7wpDQ4VSaLpwTSy3wjANBgkqhkiG9w0BAQEFAASCAgCfkWjY
+# CLKfq067n8XRlLa+E6CgObQqsNOHGuwJ8ibcnP4XQox84nQW4QiqVSSBRY+v4kcw
+# E/VSJB0MASdf/zVqTqzHldNMwMFR/XhNjS04+dnSALG+W3TC2gw3tcCJWLv3aca3
+# 3t2NLx0nlCLhTVVo5dyEwwIAKHJCQ6kxOokONbr4h5vmEqlQFBuC+YWXPz+iseFg
+# JKpIpUo/ssACGLj+eGSsqZ80WBIdCdC9VjavQizaajnyme3dyL2U4E1JduUhwD4X
+# b++LRzc4Bb5ccH4Svg2Meb6O1RYYnXZ9zSsaKtT7mQMy1BPOqqjEVYpPSAgEJvrn
+# lxGjtj3er1B55VK/gAoRgc+9oWI9oLeOQMETVTg7QkrL5su8ZiA+xn0BsqpnjPxP
+# ScveJeJAZvPQr4346VPEpJnMwW6r0be0sqCPJvXGGwwCMiqkvP8cKPPyOY/3fflG
+# bEUiwyjDhFPpsQkYNN43f1DOBoPmBHmHnCWlicu9f5LEfklVw5OGEzphLcJHqq8/
+# 5CX/lcEKOQ0ifuXJVPXDPCspbU5mRX4lU0pDN+7Irt6tqwi3pUAx9mtIjkCn5g7y
+# sC/cPDAsLwVpND36OfpRvi70vZ8FGx2JRYZyWWDMB+TfQ+GYvLEK0ekozgt809Dh
+# 58hPVxLYC4MuhwIRNXRNvEdoqW//yqq1Azu28aGCFM0wghTJBgorBgEEAYI3AwMB
+# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIHpxJpfOoPjuuwAi9vjWJT59u0v8oWRuQW5PkCaIEeVxAghWYs/sYy8i
-# pRgPMjAyNjExMDkxNTMzMjBaMAMCAQECEHd1xWYGan3MHOrt0vX6q+2gghGnMIIE
+# BAIBBQAEIHw9SWzDtx6eW+CA8EJz72stBoydPgFX1mh0vOrxer8KAghhSibitsyB
+# NBgPMjAyNjExMTAwODMzMjFaMAMCAQECEA+ycnfdgCe80wKS8mC8MlGgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1405,17 +1417,17 @@ Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwOTE1MzMyMFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIDKy
-# 9TgYsdwvMsc+WzgpgbvmASqmgPAy8/j+vvKxqjlwMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMDA4MzMyMVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIBoh
+# mQckqyRAt8iZP7jONJaXAAm+OtHHm4Zy3fUYA/d4MIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIESDBGAiEA2Km9PNh/765JZtm7XCg8BBCQnZLK/JUnt3QbhnqyoZECIQC1
-# TWz2Vj3SdImnKwVI5V5hB5z6+0LVm6F+5US3Qy7FpQ==
+# zj0EAwIERjBEAiAGrpgmWfaFUWSBPGQoAONIhWRs4m60ZjIEJYtMl7MHUAIgKGKG
+# 6XTz7CcmXJtFGh1LitIlK3l2XF/3Z95mlPDPQ58=
 # SIG # End signature block

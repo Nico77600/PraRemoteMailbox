@@ -30,7 +30,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
     Part of : PRA Remote Mailbox (repository tool, not in the package). Needs PowerShell 7.5+, Microsoft Edge, Windows (WPF).
 #>
 #Requires -Version 7.5
@@ -95,6 +95,7 @@ if ($all -or $Part -eq 'Console') {
         @{ Scenario = 'single'; Theme = 'Light' }, @{ Scenario = 'single'; Theme = 'Dark' }
         @{ Scenario = 'scope'; Theme = 'Light' }, @{ Scenario = 'twoserver'; Theme = 'Light' }, @{ Scenario = 'cloud'; Theme = 'Light' }
         @{ Scenario = 'rollback'; Theme = 'Light' }, @{ Scenario = 'rollbackad'; Theme = 'Light' }, @{ Scenario = 'rollbackcloud'; Theme = 'Light' }, @{ Scenario = 'finalize'; Theme = 'Light' }, @{ Scenario = 'check'; Theme = 'Light' }
+        @{ Scenario = 'finish'; Theme = 'Light' }, @{ Scenario = 'syncfailed'; Theme = 'Light' }
     )
     $running = @()
     foreach ($job in $jobs) {
@@ -118,6 +119,7 @@ if ($all -or $Part -eq 'Console') {
         'task-rollback', 'task-rollback-selected', 'verify-rollback', 'run-rollback', 'next-rollback'
         'task-rollback-ad', 'next-rollback-package', 'task-rollback-continue', 'task-rollback-package', 'verify-rollback-cloud', 'run-rollback-cloud', 'next-rollback-cloud'
         'task-finalize', 'verify-finalize', 'run-finalize', 'next-finalize', 'task-check', 'verify-check'
+        'task-finish', 'run-syncfailed', 'next-syncfailed'
     )
     $keepDark = @('setup', 'run-finished')
     foreach ($name in $keepLight) { Copy-Item -LiteralPath (Join-Path $shots "console-$name-light.png") -Destination (Join-Path $OutputFolder "console-$name-light.png") -Force }

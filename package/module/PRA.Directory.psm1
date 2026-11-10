@@ -26,7 +26,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -442,6 +442,36 @@ function Get-PraGroup {
     return $groups[0]
 }
 
+function Find-PraConvertedBatch {
+    <#
+    .SYNOPSIS
+        The most recent Convert batch of the backup folder that holds an object and has its AD proof (State file), or $null. A hint for the operator
+        only: the batch is verified in full when it is used.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [string]$ObjectGuid)
+    try {
+        $root = [string]$Context.Config.Storage.BackupFolder
+        if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { return $null }
+        $folders = [object[]]@(Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction Stop | Where-Object { $_.Name -match '^Batch-[0-9a-f]{32}$' })
+        $ticks = [long[]]@($folders | ForEach-Object { $_.LastWriteTimeUtc.Ticks })
+        [Array]::Sort($ticks, $folders); [Array]::Reverse($folders)
+        foreach ($folder in $folders) {
+            $batchId = $folder.Name.Substring(6)
+            if (-not (Test-Path -LiteralPath (Join-Path $folder.FullName ('State-' + $batchId + '.json')) -PathType Leaf)) { continue }
+            foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter 'Convert-*.json' -ErrorAction Stop)) {
+                try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson } catch { continue }
+                if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $data 'Operation' '')) 'Convert')) { continue }
+                if (@(@($data.Records) | Where-Object { Test-PraOrdinalIgnoreCaseEqual ([string]$_.ObjectGuid) $ObjectGuid }).Count -eq 1) {
+                    return [pscustomobject]@{ BatchId = $batchId; ShortId = $batchId.Substring(0, 8); Folder = $folder.FullName }
+                }
+            }
+        }
+    }
+    catch { Write-PraLog -Context $Context -Message ('The backup folder could not be searched for a batch of this object: {0}' -f $_.Exception.Message) -Level Detail }
+    return $null
+}
+
 function Get-PraTarget {
     <#
     .SYNOPSIS
@@ -500,7 +530,22 @@ function Get-PraTarget {
         $excluded = $samName.StartsWith('HealthMailbox', [StringComparison]::OrdinalIgnoreCase) -or $samName.StartsWith('SystemMailbox', [StringComparison]::OrdinalIgnoreCase) -or
             ([string](Get-PraValue $user 'DisplayName' '')).StartsWith('Microsoft Exchange', [StringComparison]::OrdinalIgnoreCase) -or (Test-PraOrdinalIn -IgnoreCase $user.SamAccountName $scope.ExcludeSamAccountNames)
         if (-not $eligible -or $excluded) {
-            if ($explicit) { throw "Explicit target not eligible (not an on-premises mailbox of an accepted type) or excluded: $($user.SamAccountName). Nothing converted." }
+            if ($explicit) {
+                # The stop message names this object (the context still held the last object read).
+                $Context.CurrentIdentity = $samName
+                $converted = $null
+                if (-not $eligible -and -not $excluded) { $converted = Find-PraConvertedBatch $Context $id }
+                if ($null -ne $converted) {
+                    $hook = Get-PraValue $Context 'CommandLineFor' $null
+                    # Started from the window (it sets PRA_EVENT_FILE) the operator has no command line: the way is the Task page.
+                    if ($env:PRA_EVENT_FILE) {
+                        throw ("{0} is already converted by batch {1} (it is a remote mailbox now): nothing was changed. To continue that batch (Entra Connect sync and transfer package; AD is not changed again), go to the Task page, choose Move mailboxes to Exchange Online, then Continue a batch, and pick batch {1}." -f $samName, $converted.ShortId)
+                    }
+                    $command = if ($hook -is [scriptblock]) { [string](& $hook 'Convert' 'AD' $converted.ShortId) } else { '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch ' + $converted.ShortId }
+                    throw ("{0} is already converted by batch {1} (it is a remote mailbox now): nothing was changed. To continue that batch (Entra Connect sync and transfer package; AD is not changed again) run: {2}" -f $samName, $converted.ShortId, $command)
+                }
+                throw "Explicit target not eligible (not an on-premises mailbox of an accepted type) or excluded: $samName. Nothing converted."
+            }
             continue
         }
         $selected.Add($user)
@@ -534,7 +579,7 @@ function Get-PraAttributeState {
         if ($present) {
             switch ($Kinds[$name]) {
                 String { $value = [string]$raw }
-                MultiString { $value = [string[]]@($raw | Sort-PraOrdinal) }
+                MultiString { $value = [string[]]@($raw | Get-PraOrdinalSorted) }
                 Bytes { $value = [Convert]::ToBase64String([byte[]]$raw) }
                 Bool { $value = [bool]$raw }
                 Int { $value = ([int]$raw).ToString([Globalization.CultureInfo]::InvariantCulture) }
@@ -579,7 +624,7 @@ function Test-PraStateEqual {
     if ([bool]$Left.Present -ne [bool]$Right.Present -or -not (Test-PraOrdinalEqual $Left.Kind $Right.Kind)) { return $false }
     if (-not $Left.Present) { return $true }
     if (Test-PraOrdinalEqual $Left.Kind 'MultiString') {
-        $a = @($Left.Value | Sort-PraOrdinal); $b = @($Right.Value | Sort-PraOrdinal)
+        $a = @($Left.Value | Get-PraOrdinalSorted); $b = @($Right.Value | Get-PraOrdinalSorted)
         if ($a.Count -ne $b.Count) { return $false }
         for ($i = 0; $i -lt $a.Count; $i++) { if (-not (Test-PraOrdinalEqual ([string]$a[$i]) ([string]$b[$i]))) { return $false } }
         return $true
@@ -816,7 +861,7 @@ function Get-PraX500Difference {
     $added = New-Object 'Collections.Generic.List[string]'
     foreach ($value in $nowX) { if (-not (Test-PraOrdinalIn $value $wasX -IgnoreCase) -and -not (Test-PraOrdinalIn $value $added.ToArray() -IgnoreCase)) { $added.Add([string]$value) } }
     $removed = @($wasX | Where-Object { -not (Test-PraOrdinalIn $_ $nowX -IgnoreCase) })
-    $a = @($now | Where-Object { -not (Test-PraX500Address $_) } | Sort-PraOrdinal); $b = @($was | Where-Object { -not (Test-PraX500Address $_) } | Sort-PraOrdinal)
+    $a = @($now | Where-Object { -not (Test-PraX500Address $_) } | Get-PraOrdinalSorted); $b = @($was | Where-Object { -not (Test-PraX500Address $_) } | Get-PraOrdinalSorted)
     $same = ($a.Count -eq $b.Count)
     if ($same) { for ($i = 0; $i -lt $a.Count; $i++) { if (-not (Test-PraOrdinalEqual ([string]$a[$i]) ([string]$b[$i]))) { $same = $false; break } } }
     return [pscustomobject]@{ OtherEqual = $same; Added = [string[]]$added.ToArray(); Removed = [string[]]@($removed) }
@@ -859,7 +904,7 @@ function Get-PraPermissionCache {
     <# Bounded cache (groups, trustees) shared by the shared mailboxes of one batch. #>
     [CmdletBinding()]
     param([hashtable]$Context)
-    $policy = (@($Context.Config.SharedMailbox.ExcludeTrusteeSamAccountNames | Sort-PraOrdinal) -join "`n")
+    $policy = (@($Context.Config.SharedMailbox.ExcludeTrusteeSamAccountNames | Get-PraOrdinalSorted) -join "`n")
     $cache = $null
     if ($script:PermissionCaches.TryGetValue($Context, [ref]$cache)) {
         if ((Test-PraOrdinalIgnoreCaseEqual $cache.Server $Context.Server) -and (Test-PraOrdinalEqual $cache.Policy $policy)) { return $cache }
@@ -927,7 +972,7 @@ function Expand-PraTrustee {
             }
         }
     }
-    $result = [string[]]@($upns | Sort-PraOrdinal -IgnoreCase)
+    $result = [string[]]@($upns | Get-PraOrdinalSorted -IgnoreCase)
     # An enumeration error never reaches this point: a partial expansion is never cached.
     Add-PraPermissionCache -Context $Context -Key $key -Upns $result
     Write-PraLog -Context $Context -Message ("PERMISSIONS GROUP END | unique members=$($seen.Count) | unique UPN=$($result.Count)") -Level Debug
@@ -1079,7 +1124,7 @@ function Get-PraSharedPermission {
     Write-PraMemoryStage -Context $Context -Stage 'PERMISSIONS CAPTURED' -Identity ([string]$User.ObjectGUID) -Detail ("FullAccess=$($full.Count) SendAs=$($send.Count) SendOnBehalf=$($behalf.Count)")
     $ignored = @(@($unknownFullAccess | ForEach-Object { "FullAccess $_" }) + @($unknownSendAs | ForEach-Object { "SendAs $_" }))
     if ($ignored.Count) { $Context['_PraIgnoredTrustees'][([guid]$User.ObjectGUID).ToString()] = [string[]]$ignored }
-    return @{ FullAccess=@($full | Sort-PraOrdinal -IgnoreCase); SendAs=@($send | Sort-PraOrdinal -IgnoreCase); SendOnBehalf=@($behalf | Sort-PraOrdinal -IgnoreCase) }
+    return @{ FullAccess=@($full | Get-PraOrdinalSorted -IgnoreCase); SendAs=@($send | Get-PraOrdinalSorted -IgnoreCase); SendOnBehalf=@($behalf | Get-PraOrdinalSorted -IgnoreCase) }
 }
 #endregion
 
@@ -1200,7 +1245,7 @@ function New-PraPlan {
         if ($x500.Added.Count) {
             $originalValues = if ([bool]$originalProxies.Present) { @([string[]]@($originalProxies.Value)) } else { @() }
             $keptX500 = @($x500.Added)
-            $desired.proxyAddresses = @{ Present=$true; Kind='MultiString'; Value=[string[]]@(@($originalValues) + @($keptX500) | Sort-PraOrdinal) }
+            $desired.proxyAddresses = @{ Present=$true; Kind='MultiString'; Value=[string[]]@(@($originalValues) + @($keptX500) | Get-PraOrdinalSorted) }
         }
         $sourceGroup = Get-PraValue $SourceRecord 'Licensing' $null
         if ($null -ne $sourceGroup -and $sourceGroup.Enabled) {
@@ -1547,6 +1592,17 @@ function Invoke-PraAdPreview {
     }
 }
 
+function Test-PraAdAccessDenied {
+    <# True when an Active Directory error is a refusal of the account: UnauthorizedAccessException, the directory error 8344 (insufficient access rights) or 5 (access denied) in the error id (they do not depend on the language of Windows), or the English words. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Failure)
+    $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { [Exception]$Failure }
+    $errorId = if ($Failure -is [Management.Automation.ErrorRecord]) { [string]$Failure.FullyQualifiedErrorId } else { '' }
+    $cursor = $exception
+    while ($null -ne $cursor) { if ($cursor -is [UnauthorizedAccessException]) { return $true }; $cursor = $cursor.InnerException }
+    return ($errorId -match 'ActiveDirectoryServer:(8344|5)\b' -or [string]$exception.Message -match '(?i)insufficient access rights|access is denied')
+}
+
 function Invoke-PraAdBatch {
     <#
     .SYNOPSIS
@@ -1565,6 +1621,7 @@ function Invoke-PraAdBatch {
     if ([bool](Get-PraValue $Context 'OperationFailed' $false) -or $Context.Issues.Count -gt 0 -or @($Context.Rows | Where-Object FinalStatus -eq 'Error').Count -gt 0) { throw 'No new batch after an error in this run.' }
     if (-not $Plans.Count) { Write-PraItem -Context $Context -Status Skip -Text 'Nothing to do.'; return $null }
     foreach ($plan in $Plans) { if (-not $Context.Rows.Contains($plan.Row)) { $Context.Rows.Add($plan.Row) } }
+    $receipt = $null
     try {
         foreach ($plan in $Plans) { if (-not [bool](Get-PraValue $plan 'Previewed' $false)) { Write-PraAdDelta -Context $Context -Plan $plan -Stage Planned } }
         if (-not $Context.AllowMutation -or (-not (Test-PraOrdinalIgnoreCaseEqual $Context.Mode 'Apply')) -or (Test-PraOrdinalIgnoreCaseEqual $Context.Action 'Check') -or $WhatIfPreference) {
@@ -1635,6 +1692,22 @@ function Invoke-PraAdBatch {
     catch {
         $Context.OperationFailed = $true; $Context.LastVerifiedReceipt = $null
         $failure = $_
+        # The account is refused by the domain controller and NOTHING was written: say it in plain words, and mark the folder of the backup (written before the first write) as a
+        # batch that changed nothing, so that nobody takes it for a batch to continue or to roll back. It is not deleted: the backup is the only record of what was read.
+        $written = @($Plans | Where-Object { (Get-PraValue $_.Row 'ADApplied' $null) -eq $true }).Count
+        if ($null -ne $receipt -and $written -eq 0 -and (Test-PraAdAccessDenied $failure)) {
+            $plain = 'Nothing was changed in AD. This account cannot write to {0}: run the tool on that domain controller, or with an account that has the rights (see Prerequisites). Detail: {1}' -f $Context.Server, ([string]$failure.Exception.Message -replace '\s+', ' ').Trim()
+            try {
+                $folder = Split-Path $receipt.Path -Parent
+                Write-PraImmutableFile (Join-Path $folder 'NOT-APPLIED.txt') ("Nothing was written to Active Directory by this batch (run {0}): the account was refused by {1}.`r`nThe backup in this folder is complete and was never used. This folder is NOT a batch to continue and NOT a batch to roll back.`r`n" -f $Context.RunId, $Context.Server)
+                Write-PraJournal $Context '*' 'ADBatch' 'NotApplied' 'access refused before the first write; nothing was changed in AD'
+                $Context.StateFiles.Add((Join-Path $folder 'NOT-APPLIED.txt'))
+            }
+            catch { Write-PraLog -Context $Context -Message ('The folder of the backup could not be marked as not applied: {0}' -f $_.Exception.Message) -Level Detail }
+            try { Write-PraLog -Context $Context -Message $plain -Level Error }
+            catch { $Context.Issues.Add([pscustomobject]@{ Message = $plain; Source = 'ADBatch' }) }
+            throw $plain
+        }
         try { Write-PraLog -Context $Context -Message "AD batch stopped: $($failure.Exception.Message). No further write in this run." -Level Error }
         catch { $Context.Issues.Add([pscustomobject]@{ Message=$failure.Exception.Message; Source='ADBatch' }) }
         throw $failure
@@ -1899,6 +1972,117 @@ $script:PraSyncCycle = {
     [pscustomobject]@{ Result = [string]$result.Result; Seconds = [int]$clock.Elapsed.TotalSeconds; Computer = $env:COMPUTERNAME }
 }
 
+# Read-only check of the Entra Connect synchronisation, run on EntraConnect.Server (or here): it proves that this ACCOUNT can use the ADSync module there.
+# Test-WSMan cannot prove it: it does not authenticate. Self-contained, like $script:PraSyncCycle (it also runs in the Windows PowerShell 5.1 endpoint).
+$script:PraSyncProbe = {
+    $ErrorActionPreference = 'Stop'
+    $import = @{ Name = 'ADSync'; ErrorAction = 'Stop' }
+    if ([string]::Equals([string]$PSVersionTable.PSEdition, 'Core', [StringComparison]::Ordinal)) { $import.UseWindowsPowerShell = $true }
+    Import-Module @import
+    $scheduler = Get-ADSyncScheduler -ErrorAction Stop
+    [pscustomobject]@{ Computer = $env:COMPUTERNAME; CycleEnabled = [bool]$scheduler.SyncCycleEnabled }
+}
+
+function New-PraSyncResult {
+    <# One answer of the Entra Connect check: Ok, Kind (Ok, Denied, Unreachable, NoModule, Timeout or Failed), Server, Reason (plain words, with what to do) and Technical (the raw message). #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'In-memory constructor, no change to any target or file.')]
+    [CmdletBinding()]
+    param([bool]$Ok, [string]$Kind, [string]$Server = '', [string]$Reason = '', [string]$Technical = '')
+    [pscustomobject]@{ Ok = $Ok; Kind = $Kind; Server = $Server; Reason = $Reason; Technical = $Technical }
+}
+
+function Get-PraSyncFailure {
+    <#
+    .SYNOPSIS
+        Plain words for a failed Entra Connect check or cycle: Kind (Denied, Unreachable, NoModule, Timeout or Failed), Reason (what happened and what to do)
+        and Technical (the raw message). The account that is refused is the usual cause, so it is tested first.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Failure, [string]$Server = '')
+    $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { [Exception]$Failure }
+    $technical = ([string]$exception.Message -replace '\s+', ' ').Trim()
+    $errorId = if ($Failure -is [Management.Automation.ErrorRecord]) { [string]$Failure.FullyQualifiedErrorId } else { '' }
+    $where = if ($Server) { $Server } else { 'this server' }
+    if (([int](Get-PraValue $exception 'ErrorCode' 0) -eq 5) -or $technical -match '(?i)access is denied|access denied|acc[eè]s refus|unauthorized|not authorized|logon failure|authentication|permission') {
+        $reason = if ($Server) { 'this account has no right on {0}: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncOperators)' -f $Server }
+            else { 'this account has no right to use Entra Connect on this server: it must be a member of ADSyncOperators (or Administrators)' }
+        return New-PraSyncResult -Ok $false -Kind 'Denied' -Server $Server -Reason $reason -Technical $technical
+    }
+    if ($technical -match '(?i)^Timeout:') {
+        return New-PraSyncResult -Ok $false -Kind 'Timeout' -Server $Server -Reason ('the synchronisation cycle did not finish in time on {0} (it may still be running)' -f $where) -Technical $technical
+    }
+    # The error id of a missing module does not depend on the language of Windows; the message words are the fallback.
+    if ($errorId -match 'ModuleNotFound' -or ($technical -match '(?i)ADSync' -and $technical -match '(?i)not loaded|no valid module|could not be found|not recognized|cannot find|not found|FileNotFound')) {
+        $reason = if ($Server) { '{0} answered but the ADSync module is not installed there: it is not the Entra Connect server (check EntraConnect.Server)' -f $Server } else { 'the ADSync module is not on this server' }
+        return New-PraSyncResult -Ok $false -Kind 'NoModule' -Server $Server -Reason $reason -Technical $technical
+    }
+    if ($Server -and ($exception.GetType().Name.Contains('PSRemotingTransportException') -or $technical -match '(?i)cannot connect|could not connect|cannot be resolved|cannot find the computer|no such host|network path|network name|timed out|did not respond|unreachable|WinRM|WS-Management|connection (was )?(refused|closed)|actively refused|server is unavailable')) {
+        return New-PraSyncResult -Ok $false -Kind 'Unreachable' -Server $Server -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985): check the server name in EntraConnect.Server, the network and the firewall' -f $Server) -Technical $technical
+    }
+    New-PraSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('the Entra Connect check on {0} failed ({1})' -f $where, $technical) -Technical $technical
+}
+
+function Resolve-PraSyncProbe {
+    <# Reads the answer of a check started by Start-PraSyncProbe (the job is removed). -TimedOut: the time is up and the job has not ended. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Handle, [switch]$TimedOut)
+    $server = [string]$Handle.Server
+    try {
+        if ($TimedOut -and -not $Handle.IsCompleted) {
+            Stop-Job -Job $Handle.Job -ErrorAction SilentlyContinue
+            $seconds = [int]$Handle.TimeoutSeconds
+            return New-PraSyncResult -Ok $false -Kind 'Unreachable' -Server $server -Technical ('no answer within {0} seconds' -f $seconds) `
+                -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985) within {1} seconds: check the server name in EntraConnect.Server, the network and the firewall' -f $server, $seconds)
+        }
+        $answer = Receive-Job -Job $Handle.Job -ErrorAction Stop
+        if ($null -eq $answer) { return New-PraSyncResult -Ok $false -Kind 'Failed' -Server $server -Reason ('{0} answered nothing to the Entra Connect check' -f $server) -Technical 'empty answer' }
+        New-PraSyncResult -Ok $true -Kind 'Ok' -Server $server -Reason ('{0} accepts this account and Entra Connect answers' -f $server)
+    }
+    catch { Get-PraSyncFailure $_ $server }
+    finally { Remove-Job -Job $Handle.Job -Force -ErrorAction SilentlyContinue }
+}
+
+function Start-PraSyncProbe {
+    <#
+    .SYNOPSIS
+        Starts the Entra Connect check on EntraConnect.Server as a remote job and returns at once (the window polls it). The handle has IsCompleted and
+        GetResult($timedOut); the result is the one of Test-PraSyncServer. The session has a bounded open and operation time.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Starts a read-only remote check (Get-ADSyncScheduler); nothing is changed.')]
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Server, [ValidateRange(5, 600)][int]$TimeoutSeconds = 30)
+    $option = New-PSSessionOption -OpenTimeout ($TimeoutSeconds * 1000) -OperationTimeout ($TimeoutSeconds * 1000)
+    $job = Invoke-Command -ComputerName $Server -ScriptBlock $script:PraSyncProbe -SessionOption $option -AsJob -ErrorAction Stop
+    $handle = [pscustomobject]@{ Server = $Server; TimeoutSeconds = $TimeoutSeconds; Job = $job }
+    Add-Member -InputObject $handle -MemberType ScriptProperty -Name IsCompleted -Value { -not (Test-PraOrdinalIn ([string]$this.Job.State) @('NotStarted', 'Running', 'Suspended', 'Stopping', 'Disconnected')) }
+    Add-Member -InputObject $handle -MemberType ScriptMethod -Name GetResult -Value { param([bool]$TimedOut) Resolve-PraSyncProbe -Handle $this -TimedOut:$TimedOut }
+    return $handle
+}
+
+function Test-PraSyncServer {
+    <#
+    .SYNOPSIS
+        Proves that the Entra Connect synchronisation is possible FOR THIS ACCOUNT: an authenticated, read-only call to the ADSync module of
+        EntraConnect.Server (PowerShell remoting, bounded time), or of this server when no server is given. Starts nothing, changes nothing.
+    .OUTPUTS
+        Ok, Kind (Ok, Denied, Unreachable, NoModule, Timeout or Failed), Server, Reason (plain words) and Technical (the raw message).
+    #>
+    [CmdletBinding()]
+    param([string]$Server = '', [ValidateRange(5, 600)][int]$TimeoutSeconds = 30)
+    if ($Server) {
+        try { $handle = Start-PraSyncProbe -Server $Server -TimeoutSeconds $TimeoutSeconds }
+        catch { return (Get-PraSyncFailure $_ $Server) }
+        $null = Wait-Job -Job $handle.Job -Timeout $TimeoutSeconds
+        return $handle.GetResult(-not $handle.IsCompleted)
+    }
+    if (-not @(Get-Module -ListAvailable -SkipEditionCheck ADSync).Count) {
+        return New-PraSyncResult -Ok $false -Kind 'NoModule' -Reason 'the ADSync module is not on this server (run the AD part on the Entra Connect server, or set EntraConnect.Server)' -Technical 'ADSync module not found'
+    }
+    try { $null = & $script:PraSyncProbe }
+    catch { return (Get-PraSyncFailure $_ '') }
+    New-PraSyncResult -Ok $true -Kind 'Ok' -Reason 'the ADSync module answers on this server'
+}
+
 function Invoke-PraSync {
     <#
     .SYNOPSIS
@@ -1907,13 +2091,20 @@ function Invoke-PraSync {
     .DESCRIPTION
         EntraConnect.Sync = $false: nothing is run; a warning reminds the operator to synchronise
         before the cloud part. The sync is refused if the batch is not proven in this run.
+        A cycle that fails after the AD changes were verified is NOT an error of the run: the AD part is done. The failure is recorded in
+        $Context.SyncFailure, the objects become Pending (exit code 2) and the entry script says what to do (run the sync, then go on).
+    .PARAMETER Resume
+        Continues a batch whose AD changes were made and verified by an earlier run: the AD proof loaded in this run ($Context.Proof, $Context.Source) replaces the
+        receipt of an AD write of this run.
     #>
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
-    param([hashtable]$Context)
+    param([hashtable]$Context, [switch]$Resume)
     if (-not $Context.AllowMutation -or (-not (Test-PraOrdinalIgnoreCaseEqual $Context.Mode 'Apply')) -or (-not (Test-PraOrdinalIn $Context.Action @('Convert','Recover','Finalize') -IgnoreCase)) -or $WhatIfPreference) { return }
     $settings = $Context.Config.EntraConnect
     if (-not $settings.Sync) {
         Write-PraItem -Context $Context -Status Warn -Text 'EntraConnect.Sync = $false: run a delta synchronisation on the Entra Connect server now (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the scheduled one.'
+        # The synchronisation is left to the operator: the Next steps say so, before the hand-over of the package.
+        if (@($Context.Rows | Where-Object { (Get-PraValue $_ 'ADApplied' $null) -eq $true }).Count) { $Context['SyncNotRun'] = [pscustomobject]@{ Server = $(if ($settings.Server) { [string]$settings.Server } else { [string]$env:COMPUTERNAME }) } }
         return
     }
     if (-not $PSCmdlet.ShouldProcess($(if ($settings.Server) { $settings.Server } else { $env:COMPUTERNAME }), 'Start an Entra Connect synchronisation cycle')) { return }
@@ -1921,12 +2112,22 @@ function Invoke-PraSync {
         Write-PraItem -Context $Context -Status Skip -Text 'No AD change in this run: no synchronisation needed.'
         return
     }
-    $receipt = Get-PraValue $Context 'LastVerifiedReceipt' $null
-    if ($null -eq $receipt -or -not (Test-PraOrdinalEqual $receipt.Data.RunId $Context.RunId)) { throw 'Synchronisation refused: no verified AD batch in this run.' }
+    if (-not $Resume) {
+        $receipt = Get-PraValue $Context 'LastVerifiedReceipt' $null
+        if ($null -eq $receipt -or -not (Test-PraOrdinalEqual $receipt.Data.RunId $Context.RunId)) { throw 'Synchronisation refused: no verified AD batch in this run.' }
+    }
     if ([bool](Get-PraValue $Context 'OperationFailed' $false) -or $Context.Issues.Count -gt 0 -or @($Context.Rows | Where-Object FinalStatus -eq 'Error').Count -gt 0) { throw 'Synchronisation refused after an error in this run.' }
-    $source = if (Test-PraOrdinalEqual $receipt.Data.Operation 'Convert') { $receipt } else { Get-PraValue $Context 'Source' $null }
-    if ($null -eq $source) { throw 'Synchronisation refused: the Convert source of the batch is unknown.' }
-    $null = Import-PraProof $Context $receipt.StatePath $source $receipt.Data.Operation
+    if ($Resume) {
+        $loadedProof = Get-PraValue $Context 'Proof' $null
+        $source = Get-PraValue $Context 'Source' $null
+        if ($null -eq $loadedProof -or $null -eq $source) { throw 'Synchronisation refused: the AD proof of the batch is not loaded.' }
+        $null = Import-PraProof $Context $loadedProof.Path $source ([string]$loadedProof.Data.Operation)
+    }
+    else {
+        $source = if (Test-PraOrdinalEqual $receipt.Data.Operation 'Convert') { $receipt } else { Get-PraValue $Context 'Source' $null }
+        if ($null -eq $source) { throw 'Synchronisation refused: the Convert source of the batch is unknown.' }
+        $null = Import-PraProof $Context $receipt.StatePath $source $receipt.Data.Operation
+    }
     if (-not $Context.JournalPath -or -not (Test-Path -LiteralPath $Context.JournalPath -PathType Leaf)) { throw 'Synchronisation refused: the batch journal is missing.' }
     $target = if ($settings.Server) { $settings.Server } else { $env:COMPUTERNAME }
     $Context.CurrentOperation = 'Start-ADSyncSyncCycle'; $Context.CurrentIdentity = $target
@@ -1935,22 +2136,38 @@ function Invoke-PraSync {
     Write-PraItem -Context $Context -Status Info -Icon Sync -Text ("{0} cycle started on {1}, waiting for its end (max {2} min)..." -f $settings.PolicyType, $target, $settings.TimeoutMinutes)
     Write-PraProgress -Context $Context -Text ('Waiting for the Entra Connect {0} cycle to finish on {1} (up to {2} min)' -f $settings.PolicyType, $target, $settings.TimeoutMinutes) -Current 0 -Total ([int]$settings.TimeoutMinutes * 60)
     $timeoutSeconds = [int]$settings.TimeoutMinutes * 60
-    if ($settings.Server) {
-        # The cycle runs on the Entra Connect server as a job: this side reports a wait (attempt, next check) every 5 s until it ends.
-        $job = Invoke-Command -ComputerName $settings.Server -ScriptBlock $script:PraSyncCycle -ArgumentList $settings.PolicyType, $settings.TimeoutMinutes -AsJob -ErrorAction Stop
-        try {
-            $clock = [Diagnostics.Stopwatch]::StartNew(); $poll = 0
-            while ($null -eq (Wait-Job -Job $job -Timeout 5)) {
-                $poll++
-                Write-PraProgress -Context $Context -Text ('Entra Connect synchronisation cycle in progress on {0}' -f $target) -Current ([int]$clock.Elapsed.TotalSeconds) -Total $timeoutSeconds -Attempt $poll -MaxAttempts ([int][Math]::Ceiling($timeoutSeconds / 5.0)) -NextInSeconds 5
+    try {
+        if ($settings.Server) {
+            # The cycle runs on the Entra Connect server as a job: this side reports a wait (attempt, next check) every 5 s until it ends.
+            $job = Invoke-Command -ComputerName $settings.Server -ScriptBlock $script:PraSyncCycle -ArgumentList $settings.PolicyType, $settings.TimeoutMinutes -AsJob -ErrorAction Stop
+            try {
+                $clock = [Diagnostics.Stopwatch]::StartNew(); $poll = 0
+                while ($null -eq (Wait-Job -Job $job -Timeout 5)) {
+                    $poll++
+                    Write-PraProgress -Context $Context -Text ('Entra Connect synchronisation cycle in progress on {0}' -f $target) -Current ([int]$clock.Elapsed.TotalSeconds) -Total $timeoutSeconds -Attempt $poll -MaxAttempts ([int][Math]::Ceiling($timeoutSeconds / 5.0)) -NextInSeconds 5
+                }
+                $result = Receive-Job -Job $job -ErrorAction Stop
             }
-            $result = Receive-Job -Job $job -ErrorAction Stop
+            finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
         }
-        finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        else {
+            $report = { param($Text, $Attempt, $MaxAttempts, $Elapsed) Write-PraProgress -Context $Context -Text $Text -Current $Elapsed -Total $timeoutSeconds -Attempt $Attempt -MaxAttempts $MaxAttempts -NextInSeconds 5 }.GetNewClosure()
+            $result = & $script:PraSyncCycle $settings.PolicyType $settings.TimeoutMinutes $report
+        }
     }
-    else {
-        $report = { param($Text, $Attempt, $MaxAttempts, $Elapsed) Write-PraProgress -Context $Context -Text $Text -Current $Elapsed -Total $timeoutSeconds -Attempt $Attempt -MaxAttempts $MaxAttempts -NextInSeconds 5 }.GetNewClosure()
-        $result = & $script:PraSyncCycle $settings.PolicyType $settings.TimeoutMinutes $report
+    catch {
+        # The AD changes are made and verified: the run does not fail here. The objects wait for the synchronisation (Pending, exit code 2) and the
+        # entry script writes the next steps; the transfer package is still produced.
+        $failure = Get-PraSyncFailure $_ ([string]$settings.Server)
+        try { Write-PraJournal $Context '*' 'ADSync' 'Failed' $failure.Technical } catch { Write-PraLog -Context $Context -Message ('The journal cannot be written: {0}' -f $_.Exception.Message) -Level Detail }
+        $Context['SyncFailure'] = [pscustomobject]@{ Server = $target; Kind = $failure.Kind; Reason = $failure.Reason; Technical = $failure.Technical }
+        foreach ($row in $Context.Rows) {
+            if ((Get-PraValue $row 'ADApplied' $null) -eq $true -and (Test-PraOrdinalEqual ([string]$row.FinalStatus) 'Success')) {
+                $row.FinalStatus = 'Pending'; $row.Detail = ([string]$row.Detail + ' | AD changed and verified; the Entra Connect sync has to be run').Trim(' ', '|')
+            }
+        }
+        Write-PraItem -Context $Context -Status Warn -Icon Sync -Text ('Entra Connect sync could not run on {0}: {1}. The AD changes are already made and verified; the sync is the next step.' -f $target, $failure.Reason) -Detail $failure.Technical
+        return
     }
     Write-PraJournal $Context '*' 'ADSync' 'Completed' $target
     Write-PraProgress -Context $Context -Text ('Entra Connect cycle finished on {0}' -f $target) -Current ([int](Get-PraValue $result 'Seconds' 0)) -Total ([int]$settings.TimeoutMinutes * 60)
@@ -1960,13 +2177,13 @@ function Invoke-PraSync {
 
 Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmutableFile, New-PraPrivateDirectory, Write-PraJournal,
     Initialize-PraDirectory, Get-PraUser, Get-PraExpectedX500, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
-    Import-PraProof, Invoke-PraSync, Invoke-PraAdReplication, Assert-PraReceipt, Test-PraStateEqual, Assert-PraFollowupState, Initialize-PraPermissionCache
+    Import-PraProof, Invoke-PraSync, Test-PraSyncServer, Start-PraSyncProbe, Invoke-PraAdReplication, Assert-PraReceipt, Test-PraStateEqual, Assert-PraFollowupState, Initialize-PraPermissionCache
 
 # SIG # Begin signature block
-# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCB0/ACukOh37BxT
-# rGU5JgPECD8Yl6Jap+6rx1/kJe3E36CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAxBdXsBfPaB5ug
+# UAzt0efRmshzEW7gsIJMYvjel90NtqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -2038,28 +2255,28 @@ Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmu
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCeHk7XEGd1
-# pzc3NnmIp4ys9PsDZ90gOZ0aWL96sRbjaDANBgkqhkiG9w0BAQEFAASCAgCm7Y/8
-# R1U5VGUV/KK2jOIm2MraWlng4yqEo9kg7fh++UNxTb3ugiVYfP1sWW6RJ8DNaNNC
-# Wg+meirR6LHEZk1TxYnpDKBbB4RP4lpYb3dsmkn0eccSWwgAOlJ+6b9o6PnIfvic
-# aml0dYTp6T+MQSRt0XP7Uao/WBY1Fw41vqe2IErzGWqUjEDTZRhxkiNfdMIM5m9Y
-# 5mCvAeLwPGxIkKAkpoDN2yBiRRDmaT/hvXEA+gaMb00ctFhLgGLhiE8go+3XsvaE
-# HOjVg6zI3NsJER+fcv2hL6SOObPPOELKCOzAItrRrW6bXXanQ/PiLvRY5uxepFog
-# Yd1UjD4+XoTGH7Z55INIFurDBs2odITlRjwh/AAHU7YfhZjd3El3OBMZl393i3bR
-# 4muzeJWTnH7QNF52kpIyJkVIYpqpkE1yzH5OZ3Pe1rLo4RJtLovPTGdhsW2lq/w2
-# WWs7GH36CiJsSQ+WwK+rKCPXp1+MxQLaeduWOGaxe8zanvELreQigrVYxR/UdND/
-# aUt5yH6XrD0QyxYMVLT2BksJZBkveGqU2trbXbvqz5FoIlbuC0GpkdhDngctY4PG
-# 5FRCkcHRfyNJuapAcEBsadzE3onJlZK8OCA5UI/j0i572gmJcQEOBhGjtzQbASpX
-# F9XCNLuGmk6bkR16+A26z1Vz6jvdPeb7xIN+jaGCFM8wghTLBgorBgEEAYI3AwMB
-# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBbnFMWFnLt
+# bSCl+UaWf/EGaVzKOZYxczhbFs8PFpAFHDANBgkqhkiG9w0BAQEFAASCAgAxaJCw
+# PTapYSqfUv2NzBx35tbuw1ZdZncZxWQx5nJeW0K03OE9x9Yrk2x/oUA7P1zEHkV1
+# EAwxroqFFUkRncOf5KjwO4IMQ1r2eHzR7vgrFC8oByWs8BvNCdBkMpAXQSvSHMx2
+# kwabEieLE3DnjpBkgE6H6rzbHRoil69DKl00SvEdbnXetpOa52/2a5B9eE9NP+NT
+# SOdzTt4ExQk5sI/UN0LkFuvrrFGyej7pW/3lWEnMAtpAJjidQHEDhqHcNkQFtNW2
+# YGd9nlIoUjewYyAXb3VMeHqg71BhaFME0Xb2X36rRGRJee6TxMSpmripuTrNVtfu
+# nT0XDDGWUmaw3nXCNA20cKOK3MUm19T/169ItoqilSmreVBwvaf3Z8hWiCdxIIOp
+# hu1TNafl2Xn4q6vWf4cbVmCsc+f9K9evoAqLN3Qwb0pmqJVugXXN9e0wixWn4RCA
+# Yo4HUiqbu2HWTRARx5PD5kL0qlzmb4yNu3I46cwA6lBgjaveqBGUisIwuPq/Xel3
+# ILzgf8ClmU0V6WYchmVgQ7IZ1xdsg1ALBkBskN21R8e4gIBM7kXsHFNYZOhSi4TU
+# v1z1vMUi3xNpLakv8ZTWyZgt/Pwiekjdv1wuBVYbyLxK5yOdZpDGHEyOyU8lySTO
+# 4Zk3hMPiXx8QOm1BKF77WLleg8mhTV5+EAEf96GCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIPrTnAIus5e0EUXWAuXly9hEbQko4AaztP8WrzOZ/Yx0AggeOH3B13cG
-# fhgPMjAyNjExMDkxNTMzMjdaMAMCAQECEGn7ZmeBv4mxY1Cm6uF7oFegghGnMIIE
+# BAIBBQAEIJpkqGlTAPGPB3TS35hW0s8aeAFGzO+EAKyLcB385UeIAghEh5i3vx+M
+# zxgPMjAyNjExMTAwODMzMzlaMAMCAQECEDW9bvQmzHT/ojKQliAQqfSgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -2154,17 +2371,17 @@ Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmu
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwOTE1MzMyN1owKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIJtu
-# hC+wUKu636UuJHsFMZrRwk8jEOp5IRQJX8fXCMo4MIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMDA4MzMzOVowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIPkr
+# toySmHwWScFkFEBp8/AAqf++FJxcVte9VFrRVNiVMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIESDBGAiEA0euyeudqRXbLxMBqoaYOs5aOhFtufxKGtd0rwlRrXtgCIQDF
-# ArEyIMHNjRlLP5wbbOlaTSTxSlQWdniDFE4dJDeN5Q==
+# zj0EAwIERzBFAiEAznOYEUV2DmlcVfGa3TBiUhyte5u9+VTkYCO9i+tJkhQCIFCW
+# 3XdqBr3av3J/9phBhaJ+C0Q73g+/5wUoaeKtB23K
 # SIG # End signature block

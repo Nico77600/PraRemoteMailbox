@@ -21,7 +21,7 @@
 </p>
 
 > [!TIP]
-> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/PraRemoteMailbox/releases/latest) and download **`PraRemoteMailbox-3.1.1.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the signed tool, with the HTML guides. Do not use the **Source code** archives or the green **Code** button: they are a copy of the repository, not the release package.
+> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/PraRemoteMailbox/releases/latest) and download **`PraRemoteMailbox-3.1.2.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the signed tool, with the HTML guides. Do not use the **Source code** archives or the green **Code** button: they are a copy of the repository, not the release package.
 
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
@@ -48,7 +48,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
-**Author:** Nicolas Fabert · **Version:** 3.1.1, 2026-11-09 ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 3.1.2, 2026-11-10 ([changelog](CHANGELOG.md)).
 
 > [!CAUTION]
 > Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (reference guide, chapter 6).
@@ -68,10 +68,10 @@ One path for everyone. Set the tool up once (**1 to 4**), then take branch **A**
 # 1 · Get your rights. Give the table "Requirements" below to your administrator (minimum rights, derived from the code).
 
 # 2 · On the server, in PowerShell 7.5+ as administrator: put the tool in its folder and unblock it.
-#     Download PraRemoteMailbox-3.1.1.zip from the latest release (under Assets, not Source code) and extract it to D:\PRA\PraRemoteMailbox
+#     Download PraRemoteMailbox-3.1.2.zip from the latest release (under Assets, not Source code) and extract it to D:\PRA\PraRemoteMailbox
 Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File
-Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.0 -Scope AllUsers -Force
-Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -Scope AllUsers -Force
+Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -Force
+Install-Module Microsoft.Graph.Authentication, Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope AllUsers -Force
 
 # 3 · Fill in the settings: scope, licence group, routing domain, Entra Connect server, tenant
 notepad D:\PRA\PraRemoteMailbox\config\PraRemoteMailbox.config.psd1
@@ -231,7 +231,7 @@ Every run writes a log, a PowerShell transcript, a CSV and an HTML report. Exit 
 |---|---|
 | Scenario | Hybrid Exchange organisation (Exchange Server + Exchange Online) synchronised by **Entra Connect**. Exchange on-premises is not needed (it is down); Active Directory and Entra Connect must work (both lost: [PRA Cloud Mailbox](https://github.com/Nico77600/PraCloudMailbox)) |
 | PowerShell | **PowerShell 7.5 or later** (`pwsh.exe`) for the operations and the window. Windows PowerShell 5.1 is refused (use the 2.2.x release there) |
-| Modules | RSAT `ActiveDirectory` (native in PowerShell 7 on Windows 10 1809+ / Windows Server 2019+), `ExchangeOnlineManagement` 3.10 or later and `Microsoft.Graph.Authentication` / `Microsoft.Graph.Users`, installed **for PowerShell 7**; `ADSync` on the Entra Connect server (loaded through the Windows PowerShell compatibility layer when used locally) |
+| Modules | RSAT `ActiveDirectory` (native in PowerShell 7 on Windows 10 1809+ / Windows Server 2019+), `ExchangeOnlineManagement` 3.10.1 or later and `Microsoft.Graph.Authentication` / `Microsoft.Graph.Users` 2.41.1 or later (both Graph modules in one same version), installed **for PowerShell 7**; `ADSync` on the Entra Connect server (loaded through the Windows PowerShell compatibility layer when used locally) |
 | Licences | A licence group that gives Exchange Online to the users (shared mailboxes need no licence) |
 | Console | Windows Terminal for emoji and colours; the classic console shows symbols |
 

@@ -7,7 +7,7 @@
     the real file when it exists, an empty placeholder otherwise. Dot-source this file, then call New-DocumentationPackageCopy.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.1
+    Version : 3.1.2
     Part of : PRA Remote Mailbox (repository tool, not in the package)
 #>
 function New-DocumentationPackageCopy {

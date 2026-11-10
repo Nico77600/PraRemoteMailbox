@@ -1499,6 +1499,315 @@ try { Pump 100; if($g.NetJob -or $g.Controls.RoleName.Text -cnotmatch 'AD \+ Clo
     }
 }
 
+Describe 'Release 3.1.2 - the console says plainly why Microsoft 365 or Entra Connect cannot be used (mocked probes, no network)' -Tag 'Release312' {
+    It 'puts a plain sentence before the technical message of a blocked connection, and leaves other errors as they are' {
+        $why = { param($Exception) Get-PraGuiNetworkWhy $Exception }
+        $blocked = [Net.Sockets.SocketException]::new(10013)
+        $wrapped = [AggregateException]::new([Net.Http.HttpRequestException]::new($blocked.Message, $blocked))
+        $text = & (Get-Module PRA.Gui) $why $wrapped
+        $text | Should -BeExactly ('blocked on this server (firewall, proxy or security software): ' + $blocked.Message)
+        $text | Should -Match ([regex]::Escape($blocked.Message)) -Because 'the technical detail is kept'
+        (& (Get-Module PRA.Gui) $why ([AggregateException]::new([Net.Http.HttpRequestException]::new('x', [Net.Sockets.SocketException]::new(10061))))) | Should -Match '^refused by the network \(firewall or proxy\): '
+        (& (Get-Module PRA.Gui) $why ([AggregateException]::new([Net.Http.HttpRequestException]::new('x', [Net.Sockets.SocketException]::new(11001))))) | Should -Match '^the name cannot be resolved \(DNS\): '
+        (& (Get-Module PRA.Gui) $why ([AggregateException]::new([Net.Http.HttpRequestException]::new('No such host is known.')))) | Should -BeExactly 'No such host is known.'
+    }
+    It 'checks the Entra Connect server with the account (asynchronously), never blocks, and shows the plain reason in the Microsoft 365 log line' {
+        $runtime = New-GuiTestRoot
+        $syncConfig = Join-Path $runtime.Root 'sync.psd1'
+        Write-GuiTestFile $syncConfig "@{Environment='GuiSynthetic'; Scope=@{Mode='Auto'}; Licensing=@{Enabled=`$false}; EntraConnect=@{Sync=`$true;Server='SRV-SYNC01'}; Execution=@{Phase='AD'}}"
+        $probe = Join-Path $runtime.Root 'wpf-probe-sync.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$SyncConfig)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+function SettleSync($Window,[int]$Seconds=10){ $end=[datetime]::UtcNow.AddSeconds($Seconds); while($Window.SyncJob -and [datetime]::UtcNow -lt $end){ Pump 50 }; if($Window.SyncJob){throw 'The Entra Connect check never ended'}; Pump 80 }
+function Settle($Window,[int]$Seconds=10){ $end=[datetime]::UtcNow.AddSeconds($Seconds); while($Window.NetJob -and [datetime]::UtcNow -lt $end){ Pump 50 }; if($Window.NetJob){throw 'The Microsoft 365 check never ended'}; Pump 80 }
+function SyncLight($Window){ return ,@($Window.LightRows | Where-Object Name -ceq 'Entra Connect sync')[0] }
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'},[ordered]@{Name='ExchangeOnlineManagement';Status='Ok';Detail='synthetic'},[ordered]@{Name='Entra Connect sync';Status='Ok';Detail='The synchronisation is started on SRV-SYNC01.'}); AD=$true; Cloud=$true; Role='Both' } }
+$script:Calls=New-Object 'Collections.Generic.List[string]'
+$script:Answer=$null; $script:Done=$false; $script:Boom=$false
+$syncProbe={ param($Server,$Seconds)
+  $script:Calls.Add($Server+'/'+$Seconds)
+  if($script:Boom){ throw 'boom' }
+  $handle=[pscustomobject]@{ Done=$false; Answer=$script:Answer }
+  Add-Member -InputObject $handle -MemberType ScriptProperty -Name IsCompleted -Value { $this.Done }
+  Add-Member -InputObject $handle -MemberType ScriptMethod -Name GetResult -Value { param([bool]$TimedOut) $this.Answer }
+  $script:Handle=$handle
+  $handle }
+$denied=[pscustomobject]@{ Ok=$false; Kind='Denied'; Server='SRV-SYNC01'; Reason='this account has no right on SRV-SYNC01: it must be allowed to open a remote session there (member of Remote Management Users or Administrators) and to use Entra Connect (member of ADSyncOperators)'; Technical='Access is denied' }
+$accepted=[pscustomobject]@{ Ok=$true; Kind='Ok'; Server='SRV-SYNC01'; Reason='SRV-SYNC01 accepts this account and Entra Connect answers'; Technical='' }
+function New-SyncWindow($Answer,[string]$ConfigPath){
+  $script:Answer=$Answer; $script:Calls.Clear(); $script:Boom=$false
+  $window=New-PraGuiWindow -Root $Root -ConfigPath $ConfigPath -Version 'Synthetic' -PrerequisiteProbe $detect -SyncProbe $syncProbe -SyncSeconds 6
+  $window.Form.Show(); return $window
+}
+
+# --- A: the check runs in the background (the window stays usable), then the light says why the sync will not be possible
+$g=New-SyncWindow $denied $SyncConfig
+try {
+ $c=$g.Controls
+ if(-not $g.SyncJob){throw 'The Entra Connect check did not start in the background'}
+ if($script:Calls.Count -ne 1 -or $script:Calls[0] -cne 'SRV-SYNC01/6'){throw ('The check is made once, on the configured server: '+($script:Calls -join ','))}
+ $light=SyncLight $g
+ if($light.Status -cne 'Info' -or $light.Detail -cnotmatch 'Checking that this account can use the Entra Connect server SRV-SYNC01'){throw ('While checking: '+$light.Status+' / '+$light.Detail)}
+ if(-not $c.BtnNext.IsEnabled){throw 'The window must stay usable while the Entra Connect check is pending'}
+ Pump 150
+ if(-not $g.SyncJob){throw 'The check must still be pending while the answer is not in'}
+ $script:Handle.Done=$true
+ SettleSync $g
+ $light=SyncLight $g
+ if($light.Status -cne 'Warn' -or $light.Detail -cnotmatch '^Entra Connect sync will not be possible: this account has no right on SRV-SYNC01: it must be allowed to open a remote session there \(member of Remote Management Users or Administrators\) and to use Entra Connect \(member of ADSyncOperators\)\. Either fix that, or set EntraConnect\.Sync to \$false in the configuration file and run the synchronisation yourself\.'){throw ('After the answer: '+$light.Status+' / '+$light.Detail)}
+ if(@($g.Lines | Where-Object { [string]$_.Text -cmatch 'Entra Connect check from this server\. The synchronisation will not be possible: this account has no right' }).Count -ne 1){throw 'The answer is not written in the activity log'}
+ if(-not $c.BtnNext.IsEnabled){throw 'A refused account must not block the window: the engine stops by itself before any change'}
+ # Detecting again (a setting typed, a page change) does not ask the server again; Check again does.
+ & (Get-Module PRA.Gui) { Invoke-PraGuiDetection }
+ if($script:Calls.Count -ne 1 -or $g.SyncJob){throw 'A new detection must reuse the answer'}
+ Click $g 'BtnRecheck'
+ if($script:Calls.Count -ne 2 -or -not $g.SyncJob){throw 'Check again must ask the server again'}
+ $script:Handle.Done=$true; SettleSync $g
+} finally { $g.Form.Close() }
+
+# --- B: the account is accepted
+$g=New-SyncWindow $accepted $SyncConfig
+try {
+ $script:Handle.Done=$true; SettleSync $g
+ $light=SyncLight $g
+ if($light.Status -cne 'Ok' -or $light.Detail -cne 'SRV-SYNC01 accepts this account and Entra Connect answers.'){throw ('Accepted: '+$light.Status+' / '+$light.Detail)}
+} finally { $g.Form.Close() }
+
+# --- C: no answer in time (the handle never completes): not reachable, said plainly; a probe that throws is a failure, not a crash
+$timedOut=[pscustomobject]@{ Ok=$false; Kind='Unreachable'; Server='SRV-SYNC01'; Reason='SRV-SYNC01 does not answer to PowerShell remoting (WinRM, port 5985) within 6 seconds: check the server name in EntraConnect.Server, the network and the firewall'; Technical='no answer within 6 seconds' }
+$script:Answer=$timedOut; $script:Calls.Clear()
+$g=New-PraGuiWindow -Root $Root -ConfigPath $SyncConfig -Version 'Synthetic' -PrerequisiteProbe $detect -SyncProbe $syncProbe -SyncSeconds 0.8
+$g.Form.Show()
+try {
+ SettleSync $g
+ $light=SyncLight $g
+ if($light.Status -cne 'Warn' -or $light.Detail -cnotmatch 'Entra Connect sync will not be possible: SRV-SYNC01 does not answer to PowerShell remoting'){throw ('Time out: '+$light.Status+' / '+$light.Detail)}
+} finally { $g.Form.Close() }
+$script:Boom=$true
+$g=New-PraGuiWindow -Root $Root -ConfigPath $SyncConfig -Version 'Synthetic' -PrerequisiteProbe $detect -SyncProbe $syncProbe -SyncSeconds 2
+$g.Form.Show()
+try {
+ SettleSync $g
+ $light=SyncLight $g
+ if($light.Status -cne 'Warn' -or $light.Detail -cnotmatch 'the check could not start: boom'){throw ('Throwing probe: '+$light.Status+' / '+$light.Detail)}
+} finally { $g.Form.Close() }
+
+# --- D: synchronisation off in the configuration, or no probe given: no call at all, the light is the one of the detection
+$script:Boom=$false
+$g=New-SyncWindow $accepted $Config
+try { Pump 150; if($script:Calls.Count -ne 0 -or $g.SyncJob){throw 'EntraConnect.Sync is off: nothing may be asked'} } finally { $g.Form.Close() }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $SyncConfig -Version 'Synthetic' -PrerequisiteProbe $detect
+$g.Form.Show()
+try { Pump 150; if($g.SyncJob -or (SyncLight $g).Detail -cne 'The synchronisation is started on SRV-SYNC01.'){throw 'A probe-only window must not ask the Entra Connect server'} } finally { $g.Form.Close() }
+
+# --- E: a blocked connection to Microsoft 365 reads in plain words in the activity log, the technical message stays
+$rawBlocked=[Net.Sockets.SocketException]::new(10013).Message
+$net={ param($HostName,$Seconds) [Threading.Tasks.Task]::FromException([Net.Http.HttpRequestException]::new($rawBlocked,[Net.Sockets.SocketException]::new(10013))) }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect -NetworkProbe $net -NetworkSeconds 3
+$g.Form.Show()
+try {
+ Settle $g
+ $line=@($g.Lines | Where-Object { [string]$_.Text -cmatch '^Microsoft 365 check from this server' })
+ if($line.Count -ne 1 -or $line[0].Text -cnotmatch ('login\.microsoftonline\.com: not reachable \(blocked on this server \(firewall, proxy or security software\): '+[regex]::Escape($rawBlocked))){throw ('Blocked connection: '+($line | ForEach-Object Text))}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('SYNC-LIGHT-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config, '-SyncConfig', $syncConfig)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(120000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'SYNC-LIGHT-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.1.2 - the console finishes a Convert batch whose AD part is done without its sync or package (mocked probes, no engine)' -Tag 'Release312' {
+    It 'refuses a batch with Convert -Phase AD unless the window finishes a batch, and builds the engine command of the finish' {
+        { & (Get-Module PRA.Gui) { New-PraGuiRequest -Action Convert -Phase AD -Batch 'C:\x\Convert-1.json' } } | Should -Throw '*must not receive a batch*'
+        { & (Get-Module PRA.Gui) { New-PraGuiRequest -Action Convert -Phase Both -Batch 'C:\x\Convert-1.json' -Finish $true } } | Should -Throw '*needs a Convert batch and the AD phase*'
+        { & (Get-Module PRA.Gui) { New-PraGuiRequest -Action Recover -Phase AD -Batch 'C:\x\Convert-1.json' -Finish $true } } | Should -Throw '*needs a Convert batch and the AD phase*'
+        $request = & (Get-Module PRA.Gui) { New-PraGuiRequest -Action Convert -Mode Apply -Phase AD -Batch 'C:\x\Convert-1.json' -Finish $true }
+        $request.Phase | Should -BeExactly 'AD'
+        $request.Batch | Should -BeExactly 'C:\x\Convert-1.json'
+        $command = Get-PraGuiCommand -Root 'C:\x' -ConfigPath 'C:\x\c.psd1' -Request $request
+        ($command.Tokens -join ' ') | Should -Match '-Action Convert -Mode Apply .*-Phase AD -Batch C:\\x\\Convert-1\.json'
+        $command.NeedsCloudWindow | Should -BeFalse -Because 'finishing the AD side never signs in to the cloud'
+        ($command.Tokens -join ' ') | Should -Not -Match '-Identity|-SearchBase|-CsvPath'
+        (& (Get-Module PRA.Gui) { Get-PraGuiPlanTitle 'Convert' 'AD' 'C:\x\Convert-1.json' }) -join '|' | Should -BeExactly 'Loading the batch of the AD phase|Entra Connect synchronisation|Creating the transfer package'
+        (& (Get-Module PRA.Gui) { Get-PraGuiPlanTitle 'Convert' 'AD' '' }).Count | Should -BeGreaterThan 4
+    }
+    It 'marks the batches to finish in Continue a batch, plans them as AD-side steps, and leaves the other batches to the cloud part' {
+        $runtime = New-GuiTestRoot
+        $outbox = Join-Path $runtime.Root 'Backups\Outbox'
+        $syncFailed = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $syncFailed.Folder ('Journal-' + $syncFailed.Id + '.jsonl')) ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Failed`"}`r`n")
+        $done = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $done.Folder ('Journal-' + $done.Id + '.jsonl')) ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Completed`"}`r`n")
+        $orphan = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $orphan.Folder 'NOT-APPLIED.txt') 'Nothing was written to Active Directory by this batch.'
+        $packaged = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $outbox ('PRA-GuiSynthetic-Convert-' + $packaged.Id.Substring(0, 8) + '-for-Cloud.zip')) 'x'
+        $probe = Join-Path $runtime.Root 'wpf-probe-finish.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$SyncFailedId,$DoneId,$PackagedId,$OrphanId)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+function RowOf($Window,[string]$Id){ return ,@($Window.BatchRows | Where-Object { $_.BatchId -ceq $Id })[0] }
+$script:HasCloud=$true
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$script:HasCloud; Role=$(if($script:HasCloud){'Both'}else{'AD'}) } }
+function New-FinishWindow([bool]$Cloud){
+  $script:HasCloud=$Cloud
+  $window=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect
+  $window.Form.Show()
+  Click $window 'BtnNext'
+  $window.Controls['T_Convert'].IsChecked=$true; Pump 80
+  $window.Controls['Mode_Continue'].IsChecked=$true; Pump 80
+  Click $window 'BtnReload'; Pump 80
+  return $window
+}
+
+# --- A: a server that does both sides: only the batch whose sync failed is finished here; the others go on with the cloud part
+$g=New-FinishWindow $true
+try {
+ $c=$g.Controls
+ $failed=RowOf $g $SyncFailedId; $complete=RowOf $g $DoneId; $packaged=RowOf $g $PackagedId
+ if(-not $failed -or -not $complete -or -not $packaged){throw ('Batches not listed: '+$g.BatchRows.Count)}
+ if($failed.State -cne 'AD part done, sync did not run: finish it here' -or $failed.Level -cne 'Warn' -or -not $failed.Selectable -or -not $failed.Finish){throw ('Sync failed row: '+$failed.State+' / '+$failed.Level+' / '+$failed.Finish)}
+ if($complete.State -cne 'AD part done, cloud part to do' -or $complete.Finish){throw ('Done row: '+$complete.State)}
+ if($packaged.State -cne 'AD part done, cloud part to do' -or $packaged.Finish){throw ('Packaged row: '+$packaged.State)}
+ if($c.BatchHelp.Text -cnotmatch 'finish it here'){throw 'The list help does not explain "finish it here"'}
+ $orphanRow=RowOf $g $OrphanId
+ if(-not $orphanRow -or $orphanRow.Selectable -or $orphanRow.Finish -or $orphanRow.State -cne 'Nothing was written to AD: not a batch to continue' -or $orphanRow.Level -cne 'Warn'){throw ('A folder marked not applied is not a batch to continue: '+$orphanRow.State)}
+ $c.BatchList.SelectedItem=$failed; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: AD'){throw ('Finish phase pill: '+$c.PhasePillText.Text)}
+ if($c.PhaseText.Text -cnotmatch 'Active Directory is NOT changed again.*Entra Connect synchronisation again.*ONE transfer package'){throw ('Finish phase text: '+$c.PhaseText.Text)}
+ if($c.CmdLine.Text -cnotmatch "'-Phase' 'AD'" -or $c.CmdLine.Text -cnotmatch "'-Batch' '[^']+\.json'" -or $c.CmdLine.Text -cmatch "'-Identity'|'-SearchBase'|'-CsvPath'"){throw ('Finish command: '+$c.CmdLine.Text)}
+ if(-not $c.BtnNext.IsEnabled -or $c.BlockBox.Visibility -ne 'Collapsed'){throw 'A batch to finish must be startable'}
+ $request=& (Get-Module PRA.Gui) { Get-PraGuiWindowRequest 'Preview' }
+ if($request.Phase -cne 'AD' -or $request.Action -cne 'Convert' -or -not $request.Batch.EndsWith('.json') -or $request.MaxObjects -ne 0 -or $request.Identity -or $request.SearchBase -or $request.CsvPath){throw ('Finish request: '+($request | ConvertTo-Json -Compress))}
+ Click $g 'BtnNext'
+ if($g.Page -ne 3){throw 'Verify page not reached'}
+ $titles=@($c.PlanList.Items | ForEach-Object Title)
+ if(($titles -join '|') -cne 'Loading the batch of the AD phase|Entra Connect synchronisation|Creating the transfer package'){throw ('Finish plan: '+($titles -join '|'))}
+ & (Get-Module PRA.Gui) { Show-PraGuiPage 2 }
+ Pump 80
+ $complete=RowOf $g $DoneId
+ $c.BatchList.SelectedItem=$complete; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: Cloud'){throw ('A completed batch continues in the cloud: '+$c.PhasePillText.Text)}
+ $request=& (Get-Module PRA.Gui) { Get-PraGuiWindowRequest 'Preview' }
+ if($request.Phase -cne 'Cloud'){throw 'A batch with its sync done is a cloud request'}
+} finally { $g.Form.Close() }
+
+# --- B: a server that cannot do the cloud part: a batch with no package is finished here; a packaged one is not
+$g=New-FinishWindow $false
+try {
+ $c=$g.Controls
+ $complete=RowOf $g $DoneId; $packaged=RowOf $g $PackagedId; $failed=RowOf $g $SyncFailedId
+ if($complete.State -cne 'AD part done, no package yet: finish it here' -or -not $complete.Finish){throw ('AD-only server, no package: '+$complete.State)}
+ if($packaged.Finish -or $packaged.State -cne 'AD part done, cloud part to do'){throw ('AD-only server, package present: '+$packaged.State+' / '+$packaged.Finish)}
+ if($failed.State -cne 'AD part done, sync did not run: finish it here'){throw ('AD-only server, sync failed: '+$failed.State)}
+ $c.BatchList.SelectedItem=$complete; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: AD' -or $c.BlockBox.Visibility -ne 'Collapsed'){throw ('AD-only finish: '+$c.PhasePillText.Text+' / '+$c.BlockBox.Visibility)}
+ $c.BatchList.SelectedItem=$packaged; Pump 80
+ if($c.PhasePillText.Text -cne 'Phase: Cloud' -or $c.BlockBox.Visibility -ne 'Visible'){throw 'A packaged batch still waits for the cloud server (blocked here)'}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('FINISH-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config,
+            '-SyncFailedId', $syncFailed.Id, '-DoneId', $done.Id, '-PackagedId', $packaged.Id, '-OrphanId', $orphan.Id)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(120000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'FINISH-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.1.2 - the Next steps page puts the sync first when it could not start after the AD changes' -Tag 'Release312' {
+    It 'shows the reason and the sync before the copy of the package, and keeps the normal page when the sync ran' {
+        $runtime = New-GuiTestRoot
+        $package = Join-Path $runtime.Root 'PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip'
+        Write-GuiTestFile $package 'x'
+        $probe = Join-Path $runtime.Root 'wpf-probe-next.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$Package)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$false; Role='AD' } }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect
+$g.Form.Show()
+function Show-Next([string[]]$Steps){
+  $result=[pscustomobject]@{ kind='result'; status='Pending'; exitCode=2; action='Convert'; mode='Apply'; phase='AD'; success=0; error=0; pending=2; skipped=0; planned=0; total=2; issues=@(); batchId='490cc62e'
+    nextSteps=$Steps; transferPackage=$Package; transferPackageKind='Convert'; logFile=''; htmlReport=''; globalReport='' }
+  $g.LastResult=$result
+  $g.LastRun=[pscustomobject]@{ Result=$result; Request=[ordered]@{Action='Convert';Phase='AD'}; StartedAt=[datetime]::Now; Valid=$true; Issue=''; ExitCode=2; Base='' }
+  & (Get-Module PRA.Gui) { Update-PraGuiNext }
+}
+try {
+ $c=$g.Controls
+ $copy='Copy PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip to the cloud server (anywhere), then run there:'
+ $command='.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch ''PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip'''
+ Show-Next @('AD is changed and verified. The Entra Connect sync could not start: this account has no right on SRV-AADC01.','Run a delta sync on SRV-AADC01 (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).',$copy,$command)
+ if($c.NextTitle.Text -cne 'The Active Directory part is done, but the sync did not start'){throw ('Title: '+$c.NextTitle.Text)}
+ if($c.NextLead.Text -cnotmatch '^Run the sync first \(see the steps below\), then copy ONE file to the cloud server: PRA-GuiSynthetic-Convert-490cc62e-for-Cloud\.zip'){throw ('Lead: '+$c.NextLead.Text)}
+ $rows=@($g.NextRows)
+ if($rows.Count -ne 5){throw ('Steps: '+$rows.Count)}
+ if($rows[0].Text -cnotmatch '^AD is changed and verified\. The Entra Connect sync could not start' -or $rows[0].N -cne '1'){throw ('Step 1: '+$rows[0].Text)}
+ if($rows[1].Text -cnotmatch '^Run a delta sync on SRV-AADC01 \(Start-ADSyncSyncCycle -PolicyType Delta\)' -or $rows[1].N -cne '2'){throw ('Step 2: '+$rows[1].Text)}
+ if($rows[2].Text -cnotmatch '^Copy this one file to the cloud server' -or $rows[2].N -cne '3'){throw ('Step 3: '+$rows[2].Text)}
+ if($c.NextCmdBox.Visibility -ne 'Visible' -or $c.NextCmd.Text -cne $command){throw 'The command for the cloud server must stay visible'}
+ $first=@($g.TimelineRows)[0]
+ if($first.Status -cne 'Wait' -or $first.Caption -cnotmatch 'the sync is still to run'){throw ('Timeline: '+$first.Status+' / '+$first.Caption)}
+ Show-Next @($copy,$command)
+ if($c.NextTitle.Text -cne 'The Active Directory part is done' -or @($g.NextRows).Count -ne 3 -or @($g.NextRows)[0].Text -cnotmatch '^Copy this one file'){throw ('Normal page: '+$c.NextTitle.Text+' / '+@($g.NextRows).Count)}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('NEXT-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config, '-Package', $package)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(120000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'NEXT-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
 AfterAll {
     if($script:GuiEvidence -and (Test-Path -LiteralPath $script:GuiEvidence)) {
         # A child of a test may still be closing its files for a moment: bounded retries, then the error is raised (never swallowed).

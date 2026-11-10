@@ -35,6 +35,8 @@
     Convert and Recover only. Default: Execution.Phase in the configuration.
       Both   AD part, synchronisation, then Exchange Online part on this server.
       AD     AD part only (and synchronisation). The cloud part runs later with -Phase Cloud.
+             With -Batch (Convert): finishes the AD side of a batch whose AD changes are already made and verified
+             (Entra Connect synchronisation again, then the transfer package); AD is not changed again.
       Cloud  Exchange Online part only, from the batch of the AD part (-Batch). Recover packages
              any final AD restoration for Finalize on the AD server; it never restores AD here.
 
@@ -44,7 +46,8 @@
     <Storage.BackupFolder>\Inbox, then Outbox, then the current folder). The package is verified (checksums,
     Environment, names, sizes) and extracted to private folders first; every proof check then runs unchanged.
     Required by: Recover (the Convert batch), -Phase Cloud (the batch of the AD part),
-    Finalize (the Finalize package). Optional for Check.
+    Finalize (the Finalize package). Optional for Check. Also accepted by Convert -Phase AD, to finish a batch
+    left without its synchronisation or its transfer package.
 
 .PARAMETER Identity
     One object only. Convert: UPN, sAMAccountName, DN or GUID, instead of the configured scope.
@@ -126,16 +129,23 @@
     Two-server setup: Exchange Online part of the Convert batch 490cc62e (folder copied from the AD server).
 
 .EXAMPLE
+    .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch 490cc62e
+    AD side of the batch 490cc62e already converted: runs the Entra Connect synchronisation again and writes the transfer
+    package. AD is not changed again. Use it when a run ended after the AD changes without a package.
+
+.EXAMPLE
     .\Invoke-PraRemoteMailbox.ps1 -Action Check -Identity user01@contoso.com -Expect Provisioned
     Read-only check of one mailbox in Exchange Online.
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 3.1.1
+    Version    : 3.1.2
     Requires   : PowerShell 7.5 or later (pwsh.exe; Windows PowerShell 5.1 is refused), RSAT ActiveDirectory,
-                 ExchangeOnlineManagement 3.10+, Microsoft.Graph.Authentication and Microsoft.Graph.Users
-                 (cloud part), ADSync (sync; through the Windows PowerShell compatibility layer when local).
-    Exit codes : 0 = done, 1 = failed, 2 = done but a next step is required (Pending objects).
+                 ExchangeOnlineManagement 3.10.1+, Microsoft.Graph.Authentication and Microsoft.Graph.Users 2.41.1+ in one same
+                 version (cloud part), ADSync (sync; through the Windows PowerShell compatibility layer when local).
+    Exit codes : 0 = done, 1 = failed, 2 = done but a next step is required (Pending objects: a phase AD that ends with a package for
+                 the other server, or for instance the Entra Connect
+                 synchronisation could not start after the AD changes; the Next steps say what to do).
     Documentation : docs\PraRemoteMailbox-Guide.md (or .html)
 
     Disclaimer:
@@ -149,7 +159,7 @@
 #Requires -Version 7.5
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High', DefaultParameterSetName = 'Run')]
 param(
-    [Parameter(Mandatory, ParameterSetName = 'Run')][ValidateSet('Convert','Recover','Finalize','Check')][string]$Action,
+    [Parameter(ParameterSetName = 'Run')][ValidateSet('Convert','Recover','Finalize','Check')][string]$Action,
     [Parameter(ParameterSetName = 'Run')][ValidateSet('Preview','Apply')][string]$Mode = 'Preview',
     [Parameter(ParameterSetName = 'Run')][ValidateSet('Both','AD','Cloud')][string]$Phase,
     [Parameter(ParameterSetName = 'Run')][string]$Batch,
@@ -212,6 +222,12 @@ foreach ($parameterInfo in $MyInvocation.MyCommand.Parameters.Values) {
         if ($PSBoundParameters.ContainsKey($parameterInfo.Name)) { $PSBoundParameters[$parameterInfo.Name] = [string]$official[0] }
     }
 }
+# -Action is not a Mandatory parameter on purpose: PowerShell would ask for it with a prompt, and a scheduled or unattended run (no console, no keyboard) would wait for
+# an answer forever. A missing -Action stops at once, with the usage. (A new PowerShell process started with -NonInteractive would stop too; this does not depend on it.)
+if (-not $Action -and -not $Gui) {
+    Write-Error -ErrorAction Continue -Message ('-Action is missing: nothing was done. Give the task: -Action Convert, Recover, Finalize or Check (Preview is the default mode). Example: .\Invoke-PraRemoteMailbox.ps1 -Action Convert -Mode Preview. For the window: -Gui. Help: Get-Help .\Invoke-PraRemoteMailbox.ps1 -Full.')
+    exit 1
+}
 if ($Gui) {
     try {
         Import-Module (Join-Path $PSScriptRoot 'PraRemoteMailbox.psd1') -Force -ErrorAction Stop
@@ -260,6 +276,8 @@ $context = @{
     BatchId = ''; NextSteps = @()
 }
 $context.Approval = New-PraApprovalCallback $caller $context
+# Lets the modules write a command line of this run's own style (-ConfigPath kept) in a message; defined here because Get-PraCommandLine is a function of this script.
+$context.CommandLineFor = { param([string]$ActionName, [string]$PhaseName, [string]$BatchId) Get-PraCommandLine -ActionName $ActionName -PhaseName $PhaseName -BatchId $BatchId }
 
 # =================================================================================================
 # Helper functions of the entry script (they use $context).
@@ -512,6 +530,10 @@ function Publish-PraTransferPackage {
         [Parameter(Mandatory)][string]$NextAction, [string]$NextPhase = '', [Parameter(Mandatory)][string[]]$FallbackSteps)
     $targetName = if ((Test-PraOrdinalIgnoreCaseEqual $Kind 'Finalize')) { 'AD' } else { 'cloud' }
     $context.CurrentOperation = 'Create-TransferPackage'; $context.CurrentIdentity = ''
+    # A hand-over means that the batch is only half done: the objects are Pending (exit code 2, "done, next step required"), whether the package could be written or not.
+    foreach ($row in $context.Rows) {
+        if ((Test-PraOrdinalIn ([string]$row.FinalStatus) @('Success', 'AlreadyDone'))) { $row.FinalStatus = 'Pending'; $row.Detail = ([string]$row.Detail + (' | next: the {0} part' -f $targetName)).Trim(' ', '|') }
+    }
     # This run is not the last one: what it did travels in the package, so that the last server can report on every object from end to end.
     $context.HandOff = $Kind
     $phaseFolder = [string](Get-PraValue $context 'PhaseWriteFolder' '')
@@ -552,21 +574,43 @@ function Resolve-PraTransferPackagePath {
 function Test-PraSyncAvailable {
     <#
     .SYNOPSIS
-        Before any AD write: checks that the Entra Connect synchronisation requested by the
-        configuration can run (local ADSync module, or WinRM to EntraConnect.Server).
+        Proves, with the account that runs the tool, that the Entra Connect synchronisation requested by the configuration is possible: an authenticated
+        read-only call to the ADSync module of EntraConnect.Server (PowerShell remoting, bounded time) or of this server. A bare WinRM connection test would not do: it does not authenticate.
+    .DESCRIPTION
+        Apply: when the check fails, the run STOPS here, before the confirmation and before any AD write (nothing is changed).
+        Preview: the same check, reported as a warning that says why the synchronisation will not be possible and what to do.
     #>
     $sync = $context.Config.EntraConnect
     if (-not $sync.Sync) { return }
     $context.CurrentOperation = 'Check-EntraConnect'
-    if ($sync.Server) {
-        try { $null = Test-WSMan -ComputerName $sync.Server -ErrorAction Stop }
-        catch { throw "Entra Connect server $($sync.Server) is not reachable with PowerShell remoting (WinRM): $($_.Exception.Message). Fix the access, or set EntraConnect.Sync = `$false and run the synchronisation yourself." }
-        Write-PraItem -Context $context -Status Ok -Icon Sync -Text ("Entra Connect: {0} reachable, a {1} cycle runs after the AD changes" -f $sync.Server, $sync.PolicyType)
+    $answer = Test-PraSyncServer -Server ([string]$sync.Server)
+    if ($answer.Ok) {
+        Write-PraItem -Context $context -Status Ok -Icon Sync -Text ("Entra Connect: {0}, a {1} cycle runs after the AD changes" -f $answer.Reason, $sync.PolicyType)
+        return
     }
-    elseif (-not @(Get-Module -ListAvailable -SkipEditionCheck ADSync).Count) {
-        throw 'EntraConnect.Sync = $true but the ADSync module is not on this server. Run the AD part on the Entra Connect server, set EntraConnect.Server, or set EntraConnect.Sync = $false and run the synchronisation yourself.'
+    $message = 'Entra Connect sync will not be possible: {0}. Either fix that, or set EntraConnect.Sync = $false in the configuration file and run the synchronisation yourself after the AD changes.' -f $answer.Reason
+    if ($context.AllowMutation) { throw ('{0} Nothing was changed.' -f $message) }
+    Write-PraItem -Context $context -Status Warn -Icon Sync -Text $message -Detail $answer.Technical
+}
+
+function Test-PraCloudModuleAvailable {
+    <#
+    .SYNOPSIS
+        Before any change, checks the cloud modules of this server: ExchangeOnlineManagement at the minimum version or later, and ONE version of Microsoft.Graph.Authentication
+        and Microsoft.Graph.Users at the minimum version or later (Get-PraCloudModuleReport). The versions found, the minimum and the exact Install-Module command are in the message.
+    .DESCRIPTION
+        Apply, Check and phase Cloud (they sign in): the run STOPS here, with nothing changed. Preview of phase Both (it does not sign in): a warning.
+    #>
+    $context.CurrentOperation = 'Check-CloudModules'
+    $report = Get-PraCloudModuleReport -MinExo ([string]$context.Config.Exo.MinModuleVersion)
+    if ($report.Ok) {
+        Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Cloud modules: Microsoft Graph {0} (Authentication and Users), ExchangeOnlineManagement {1}' -f $report.Graph.Version, $report.Exo.Version)
+        return
     }
-    else { Write-PraItem -Context $context -Status Ok -Icon Sync -Text ('Entra Connect: ADSync module found, a {0} cycle runs after the AD changes' -f $sync.PolicyType) }
+    $text = $report.Messages -join ' '
+    $signsIn = $context.AllowMutation -or (Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -or (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')
+    if ($signsIn) { throw ('The cloud part cannot run on this server. {0} Nothing was changed.' -f $text) }
+    Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('The cloud part will not be possible on this server. {0}' -f $text)
 }
 
 function Confirm-PraApply {
@@ -634,6 +678,7 @@ function Get-PraSkipReason {
 # Main
 # =================================================================================================
 $script:ConfigPathBound = $PSBoundParameters.ContainsKey('ConfigPath')
+$script:PreviewPackage = ''
 $script:ConfirmBound = $PSBoundParameters.ContainsKey('Confirm')
 try {
     # ---------------------------------------------------------------------------------------------
@@ -641,7 +686,7 @@ try {
     # ---------------------------------------------------------------------------------------------
     $context.CurrentOperation = 'Read-Configuration'
     $targetOverride = Get-PraTargetOverride -SearchBase $SearchBase -CsvPath $CsvPath -Identity $Identity
-    $context.Config = Import-PraConfiguration -Path $ConfigPath -Root $PSScriptRoot -ScopeOverride $targetOverride
+    $context.Config = Import-PraConfiguration -Path $ConfigPath -Root $PSScriptRoot -ScopeOverride $targetOverride -DeferScopeCheck
     $config = $context.Config
     $context.BackupFolder = $config.Storage.BackupFolder
     $context.LogFolder = $config.Logging.Folder
@@ -661,7 +706,7 @@ try {
     # What differs is written to the log, the summary card and the result.
     $configDifferences = @()
     if ($BaseConfigPath) {
-        $baseConfig = Import-PraConfiguration -Path $BaseConfigPath -Root $PSScriptRoot -ScopeOverride $targetOverride
+        $baseConfig = Import-PraConfiguration -Path $BaseConfigPath -Root $PSScriptRoot -ScopeOverride $targetOverride -DeferScopeCheck
         $configDifferences = @(Get-PraConfigurationDifference -Base $baseConfig -Effective $config)
         $context.ConfigOverrides = @(@(Get-PraList $context 'ConfigOverrides') + @($configDifferences | ForEach-Object { $_.Text }))
     }
@@ -674,6 +719,9 @@ try {
     if (($SearchBase -or $CsvPath) -and ((-not (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert')) -or (-not (Test-PraOrdinalIn $effectivePhase @('AD','Both') -IgnoreCase)))) {
         throw 'SearchBase/CsvPath are only available for Convert -Phase AD or Both.'
     }
+
+    # Only a new conversion (Convert, phase AD or Both, no batch, no single account) needs to know which mailboxes to take: Check, the cloud phases, Recover and Finalize never ask for the scope.
+    if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIn $effectivePhase @('AD','Both') -IgnoreCase) -and -not $Batch -and -not $Identity) { Test-PraScopeConfiguration -Config $config }
 
     Initialize-PraAudit $context
 
@@ -707,6 +755,7 @@ try {
     $steps = switch ($Action) {
         'Convert' {
             if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { @('Loading the batch of the AD phase','Exchange Online: mailboxes, licences and permissions') }
+            elseif ($Batch -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) { @('Loading the batch of the AD phase','Entra Connect synchronisation','Creating the transfer package') }
             else {
                 @('Active Directory connection','Targets and planned changes') +
                 $(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { @('Exchange Online pre-check') } else { @() }) +
@@ -735,7 +784,11 @@ try {
     foreach ($forbidden in $config.Storage.ForbiddenBackupRoots) {
         if ($context.AllowMutation -and ($context.BackupFolder.TrimEnd('\') + '\').StartsWith($forbidden, [StringComparison]::OrdinalIgnoreCase)) { throw "Backup folder on a forbidden volume (Storage.ForbiddenBackupRoots): $forbidden" }
     }
-    if ($Batch -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (-not (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud'))) { throw '-Batch is not used by Convert on the AD side: the targets come from the configuration (or -Identity).' }
+    if ($Batch -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (-not (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud'))) {
+        # -Phase AD -Batch finishes a batch already converted (synchronisation and transfer package); a new conversion takes its targets from the configuration.
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) { throw '-Batch is not used by Convert -Phase Both: the targets come from the configuration (or -Identity). To finish the AD side of a batch already converted, use -Phase AD -Batch <id>; for its Exchange Online part, -Phase Cloud -Batch <id>.' }
+        if ($Identity -or $SearchBase -or $CsvPath) { throw '-Phase AD with -Batch finishes a batch as a whole: -Identity, -SearchBase and -CsvPath cannot be combined with it.' }
+    }
     if (-not $Batch -and ((Test-PraOrdinalIn $Action @('Recover','Finalize') -IgnoreCase) -or ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')))) {
         throw ("-Batch is required for {0}{1}: give the batch ID printed at the end of the previous step." -f $Action, $(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { ' -Phase Cloud' } else { '' }))
     }
@@ -752,6 +805,8 @@ try {
             Initialize-PraPrivateFolder -Path $importRoot
             $context.PreviewStaging = $importRoot; $context.BackupFolder = $importRoot
         }
+        # A Preview extracts the package to a private folder that is deleted at the end: the batch ID is then nowhere to be found, so the next commands name the package itself.
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) { $script:PreviewPackage = [string]$Batch }
         $imported = Import-PraTransferPackage -Path $packagePath -BackupFolder $importRoot -Environment $config.Environment -ExpectedKind $expectedKind
         Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Transfer package {0} verified (checksums, Environment, names): {1} folder(s) extracted, {2} already present and identical' -f $imported.Name, $imported.Created.Count, $imported.Existing.Count)
         if ((-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply'))) { Write-PraItem -Context $context -Status Info -Text 'Preview: the package was verified and read from a private temporary folder, deleted at the end. Nothing was written to the backup folder.' }
@@ -784,10 +839,8 @@ try {
             })
         $null = Show-PraPlanSummary $plans
         Invoke-PraAdPreview $context $plans
-        if ($context.AllowMutation) {
-            Test-PraSyncAvailable
-            Confirm-PraApply ("Restore the on-premises attributes of {0} object(s) listed above?" -f $plans.Count)
-        }
+        Test-PraSyncAvailable
+        if ($context.AllowMutation) { Confirm-PraApply ("Restore the on-premises attributes of {0} object(s) listed above?" -f $plans.Count) }
         Write-PraStep -Context $context -Title 'Backup and Active Directory changes' -Icon Backup
         $receipt = Invoke-PraAdBatch $context $plans 'Finalize'
         if ($null -ne $receipt) {
@@ -798,13 +851,58 @@ try {
             if ($replicate) { Skip-PraStep -Title 'Active Directory replication' -Reason (Get-PraSkipReason $plans.Count) -Icon Directory }
             Skip-PraStep -Title 'Entra Connect synchronisation' -Reason (Get-PraSkipReason $plans.Count)
         }
-        if (-not $context.AllowMutation) { $context.NextSteps = @(Get-PraCommandLine -ActionName 'Finalize' -BatchId $context.BatchId) }
+        if (-not $context.AllowMutation) { $context.NextSteps = @(Get-PraCommandLine -ActionName 'Finalize' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $context.BatchId })) }
+    }
+    # ---------------------------------------------------------------------------------------------
+    # CONVERT - finish the AD side of a batch whose AD changes are already made and verified (-Phase AD -Batch):
+    # the Entra Connect synchronisation again, then the transfer package. AD is not written.
+    # ---------------------------------------------------------------------------------------------
+    elseif ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD') -and $Batch) {
+        Write-PraStep -Context $context -Title 'Loading the batch of the AD phase' -Icon Batch
+        $context.Source = Import-PraBackup $context (Get-PraBatchFile -Value $Batch -Operations @('Convert'))
+        if (-not (Test-PraOrdinalEqual $context.Source.Data.Operation 'Convert')) { throw 'The batch to finish must be a Convert batch.' }
+        if ($context.Source.Legacy) { throw 'This batch was written by an old version and has no AD proof (State file): it cannot be finished from here. Nothing was changed.' }
+        $batchFolder = Split-Path $context.Source.Path -Parent
+        $proofPath = Join-Path $batchFolder ('State-' + $context.Source.Data.BatchId + '.json')
+        if (-not (Test-Path -LiteralPath $proofPath -PathType Leaf)) { throw 'This batch has no AD proof (State file): its AD changes were not verified, so it cannot be finished from here. Nothing was changed.' }
+        $context.SourceBackupHash = $context.Source.Hash
+        $context.Proof = Import-PraProof $context $proofPath $context.Source 'Convert'
+        $context.BatchId = Get-PraShortId ([string]$context.Source.Data.BatchId)
+        $context.PhaseFolders = @($batchFolder)
+        foreach ($record in @($context.Source.Data.Records)) {
+            if (@($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid }).Count -ne 1) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName). The batch cannot be finished from here. Nothing was changed." }
+            $row = New-PraRow $context $record
+            $row.ADVerified = $true; $row.ADApplied = $true; $row.BackupPath = $context.Proof.Receipt.Path
+            $row.FinalStatus = if ($context.AllowMutation) { 'Success' } else { 'Planned' }
+            $row.Detail = 'AD changes made and verified by an earlier run of this batch; they are not changed again.'
+            $context.Rows.Add($row)
+            # The journey of the object in the global report says what this run really did (it did not write AD).
+            $context.CurrentIdentity = [string]$record.ObjectGuid
+            Write-PraItem -Context $context -Status Info -Text 'AD changes made and verified by an earlier run of this batch; not changed again'
+            $context.CurrentIdentity = ''
+        }
+        Send-PraPlanCount $context.Rows.Count
+        Write-PraItem -Context $context -Status Ok -Text ("Batch {0}: {1} object(s), AD changes already made and verified (they are not changed again), backup and proof checked" -f $context.BatchId, $context.Rows.Count)
+        Test-PraSyncAvailable
+        if ($context.AllowMutation) {
+            Confirm-PraApply ("Finish batch {0}? {1}A transfer package is written. AD is not changed again." -f $context.BatchId, $(if ($config.EntraConnect.Sync) { 'Entra Connect synchronises first. ' } else { '' }))
+            $context.PhaseWriteFolder = $batchFolder
+            $context.JournalPath = Join-Path $batchFolder ('Journal-' + $context.Source.Data.BatchId + '.jsonl')
+            Write-PraStep -Context $context -Title 'Entra Connect synchronisation' -Icon Sync
+            Invoke-PraSync $context -Resume
+            Write-PraStep -Context $context -Title 'Creating the transfer package' -Icon Batch
+            Publish-PraTransferPackage -Kind 'Convert' -BatchId ([string]$context.Source.Data.BatchId) -Folders @($batchFolder) -NextAction 'Convert' -NextPhase 'Cloud' `
+                -FallbackSteps @("Copy the folder $batchFolder to the Backups folder of the cloud server, then run there:",
+                    (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'Cloud' -BatchId $context.BatchId -OtherServer))
+        }
+        else { $context.NextSteps = @(Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -BatchId $context.BatchId) }
     }
     # ---------------------------------------------------------------------------------------------
     # CONVERT - AD side (phase AD or Both).
     # ---------------------------------------------------------------------------------------------
     elseif ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIn $effectivePhase @('Both','AD') -IgnoreCase)) {
         Write-PraStep -Context $context -Title 'Active Directory connection' -Icon Directory
+        if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { Test-PraCloudModuleAvailable }
         Initialize-PraDirectory $context -ValidateScope
         Write-PraStep -Context $context -Title 'Targets and planned changes' -Icon Plan
         $targets = @(Get-PraTarget $context $Identity $Scope $MaxObjects)
@@ -815,8 +913,8 @@ try {
             $null = Show-PraPlanSummary $plans
             Invoke-PraAdPreview $context $plans
         }
+        if ($plans.Count) { Test-PraSyncAvailable }
         if ($context.AllowMutation -and $plans.Count) {
-            Test-PraSyncAvailable
             $question = "Convert the {0} object(s) listed above? A backup is written first; then AD is changed{1}." -f $plans.Count, $(if ($config.EntraConnect.Sync) { ', Entra Connect synchronises' } else { '' })
             if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { $question = $question.TrimEnd('.') + ' and Exchange Online is completed.' }
             Confirm-PraApply $question
@@ -842,7 +940,8 @@ try {
             $context.Proof = Import-PraProof $context $receipt.StatePath $receipt 'Convert'
             $context.BatchId = Get-PraShortId $receipt.Data.BatchId
             Invoke-PraSync $context
-            $runCloud = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')
+            # The Exchange Online part does not start when the synchronisation could not run: its mailboxes would not appear. The Next steps say how to go on.
+            $runCloud = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -and ($null -eq (Get-PraValue $context 'SyncFailure' $null))
             if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) {
                 Write-PraStep -Context $context -Title 'Creating the transfer package' -Icon Batch
                 Publish-PraTransferPackage -Kind 'Convert' -BatchId ([string]$receipt.Data.BatchId) -Folders @(Split-Path $receipt.Path -Parent) -NextAction 'Convert' -NextPhase 'Cloud' `
@@ -861,6 +960,7 @@ try {
     # ---------------------------------------------------------------------------------------------
     elseif ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover') -and (Test-PraOrdinalIn $effectivePhase @('Both','AD') -IgnoreCase)) {
         Write-PraStep -Context $context -Title 'Loading the Convert batch' -Icon Batch
+        if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { Test-PraCloudModuleAvailable }
         $context.Source = Import-PraBackup $context (Get-PraBatchFile -Value $Batch -Operations @('Convert'))
         if (-not (Test-PraOrdinalEqual $context.Source.Data.Operation 'Convert')) { throw 'Recover needs the original Convert batch.' }
         $context.SourceBackupHash = $context.Source.Hash
@@ -879,8 +979,8 @@ try {
             $null = Show-PraPlanSummary $plans
             Invoke-PraAdPreview $context $plans
         }
+        if ($plans.Count) { Test-PraSyncAvailable }
         if ($context.AllowMutation -and $plans.Count) {
-            Test-PraSyncAvailable
             Confirm-PraApply ("Roll back the {0} object(s) listed above? Users get their on-premises attributes back; shared mailboxes are first deprovisioned in Exchange Online." -f $plans.Count)
         }
         if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) {
@@ -904,7 +1004,7 @@ try {
             $context.Proof = Import-PraProof $context $receipt.StatePath $context.Source 'Recover'
             $context.BatchId = Get-PraShortId $receipt.Data.BatchId
             Invoke-PraSync $context
-            $runCloud = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')
+            $runCloud = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -and ($null -eq (Get-PraValue $context 'SyncFailure' $null))
             if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) {
                 Write-PraStep -Context $context -Title 'Creating the transfer package' -Icon Batch
                 Publish-PraTransferPackage -Kind 'Recover' -BatchId ([string]$receipt.Data.BatchId) -Folders @((Split-Path $receipt.Path -Parent), (Split-Path $context.Source.Path -Parent)) -NextAction 'Recover' -NextPhase 'Cloud' `
@@ -914,7 +1014,7 @@ try {
         }
         elseif ($plans.Count) {
             if ($replicate) { Skip-PraStep -Title 'Active Directory replication' -Reason (Get-PraSkipReason $plans.Count) -Icon Directory }
-            $context.NextSteps = @(Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -BatchId $Batch -KeepFilters)
+            $context.NextSteps = @(Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $Batch }) -KeepFilters)
         }
     }
     # ---------------------------------------------------------------------------------------------
@@ -924,6 +1024,7 @@ try {
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check')) { $cloudAction = if ((Test-PraOrdinalIgnoreCaseEqual $Expect 'Deprovisioned')) { 'Recover' } else { 'Convert' } }
         $stepTitle = switch ($Action) { 'Check' { 'Objects to check' } 'Recover' { 'Loading the Recover batch' } default { 'Loading the batch of the AD phase' } }
         Write-PraStep -Context $context -Title $stepTitle -Icon Batch
+        Test-PraCloudModuleAvailable
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and $Identity -and -not $Batch) {
             if ($Identity -match '@') { $record = [pscustomobject]@{ ObjectGuid = ''; SamAccountName = $Identity; UserPrincipalName = $Identity; IsShared = ((Test-PraOrdinalIgnoreCaseEqual $Scope 'SharedOnly')); ExpectedX500Note = 'identity given as a UPN, no Active Directory read: give the sAMAccountName or -Batch' } }
             else {
@@ -1046,23 +1147,44 @@ try {
             else { Write-PraItem -Context $context -Status Skip -Text 'Preview: nothing restored.' }
         }
         if (-not $context.AllowMutation -and (Test-PraOrdinalIn $Action @('Convert','Recover') -IgnoreCase) -and -not $context.NextSteps.Count) {
-            $context.NextSteps = @(Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $Batch -KeepFilters)
+            $context.NextSteps = @(Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $Batch }) -KeepFilters)
         }
     }
     elseif ($runCloud) { Write-PraItem -Context $context -Status Warn -Text 'No object to check in Exchange Online.' }
 
     # Steps announced but not run (preview, nothing to do) are shown as skipped, in their order.
+    $syncFailure = Get-PraValue $context 'SyncFailure' $null
     $announced = @($steps)
-    for ($i = [int]$context.StepIndex; $i -lt $announced.Count; $i++) { Skip-PraStep -Title $announced[$i] -Reason (Get-PraSkipReason ($context.Rows.Count -gt 0)) }
+    for ($i = [int]$context.StepIndex; $i -lt $announced.Count; $i++) {
+        $skipReason = if ($null -ne $syncFailure) { 'Not run: the Entra Connect synchronisation could not start (see the next steps).' } else { Get-PraSkipReason ($context.Rows.Count -gt 0) }
+        Skip-PraStep -Title $announced[$i] -Reason $skipReason
+    }
 
-    if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIn $effectivePhase @('Both','Cloud') -IgnoreCase) -and $context.BatchId -and -not $context.Issues.Count) {
+    if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIn $effectivePhase @('Both','Cloud') -IgnoreCase) -and $context.BatchId -and -not $context.Issues.Count -and $null -eq $syncFailure) {
         $context.NextSteps = @($(if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { 'To roll back this batch later, on the AD server: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId -OtherServer) } else { 'To roll back this batch later: ' + (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $context.BatchId) }))
+    }
+
+    # The synchronisation could not run after the AD changes were verified: say plainly what is done and what to do (the transfer package, when there is one, follows).
+    if ($null -ne $syncFailure) {
+        $syncLines = @(
+            ('AD is changed and verified. The Entra Connect sync could not start: {0}.' -f $syncFailure.Reason),
+            ('Run a delta sync on {0} (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).' -f $syncFailure.Server))
+        if ((Test-PraOrdinalIn $Action @('Convert','Recover') -IgnoreCase) -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -and $context.BatchId) {
+            $syncLines += ('Then continue this batch from here (it waits for the Exchange Online part to be ready): ' + (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $context.BatchId))
+        }
+        $context.NextSteps = @($syncLines) + @(Get-PraList $context 'NextSteps')
+    }
+
+    # The synchronisation is left to the operator (EntraConnect.Sync = $false): it comes before the copy of the package, in the same list.
+    $syncNotRun = Get-PraValue $context 'SyncNotRun' $null
+    if ($null -ne $syncNotRun -and $null -eq $syncFailure -and ([string](Get-PraValue $context 'HandOff' '') -or (Test-PraOrdinalIgnoreCaseEqual $Action 'Finalize'))) {
+        $context.NextSteps = @(('Run a delta sync on {0} (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).' -f $syncNotRun.Server)) + @(Get-PraList $context 'NextSteps')
     }
 
     # X500 addresses missing in Exchange Online (warning of the cloud phase): synchronise, then check again.
     $x500Missing = @(Get-PraList $context 'X500Missing')
     if ($x500Missing.Count) {
-        $checkCommand = Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $context.BatchId -KeepFilters
+        $checkCommand = Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $context.BatchId }) -KeepFilters
         $context.NextSteps = @(@(Get-PraList $context 'NextSteps') + ('X500 missing in Exchange Online for {0} object(s) (replies to old messages can bounce): run an Entra Connect synchronisation, then check again: {1}' -f $x500Missing.Count, $checkCommand))
     }
 }
@@ -1100,10 +1222,10 @@ finally {
 }
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCC2+5RwuKHOA4FQ
-# bLw6DOJRbJ9SujzM/QDZE8TG+PrKjaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCl7PKR8vqWmCTH
+# Qc+e/OTi5hIqOUuoON9lpDx82WoFXaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1175,28 +1297,28 @@ finally {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAKEn52qWqD
-# 9DM3ND6P7/ND9DYfHkiHMVLHpvNvD7a0ZjANBgkqhkiG9w0BAQEFAASCAgBHaHo0
-# gXUgbIB10waqVtKoavO3tA2dS9hUd+a/zG1Tv10Xq2wOH1woqbxVNSvS1dExK/k4
-# gbK8uLbqcf7XSDr80++F7pBIe3daOpqLkCU5HN+vNY2mOPfsnksEpsodE11oIgI0
-# Tzxh5vBMl0gHaYYASAYLqgk8Loef4FRkY4EZBznpVHe2dwlvl4i90d7nixu3sjVr
-# ey4dvM1wku5ed3GSjMvWCTaDE1G7CT5unYQzGdJComalNjCFeE2b5W6OWopLuaoW
-# W/M4lxoG6SF36adx07PaQ7V1PRqnU8or+Ba7az14FQP3cgUlAa9MicG6LQQS8NFa
-# wxIAg5ItyFbqXPYJ36305BE1uGo7MGSLdATad+9lTSvrUKj3ENOFStCThO1km5WC
-# Z/Ee9+pptqkLcS3ZLWxTeKIdg8+24LM8go6KsQT2mwY1bxjpPw1lFNFUYJJ5COPd
-# XDdkprIIY56RPCbFreduUemUeHlnluP03FvhgDX/LukApHQxxYdZ2vbNw8U81ypp
-# jpyfhGDba/ztrKjEZ/M0GIh3mLazlkkRbJEjB2Nzwr/FU0eyK2YtksXbIkTb6tlo
-# RvCJ/Q87iheO4UJ0MFjIQZiUjRdje5pU/Di41f9HdA2GRFP/2OsfJ0O8IUiDEdgD
-# 6MOH2PSfJbo/5ZCisIzdnL3vY+Et8R0Nyvknd6GCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDq9X7m/dph
+# PALur9LPRbqQSNv8HOs5QR46QTJ8uV6tOTANBgkqhkiG9w0BAQEFAASCAgCiBFXc
+# k/naW9qByhVLEPYI/VPziJ58Cj/SJ9cTj1NIJS9E76bEKnPnULLEg+mFCQZwlqcc
+# xDDMrlTsVIHLxL7lJJOvoI8nCjIop+CX008If7n4ZKFk6Mpf9q9Y4pG0shOwdGrK
+# vgGXoZU5rC2AzUrgZ5evWgy9gRg0Le1RQNoPGxDDaoPWE6VXTCS8MtO3M2GWxB57
+# aBshH6wvuHVofS8UgKp18KuZGK6XMEv8+/SCoe80pb13tUjajZVxnNw9lapr3iXx
+# VpQnblkouLZDbs88rkxMjK9Tup1NgRcBpKR12d1k2BqKT9RwZ2XTZp33Oo7wj1Ru
+# R3dVu5ADjQdBQVs5f5T9vkMy8vqBm0U7e9N86lA5FeL48tP4J6kMv4AVWLNFMR7h
+# Kh1TayfepSAQUAKR0d7VgoCWStudfSyUHrZD9I/CH3qNVtA/TKpZhtKE4VE3qdoj
+# h/0cvNwpKwUYArIe7jD+YInlwGu08p0v1/WNwB9NCNdru/9Vjp04uTuH+bAJkgbr
+# 8JcNcG2PREThMAxxY+ilMJ96qEiMi42J1Y3JKrCdo6ptp13GlR9Vp5j/5ccZgOC2
+# mLQXB3WD0nHrpPsC31NgWiE8pfVTn8Xd/ngNe7JKH0UjW9pngkcXRO59vZ17wxfF
+# yyMwIm74/nvK+mWeDXkm1FWXjrajGHSgXft2jaGCFM8wghTLBgorBgEEAYI3AwMB
+# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIFOtWwWfa3M1mwvDrFiYACdOJX/IRiq/FVxh6C9/UBwrAggznVi7TTXc
-# lxgPMjAyNjExMDkxNTMzMTJaMAMCAQECEE1SSqtitfMKvMjyb2C1QuegghGnMIIE
+# BAIBBQAEIBH137qTftgYmC7Z3Q+6jRAXrKpG9gy4hRJqaMltI7eTAghfBbZVDpYz
+# hBgPMjAyNjExMTAwODMyNTdaMAMCAQECEBkH5v/p8nCU5BoFfINI/WmgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1291,17 +1413,17 @@ finally {
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEwOTE1MzMxMlowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIKIK
-# rQhZtGTpwsUKBmAFcp+bk+TrlQHo3n2No5bUMIJpMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMDA4MzI1N1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIJoU
+# ahiePJDtGkxNhbiycvlY45DZrMI+3syJHO9ASsn7MIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiB3LF3alC0OOFha0H5HzDmHdfgpOc0Qoi+K8apEmbKRkAIhALo8
-# 7PtJj0G96olQlXvnegI1k+TfNrABjFX0za6YHsg8
+# zj0EAwIESDBGAiEA1s+ESC73XnvMwRBaijql8emlCvPxZziYkW8Ofe/B6dgCIQDz
+# npa4EVo5LnQW64/td43MZW4CUb2fN84nQwtbNw8BkQ==
 # SIG # End signature block
