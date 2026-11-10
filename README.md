@@ -48,7 +48,7 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
-**Author:** Nicolas Fabert · **Version:** 3.1.2, 2026-11-09 ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 3.1.2, 2026-11-10 ([changelog](CHANGELOG.md)).
 
 > [!CAUTION]
 > Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (reference guide, chapter 6).

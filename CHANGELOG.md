@@ -4,7 +4,7 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
-## 3.1.2 — 2026-11-09
+## 3.1.2 — 2026-11-10
 
 ### Fixed
 - The console no longer prints "unapproved verbs" warnings at start.
