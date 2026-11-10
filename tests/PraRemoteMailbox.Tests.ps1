@@ -7317,8 +7317,8 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'config\PraRemoteMailbox.config.psd1')) | Should -Match "MinModuleVersion\s*=\s*'3\.10\.1'"
     }
     It 'the window shows the same answer on the Graph and Exchange Online lights' {
-        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Gui.psm1') -Force
-        $old = & (Get-Module PRA.Gui) {
+        $guiModule = Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Gui.psm1') -Force -PassThru | Select-Object -Last 1
+        $old = & $guiModule {
             $script:GuiCloudModules = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.40.0' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.35.1' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.0' })
             Get-PraGuiPrerequisite -Signin Wam -SyncEnabled $false
         }
@@ -7328,7 +7328,7 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         $exo.Status | Should -BeExactly 'Fail'
         $exo.Detail | Should -Match 'found 3\.10\.0; the tool needs 3\.10\.1 or later.*Install-Module ExchangeOnlineManagement -MinimumVersion 3\.10\.1 -Scope AllUsers'
         $old.Cloud | Should -BeFalse
-        $good = & (Get-Module PRA.Gui) {
+        $good = & $guiModule {
             $script:GuiCloudModules = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' })
             Get-PraGuiPrerequisite -Signin Wam -SyncEnabled $false
         }
