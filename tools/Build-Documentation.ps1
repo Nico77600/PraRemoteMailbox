@@ -27,7 +27,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2 (from the Purview DLP Report builder)
+    Version : 3.1.3 (from the Purview DLP Report builder)
     PowerShell pitfall: never name a variable $matches — every -match overwrites the automatic
     $Matches, and variable names are case-insensitive.
 #>
@@ -37,7 +37,7 @@ param(
     [string]$Destination
 )
 $ErrorActionPreference = 'Stop'
-# Defaults here, not in param(): $PSScriptRoot can be empty in param() defaults (kept from 2.x, where Windows PowerShell 5.1 left it empty with -File).
+# Defaults here, not in param(): $PSScriptRoot can be empty in param() defaults.
 if (-not $Source) {
     foreach ($name in 'PraRemoteMailbox-Guide', 'PraRemoteMailbox-UserGuide') {
         & $PSCommandPath -Source (Join-Path $PSScriptRoot "..\package\docs\$name.md")

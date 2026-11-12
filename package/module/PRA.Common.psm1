@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2
+    Version : 3.1.3
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # window, run context, report, audit). The literal comments "Version : x.y.z" of the file headers cannot be
 # computed (the signature and the manifest hash the exact bytes): they are listed in the guide, annex D, and
 # checked against this value by the tests. tools\New-PraPackage.ps1 reads the version from this line.
-$script:ToolVersion = '3.1.2'
+$script:ToolVersion = '3.1.3'
 $script:TranscriptOwner = $null
 $script:PraNativePath = $null
 $script:PraNativeProcess = $null
@@ -67,8 +67,8 @@ function ConvertFrom-PraJson {
     .DESCRIPTION
         ConvertFrom-Json of PowerShell 7 turns ISO 8601 strings (CapturedUtc, CreatedUtc, Utc) into [DateTime] unless told
         otherwise, which would break the byte-exact, string-based comparisons of the proofs and of the memory fingerprint.
-        -DateKind String (PowerShell 7.5+) keeps every date as the string that was written, exactly as Windows PowerShell 5.1 did,
-        so a file written by 2.x under Windows PowerShell 5.1 and a file written by 3.x are read the same way.
+        -DateKind String (PowerShell 7.5+) keeps every date as the string that was written,
+        so a file written by any version of the tool is read the same way.
         A test refuses any other ConvertFrom-Json call in the package.
     #>
     [CmdletBinding()]
@@ -82,7 +82,7 @@ function ConvertFrom-PraJson {
 # PowerShell 7 runs on .NET with ICU: every CULTURE-sensitive string comparison ignores zero-weight characters. -eq, -ceq, -ne, -cne,
 # -in, -cin, -contains, -like, -clike, switch, Group-Object, Select-Object -Unique, Sort-Object, Compare-Object, [string]::Compare,
 # .StartsWith(string), .EndsWith(string), .IndexOf(string), .CompareTo and hashtables built on a culture comparer treat "a" and
-# "a<U+0001>" (or "a<U+200B>") as EQUAL (the "c" operators only drop the case, never the culture). Windows PowerShell 5.1 (NLS) was strict.
+# "a<U+0001>" (or "a<U+200B>") as EQUAL (the "c" operators only drop the case, never the culture).
 # This tool is fail-closed: every comparison that guards integrity, identity or authorisation goes through these helpers or through an
 # explicit [StringComparison]::Ordinal / OrdinalIgnoreCase (regular expressions are already ordinal). The experiment is in
 # the guide, annex "Limitations" and the tests (OrdinalComparison).
@@ -100,6 +100,15 @@ function Test-PraOrdinalIgnoreCaseEqual {
     param([AllowNull()][object]$Left, [AllowNull()][object]$Right)
     if ($null -eq $Left -or $null -eq $Right) { return ($null -eq $Left -and $null -eq $Right) }
     return [string]::Equals([string]$Left, [string]$Right, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Resolve-PraOfficialValue {
+    <# The official spelling of Value among Set (ordinal, ignoring the case), or $null when Value is none of them. #>
+    [OutputType([string])]
+    param([AllowNull()][object]$Value, [Parameter(Mandatory)][object[]]$Set)
+    if ($null -eq $Value) { return $null }
+    foreach ($item in $Set) { if ([string]::Equals([string]$Value, [string]$item, [StringComparison]::OrdinalIgnoreCase)) { return [string]$item } }
+    return $null
 }
 
 function Test-PraOrdinalIn {
@@ -190,8 +199,7 @@ function Compare-PraX500Address {
 }
 #endregion
 
-# Minimum versions of the cloud modules (owner's decision). Microsoft Graph modules must be loaded in ONE version for all of them: two versions of
-# Microsoft.Graph.Authentication / Microsoft.Graph.Users in one session fail with an opaque "assembly with same name is already loaded".
+# Minimum versions of the cloud modules. The Microsoft Graph modules are used in ONE version for all of them (two versions of the same module cannot share a session).
 $script:PraMinGraphVersion = '2.41.1'
 $script:PraMinExoVersion = '3.10.1'
 
@@ -223,7 +231,7 @@ function Get-PraCloudModuleReport {
         param([object[]]$Modules, [string]$Name)
         $found = New-Object 'Collections.Generic.List[version]'
         foreach ($module in @($Modules)) {
-            if ($null -eq $module -or -not (Test-PraOrdinalEqual ([string]$module.Name) $Name)) { continue }
+            if ($null -eq $module -or -not (Test-PraOrdinalIgnoreCaseEqual ([string]$module.Name) $Name)) { continue }
             $version = [version]$module.Version
             if (-not $found.Contains($version)) { $found.Add($version) }
         }
@@ -236,11 +244,13 @@ function Get-PraCloudModuleReport {
     $users = & $versionsOf $Available 'Microsoft.Graph.Users'
     $coherent = New-Object 'Collections.Generic.List[version]'
     foreach ($version in $auth) { if ($version -ge $minGraphVersion -and $users.Contains($version)) { $coherent.Add($version) } }
-    $graphCommand = 'Install-Module Microsoft.Graph.Authentication,Microsoft.Graph.Users -MinimumVersion {0} -Scope AllUsers' -f $MinGraph
+    # One Install-Module per module: PowerShellGet refuses -MinimumVersion when several names are given.
+    $graphCommand = 'Install-Module Microsoft.Graph.Authentication -MinimumVersion {0} -Scope CurrentUser; Install-Module Microsoft.Graph.Users -MinimumVersion {0} -Scope CurrentUser' -f $MinGraph
+    $scopeHint = 'to install for every user, use -Scope AllUsers in a window opened as administrator'
     $graph = [ordered]@{ Ok = $false; Version = ''; Message = '' }
     $loadedVersions = New-Object 'Collections.Generic.List[version]'
     foreach ($module in @($Loaded)) {
-        if ($null -eq $module -or -not ([string]$module.Name).StartsWith('Microsoft.Graph.', [StringComparison]::Ordinal)) { continue }
+        if ($null -eq $module -or -not ([string]$module.Name).StartsWith('Microsoft.Graph.', [StringComparison]::OrdinalIgnoreCase)) { continue }
         if (-not $loadedVersions.Contains([version]$module.Version)) { $loadedVersions.Add([version]$module.Version) }
     }
     if ($loadedVersions.Count -gt 1) {
@@ -253,14 +263,20 @@ function Get-PraCloudModuleReport {
     elseif ($loadedVersions.Count -eq 1) { $graph.Ok = $true; $graph.Version = $loadedVersions[0].ToString() }
     elseif ($coherent.Count) { $graph.Ok = $true; $graph.Version = $coherent[0].ToString() }
     else {
-        $graph.Message = 'Microsoft Graph: found Microsoft.Graph.Authentication {0}; Microsoft.Graph.Users {1}. The tool needs both in one same version {2} or later. Run: {3}' -f (& $texts $auth), (& $texts $users), $MinGraph, $graphCommand
+        # Versions are listed only for a module that is installed; a missing one is said so.
+        $present = @(); $absent = @()
+        foreach ($pair in @(@('Microsoft.Graph.Authentication', $auth), @('Microsoft.Graph.Users', $users))) {
+            if ($pair[1].Count) { $present += ('{0} {1}' -f $pair[0], (& $texts $pair[1])) } else { $absent += ('{0} is not installed' -f $pair[0]) }
+        }
+        $inventory = (@($(if ($present.Count) { 'found ' + ($present -join '; ') } else { @() })) + $absent) -join '; '
+        $graph.Message = 'Microsoft Graph: {0}. The tool needs both in one same version {1} or later. Run: {2} (one command per module, the same version for both; {3}).' -f $inventory, $MinGraph, $graphCommand, $scopeHint
     }
     # Exchange Online.
     $exoVersions = & $versionsOf $Available 'ExchangeOnlineManagement'
     $exo = [ordered]@{ Ok = $false; Version = ''; Message = '' }
     if ($exoVersions.Count -and $exoVersions[0] -ge $minExoVersion) { $exo.Ok = $true; $exo.Version = $exoVersions[0].ToString() }
     else {
-        $exo.Message = 'ExchangeOnlineManagement: {0}; the tool needs {1} or later. Run: Install-Module ExchangeOnlineManagement -MinimumVersion {1} -Scope AllUsers' -f $(if ($exoVersions.Count) { 'found ' + (& $texts $exoVersions) } else { 'not installed' }), $MinExo
+        $exo.Message = 'ExchangeOnlineManagement: {0}; the tool needs {1} or later. Run: Install-Module ExchangeOnlineManagement -MinimumVersion {1} -Scope CurrentUser ({2}).' -f $(if ($exoVersions.Count) { 'found ' + (& $texts $exoVersions) } else { 'not installed' }), $MinExo, $scopeHint
     }
     $messages = @(@($graph.Message, $exo.Message) | Where-Object { $_ })
     return [pscustomobject]@{ Ok = ($graph.Ok -and $exo.Ok); Messages = $messages; Graph = [pscustomobject]$graph; Exo = [pscustomobject]$exo }
@@ -636,7 +652,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v3.1.2 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v3.1.3 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)
@@ -947,7 +963,7 @@ function Assert-PraOutputFolder {
     if ($lexical) {
         $relative = $full.Substring($rootFull.Length).TrimStart('\')
         $first = if ($relative) { $relative.Split('\')[0] } else { '' }
-        if (-not [string]::Equals($first, $Canonical, [StringComparison]::Ordinal)) {
+        if (-not [string]::Equals($first, $Canonical, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Configuration: $Name ($full) is inside the signed package and is not the $Canonical folder. Use '.\$Canonical' (a sub-folder of it is accepted) or a folder outside the package; any other folder inside the package would break package integrity."
         }
         $current = $rootFull
@@ -971,6 +987,13 @@ function Assert-PraOutputFolder {
     }
     $relative = $physical.Substring($physicalRoot.Length).TrimStart('\')
     $first = if ($relative) { $relative.Split('\')[0] } else { '' }
+    # A folder that does not exist yet is created with the canonical spelling, whatever case the configuration wrote.
+    if ($first -and [string]::Equals($first, $Canonical, [StringComparison]::OrdinalIgnoreCase) -and -not [string]::Equals($first, $Canonical, [StringComparison]::Ordinal) -and
+        -not (Test-Path -LiteralPath ($physicalRoot + '\' + $first))) {
+        $physical = $physicalRoot + '\' + $Canonical + $relative.Substring($first.Length)
+        $relative = $physical.Substring($physicalRoot.Length).TrimStart('\')
+        $first = $Canonical
+    }
     if (-not [string]::Equals($first, $Canonical, [StringComparison]::Ordinal)) {
         throw "Configuration: $Name ($full) resolves to $physical, inside the signed package, and is not the $Canonical folder. Use '.\$Canonical' (a sub-folder of it is accepted) or a folder outside the package; any other folder inside the package would break package integrity."
     }
@@ -1086,14 +1109,15 @@ function Get-PraDefaultConfiguration {
 function Get-PraTargetOverride {
     <# Run-specific targeting; the original data file is never rewritten. #>
     [CmdletBinding()]
-    param([string]$SearchBase = '', [string]$CsvPath = '', [string]$Identity = '')
-    foreach ($value in @($SearchBase,$CsvPath)) {
-        if ($value -match '[\x00-\x1f]' -or ($value -and [string]::IsNullOrWhiteSpace($value))) { throw 'Target OU/CSV contains an empty value or a control character.' }
+    param([string]$SearchBase = '', [string]$CsvPath = '', [string]$Identity = '', [string]$Group = '')
+    foreach ($value in @($SearchBase,$CsvPath,$Group)) {
+        if ($value -match '[\x00-\x1f]' -or ($value -and [string]::IsNullOrWhiteSpace($value))) { throw 'Target OU/CSV/group contains an empty value or a control character.' }
     }
-    if ($SearchBase -and $CsvPath) { throw 'Choose one source: SearchBase (OU) or CsvPath, not both.' }
-    if ($Identity -and ($SearchBase -or $CsvPath)) { throw 'Identity cannot be combined with a selected OU or CSV.' }
+    if (@(@($SearchBase, $CsvPath, $Group) | Where-Object { $_ }).Count -gt 1) { throw 'Choose one source: -SearchBase (OU), -CsvPath or -Group, not several.' }
+    if ($Identity -and ($SearchBase -or $CsvPath -or $Group)) { throw 'Identity cannot be combined with a selected OU, CSV or group.' }
     if ($SearchBase) { return @{ Mode='OU'; SearchBase=$SearchBase.Trim(); CsvPath=''; GroupDN='' } }
     if ($CsvPath) { return @{ Mode='Csv'; CsvPath=$CsvPath.Trim(); SearchBase=''; GroupDN='' } }
+    if ($Group) { return @{ Mode='Group'; GroupDN=$Group.Trim(); SearchBase=''; CsvPath='' } }
     return @{}
 }
 
@@ -1124,10 +1148,17 @@ function Test-PraScopeConfiguration {
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Config)
     $scope = $Config.Scope
-    $how = 'Fill it in the configuration file, or give -Identity (one account), -CsvPath (a CSV file with an Identity column) or -SearchBase (an OU) for this run' + $(if (Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Auto') { '.' } else { ', or set Scope.Mode = Auto to take every mailbox of the domain.' })
+    $how = 'Fill it in the configuration file, or give -Identity (one account), -CsvPath (a CSV file with an Identity column), -SearchBase (an OU) or -Group (an AD group) for this run' + $(if (Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Auto') { '.' } else { ', or set Scope.Mode = Auto to take every mailbox of the domain.' })
     if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'OU') -and -not $scope.SearchBase) { throw ('Configuration: Scope.Mode = OU requires Scope.SearchBase: no OU is set, so the tool does not know which mailboxes to convert. ' + $how) }
     if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Group') -and -not $scope.GroupDN) { throw ('Configuration: Scope.Mode = Group requires Scope.GroupDN: no group is set, so the tool does not know which mailboxes to convert. ' + $how) }
     if ((Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Csv') -and -not $scope.CsvPath) { throw ('Configuration: Scope.Mode = Csv requires Scope.CsvPath: no CSV file is set, so the tool does not know which mailboxes to convert. ' + $how) }
+}
+
+function Get-PraConfigurationValueError {
+    <# The refusal of a configuration value that is not one of the accepted words: the key, the accepted words, the value found and the file. #>
+    param([string]$File, [string]$Key, [string]$Accepted, [AllowNull()][object]$Value)
+    $shown = if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { 'empty' } else { "'$Value'" }
+    return ('Configuration: {0} must be {1}: the value is {2} in {3}.' -f $Key, $Accepted, $shown, $File)
 }
 
 function Import-PraConfiguration {
@@ -1149,14 +1180,17 @@ function Import-PraConfiguration {
     $config = Import-PowerShellDataFile -LiteralPath $file -ErrorAction Stop
     Merge-PraConfiguration $config (Get-PraDefaultConfiguration)
     foreach ($key in $ScopeOverride.Keys) {
-        if (-not (Test-PraOrdinalIn $key @('Mode','SearchBase','CsvPath','GroupDN')) -or $ScopeOverride[$key] -isnot [string]) { throw 'Unsupported target scope override.' }
-        $config.Scope[$key] = $ScopeOverride[$key]
+        $overrideKey = Resolve-PraOfficialValue $key @('Mode','SearchBase','CsvPath','GroupDN')
+        if ($null -eq $overrideKey -or $ScopeOverride[$key] -isnot [string]) { throw 'Unsupported target scope override.' }
+        $config.Scope[$overrideKey] = $ScopeOverride[$key]
     }
 
     if ($config.Environment -notmatch '^[A-Za-z0-9_.-]{1,64}\z') { throw 'Configuration: Environment must be 1 to 64 letters, digits, dot, dash or underscore (it is used in file names).' }
     if ($config.DomainController -and $config.DomainController -notmatch '^[A-Za-z0-9.-]+\z') { throw 'Configuration: DomainController must be a host name.' }
     $scope = $config.Scope
-    if (-not (Test-PraOrdinalIn $scope.Mode @('Auto','OU','Group','Csv'))) { throw 'Configuration: Scope.Mode must be Auto, OU, Group or Csv.' }
+    $badValue = $scope.Mode
+    $scope.Mode = Resolve-PraOfficialValue $scope.Mode @('Auto','OU','Group','Csv')
+    if ($null -eq $scope.Mode) { throw (Get-PraConfigurationValueError $file 'Scope.Mode' 'Auto, OU, Group or Csv' $badValue) }
     # The mailboxes to convert are only needed by a conversion (Convert, phase AD or Both): the entry script checks them then (Test-PraScopeConfiguration). A Check, a cloud
     # phase, a Recover or a Finalize on a server without that setting must not fail on it; -DeferScopeCheck leaves the check to the caller.
     if (-not $DeferScopeCheck) { Test-PraScopeConfiguration -Config $config }
@@ -1165,7 +1199,9 @@ function Import-PraConfiguration {
     if ($config.Licensing.Enabled -and -not $config.Licensing.GroupDN) { throw 'Configuration: Licensing.Enabled requires Licensing.GroupDN.' }
     $shared = $config.SharedMailbox
     if ((-not (Test-PraOrdinalIn $shared.RemoteRecipientType @(97,99,100,102) -IgnoreCase))) { throw 'Configuration: SharedMailbox.RemoteRecipientType must be 97 or 99 (100/102 are accepted only to read old backups).' }
-    if (-not (Test-PraOrdinalIn $shared.PermissionSource @('AD','Csv','CustomAttribute','None'))) { throw 'Configuration: SharedMailbox.PermissionSource must be AD, Csv, CustomAttribute or None.' }
+    $badValue = $shared.PermissionSource
+    $shared.PermissionSource = Resolve-PraOfficialValue $shared.PermissionSource @('AD','Csv','CustomAttribute','None')
+    if ($null -eq $shared.PermissionSource) { throw (Get-PraConfigurationValueError $file 'SharedMailbox.PermissionSource' 'AD, Csv, CustomAttribute or None' $badValue) }
     if ((Test-PraOrdinalIgnoreCaseEqual $shared.PermissionSource 'Csv') -and -not $shared.CsvPath) { throw 'Configuration: SharedMailbox.PermissionSource = Csv requires SharedMailbox.CsvPath.' }
     if ($shared.CustomAttribute -notmatch '^extensionAttribute([1-9]|1[0-5])\z') { throw 'Configuration: SharedMailbox.CustomAttribute must be extensionAttribute1 to extensionAttribute15.' }
     $replication = $config.Directory
@@ -1176,11 +1212,15 @@ function Import-PraConfiguration {
         if ([string]$replicationTarget -notmatch '^[A-Za-z0-9.-]+\z') { throw 'Configuration: Directory.ReplicationTargets must be a list of domain controller host names.' }
     }
     $sync = $config.EntraConnect
-    if (-not (Test-PraOrdinalIn $sync.PolicyType @('Delta','Initial'))) { throw 'Configuration: EntraConnect.PolicyType must be Delta or Initial.' }
+    $badValue = $sync.PolicyType
+    $sync.PolicyType = Resolve-PraOfficialValue $sync.PolicyType @('Delta','Initial')
+    if ($null -eq $sync.PolicyType) { throw (Get-PraConfigurationValueError $file 'EntraConnect.PolicyType' 'Delta or Initial' $badValue) }
     if ($sync.TimeoutMinutes -lt 1 -or $sync.TimeoutMinutes -gt 240) { throw 'Configuration: EntraConnect.TimeoutMinutes must be between 1 and 240.' }
     if ($sync.Server -and $sync.Server -notmatch '^[A-Za-z0-9.-]+\z') { throw 'Configuration: EntraConnect.Server must be a host name (empty = this server).' }
     $cloud = $config.Cloud
-    if (-not (Test-PraOrdinalIn $cloud.MailboxCheckVia @('Graph','Exo'))) { throw 'Configuration: Cloud.MailboxCheckVia must be Exo or Graph.' }
+    $badValue = $cloud.MailboxCheckVia
+    $cloud.MailboxCheckVia = Resolve-PraOfficialValue $cloud.MailboxCheckVia @('Graph','Exo')
+    if ($null -eq $cloud.MailboxCheckVia) { throw (Get-PraConfigurationValueError $file 'Cloud.MailboxCheckVia' 'Exo or Graph' $badValue) }
     if ([bool]$cloud.AppId -ne [bool]$cloud.CertificateThumbprint) { throw 'Configuration: Cloud.AppId and Cloud.CertificateThumbprint go together (both set = certificate sign-in, both empty = interactive sign-in).' }
     if ($cloud.AppId) {
         # Certificate (app-only) sign-in cannot work without the tenant: refuse it at load, not in the middle of a run.
@@ -1197,7 +1237,9 @@ function Import-PraConfiguration {
     $retention = $config.Retention
     if ($retention.Tag.Attribute -notmatch '^extensionAttribute([1-9]|1[0-5])\z') { throw 'Configuration: Retention.Tag.Attribute must be extensionAttribute1 to extensionAttribute15.' }
     if ($retention.Enabled -and $retention.Tag.Enabled -and -not $retention.Tag.Value) { throw 'Configuration: Retention.Tag.Value is empty.' }
-    if (-not (Test-PraOrdinalIn $config.Execution.Phase @('Both','AD','Cloud'))) { throw 'Configuration: Execution.Phase must be Both, AD or Cloud.' }
+    $badValue = $config.Execution.Phase
+    $config.Execution.Phase = Resolve-PraOfficialValue $config.Execution.Phase @('Both','AD','Cloud')
+    if ($null -eq $config.Execution.Phase) { throw (Get-PraConfigurationValueError $file 'Execution.Phase' 'Both, AD or Cloud' $badValue) }
 
     $config.Storage.BackupFolder = Resolve-PraPath $config.Storage.BackupFolder 'Storage.BackupFolder' $Root
     $config.Storage.ForbiddenBackupRoots = @(foreach ($forbidden in $config.Storage.ForbiddenBackupRoots) { (Resolve-PraPath ([string]$forbidden) 'Storage.ForbiddenBackupRoots' $Root).TrimEnd('\') + '\' })
@@ -1311,7 +1353,11 @@ function Get-PraOutcome {
     param([hashtable]$Context)
     $rows = New-Object 'System.Collections.Generic.List[object]'
     $errorIdentities = @{}
-    foreach ($row in $Context.Rows.ToArray()) {
+    # Errors of the run itself (an object that could not be read), apart from the objects found not in the expected state.
+    $runErrors = 0
+    # A run refused before any change (Entra Connect check, cloud modules, domain controller refusing the account) touched no object: only its error is a result row.
+    $untouched = [bool](Get-PraValue $Context 'NoChangeMade' $false)
+    foreach ($row in $(if ($untouched) { @() } else { $Context.Rows.ToArray() })) {
         $copy = [ordered]@{}
         # Same lookup as Get-PraValue (missing and $null both give $null), inlined: this loop runs 22 times per row on very large runs.
         foreach ($field in $script:RowFields) {
@@ -1326,33 +1372,49 @@ function Get-PraOutcome {
         }
         if (Test-PraOrdinalEqual $copy.FinalStatus 'Error') {
             foreach ($field in @('ObjectGuid','SamAccountName','UserPrincipalName')) { if ($copy[$field]) { $errorIdentities[[string]$copy[$field]] = $true } }
+            if ([bool](Get-PraValue $row 'RunError' $false)) { $runErrors++ }
         }
         [void]$rows.Add([pscustomobject]$copy)
     }
     foreach ($issue in $Context.Issues.ToArray()) {
         $identity = [string](Get-PraValue $issue 'Identity' '')
         $source = [string](Get-PraValue $issue 'Source' 'Execution')
-        if ((Test-PraOrdinalEqual $source 'Execution') -and $identity -and $errorIdentities.ContainsKey($identity)) { continue }
+        # The error of an object is its row: the cloud error and the stop that follow it are the same failure, not two more.
+        if ((Test-PraOrdinalIn $source @('Execution', 'Cloud')) -and $identity -and $errorIdentities.ContainsKey($identity)) { continue }
         $failure = [ordered]@{}
         foreach ($field in $script:RowFields) { $failure[$field] = $null }
-        $failure.Action = $Context.Action; $failure.UserPrincipalName = $identity
+        $failure.Action = $Context.Action
+        $failure.UserPrincipalName = if ($identity -or -not $untouched) { $identity } elseif ([string](Get-PraValue $Context 'BatchId' '')) { '(batch {0})' -f (Get-PraValue $Context 'BatchId' '') } else { '(run)' }
         $failure.FinalStatus = 'Error'; $failure.LastOperation = Get-PraValue $issue 'Operation' ''
         $failure.Detail = '[Run/{0}] {1}' -f $source, (Get-PraValue $issue 'Message' ([string]$issue))
-        [void]$rows.Add([pscustomobject]$failure)
+        [void]$rows.Add([pscustomobject]$failure); $runErrors++
     }
-    $counts = @{ Success = 0; Error = 0; Pending = 0; Skipped = 0; Planned = 0 }
+    $counts = @{ Success = 0; Error = 0; Pending = 0; Skipped = 0; Planned = 0; RunError = $runErrors }
     foreach ($row in $rows) {
         $key = [string]$row.FinalStatus
         if (Test-PraOrdinalEqual $key 'AlreadyDone') { $key = 'Success' }
         $counts[$key]++
     }
-    $requested = [string](Get-PraValue $Context 'ResultStatus' '')
+    # The members of a selected group that are not converted have no row: they are skipped objects of the run.
+    $counts.Skipped += @(Get-PraList $Context 'SkippedMembers').Count
+    $requested =[string](Get-PraValue $Context 'ResultStatus' '')
     $code = 0; $status = 'Success'
-    if ($counts.Error -gt 0 -or $Context.Issues.Count -gt 0 -or [int]$Context.ExitCode -eq 1 -or $Context.CloudConnectFailed -or (Test-PraOrdinalIgnoreCaseEqual $requested 'Failed')) {
+    # An operator who answered no to the confirmation cancelled the run: nothing was written and no error is counted (exit code 1, the work was not done).
+    if ([bool](Get-PraValue $Context 'Cancelled' $false) -and $counts.Error -eq 0 -and $Context.Issues.Count -eq 0 -and -not $Context.CloudConnectFailed) { $code = 1; $status = 'Cancelled' }
+    elseif ($counts.Error -gt 0 -or $Context.Issues.Count -gt 0 -or [int]$Context.ExitCode -eq 1 -or $Context.CloudConnectFailed -or (Test-PraOrdinalIgnoreCaseEqual $requested 'Failed')) {
         $code = 1; $status = 'Failed'
     } elseif ($counts.Pending -gt 0) { $code = 2; $status = 'Pending' }
     elseif ((-not (Test-PraOrdinalIgnoreCaseEqual $Context.Mode 'Apply')) -and $counts.Planned -gt 0) { $status = 'Planned' }
     return [pscustomobject]@{ Rows = $rows.ToArray(); Counts = $counts; Status = $status; ExitCode = $code }
+}
+
+function Get-PraVerdict {
+    <# The verdict line of a run: the last line of the log and of the transcript. #>
+    param($Outcome)
+    if ((Test-PraOrdinalEqual ([string]$Outcome.Status) 'Cancelled')) { return 'RESULT: CANCELLED' }
+    if ($Outcome.ExitCode -eq 1) { return 'RESULT: FAIL' }
+    if ($Outcome.ExitCode -eq 2) { return 'RESULT: PENDING' }
+    return 'RESULT: PASS'
 }
 
 function ConvertTo-PraHtmlText {
@@ -1499,7 +1561,7 @@ function Write-PraReportHtml {
     $c = $Outcome.Counts
     $warningList = @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
     $issueList = @($Context.Issues.ToArray())
-    $statusClass = @{ Success='ok'; Planned='info'; Pending='warn'; Failed='fail' }[$Outcome.Status]
+    $statusClass = @{ Success='ok'; Planned='info'; Pending='warn'; Cancelled='warn'; Failed='fail' }[$Outcome.Status]
     $tiles = New-Object Text.StringBuilder
     foreach ($tile in @(
             @('Result', $Outcome.Status, $statusClass), @('Objects', $Outcome.Rows.Count, ''), @('Done', $c.Success, 'ok'),
@@ -1512,6 +1574,8 @@ function Write-PraReportHtml {
     $meta = [ordered]@{
         'Action' = ('{0} · phase {1} · {2}' -f $Context.Action, $Context.Phase, $modeText)
         'Environment' = [string](Get-PraValue $Context.Config 'Environment' '')
+        'Objects' = [string](Get-PraValue $Context 'ObjectsText' '')
+        'Skipped members' = $(if (@(Get-PraList $Context 'SkippedMembers').Count) { '{0} member(s) not converted: {1}' -f @(Get-PraList $Context 'SkippedMembers').Count, (@(Get-PraList $Context 'SkippedMembers') -join '; ') } else { '' })
         'Batch' = [string](Get-PraValue $Context 'BatchId' '')
         'Domain controller' = [string]$Context.Server
         'Computer / account' = ('{0} · {1}\{2}' -f $env:COMPUTERNAME, $env:USERDOMAIN, $env:USERNAME)
@@ -1630,10 +1694,11 @@ function Complete-PraRun {
         Ends every run: reports, summary card, transcript, verdict. Returns one result object (no exit).
     .DESCRIPTION
         Always called from the finally block of the entry script, also after an error. The verdict
-        'RESULT: PASS' or 'RESULT: FAIL' is the last line of the log and of the transcript; it is
+        'RESULT: PASS', 'RESULT: PENDING' (exit code 2, a next step is required), 'RESULT: CANCELLED' (the operator answered no to the confirmation; exit code 1,
+        nothing was written) or 'RESULT: FAIL' is the last line of the log and of the transcript; it is
         added after the transcript is stopped so that a failure to stop it is still reported.
     .OUTPUTS
-        PSCustomObject: RunId, Status (Success, Planned, Pending, Failed), ExitCode, counters,
+        PSCustomObject: RunId, Status (Success, Planned, Pending, Cancelled, Failed), ExitCode, counters,
         BatchId, NextSteps, file paths and Issues.
     #>
     [CmdletBinding()]
@@ -1646,7 +1711,7 @@ function Complete-PraRun {
         catch { $console = $Context.Clone(); $console.LogFile = ''; Write-PraLog $console $message -Level $level }
     }
     $ownsTranscript = [object]::ReferenceEquals($script:TranscriptOwner, $Context)
-    if (([int]$Context.ExitCode -ne 0 -or $Context.CloudConnectFailed -or (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $Context 'ResultStatus' '') 'Failed')) -and $Context.Issues.Count -eq 0) {
+    if (([int]$Context.ExitCode -ne 0 -or $Context.CloudConnectFailed -or (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $Context 'ResultStatus' '') 'Failed')) -and $Context.Issues.Count -eq 0 -and -not [bool](Get-PraValue $Context 'Cancelled' $false)) {
         Add-PraIssue $Context 'Failure reported by the run (exit code / cloud connection).' 'Run'
     }
     foreach ($key in @('LogFile','TranscriptPath','BackupFiles','StateFiles')) {
@@ -1690,24 +1755,40 @@ function Complete-PraRun {
     Close-PraStepEvent -Context $Context -State $(if ($outcome.ExitCode -eq 1) { 'fail' } else { '' })
     $c = $outcome.Counts
     $isApply = (Test-PraOrdinalIgnoreCaseEqual $Context.Mode 'Apply')
+    # A Preview (not a Check, which has its own words) changes nothing: its objects are "ready" or "planned", never "done".
+    $isPreviewRun = (-not $isApply) -and (-not (Test-PraOrdinalIgnoreCaseEqual $Context.Action 'Check'))
+    $isCheckRun = (Test-PraOrdinalIgnoreCaseEqual $Context.Action 'Check')
+    # A Check that ran to the end and found differences is finished; it "stopped" only when a run error prevented it.
+    $checkRanToEnd = $isCheckRun -and (Test-PraOrdinalEqual $outcome.Status 'Failed') -and [bool](Get-PraValue $Context 'CheckFinished' $false) -and $c.RunError -eq 0 -and $c.Error -gt 0
     $title = switch ($outcome.Status) {
-        'Failed' { '{0} stopped - see the errors below' -f $Context.Action }
+        'Failed' { if ($checkRanToEnd) { 'Check finished - {0} object(s) not in the expected state' -f $c.Error } else { '{0} stopped - see the errors below' -f $Context.Action } }
         'Pending' { '{0} done - next step required' -f $Context.Action }
-        'Planned' { '{0} preview - nothing was changed' -f $Context.Action }
-        default { '{0} finished' -f $Context.Action }
+        'Cancelled' { '{0} cancelled - nothing was written' -f $Context.Action }
+        default { if ($isPreviewRun) { '{0} preview finished - nothing was changed' -f $Context.Action } else { '{0} finished' -f $Context.Action } }
     }
-    $status = @{ Failed='Fail'; Pending='Warn'; Planned='Ok'; Success='Ok' }[$outcome.Status]
-    $objects = if ($isApply -or $c.Success -or $c.Pending) { '{0} done {4} {1} pending {4} {2} error(s) {4} {3} skipped' -f $c.Success, $c.Pending, $c.Error, $c.Skipped, [char]0x00B7 }
+    $status = @{ Failed='Fail'; Pending='Warn'; Cancelled='Warn'; Planned='Ok'; Success='Ok' }[$outcome.Status]
+    # A Check counts "not as expected" only for objects that were read and compared; a run error is an error.
+    $objects = if ($isCheckRun) { '{0} as expected {3} {1} not as expected {3} {4}{2} skipped' -f $c.Success, ($c.Error - $c.RunError), $c.Skipped, [char]0x00B7, $(if ($c.RunError) { '{0} error(s) {1} ' -f $c.RunError, [char]0x00B7 } else { '' }) }
+        elseif ($isPreviewRun) { '{0} ready {5} {1} planned {5} {4}{2} error(s) {5} {3} skipped' -f $c.Success, $c.Planned, $c.Error, $c.Skipped, $(if ($c.Pending) { '{0} pending {1} ' -f $c.Pending, [char]0x00B7 } else { '' }), [char]0x00B7 }
+        elseif ($isApply -or $c.Success -or $c.Pending) { '{0} done {4} {1} pending {4} {2} error(s) {4} {3} skipped' -f $c.Success, $c.Pending, $c.Error, $c.Skipped, [char]0x00B7 }
         else { '{0} planned {3} {1} error(s) {3} {2} skipped' -f $c.Planned, $c.Error, $c.Skipped, [char]0x00B7 }
     $values = [ordered]@{ 'Result' = @('Target', $objects) }
     $batch = [string](Get-PraValue $Context 'BatchId' '')
     if ($batch) { $values['Batch'] = @('Batch', $batch) }
-    $issueLines = @($Context.Issues.ToArray() | Select-Object -Last 2 | ForEach-Object {
-            $message = [string](Get-PraValue $_ 'Message' ([string]$_))
-            if ($message.Length -gt 240) { $message = $message.Substring(0, 237) + '...' }
-            $message })
+    $objectsText = [string](Get-PraValue $Context 'ObjectsText' '')
+    if ($objectsText) { $values['Objects'] = @('Target', $objectsText) }
+    # The errors of the objects come first (at most 5, then how many more), the stop of the run is the last line.
+    $issueTexts = @($Context.Issues.ToArray() | ForEach-Object { [string](Get-PraValue $_ 'Message' ([string]$_)) })
+    $stopAt = -1
+    for ($i = $issueTexts.Count - 1; $i -ge 0; $i--) { if ($issueTexts[$i].StartsWith("Stopped at step '", [StringComparison]::Ordinal)) { $stopAt = $i; break } }
+    $objectTexts = @(for ($i = 0; $i -lt $issueTexts.Count; $i++) { if ($i -ne [int]$stopAt) { $issueTexts[$i] } })
+    $issueLines = @($objectTexts | Select-Object -First 5)
+    if ($objectTexts.Count -gt 5) { $issueLines += ('... and {0} more, see the report' -f ($objectTexts.Count - 5)) }
+    if ($stopAt -ge 0) { $issueLines += $issueTexts[$stopAt] }
+    $issueLines = @($issueLines | ForEach-Object { if ($_.Length -gt 240) { $_.Substring(0, 237) + '...' } else { $_ } })
     if ($issueLines.Count) {
-        if ($Context.Issues.Count -gt 2) { $issueLines = @(('{0} error(s) in total, see the log and the report' -f $Context.Issues.Count)) + $issueLines }
+        # The same count as the Result line: an object that failed and the stop that follows its error are one error, not two.
+        if ($Context.Issues.Count -gt 2) { $issueLines = @(('{0} error(s) in total, see the log and the report' -f $(if ($isCheckRun) { $c.RunError } else { $c.Error }))) + $issueLines }
         $values['Error'] = @('Fail', $issueLines)
     }
     $warningList = @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
@@ -1733,7 +1814,13 @@ function Complete-PraRun {
         if (-not (Test-PraOrdinalIn $replicationNote @(Get-PraList $Context 'NextSteps'))) { $Context.NextSteps = @($replicationNote) + @(Get-PraList $Context 'NextSteps') }
     }
     $next = @(@(Get-PraValue $Context 'NextSteps' @()) | ForEach-Object { $_ } | Where-Object { $_ })
-    if (($outcome.ExitCode -ne 1 -or $unconfirmed.Count) -and $next.Count) { $values['Next'] = @('Next', $next) }
+    $showNext = ($outcome.ExitCode -ne 1 -or $unconfirmed.Count -or [bool](Get-PraValue $Context 'NoChangeMade' $false) -or [bool](Get-PraValue $Context 'NextOnFailure' $false))
+    # A failed run always ends with a next step: the one the run set, else the fallback given by the entry script.
+    if ($outcome.ExitCode -eq 1 -and (-not $showNext -or -not $next.Count)) {
+        $fallback = @(@(Get-PraValue $Context 'FallbackNext' @()) | ForEach-Object { $_ } | Where-Object { $_ })
+        if ($fallback.Count) { $next = $fallback; $Context.NextSteps = $fallback; $showNext = $true }
+    }
+    if ($showNext -and $next.Count) { $values['Next'] = @('Next', $next) }
     try { Write-PraSummary -Context $Context -Title $title -Values $values -Status $status }
     catch { & $safeLog ('Summary unavailable: ' + $_.Exception.Message) }
     foreach ($key in @('BackupFiles','StateFiles')) { foreach ($path in $paths[$key]) { & $safeLog ('{0}: {1}' -f $key, $path) } }
@@ -1747,11 +1834,11 @@ function Complete-PraRun {
     }
     Write-PraReport $Context $reports
     $outcome = Get-PraOutcome $Context
-    $verdict = if ($outcome.ExitCode -eq 1) { 'RESULT: FAIL' } else { 'RESULT: PASS' }
+    $verdict = Get-PraVerdict $outcome
     try { if ($ownsTranscript -and $paths.TranscriptPath) { Add-Content -LiteralPath $paths.TranscriptPath -Value $verdict -Encoding UTF8 -WhatIf:$false -Confirm:$false -ErrorAction Stop } }
     catch { Add-PraIssue $Context ('Transcript verdict: {0}' -f $_.Exception.Message) 'Audit'; Write-PraReport $Context $reports }
     $outcome = Get-PraOutcome $Context; $beforeVerdict = $Context.Issues.Count
-    $verdict = if ($outcome.ExitCode -eq 1) { 'RESULT: FAIL' } else { 'RESULT: PASS' }
+    $verdict = Get-PraVerdict $outcome
     try { Write-PraLogFile -Context $Context -Level 'INFO' -Message $verdict } catch { $null = $_ }
     Write-PraHost @(,@(('  ' + $verdict), $script:Theme.Dim))
     Write-Host ''
@@ -1842,7 +1929,7 @@ function Test-PraTransferEntryName {
     if ($Name.Contains('\')) { return 'backslash' }
     if ($Name.Contains('..')) { return 'parent folder (..)' }
     if ($Name.Contains(':')) { return 'drive or stream separator' }
-    $match = [regex]::Match($Name, '\A(?<folder>(?:Batch|Finalize)-[A-Za-z0-9._-]{1,100})/(?<file>[A-Za-z0-9._-]{1,120})\z', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $match = [regex]::Match($Name, '\A(?<folder>(?i:Batch|Finalize)-[A-Za-z0-9._-]{1,100})/(?<file>[A-Za-z0-9._-]{1,120})\z', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
     if (-not $match.Success) { return 'not a <folder>/<file> name made of letters, digits, dot, dash and underscore' }
     $reserved = @('CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9')
     foreach ($part in @($match.Groups['folder'].Value, $match.Groups['file'].Value)) {
@@ -1894,7 +1981,11 @@ function Invoke-PraTransferPackage {
         $zipHash = Get-PraStreamSha256 $stream
         if (-not $SkipSidecar) {
             $sidecar = $full + '.sha256'
-            if (-not [IO.File]::Exists($sidecar)) { throw 'Transfer package: the .sha256 file next to the package is missing.' }
+            if (-not [IO.File]::Exists($sidecar)) {
+                $packageName = [IO.Path]::GetFileName($full)
+                $writer = if ($packageName.EndsWith('-for-Cloud.zip', [StringComparison]::OrdinalIgnoreCase)) { 'AD' } elseif ($packageName.EndsWith('-for-AD.zip', [StringComparison]::OrdinalIgnoreCase)) { 'cloud' } else { '' }
+                throw ('Transfer package: the .sha256 file next to the package is missing. Copy {0}.sha256 from the Outbox folder of the {1}server that wrote the package, into the same folder as the .zip, then run again.' -f $packageName, $(if ($writer) { $writer + ' ' } else { '' }))
+            }
             $token = ([IO.File]::ReadAllText($sidecar).Trim() -split '\s+')[0]
             if ($token -notmatch '\A[0-9a-fA-F]{64}\z' -or -not [string]::Equals($token, $zipHash, [StringComparison]::OrdinalIgnoreCase)) {
                 throw 'Transfer package: the SHA-256 of the package does not match its .sha256 file (the file was changed or damaged).'
@@ -1933,7 +2024,7 @@ function Invoke-PraTransferPackage {
         if ($ExpectedKind -and -not (Test-PraOrdinalEqual $kind $ExpectedKind)) { throw ("Transfer package: this is a {0} package, a {1} package is needed here." -f $kind, (Get-PraSafeText $ExpectedKind)) }
         $packageEnvironment = [string](Get-PraValue $manifest 'Environment' '')
         if ($packageEnvironment -notmatch '\A[A-Za-z0-9_.-]{1,64}\z') { throw 'Transfer package: invalid Environment in transfer.json.' }
-        if ($Environment -and -not (Test-PraOrdinalEqual $packageEnvironment $Environment)) {
+        if ($Environment -and -not (Test-PraOrdinalIgnoreCaseEqual $packageEnvironment $Environment)) {
             throw ("Transfer package: it was made for Environment '{0}', this configuration is '{1}': refused." -f $packageEnvironment, (Get-PraSafeText $Environment))
         }
         $batchId = [string](Get-PraValue $manifest 'BatchId' '')
@@ -1965,7 +2056,8 @@ function Invoke-PraTransferPackage {
         if ($expected.Count -ne $files.Count) { throw 'Transfer package: an entry listed in transfer.json is missing from the package.' }
         $prefix = $script:PraTransferKinds[$kind].Prefix
         $folders = @($files | ForEach-Object { ([string]$_.FullName).Split('/')[0] } | Get-PraOrdinalUnique | Get-PraOrdinalSorted)
-        foreach ($folder in $folders) { if (-not $folder.StartsWith($prefix, [StringComparison]::Ordinal)) { throw ("Transfer package: a {0} package holds {1}* folders only." -f $kind, $prefix) } }
+        if (@($folders | Get-PraOrdinalUnique -IgnoreCase).Count -ne $folders.Count) { throw 'Transfer package: two folders have the same name apart from letter case.' }
+        foreach ($folder in $folders) { if (-not $folder.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { throw ("Transfer package: a {0} package holds {1}* folders only." -f $kind, $prefix) } }
         if (-not (Test-PraOrdinalIn ($prefix + $batchId) $folders -IgnoreCase)) { throw 'Transfer package: the folder of the batch named in transfer.json is not in the package.' }
         # Content: hash of every entry, from the stream, with a hard bound on the bytes actually produced. Nothing is written yet.
         $buffer = New-Object byte[] 1048576
@@ -1993,7 +2085,7 @@ function Invoke-PraTransferPackage {
         }
         if (-not $Extract) { return $info }
 
-        # Extraction. Every target folder is decided BEFORE anything is created: an existing folder must be identical.
+        # Extraction. Every target folder is decided before anything is created: an existing folder must be identical.
         if (-not $BackupFolder) { throw 'Transfer package: the backup folder is required to import.' }
         $root = [IO.Path]::GetFullPath($BackupFolder).TrimEnd('\')
         if (-not [IO.Directory]::Exists($root)) { Initialize-PraPrivateFolder -Path $root }
@@ -2322,7 +2414,7 @@ function New-PraEffectiveConfiguration {
         [IO.FileSystemAclExtensions]::SetAccessControl((New-Object IO.FileInfo $target), $acl)
         $loaded = Import-PraConfiguration -Path $target -Root $Root -DeferScopeCheck
         $expected = $config.Environment
-        if (-not (Test-PraOrdinalEqual $loaded.Environment $expected)) { throw 'The effective configuration does not round-trip.' }
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $loaded.Environment $expected)) { throw 'The effective configuration does not round-trip.' }
         $hashStream = [IO.File]::Open($target, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
         try { $hash = Get-PraStreamSha256 $hashStream } finally { $hashStream.Dispose() }
     }
@@ -2549,7 +2641,7 @@ function Read-PraPhaseData {
                 $schema = Get-PraValue $record 'SchemaVersion' $null
                 if (($schema -isnot [int] -and $schema -isnot [long]) -or [int]$schema -ne 1) { throw 'unsupported schema' }
                 if (-not (Test-PraOrdinalEqual (Get-PraValue $record 'Kind' '') 'PhaseData')) { throw 'not phase data' }
-                if ($Environment -and -not (Test-PraOrdinalEqual (Get-PraValue $record 'Environment' '') $Environment)) { throw 'another Environment' }
+                if ($Environment -and -not (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $record 'Environment' '') $Environment)) { throw 'another Environment' }
                 $phase = Get-PraValue $record 'Phase' $null
                 $runId = [string](Get-PraValue $phase 'RunId' '')
                 if ($null -eq $phase -or -not $runId -or -not [string](Get-PraValue $phase 'Action' '') -or -not [string](Get-PraValue $phase 'StartedUtc' '')) { throw 'incomplete' }
@@ -2911,6 +3003,7 @@ function Test-PraGlobalReportWanted {
     if (-not (Get-PraValue $Context 'AllowMutation' $false)) { return $false }
     if (-not (Test-PraOrdinalIn ([string](Get-PraValue $Context 'Action' '')) @('Convert', 'Recover', 'Finalize'))) { return $false }
     if ([string](Get-PraValue $Context 'HandOff' '')) { return $false }
+    if ([bool](Get-PraValue $Context 'NoChangeMade' $false)) { return $false }
     return ($Context.Rows.Count -gt 0)
 }
 
@@ -2942,10 +3035,10 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCxiFS0t15lK4cc
-# hR9o/ZadUbkDoULa2FHSvTfqKCm676CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDUJ81KrbFuuCVa
+# 0jDxSLRJDI3uksyr+86L5yUbT08XXaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -3017,28 +3110,28 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDSlbRxMgZU
-# vTen1U79tTMwVFKA6KNh9uMJsGVbrPsN/TANBgkqhkiG9w0BAQEFAASCAgAnLTSi
-# pGdFIcUJwnjB2iqhdCD4+5co5bylquA30KaLOCj2GkMY2UQHAqt0fTd1/tEphWDI
-# +TF55VWncXKKsRRiOUq/FHgzAwmqMOEt2ZWOL6Obq+0mUQiP8tocitXCw+B5hb8o
-# 6TpgNieK/nZpgpZ9edgdWU4h3Zbd0u6pp5DjtX69Mv58c/FixpLxeJnoG0W/vho6
-# 0yTwCy9CE9gY4HSzfbT3NIpRGejP3mG66qFB/RY3Marup7JVM0X+WIaAsfUMQFEc
-# sanNNIZ3d2uBgYbfQtYM6ktneOd305EwhVmQXKstIkWBtY/LK/bNFqTi2O5vunOV
-# UNN1AiE2gwCUu71d4lZrNiy+QtJriYICWVtFDkNzW/v0IpDifeyLPlzyzLJ5/cTJ
-# Q27AKv6zMAkFdB9A13Ov9lZjGee+jWKB/dZuW0WQQ2XJb+MtlHoEs0b8sGrqM7dt
-# +WgdXQ3GMVDYtjZcrjPWe1CmUktZ7GNz4Pu+a3IyYzQ+s0ayc/kAsgG/b0VNxh28
-# ySX9LLnlqya6bHlRSDKOgDWZJfx9C1KptFZfo6NNGO68qE4pp0kYPQV2NcnBzbUz
-# amFiGrh1XIjBW33OdsIDIodR+TWsSyJSrt6yWVAyWMsM2ySMWQHKHkgGm38p+uv8
-# +f1Kn64Wtlg8X7OvOxLsxhb7Fw4WfNbxSLL4jqGCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAPfK1Iij5o
+# AJi6iIg00QBULRLwAY8femVxp2m91D6yJDANBgkqhkiG9w0BAQEFAASCAgBNs+vE
+# 02BTGQuqR7BHt4TLektflHPoDP2q/1gaShmRgfw/6HonLu0fVJXehjswbI9mO1sf
+# taPrp2H3fTWla5Mp4VX3cQs01+znzyBd/Cdwo/tvtdaswt7RxGfGlamDZ2qRlnUT
+# XVWs/RSTci3DXZ8F4Nq3HS39++qDqIRkAM6dY0apky7bnM+xkdau5Y2apfEJwAXc
+# xHaoGxVtssqvMxQAqfe31L3Scw3xAb9hijp94dNqrWvnua1dtsFzEu6DffH2le2Z
+# nt+dXDjXvV8uTP8QBAj5I9dEXplXGI9ewn9Sx/M6azaWX3fi2Ex0MX48Bjn+L/G4
+# t/czA9q7T0ANDNO0QsawJCbR4F2f7FRJftZHaH1a8gx/bcBvpIXxm5rAelDm427C
+# 3ebSr59nutHnR0DMyWwVmDBg78VIzea79bRUhVHlh4Uuof2fVGyeb7mz18wskuqZ
+# l9j60OIF5RnbLBGKA1Bo3np9Ezfj1hpcjBMJyEv29IO9Au1xN1jLRTfN+8kQ8cGB
+# dO0ZjWMNw9BlI9AbewfZ9blkX0cSH5aI7lCkkGlr5EIlDv20bx60LLxnmpzyMgd9
+# aIEa+ivfZfFkNWca5/JycKounEOe8zaC3UkaObkD4ed3Svk7P6fbImOaTb2vR/pg
+# qA1hfLyhaVpwtjLylSSFB0jJ46oooJArkgK4RaGCFM0wghTJBgorBgEEAYI3AwMB
+# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEINXS0ECreDRPGyl6QcqOLPrvz1PEGPEE3oGR4rrd3/5/AghQjry3vDLC
-# wRgPMjAyNjExMTAwODMzMzFaMAMCAQECEGmc+4+8DvF944Fp/IKwGwKgghGnMIIE
+# BAIBBQAEINUcauGKJYYc7IWSO1jrQscGL58fIEJ5joyUzOIGnBORAggAwbeBc8J6
+# MRgPMjAyNjExMTIxODAxNThaMAMCAQECEGP5XzWcYBjHcBoLGCD7m/CgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3133,17 +3226,17 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMDA4MzMzMVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIJbj
-# k5NxqnH4R+0ONVtmFja1ryqHUPSOBT/PX7+KwINCMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMjE4MDE1OFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIF+4
+# g0T9mTws1PvloM7vcrlD0IXPErQ76kFIJ7PvaPZxMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiASpP/I8goMI6uyiAS+qM4ufjhmErLzKporgWWv93OwyQIhAMk6
-# V44C07bnX2CdrqNv9zf+XFIL62wje8tIE3xzBxpl
+# zj0EAwIERjBEAiBKDRq78fdacuXyWyacuLdMjlGa2mqlEUpLEhG9fJcgFQIgZGWR
+# zi3S6ws8wAGuMtye2e0fqiYl5ZJSjcI9FX3gH+o=
 # SIG # End signature block

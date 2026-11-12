@@ -7,7 +7,7 @@
     Error and records a run error, or throws):
 
       Initialize-PraCloudPreflight  Convert or Recover, Apply, phase Both: sign-in, targets (and, for Convert,
-                                    trustees) resolved in Exchange Online BEFORE the AD part (read only)
+                                    trustees) resolved in Exchange Online before the AD part (read only)
       Invoke-PraCloudPhase          checks (and waits for) the expected cloud state of every row and, in
                                     Apply, grants the shared mailbox permissions
       Invoke-PraRetentionCheck      Check -Expect Retained: retention policy holds (read only)
@@ -28,8 +28,7 @@
     bounded re-reads (Exo.GrantVerifyAttempts x Exo.GrantVerifyDelaySeconds) and a line "Verified".
     A grant is never retried.
 
-    Sessions: Microsoft Graph is connected before Exchange Online (kept from 2.x, where both modules shared
-    one set of assemblies under Windows PowerShell 5.1; free of cost under PowerShell 7); an Exchange Online
+    Sessions: Microsoft Graph is connected before Exchange Online; an Exchange Online
     or Graph session that already exists in the console is refused;
     tenant, token, connection ID and module path are checked before each call. Exo.UseSubprocess (or
     an ExchangeOnlineManagement older than Exo.MinModuleVersion) runs every Exchange Online call in a
@@ -37,7 +36,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2
+    Version : 3.1.3
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -98,18 +97,33 @@ $script:PraExoWorker = {
         if (-not [guid]::TryParse($tenant,[ref]$parsed) -or $parsed -eq [guid]::Empty) { throw 'Expected Exchange Online tenant missing or invalid (Cloud.TenantId).' }
         $organization=[string](V $SessionBinding 'Organization' (V $P 'Organization' ''))
         $appId=[string](V $SessionBinding 'AppId' (V $P 'AppId' ''))
-        $connections=@(Get-ConnectionInformation -ErrorAction Stop)
-        if ($connections.Count -ne 1) { throw 'Exactly one Exchange Online connection is expected in this process.' }
-        $c=$connections[0]; $location=[string](V $c 'ModuleName' ''); $id=[string](V $c 'ConnectionId' '')
-        # Interactive sign-in reports the tenant GUID; certificate (app-only) sign-in reports the
-        # organisation domain (tenant.onmicrosoft.com) and the AppId: both are accepted, nothing else.
-        $sessionTenant=[string](V $c 'TenantID' '')
-        $tenantOk=(SameIgnoreCase $sessionTenant $tenant) -or ($organization -and (SameIgnoreCase $sessionTenant $organization))
-        if ($appId -and -not (SameIgnoreCase ([string](V $c 'AppId' '')) $appId)) { $tenantOk=$false }
-        if (-not $tenantOk -or -not (SameIgnoreCase ([string](V $c 'State' '')) 'Connected') -or
-            -not (SameIgnoreCase ([string](V $c 'TokenStatus' '')) 'Active') -or -not $id -or -not [IO.Path]::IsPathRooted($location)) {
-            throw ("Exchange Online session: wrong tenant ({0}), state, token, connection ID or module path." -f $sessionTenant)
+        # The connection is read again once, after a short pause, when only its state, token, connection ID or module path is not as expected: a connection that is still settling.
+        # A wrong tenant or application is not transient and stops at once.
+        $c=$null; $location=''; $id=''; $problems=@()
+        for ($attempt=1; $attempt -le 2; $attempt++) {
+            $connections=@(Get-ConnectionInformation -ErrorAction Stop)
+            if ($connections.Count -ne 1) { throw 'Exactly one Exchange Online connection is expected in this process.' }
+            $c=$connections[0]; $location=[string](V $c 'ModuleName' ''); $id=[string](V $c 'ConnectionId' '')
+            # Interactive sign-in reports the tenant GUID; certificate (app-only) sign-in reports the
+            # organisation domain (tenant.onmicrosoft.com) and the AppId: both are accepted, nothing else.
+            $sessionTenant=[string](V $c 'TenantID' '')
+            $problems=@(); $transient=@()
+            if (-not ((SameIgnoreCase $sessionTenant $tenant) -or ($organization -and (SameIgnoreCase $sessionTenant $organization)))) {
+                $problems+=("wrong tenant ({0}), expected {1}" -f $(if ($sessionTenant) { $sessionTenant } else { 'none' }),$tenant)
+            }
+            if ($appId -and -not (SameIgnoreCase ([string](V $c 'AppId' '')) $appId)) {
+                $problems+=("wrong application ID ({0}), expected {1}" -f $(if ([string](V $c 'AppId' '')) { [string](V $c 'AppId' '') } else { 'none' }),$appId)
+            }
+            $state=[string](V $c 'State' ''); $token=[string](V $c 'TokenStatus' '')
+            if (-not (SameIgnoreCase $state 'Connected')) { $transient+=("connection state '{0}', expected Connected" -f $state) }
+            if (-not (SameIgnoreCase $token 'Active')) { $transient+=("token status '{0}', expected Active" -f $token) }
+            if (-not $id) { $transient+=('no connection ID') }
+            if (-not [IO.Path]::IsPathRooted($location)) { $transient+=("module path '{0}' is not a full path" -f $location) }
+            $problems+=$transient
+            if (-not $transient.Count -or $transient.Count -ne $problems.Count -or $attempt -ge 2) { break }
+            Start-Sleep -Seconds 2
         }
+        if ($problems.Count) { throw ('Exchange Online session: {0}.' -f ($problems -join '; ')) }
         $modules=@(Get-Module | Where-Object { (SameIgnoreCase $_.ModuleBase $location) -or (SameIgnoreCase $_.Path $location) })
         if ($modules.Count -ne 1 -or -not $modules[0].Path) { throw 'Module of the Exchange Online session not found or ambiguous.' }
         if ($null -ne $SessionBinding -and (V $SessionBinding 'ConnectionId' '')) {
@@ -135,14 +149,14 @@ $script:PraExoWorker = {
     function MissingRecipient {
         param([System.Management.Automation.ErrorRecord]$Record,[string]$Upn)
         # A selector read (-UserPrincipalName) answers an absent object with HTTP 404 ManagementObjectNotFoundException
-        # instead of an empty result (seen in the lab while a deprovisioned mailbox turns into a MailUser).
+        # instead of an empty result (for example while a deprovisioned mailbox turns into a MailUser).
         $text=$Record.Exception.Message
         if ($text -notmatch 'HttpStatusCode=404') { return $false }
         $json=[regex]::Match($text,'(?s)\{\s*"error"\s*:\s*\{.*\}\s*\}')
         if (-not $json.Success) { return $false }
         try {
             $payload=$json.Value | ConvertFrom-Json -DateKind String -ErrorAction Stop
-            # Substring searches are ordinal and case-insensitive (the former -like was case-insensitive, and culture-sensitive under ICU).
+            # Substring searches are ordinal and case-insensitive.
             $object="object '"+$Upn+"' couldn't be found"
             $detail=@($payload.error.details | Where-Object { ([string]$_.message).IndexOf('|Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException|',[StringComparison]::OrdinalIgnoreCase) -ge 0 })
             return ((SameOrdinal $payload.error.code 'NotFound') -and ([string]$payload.error.message).IndexOf($object,[StringComparison]::OrdinalIgnoreCase) -ge 0 -and $detail.Count -gt 0 -and ([string]$detail[0].message).IndexOf($object,[StringComparison]::OrdinalIgnoreCase) -ge 0)
@@ -244,7 +258,7 @@ $script:PraExoWorker = {
         if (-not $json.Success) { return $false }
         try {
             $payload=$json.Value | ConvertFrom-Json -DateKind String -ErrorAction Stop
-            # The message prefix stays an exact (case-sensitive) match. The trustee echoed by Exchange Online is compared
+            # The message prefix is an exact (case-sensitive) match. The trustee echoed by Exchange Online is compared
             # case-insensitively: the service may return the UPN or alias with another casing than the one requested.
             $prefix='No permissions were found for the user:'
             $messages=@([string]$payload.error.message,[string]$payload.error.innererror.message)
@@ -266,7 +280,7 @@ $script:PraExoWorker = {
             $expectedEntries=@($globalEntries | Where-Object { (InSetIgnoreCase $Right $_.Rights) -and (InSetIgnoreCase $_.Principal $Recipient.Keys) })
             # "No permissions were found" is the normal answer before a grant. It is read through -ErrorVariable,
             # not -ErrorAction Stop, so that Windows PowerShell does not write it as an error in the transcript.
-            # Every error record is still checked: anything else than that exact answer stops, as before.
+            # Every error record is checked: anything else than that exact answer stops.
             $filteredErrors=$null
             $filteredRaw=@(if ((SameIgnoreCase $Right 'FullAccess')) { Get-EXOMailboxPermission -Identity $Upn -User $Trustee -ErrorAction SilentlyContinue -ErrorVariable filteredErrors -WarningAction Stop }
                 else { Get-EXORecipientPermission -Identity $Upn -Trustee $Trustee -ErrorAction Stop -WarningAction Stop })
@@ -336,7 +350,7 @@ $script:PraExoWorker = {
     }
     $trustee = [string](V $P 'Trustee'); $right = [string](V $P 'Right')
     if (-not (InSetIgnoreCase $right @('FullAccess','SendAs','SendOnBehalf'))) { throw 'Unknown permission.' }
-    # From here on the right has its official spelling (the permit below is still compared with the right as it was requested).
+    # From here on the right has its official spelling; the permit below is compared with the right as it was requested.
     $requestedRight = $right
     $right = @('FullAccess','SendAs','SendOnBehalf') | Where-Object { SameIgnoreCase $_ $requestedRight } | Select-Object -First 1
     if ((SameIgnoreCase $Operation 'Grant')) {
@@ -344,7 +358,7 @@ $script:PraExoWorker = {
             $b = V -Object $Permit -Name $flag -Default $false
             if ($b -isnot [bool] -or -not $b) { throw 'Exchange Online grant without its individual authorisation.' }
         }
-        if (-not (SameOrdinal (V $Permit 'Target') $upn) -or -not (SameOrdinal (V $Permit 'Trustee') $trustee) -or -not (SameOrdinal (V $Permit 'Right') $requestedRight) -or
+        if (-not (SameIgnoreCase (V $Permit 'Target') $upn) -or -not (SameIgnoreCase (V $Permit 'Trustee') $trustee) -or -not (SameOrdinal (V $Permit 'Right') $requestedRight) -or
             -not (SameIgnoreCase (V $Permit 'Action') 'Convert') -or -not (SameIgnoreCase (V $Permit 'Mode') 'Apply') -or -not (InSetIgnoreCase (V $Permit 'Phase') @('Cloud','Both'))) { throw 'Exchange Online authorisation does not match this grant.' }
         if (-not (SameIgnoreCase (Mailbox $upn).Type 'SharedMailbox')) { throw 'Grant refused: SharedMailbox not confirmed.' }
     }
@@ -398,18 +412,58 @@ function Get-PraCloudSession {
     return $Context['_PraCloudSession']
 }
 
+function Get-PraNetworkFailure {
+    <# $null when the error is not a network failure (no answer, refused, unknown host, connection closed); otherwise an object whose Host is the "host:port" the error names ('' when it names none). Looks at the inner exceptions, then at the text (the Exchange Online child process only returns text). #>
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $texts=New-Object 'System.Collections.Generic.List[string]'; $network=$false
+    $queue=New-Object 'System.Collections.Generic.Queue[object]'; $queue.Enqueue($ErrorRecord.Exception)
+    while ($queue.Count) {
+        $e=$queue.Dequeue(); if ($null -eq $e) { continue }
+        $texts.Add([string]$e.Message)
+        if ($e -is [System.Net.Sockets.SocketException] -or $e -is [TimeoutException] -or $e -is [System.Threading.Tasks.TaskCanceledException]) { $network=$true }
+        elseif ($e -is [System.Net.Http.HttpRequestException] -and $null -eq $e.StatusCode) { $network=$true }
+        elseif ($e -is [System.Net.WebException] -and ([string]$e.Status) -match '^(ConnectFailure|NameResolutionFailure|Timeout|ConnectionClosed|ReceiveFailure|SendFailure|ProxyNameResolutionFailure|KeepAliveFailure)$') { $network=$true }
+        if ($e -is [AggregateException]) { foreach ($inner in $e.InnerExceptions) { $queue.Enqueue($inner) } }
+        elseif ($null -ne $e.InnerException) { $queue.Enqueue($e.InnerException) }
+    }
+    $all=$texts -join ' '
+    if (-not $network -and $all -notmatch '(?i)timed out|connection attempt failed|actively refused|no such host|name or service not known|could not be resolved|forcibly closed|network is unreachable|tentative de connexion|n.a pas r.pondu') { return $null }
+    $hostPort=''
+    if ($all -match '(?<h>[A-Za-z0-9][A-Za-z0-9\-]*(?:\.[A-Za-z0-9\-]+)+:\d{1,5})') { $hostPort=$Matches.h }
+    return [pscustomobject]@{ Host=$hostPort }
+}
+
 function Write-PraCloudError {
-    param([hashtable]$Context,$Row,[string]$Message)
+    <# One cloud error: a run error, the row of the object, ONE red line (plain words in $Message) and, when given, the technical text in the log and in the CloudDetail of the row. -RunError: the object could not be read (it is not "not in the expected state"). #>
+    param([hashtable]$Context,$Row,[string]$Message,[string]$Technical='',[switch]$RunError)
     if ($null -ne $Row) {
-        $Row.CloudStatus='Error'; $Row.FinalStatus='Error'; $Row.CloudDetail=$Message
+        $Row.CloudStatus='Error'; $Row.FinalStatus='Error'; $Row.CloudDetail=$(if ($Technical) { $Technical } else { $Message })
+        if ($RunError) { Add-Member -InputObject $Row -NotePropertyName RunError -NotePropertyValue $true -Force }
         if ($null -ne $Row.PSObject.Properties['DeprovisionConfirmed']) { $Row.DeprovisionConfirmed=$false }
         $Row.Detail = ([string](Get-PraValue $Row 'Detail' '') + ' | cloud: ' + $Message).Trim(' ','|')
-        $Context.CurrentIdentity=[string](Get-PraValue $Row 'ObjectGuid' (Get-PraValue $Row 'UserPrincipalName' ''))
+        # A Check given a UPN has no object GUID: the error is then attached to the UPN, so that the run counts ONE error for it.
+        $Context.CurrentIdentity=[string](Get-PraValue $Row 'ObjectGuid' '')
+        if (-not $Context.CurrentIdentity) { $Context.CurrentIdentity=[string](Get-PraValue $Row 'UserPrincipalName' '') }
     }
-    # Recorded here, whatever the logger does with Issues.
     [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase=$Context.CurrentPhase
         Source='Cloud'; Operation=$Context.CurrentOperation; Identity=$Context.CurrentIdentity; Message=$Message })
-    $null = Write-PraLog -Context $Context -Message $Message -Level Warning
+    Write-PraItem -Context $Context -Status Fail -Text $Message -Detail $Technical
+    if ($Technical) { $null = Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $Technical) -Level Detail }
+}
+
+function Write-PraCloudFailure {
+    <# A cloud call that threw. A network failure is said in plain words with the raw text in the technical detail only; any other failure keeps its message. -Expectation: the message of another failure may be a result of the check itself (not a run error). #>
+    param([hashtable]$Context,$Row,[Parameter(Mandatory)]$ErrorRecord,[string]$Upn='',[string]$Extra='',[switch]$Expectation)
+    $raw=[string]$ErrorRecord.Exception.Message
+    $network=Get-PraNetworkFailure $ErrorRecord
+    if ($null -ne $network) {
+        $Context.NetworkFailure=$true
+        $plain='{0}Microsoft 365 did not answer (network){1}. Run again.' -f $(if ($Upn) { $Upn + ': ' } else { '' }), $(if ($network.Host) { ': ' + $network.Host } else { '' })
+        Write-PraCloudError -Context $Context -Row $Row -Message $plain -Technical $raw -RunError
+        return
+    }
+    $message=$(if ($Extra) { $raw + ' | ' + $Extra } else { $raw })
+    if ($Expectation) { Write-PraCloudError -Context $Context -Row $Row -Message $message } else { Write-PraCloudError -Context $Context -Row $Row -Message $message -RunError }
 }
 
 function Read-PraExoProgress {
@@ -551,7 +605,7 @@ if ($failure) { exit 1 }; exit 0
                 if ([IO.File]::Exists($appliedPath)) {
                     $receipt=[IO.File]::ReadAllText($appliedPath) | ConvertFrom-PraJson
                     if ((-not (Test-PraOrdinalIgnoreCaseEqual $Operation 'Grant')) -or $receipt.Protocol -ne 1 -or -not (Test-PraOrdinalEqual $receipt.Id $id) -or -not (Test-PraOrdinalEqual $receipt.Status 'Applied') -or
-                        -not (Test-PraOrdinalEqual $receipt.Target $Params.Upn) -or -not (Test-PraOrdinalEqual $receipt.Trustee $Params.Trustee) -or -not (Test-PraOrdinalEqual $receipt.Right $Params.Right) -or $OnApplied -isnot [scriptblock]) { throw 'Invalid Applied receipt from the Exchange Online child process.' }
+                        -not (Test-PraOrdinalIgnoreCaseEqual $receipt.Target $Params.Upn) -or -not (Test-PraOrdinalIgnoreCaseEqual $receipt.Trustee $Params.Trustee) -or -not (Test-PraOrdinalEqual $receipt.Right $Params.Right) -or $OnApplied -isnot [scriptblock]) { throw 'Invalid Applied receipt from the Exchange Online child process.' }
                     $null=& $OnApplied
                     [IO.File]::Delete($appliedPath)
                 }
@@ -593,11 +647,10 @@ function Connect-PraCloudSession {
     if ([bool]$app -ne [bool]$thumb) { throw 'Certificate sign-in incomplete: set both Cloud.AppId and Cloud.CertificateThumbprint.' }
     if ($NeedGraph -and $s.Graph) { Assert-PraGraphSession $Context }
     if ($NeedExo -and $s.Exo) { $null=Invoke-PraExo -Context $Context -Operation Probe }
-    # Graph must establish its CLR dependencies before EXO in this dedicated process.
-    # Removing a module cannot repair an already-loaded conflicting assembly.
+    # Graph is connected before Exchange Online.
     if ($NeedGraph -and -not $s.Graph) {
         $Context.CurrentOperation='Connect-MgGraph'
-        # ONE version of every Graph module (the highest that exists for all, at the minimum or later): two versions in one session fail with an opaque assembly error.
+        # ONE version of every Graph module: the highest that exists for all of them, at the minimum or later.
         $modules = Get-PraCloudModuleReport -MinExo ([string](Get-PraValue (Get-PraValue $Context.Config 'Exo' @{}) 'MinModuleVersion' '3.10.1'))
         if (-not $modules.Graph.Ok) { throw $modules.Graph.Message }
         $graphVersion = [version]$modules.Graph.Version
@@ -609,9 +662,8 @@ function Connect-PraCloudSession {
         $s.GraphAttempted=$true
         try { Connect-MgGraph @connect | Out-Null }
         catch {
-            # Typical when Exchange Online was used earlier in the same console: its assemblies stay loaded.
             if ($_.Exception.Message -match 'does not have an implementation|Could not load (type|file or assembly)|Method not found') {
-                throw ('Microsoft Graph cannot load in this console (assembly conflict, usually because Exchange Online was used earlier in the same window): run the tool in a new PowerShell 7 window. Detail: '+$_.Exception.Message)
+                throw ('Microsoft Graph could not load an assembly in this console: close this window and run the tool in a new PowerShell 7 window. Detail: '+$_.Exception.Message)
             }
             throw
         }
@@ -668,7 +720,7 @@ function Assert-PraGraphSession {
     if ($null -eq $current -or -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $current 'TenantId' '')) $tenant) -or
         -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $current 'ContextScope' '')) 'Process')) { throw 'Microsoft Graph session missing, on another tenant or not limited to this process.' }
     foreach ($key in @('TenantId','ClientId','Account','AuthType','ContextScope')) {
-        if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $current $key '')) ([string](Get-PraValue $s.GraphContext $key '')))) { throw 'The Microsoft Graph session changed.' }
+        if (-not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $current $key '')) ([string](Get-PraValue $s.GraphContext $key '')))) { throw 'The Microsoft Graph session changed.' }
     }
 }
 
@@ -700,7 +752,7 @@ function Close-PraCloudSession {
             if ($null -ne $current) {
                 if ($null -eq (Get-PraValue $s 'GraphContext' $null)) { throw 'The Microsoft Graph session was not opened by the tool: not signed out.' }
                 foreach ($key in @('TenantId','ClientId','Account','AuthType','ContextScope')) {
-                    if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $current $key '')) ([string](Get-PraValue $s.GraphContext $key '')))) { throw 'The Microsoft Graph session was replaced: not signed out.' }
+                    if (-not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $current $key '')) ([string](Get-PraValue $s.GraphContext $key '')))) { throw 'The Microsoft Graph session was replaced: not signed out.' }
                 }
                 Disconnect-MgGraph -ErrorAction Stop | Out-Null
             }
@@ -734,7 +786,7 @@ function Get-PraPermissionRequest {
 function Initialize-PraCloudPreflight {
     <#
     .SYNOPSIS
-        Signs in and resolves every target and trustee in Exchange Online BEFORE the AD part of a Convert (Apply, phase Both). Read only.
+        Signs in and resolves every target and trustee in Exchange Online before the AD part of a Convert (Apply, phase Both). Read only.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
@@ -858,7 +910,7 @@ function Invoke-PraSharedPermission {
         $Row.PermDetail="Permissions verified=$verified/$($Requests.Count); current=$($request.Right)/$($request.Trustee)"
         $r=Invoke-PraExo -Context $Context -Operation 'Permission' -Params $p
         if ((Get-PraValue $r 'TrusteeFound' $false) -ne $true) {
-            if (-not $missing.Contains($request.Trustee)) { [void]$missing.Add($request.Trustee) }
+            if (-not (Test-PraOrdinalIn $request.Trustee $missing.ToArray() -IgnoreCase)) { [void]$missing.Add($request.Trustee) }
             $Row.PermMissing=$missing.ToArray(); continue
         }
         if ((Get-PraValue $r 'Verified' $false) -ne $true) {
@@ -989,7 +1041,7 @@ function Invoke-PraCloudPhase {
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,
         [Parameter(Mandatory)][ValidateSet('Convert','Recover')][string]$Act)
-    $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='Prepare'; $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$false
+    $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='Prepare'; $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$false; $Context.NetworkFailure=$false; $Context.NotYetExpected=0; $Context.CloudNotReached=0
     $states=New-Object 'System.Collections.Generic.List[object]'
     try {
         if (-not (Test-PraOrdinalIn $Act @('Convert','Recover'))) { throw 'Unknown -Act.' }
@@ -1004,12 +1056,12 @@ function Invoke-PraCloudPhase {
             Add-Member -InputObject $row -NotePropertyName DeprovisionConfirmed -NotePropertyValue $false -Force
             $row.CloudMailbox=$null; $row.CloudLicense=$null; $row.CloudStatus='Pending'; $row.CloudDetail=''
             $upn=[string](Get-PraValue $row 'UserPrincipalName' '')
-            if (-not $upn) { Write-PraCloudError -Context $Context -Row $row -Message 'UPN missing: check impossible.'; continue }
-            if (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $row 'FinalStatus' '') 'Error') { Write-PraCloudError -Context $Context -Row $row -Message 'Previous error: cloud part not allowed.'; continue }
+            if (-not $upn) { Write-PraCloudError -Context $Context -Row $row -Message 'UPN missing: check impossible.' -RunError; continue }
+            if (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $row 'FinalStatus' '') 'Error') { Write-PraCloudError -Context $Context -Row $row -Message 'Previous error: cloud part not allowed.' -RunError; continue }
             $shared=[bool](Get-PraValue $row 'IsShared' $false)
             $preserveMailbox=Get-PraValue $row 'PreserveCloudMailbox' $false; $preserveLicense=Get-PraValue $row 'PreserveLicense' $false
             if ($preserveMailbox -isnot [bool] -or $preserveLicense -isnot [bool] -or ($preserveMailbox -and -not $shared)) {
-                Write-PraCloudError -Context $Context -Row $row -Message 'Invalid keep flags (PreserveCloudMailbox is for shared mailboxes only).'; continue
+                Write-PraCloudError -Context $Context -Row $row -Message 'Invalid keep flags (PreserveCloudMailbox is for shared mailboxes only).' -RunError; continue
             }
             $requests=@(); if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { $requests=@(Get-PraPermissionRequest $Context $row) }
             $mb=([bool](Get-PraValue $cloud 'CheckMailbox' $false) -or (Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -or $requests.Count -gt 0)
@@ -1017,7 +1069,7 @@ function Invoke-PraCloudPhase {
             if (-not $mb -and -not $lic) {
                 $row.CloudStatus='Skipped'; $row.CloudDetail='No applicable check; no restore confirmation.'; $row.FinalStatus='Skipped'; continue
             }
-            # X500 control (Convert): the addresses recorded by the AD phase must be on the cloud mailbox. A batch written before 3.1.0 has none: skipped, never a failure.
+            # X500 control (Convert): the addresses recorded by the AD phase must be on the cloud mailbox. A batch written without the list has none: the control is skipped, never a failure.
             $x500Expected=$null
             if ($mb -and (Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) {
                 $source=Get-PraValue $row 'BackupRec' $null
@@ -1038,7 +1090,7 @@ function Invoke-PraCloudPhase {
             $exoMailbox=$mb -and ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -or $shared -or (Test-PraOrdinalIgnoreCaseEqual $via 'Exo'))
             $needGraph=$needGraph -or $lic -or $graphMailbox; $needExo=$needExo -or $exoMailbox
             [void]$states.Add(@{ Row=$row; Upn=$upn; Shared=$shared; Mailbox=$mb; License=$lic; GraphMailbox=$graphMailbox
-                ExoMailbox=$exoMailbox; Requests=$requests; PreserveMailbox=$preserveMailbox; PreserveLicense=$preserveLicense; Done=$false
+                ExoMailbox=$exoMailbox; Requests=$requests; PreserveMailbox=$preserveMailbox; PreserveLicense=$preserveLicense; Done=$false; PlainText=''
                 X500=$x500Expected; X500Reads=0; X500Failure=''; X500Last=$null; CoreDone=$false })
         }
         if ($states.Count -eq 0) { return }
@@ -1053,7 +1105,7 @@ function Invoke-PraCloudPhase {
                 $row=$s.Row; $Context.CurrentIdentity=[string](Get-PraValue $row 'ObjectGuid' $s.Upn); $Context.CurrentOperation='CloudCheck'
                 try {
                     if ($s.CoreDone) { $null=Invoke-PraX500Step -Context $Context -State $s -Fresh $null -MaxReads $x500MaxReads -Final ([bool]$Context.Once); continue }
-                    $details=New-Object 'System.Collections.Generic.List[string]'; $mbok=$true; $licok=$true; $facts=$null
+                    $details=New-Object 'System.Collections.Generic.List[string]'; $plain=New-Object 'System.Collections.Generic.List[string]'; $mbok=$true; $licok=$true; $facts=$null
                     if ($s.GraphMailbox -or $s.License) { $facts=Get-PraGraphFact -Context $Context -Upn $s.Upn -Mailbox $s.GraphMailbox -License $s.License -Addresses ([bool]($null -ne $s.X500 -and $s.GraphMailbox)) }
                     if ($s.ExoMailbox) {
                         $m=Invoke-PraExo -Context $Context -Operation 'Mailbox' -Params @{ Upn=$s.Upn }
@@ -1061,26 +1113,40 @@ function Invoke-PraCloudPhase {
                             if ($s.PreserveMailbox) {
                                 $mbok=(Get-PraValue $m 'Found' $false) -eq $true -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $m 'Type' '') 'SharedMailbox')
                                 [void]$details.Add("MBX:KeepCloudShared SharedMailbox present=$mbok; deprovisioning NOT confirmed, tag kept")
+                                if (-not $mbok) { [void]$plain.Add('the shared mailbox is not in Exchange Online as a shared mailbox') }
                             } else {
                                 $r=Invoke-PraExo -Context $Context -Operation 'Recipient' -Params @{ Upn=$s.Upn }
                                 $mbok=(Get-PraValue $m 'Found' $true) -eq $false -and (Get-PraValue $r 'Found' $false) -eq $true -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $r 'Type' '') 'MailUser')
                                 [void]$details.Add("MBX:absence=$(-not [bool](Get-PraValue $m 'Found' $true)); recipient=$(Get-PraValue $r 'Type' 'none')")
                                 if ($s.GraphMailbox) { [void]$details.Add("Graph:Enabled=$($facts.Enabled),Provisioned=$($facts.Provisioned) (Exchange Online is authoritative, Graph errors stop)") }
+                                if (-not $mbok) { [void]$plain.Add($(if ((Get-PraValue $m 'Found' $true) -eq $true) { 'the mailbox still exists in Exchange Online (not deprovisioned yet)' } else { 'the object is not yet a mail user in Exchange Online (the sync has not run)' })) }
                             }
                         } else {
                             $type=[string](Get-PraValue $m 'Type' '')
                             $mbok=if ($s.Shared) { Test-PraOrdinalIgnoreCaseEqual $type 'SharedMailbox' } else { Test-PraOrdinalIgnoreCaseIn $type @('UserMailbox','SharedMailbox','RoomMailbox','EquipmentMailbox') }
                             [void]$details.Add("MBX:EXO type=$type")
+                            if (-not $mbok) { [void]$plain.Add($(if (-not $type) { 'no mailbox in Exchange Online yet (the object is still an on-premises mailbox, or the sync has not run)' } elseif ($s.Shared) { "it is a $type in Exchange Online, not a shared mailbox" } else { "it is a $type in Exchange Online, not a mailbox" })) }
                         }
-                    } elseif ($s.GraphMailbox) { $mbok=$facts.Provisioned; [void]$details.Add("MBX:Graph provisioning=$mbok; Enabled=$($facts.Enabled) [$($facts.Detail)]") }
+                    } elseif ($s.GraphMailbox) {
+                        $mbok=$facts.Provisioned; [void]$details.Add("MBX:Graph provisioning=$mbok; Enabled=$($facts.Enabled) [$($facts.Detail)]")
+                        if (-not $mbok) { [void]$plain.Add('the mailbox is not provisioned in Exchange Online yet') }
+                    }
                     if ($s.Mailbox) { $row.CloudMailbox=[bool]$mbok }
                     if ($s.License) {
                         $licok=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert') -or $s.PreserveLicense) { $facts.LicenseCount -gt 0 -and $facts.Enabled -and $facts.RequiredSkuOk }
                             elseif ($facts.RequiredSku) { -not $facts.RequiredSkuOk } else { -not $facts.Enabled }
                         $row.CloudLicense=[bool]$licok
                         [void]$details.Add("LIC:OK=$licok; Preserve=$($s.PreserveLicense); ExpectedSKU=$($facts.RequiredSku); SKUPresent=$($facts.RequiredSkuOk); licences=$($facts.LicenseCount); ExchangeEnabled=$($facts.Enabled)")
+                        if (-not $licok) {
+                            [void]$plain.Add($(if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert') -or $s.PreserveLicense) {
+                                if ([int]$facts.LicenseCount -le 0) { 'no licence is assigned' }
+                                elseif ($facts.RequiredSku -and -not $facts.RequiredSkuOk) { 'the required licence ({0}) is not assigned' -f $facts.RequiredSku }
+                                elseif (-not $facts.Enabled) { 'Exchange Online is not enabled in the licence' }
+                                else { 'the licence is not in the expected state' }
+                            } elseif ($facts.RequiredSku) { 'the licence ({0}) is still assigned' -f $facts.RequiredSku } else { 'Exchange Online is still enabled in the licence' }))
+                        }
                     } elseif ($s.Shared) { [void]$details.Add('LIC:N/A (shared)') }
-                    $row.CloudDetail=$details -join ' | '
+                    $row.CloudDetail=$details -join ' | '; $s.PlainText=$plain -join '; '
                     if ($mbok -and $licok) {
                         if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -and -not $s.ExoMailbox) {
                             $row.CloudStatus='Skipped'; $row.FinalStatus='Skipped'; $row.CloudDetail+=' | LicenseOnly: no Exchange Online confirmation, restore not allowed.'
@@ -1108,15 +1174,17 @@ function Invoke-PraCloudPhase {
                             $null=Invoke-PraX500Step -Context $Context -State $s -Fresh $fresh -MaxReads $x500MaxReads -Final ([bool]$Context.Once)
                         } else { $s.Done=$true }
                     } else { $row.CloudStatus='Pending' }
-                } catch { Write-PraCloudError -Context $Context -Row $row -Message ($_.Exception.Message+' | '+[string]$row.PermDetail); $s.Done=$true }
+                } catch { Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $_ -Upn $s.Upn -Extra ([string]$row.PermDetail); $s.Done=$true }
             }
             $pending=@($states | Where-Object { -not $_.Done })
             if (-not $pending.Count -or $Context.Once -or $clock.Elapsed.TotalSeconds -ge $timeout) { break }
             $seconds=[Math]::Min([Math]::Max(1,([double]$Context.IntervalMinutes*60)),[Math]::Max(0,($timeout-$clock.Elapsed.TotalSeconds)))
             # A mailbox that is ready and only waits for its X500 addresses is not "not ready": its own message, and the wait is at most two more checks.
             $notReady=@($pending | Where-Object { -not $_.CoreDone })
-            if ($notReady.Count) { $null=Write-PraLog -Context $Context -Message ("Not ready yet: {0} - next check in {1:0} s (waiting up to {2} min in total)" -f (($notReady | ForEach-Object { $_.Upn }) -join ', '), $seconds, $Context.TimeoutMinutes) -Level Sub }
-            foreach ($s in @($pending | Where-Object { $_.CoreDone })) { $null=Write-PraLog -Context $Context -Message ("{0}: mailbox ready; X500 addresses not all visible yet, check {1} of {2} in {3:0} s" -f $s.Upn, ([int]$s.X500Reads + 1), $x500MaxReads, $seconds) -Level Sub }
+            # A Check says what it waits for: a mailbox that was never converted (still on-premises) does not reach the expected state, and the wait is long. -Once looks once.
+            $checkHint=if ((Test-PraOrdinalIgnoreCaseEqual $Context.Action 'Check')) { ' Waiting for {0}. A mailbox that is still on-premises never gets there without a Convert; with -Once the check looks once and stops.' -f $(if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { 'the mailbox to be deprovisioned (a MailUser) in Exchange Online' } else { 'the mailbox to exist in Exchange Online' }) } else { '' }
+            if ($notReady.Count) { Write-PraItem -Context $Context -Status Info -Icon Clock -Text ("Not ready yet: {0} - next check in {1:0} s (waiting up to {2} min in total).{3}" -f (($notReady | ForEach-Object { $_.Upn }) -join ', '), $seconds, $Context.TimeoutMinutes, $checkHint) }
+            foreach ($s in @($pending | Where-Object { $_.CoreDone })) { Write-PraItem -Context $Context -Status Info -Icon Clock -Text ("{0}: mailbox ready; X500 addresses not all visible yet, check {1} of {2} in {3:0} s" -f $s.Upn, ([int]$s.X500Reads + 1), $x500MaxReads, $seconds) }
             foreach ($s in $pending) { $null=Write-PraLog -Context $Context -Message ("{0} | {1}" -f $s.Upn, $s.Row.CloudDetail) -Level Detail }
             $intervalSeconds=[Math]::Max(1,([double]$Context.IntervalMinutes*60))
             $waitText=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { 'Waiting for Exchange Online to finish deprovisioning' } elseif ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { 'Waiting for the mailbox and licence to appear in Exchange Online' } else { 'Waiting for Exchange Online' }
@@ -1129,19 +1197,25 @@ function Invoke-PraCloudPhase {
             if ($s.Done) { continue }
             if ($s.CoreDone) { Complete-PraX500Check -Context $Context -State $s; continue }
             if ($preview) {
-                $s.Row.CloudStatus='Pending'; $s.Row.FinalStatus='Planned'
+                $s.Row.CloudStatus='Pending'; $s.Row.FinalStatus='Planned'; $Context.NotYetExpected=[int]$Context.NotYetExpected+1
                 $s.Row.Detail=([string]$s.Row.Detail+' | not yet in the expected state in Exchange Online (preview): '+$s.Row.CloudDetail).Trim(' ','|')
-                $null=Write-PraLog -Context $Context -Message ("{0}: not yet in the expected state ({1})" -f $s.Upn, $s.Row.CloudDetail) -Level Info
+                $null=Write-PraLog -Context $Context -Message ("{0}: not yet in the expected state: {1}" -f $s.Upn, $(if ($s.PlainText) { $s.PlainText } else { 'see the log' })) -Level Info
+                $null=Write-PraLog -Context $Context -Message ("{0}: technical detail: {1}" -f $s.Upn, $s.Row.CloudDetail) -Level Detail
             }
-            else { Write-PraCloudError -Context $Context -Row $s.Row -Message ('Expected state not reached (timeout or -Once): '+$s.Row.CloudDetail) }
+            else {
+                $because=$(if ($s.PlainText) { $s.PlainText } else { 'see the log' })
+                $message=$(if ($Context.Once) { '{0}: not in the expected state: {1}.' -f $s.Upn,$because } else { '{0}: still not in the expected state after waiting {1} min: {2}.' -f $s.Upn,$Context.TimeoutMinutes,$because })
+                $Context.CloudNotReached=[int]$Context.CloudNotReached+1
+                Write-PraCloudError -Context $Context -Row $s.Row -Message $message -Technical ('Expected state not reached (timeout or -Once): '+$s.Row.CloudDetail)
+            }
         }
     } catch {
-        $failure=$_.Exception.Message
-        foreach ($row in $Rows) { Write-PraCloudError -Context $Context -Row $row -Message $failure }
-        if ($Rows.Count -eq 0) { Write-PraCloudError -Context $Context -Row $null -Message $failure }
+        $failure=$_
+        foreach ($row in $Rows) { Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $failure -Upn ([string](Get-PraValue $row 'UserPrincipalName' '')) }
+        if ($Rows.Count -eq 0) { Write-PraCloudFailure -Context $Context -Row $null -ErrorRecord $failure }
     } finally {
         try { Close-PraCloudSession $Context }
-        catch { foreach ($row in $Rows) { Write-PraCloudError -Context $Context -Row $row -Message ('Cloud sign-out failed: '+$_.Exception.Message) } }
+        catch { foreach ($row in $Rows) { Write-PraCloudError -Context $Context -Row $row -Message ('Cloud sign-out failed: '+$_.Exception.Message) -RunError } }
     }
 }
 
@@ -1152,7 +1226,7 @@ function Invoke-PraRetentionCheck {
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
-    $Context.CurrentPhase='Retention'; $Context.CurrentOperation='Prepare'; $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$false
+    $Context.CurrentPhase='Retention'; $Context.CurrentOperation='Prepare'; $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$false; $Context.NetworkFailure=$false
     try {
         if ($Rows.Count -eq 0) { return }
         $cfg=Get-PraValue $Context.Config 'Retention' @{}; $raw=[string](Get-PraValue $cfg 'PolicyGuid' '')
@@ -1211,25 +1285,25 @@ function Invoke-PraRetentionCheck {
                 $row.CloudStatus='Success'; if (-not (Test-PraOrdinalIgnoreCaseEqual $row.FinalStatus 'Error')) { $row.FinalStatus='Success' }
                 $row.CloudDetail+=' | COVERED (GUID='+$guid+')'
                 $null=Write-PraLog -Context $Context -Message $row.CloudDetail -Level Success
-            } catch { Write-PraCloudError -Context $Context -Row $row -Message $_.Exception.Message }
+            } catch { Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $_ -Upn ([string](Get-PraValue $row 'UserPrincipalName' '')) -Expectation }
         }
     } catch {
-        $failure=$_.Exception.Message
-        foreach ($row in $Rows) { Write-PraCloudError -Context $Context -Row $row -Message $failure }
-        if ($Rows.Count -eq 0) { Write-PraCloudError -Context $Context -Row $null -Message $failure }
+        $failure=$_
+        foreach ($row in $Rows) { Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $failure -Upn ([string](Get-PraValue $row 'UserPrincipalName' '')) }
+        if ($Rows.Count -eq 0) { Write-PraCloudFailure -Context $Context -Row $null -ErrorRecord $failure }
     } finally {
         try { Close-PraCloudSession $Context }
-        catch { foreach ($row in $Rows) { Write-PraCloudError -Context $Context -Row $row -Message ('Sign-out after the retention check failed: '+$_.Exception.Message) } }
+        catch { foreach ($row in $Rows) { Write-PraCloudError -Context $Context -Row $row -Message ('Sign-out after the retention check failed: '+$_.Exception.Message) -RunError } }
     }
 }
 
 Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,Invoke-PraRetentionCheck,Close-PraCloudSession
 
 # SIG # Begin signature block
-# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBuk2+Au1Hz+cFK
-# X0Ax6iz9SHrq6g2j4Ew7vBBSbyH1MKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBl4wHVAZUfvRsx
+# wkOGUxqvZAQuKSyO3juAza5NcyazMaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1301,28 +1375,28 @@ Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCC3NJvdPH4T
-# gx5HbAn5pMGP0+td7wpDQ4VSaLpwTSy3wjANBgkqhkiG9w0BAQEFAASCAgCfkWjY
-# CLKfq067n8XRlLa+E6CgObQqsNOHGuwJ8ibcnP4XQox84nQW4QiqVSSBRY+v4kcw
-# E/VSJB0MASdf/zVqTqzHldNMwMFR/XhNjS04+dnSALG+W3TC2gw3tcCJWLv3aca3
-# 3t2NLx0nlCLhTVVo5dyEwwIAKHJCQ6kxOokONbr4h5vmEqlQFBuC+YWXPz+iseFg
-# JKpIpUo/ssACGLj+eGSsqZ80WBIdCdC9VjavQizaajnyme3dyL2U4E1JduUhwD4X
-# b++LRzc4Bb5ccH4Svg2Meb6O1RYYnXZ9zSsaKtT7mQMy1BPOqqjEVYpPSAgEJvrn
-# lxGjtj3er1B55VK/gAoRgc+9oWI9oLeOQMETVTg7QkrL5su8ZiA+xn0BsqpnjPxP
-# ScveJeJAZvPQr4346VPEpJnMwW6r0be0sqCPJvXGGwwCMiqkvP8cKPPyOY/3fflG
-# bEUiwyjDhFPpsQkYNN43f1DOBoPmBHmHnCWlicu9f5LEfklVw5OGEzphLcJHqq8/
-# 5CX/lcEKOQ0ifuXJVPXDPCspbU5mRX4lU0pDN+7Irt6tqwi3pUAx9mtIjkCn5g7y
-# sC/cPDAsLwVpND36OfpRvi70vZ8FGx2JRYZyWWDMB+TfQ+GYvLEK0ekozgt809Dh
-# 58hPVxLYC4MuhwIRNXRNvEdoqW//yqq1Azu28aGCFM0wghTJBgorBgEEAYI3AwMB
-# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCsdttYI2c8
+# wO5LjwK/SVNBrxy6vKNV2w90avMD/vDUcjANBgkqhkiG9w0BAQEFAASCAgCl2Qx/
+# /XaCfgZzf7+0ESSlImgVV3hvfuxotppoktHEB0SWPcgKnFxdtIm10b4qL6+9Uzrr
+# cuPmI8Hy/S/AWpHCW74Y5iFBwIWhnKBxT1Duw7are0akG6jlIYTUzyfgtMPVQW4P
+# C14rRfFEgMjPudd9qEUnjrsOuud5qe1oQycQ2xCjBmf1u/v404GJBej9CiNyAm6G
+# ru+ksC+Dct4QHIn+YVIzeHZu8hdFH7UbC3fIMFSDNBHQPvQ5w/+4aqcwLYcERh8r
+# RBDkS0ULBJrDxrw7gkW9P6mlqIsjPKdF6K7fjuC1HoEG4EbL1mReDAGcH+3JglfQ
+# BY9Q5G8FWYZNPnF23IxmIBIs4/hGXffv+dc8cTXY1GibJ3f6I3S0Z5s0oNaI13KY
+# 1ayat7VgzJHTkhs8CWbj6KmJ08PvkjLQoyTXaXbD7xTnvInxJ70ELJbLIy1lg0K1
+# a7giIht/7WTdZzO7qs27B1JCGcPAaLAsEhPnuBIcj5ONvkEsR1Gg4jSlARr2F9Io
+# OWE7UTWW8FJYVTG6+7L6pWaq2nBO+anpWC+o2KAuC/2Wf7zrN7D3opCsAR7AHVCx
+# X17cRupS60WGbE4b0itnFCVa2IVQwR29Cq6DnGWM7IQ/yT1gf4CvZYS3/qNMtCCN
+# SBE3ltHYD9B2nMmsTJ8IhY/pu8hxN6ADq7d6YaGCFM8wghTLBgorBgEEAYI3AwMB
+# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIHw9SWzDtx6eW+CA8EJz72stBoydPgFX1mh0vOrxer8KAghhSibitsyB
-# NBgPMjAyNjExMTAwODMzMjFaMAMCAQECEA+ycnfdgCe80wKS8mC8MlGgghGnMIIE
+# BAIBBQAEIJDRAQyj/giDqsK+kcKGAVfHKec0aJk8Mjfo4cRNYjUmAghWmcLafSm1
+# MBgPMjAyNjExMTIxODAxNTRaMAMCAQECEF/E6thzDrAG3ab9Gd4fTPegghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1417,17 +1491,17 @@ Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMDA4MzMyMVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIBoh
-# mQckqyRAt8iZP7jONJaXAAm+OtHHm4Zy3fUYA/d4MIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMjE4MDE1NFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIPv/
+# T5DjukG0bs3VdNnJYVewui8+vDapi5s77uEL1Qj+MIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERjBEAiAGrpgmWfaFUWSBPGQoAONIhWRs4m60ZjIEJYtMl7MHUAIgKGKG
-# 6XTz7CcmXJtFGh1LitIlK3l2XF/3Z95mlPDPQ58=
+# zj0EAwIESDBGAiEApNISVnbKEUfTsATs+8JXlt4QGUNSXmDQWJWBGPpdHEoCIQCw
+# rAv/1j9Ytj3IaezttNQXJBXpdw62kdf63TKr00zUiA==
 # SIG # End signature block

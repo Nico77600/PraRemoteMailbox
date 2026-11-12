@@ -1,6 +1,6 @@
 # PRA Remote Mailbox
 
-When the on-premises Exchange servers are lost, gives every user a mailbox in Exchange Online and rolls everything back when Exchange is available again. PowerShell 7.5+ engine, optional WPF window. Author: Nicolas Fabert. Version 3.1.2.
+When the on-premises Exchange servers are lost, gives every user a mailbox in Exchange Online and rolls everything back when Exchange is available again. PowerShell 7.5+ engine, optional WPF window. Author: Nicolas Fabert. Version 3.1.3.
 
 This folder contains everything needed to run the tool: `Invoke-PraRemoteMailbox.ps1`, its modules and WPF window, the configuration and CSV samples, the report template and the two guides (user guide and reference guide). Tests and build tools stay outside it, in the repository.
 

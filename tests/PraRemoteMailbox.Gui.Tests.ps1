@@ -711,7 +711,7 @@ try {
  if($c.ObjCard.Visibility -ne 'Visible' -or $c.Journey.Items.Count -ne 3){throw 'Object journey card did not show'}
  Click $g 'BtnNext'
  if($g.Page -ne 5 -or $c.PackageBox.Visibility -ne 'Visible' -or $c.PkgName.Text -notmatch 'for-Cloud\.zip' -or $c.NextCmd.Text -notmatch 'Batch'){throw 'Next steps must show the transfer package and the command'}
- if(@($g.NextRows).Count -lt 3 -or ($c.NextSteps.Items[0].Text -notmatch 'one file')){throw 'Next steps instructions are not the one-file instructions'}
+ if(@($g.NextRows).Count -lt 3 -or ($c.NextSteps.Items[0].Text -notmatch 'the two files .*\.zip and .*\.zip\.sha256')){throw 'Next steps instructions do not name the zip and its sha256 file'}
  if(($g.NextRows | ForEach-Object Text) -match 'whole folder'){throw 'Instructions still say copy the whole folder'}
  # --- Check: read only, no confirmation, no Preview
  Click $g 'BtnNext'
@@ -787,7 +787,7 @@ Describe 'Console 3.0.0 - detection, effective configuration and files' {
     }
     It 'detects the lights and the role from what is installed (no import, no connection)' {
         $result=& (Get-Module PRA.Gui) { Get-PraGuiPrerequisite -Signin Cert -Thumbprint '0000000000000000000000000000000000000000' -SyncEnabled $false -Refresh }
-        $result.Lights.Count | Should -Be 5
+        $result.Lights.Count | Should -Be 4 -Because 'RSAT, Cloud modules, Entra Connect sync and the sign-in: the two cloud modules share one light'
         ($result.Lights | Where-Object Name -eq 'Sign-in: Certificate').Status | Should -BeExactly 'Fail'
         ($result.Lights | Where-Object Name -eq 'Entra Connect sync').Status | Should -BeExactly 'NA' -Because 'a synchronisation that is not used is neutral grey, not a green check'
         $result.Role | Should -BeIn @('Both','AD','Cloud','None')
@@ -795,6 +795,8 @@ Describe 'Console 3.0.0 - detection, effective configuration and files' {
         $result.Cloud | Should -BeFalse -Because 'a missing certificate removes the cloud capability'
         $wam=& (Get-Module PRA.Gui) { Get-PraGuiPrerequisite -Signin Wam -SyncEnabled $false }
         ($wam.Lights | Where-Object Name -like 'Sign-in*').Name | Should -Be 'Sign-in: Interactive (WAM)'
+        @($wam.Lights | Where-Object Name -eq 'Cloud modules').Count | Should -Be 1
+        @($wam.Lights | Where-Object { $_.Name -in @('ExchangeOnlineManagement','Microsoft.Graph') }).Count | Should -Be 0
         Get-Module ActiveDirectory,ExchangeOnlineManagement,Microsoft.Graph.Authentication | Should -BeNullOrEmpty
     }
     It 'passes the base configuration to the engine and guards both configuration files' {
@@ -983,6 +985,29 @@ exit 0
             ($global:PraGuiLinesProbe -join '|') | Should -BeExactly 'engine · Done with warnings in the module'
         } finally { Remove-Variable PraGuiLinesProbe -Scope Global -ErrorAction SilentlyContinue }
     }
+    It 'sees no change of a run setting when only the letter case differs from the configuration file, and still sees a real change' -Tag 'Release313h' {
+        $result = & (Get-Module PRA.Gui) {
+            $saved = $script:Gui
+            try {
+                $box = { param($text) [pscustomobject]@{ Text = $text } }
+                $radio = { param($on) [pscustomobject]@{ IsChecked = $on } }
+                $script:Gui = @{
+                    Defaults = @{ Env = 'PROD'; Dc = 'dc01.example.invalid'; Tenant = 'contoso.onmicrosoft.com'; Org = 'Contoso.onmicrosoft.com'; AppId = 'AAAA'; Thumb = 'ABCDEF'; Repl = $false }
+                    Controls = @{ F_Env = (& $box 'prod'); F_Dc = (& $box 'DC01.EXAMPLE.INVALID'); F_Tenant = (& $box 'CONTOSO.ONMICROSOFT.COM'); F_Org = (& $box 'contoso.onmicrosoft.com')
+                        F_AppId = (& $box 'aaaa'); F_Thumb = (& $box 'abcdef'); F_Repl = (& $radio $false); S_Signin_Cert = (& $radio $true); S_Signin_Wam = (& $radio $false) } }
+                $same = Get-PraGuiOverride
+                $modifiedEnv = Test-PraGuiModified 'Env'
+                $script:Gui.Controls.F_Env.Text = 'OTHER'
+                $script:Gui.Controls.F_Thumb.Text = '123456'
+                [pscustomobject]@{ SameCount = @($same.Keys).Count; ModifiedEnv = $modifiedEnv; Changed = (Get-PraGuiOverride); ChoiceSet = (Test-GuiOrdinal 'Cert' 'cert' -IgnoreCase) }
+            } finally { $script:Gui = $saved }
+        }
+        $result.SameCount | Should -Be 0
+        $result.ModifiedEnv | Should -BeFalse
+        $result.Changed.Environment | Should -BeExactly 'OTHER'
+        $result.Changed.Cloud.CertificateThumbprint | Should -BeExactly '123456'
+        $result.ChoiceSet | Should -BeTrue
+    }
     It 'accepts the typed confirmation in any letter case, ignoring surrounding spaces, and rejects any other word' -TestCases @(
         @{Typed='CONVERT';Action='Convert';Ok=$true},@{Typed='convert';Action='Convert';Ok=$true},@{Typed='  CoNvErT ';Action='Convert';Ok=$true}
         @{Typed='recover';Action='Recover';Ok=$true},@{Typed='Finalize';Action='Finalize';Ok=$true}
@@ -1110,7 +1135,7 @@ exit 0
     }
 }
 
-Describe 'Console 3.0.0 lot 2b - phase, replication option, identity preview, counters, backup, journey, Back after Apply' {
+Describe 'Console 3.0.0 - phase, replication option, identity preview, counters, backup, journey, Back after Apply' {
     It 'behaves as the owner asked (one window, synthetic probes, no engine run)' {
         $runtime=New-GuiTestRoot
         $probe=Join-Path $runtime.Root 'wpf-probe-2b.ps1'
@@ -1256,7 +1281,7 @@ try {
     }
 }
 
-Describe 'Console 3.0.0 lot 2c - packages: configured Environment, Finalize package in the Inbox, checks off the window thread' {
+Describe 'Console 3.0.0 - packages: configured Environment, Finalize package in the Inbox, checks off the window thread' {
     It 'refuses a package made for another Environment, offers "Complete a rollback" for a Finalize package of the Inbox, and imports without freezing' {
         $runtime=New-GuiTestRoot
         Write-GuiTestFile (Join-Path $runtime.Root 'module\PRA.Gui.Directory.ps1') @'
@@ -1776,21 +1801,21 @@ function Show-Next([string[]]$Steps){
 }
 try {
  $c=$g.Controls
- $copy='Copy PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip to the cloud server (anywhere), then run there:'
+ $copy='Copy these two files, together in the same folder, to the cloud server (anywhere): PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip and PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip.sha256. Then run there:'
  $command='.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch ''PRA-GuiSynthetic-Convert-490cc62e-for-Cloud.zip'''
- Show-Next @('AD is changed and verified. The Entra Connect sync could not start: this account has no right on SRV-AADC01.','Run a delta sync on SRV-AADC01 (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).',$copy,$command)
+ Show-Next @('AD is changed and verified. The Entra Connect sync did not run: this account has no right on SRV-AADC01.','Run a delta sync on SRV-AADC01 (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).',$copy,$command)
  if($c.NextTitle.Text -cne 'The Active Directory part is done, but the sync did not start'){throw ('Title: '+$c.NextTitle.Text)}
- if($c.NextLead.Text -cnotmatch '^Run the sync first \(see the steps below\), then copy ONE file to the cloud server: PRA-GuiSynthetic-Convert-490cc62e-for-Cloud\.zip'){throw ('Lead: '+$c.NextLead.Text)}
+ if($c.NextLead.Text -cnotmatch '^Run the sync first \(see the steps below\), then copy these two files to the cloud server, into the same folder: PRA-GuiSynthetic-Convert-490cc62e-for-Cloud\.zip and PRA-GuiSynthetic-Convert-490cc62e-for-Cloud\.zip\.sha256'){throw ('Lead: '+$c.NextLead.Text)}
  $rows=@($g.NextRows)
  if($rows.Count -ne 5){throw ('Steps: '+$rows.Count)}
- if($rows[0].Text -cnotmatch '^AD is changed and verified\. The Entra Connect sync could not start' -or $rows[0].N -cne '1'){throw ('Step 1: '+$rows[0].Text)}
+ if($rows[0].Text -cnotmatch '^AD is changed and verified\. The Entra Connect sync did not run' -or $rows[0].N -cne '1'){throw ('Step 1: '+$rows[0].Text)}
  if($rows[1].Text -cnotmatch '^Run a delta sync on SRV-AADC01 \(Start-ADSyncSyncCycle -PolicyType Delta\)' -or $rows[1].N -cne '2'){throw ('Step 2: '+$rows[1].Text)}
- if($rows[2].Text -cnotmatch '^Copy this one file to the cloud server' -or $rows[2].N -cne '3'){throw ('Step 3: '+$rows[2].Text)}
+ if($rows[2].Text -cnotmatch '^Copy the two files PRA-GuiSynthetic-Convert-490cc62e-for-Cloud\.zip and PRA-GuiSynthetic-Convert-490cc62e-for-Cloud\.zip\.sha256 to the cloud server' -or $rows[2].N -cne '3'){throw ('Step 3: '+$rows[2].Text)}
  if($c.NextCmdBox.Visibility -ne 'Visible' -or $c.NextCmd.Text -cne $command){throw 'The command for the cloud server must stay visible'}
  $first=@($g.TimelineRows)[0]
  if($first.Status -cne 'Wait' -or $first.Caption -cnotmatch 'the sync is still to run'){throw ('Timeline: '+$first.Status+' / '+$first.Caption)}
  Show-Next @($copy,$command)
- if($c.NextTitle.Text -cne 'The Active Directory part is done' -or @($g.NextRows).Count -ne 3 -or @($g.NextRows)[0].Text -cnotmatch '^Copy this one file'){throw ('Normal page: '+$c.NextTitle.Text+' / '+@($g.NextRows).Count)}
+ if($c.NextTitle.Text -cne 'The Active Directory part is done' -or @($g.NextRows).Count -ne 3 -or @($g.NextRows)[0].Text -cnotmatch '^Copy the two files '){throw ('Normal page: '+$c.NextTitle.Text+' / '+@($g.NextRows).Count)}
 } finally { $g.Form.Close() }
 [Console]::WriteLine('NEXT-PASS')
 '@
@@ -1804,6 +1829,189 @@ try {
             $process.WaitForExit(120000) | Should -BeTrue
             $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
             $out.Result | Should -Match 'NEXT-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.1.3 - the console takes the members of an AD group (mocked probe, no engine, no network)' -Tag 'Release313g' {
+    It 'passes -Group only to Convert AD/Both, as data, and refuses it with another source' {
+        foreach ($phase in @('AD', 'Both')) {
+            $r = New-PraGuiRequest -Phase $phase -Group 'CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com'
+            $r.Group | Should -BeExactly 'CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com'
+            $c = Get-PraGuiCommand 'C:\Synthetic' 'C:\Synthetic\config.psd1' $r
+            $c.Tokens | Should -Contain '-Group'
+            $c.Tokens | Should -Contain 'CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com'
+        }
+        (Get-PraGuiCommand 'C:\Synthetic' 'C:\Synthetic\config.psd1' (New-PraGuiRequest -Phase AD)).Tokens | Should -Not -Contain '-Group'
+        { New-PraGuiRequest -Phase Cloud -Batch '01234567' -Group 'PRA-Wave1' } | Should -Throw
+        { New-PraGuiRequest -Action Recover -Batch '01234567' -Group 'PRA-Wave1' } | Should -Throw
+        { New-PraGuiRequest -Group 'PRA-Wave1' -SearchBase 'OU=Selected,DC=example,DC=invalid' } | Should -Throw
+        { New-PraGuiRequest -Group 'PRA-Wave1' -CsvPath 'targets.csv' } | Should -Throw
+        { New-PraGuiRequest -Group 'PRA-Wave1' -Identity 'one@example.invalid' } | Should -Throw
+        { New-PraGuiRequest -Group "bad`nvalue" } | Should -Throw
+    }
+    It 'has the source, the field, the Check button and the answer line on the Task page' {
+        $xaml = [IO.File]::ReadAllText((Join-Path $script:GuiProjectRoot 'module\PRA.Gui.xaml'))
+        foreach ($name in @('S_Source_Group', 'Row_Group', 'F_Group', 'BtnCheckGroup', 'GroupInfo')) { $xaml | Should -Match ('x:Name="' + $name + '"') }
+        $xaml | Should -Match 'Content="AD group"'
+    }
+    It 'behaves as the owner asked (one window, synthetic probe, no engine run)' {
+        $runtime = New-GuiTestRoot
+        $probe = Join-Path $runtime.Root 'wpf-probe-313g.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+function Check($Window,[string]$Name){ $Window.Controls[$Name].IsChecked=$true; Pump 30 }
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$false; Role='AD' } }
+$script:Mode='found'
+$group={ param($Group)
+  switch ($script:Mode) {
+    'found' { [pscustomobject]@{Success=$true;Name='PRA-Wave1';DistinguishedName='CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com';Members=12} }
+    'one' { [pscustomobject]@{Success=$true;Name='PRA-Wave1';DistinguishedName='CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com';Members=1} }
+    'missing' { [pscustomobject]@{Success=$false;Error="The group 'PRA-Wave9' was not found in Active Directory (checked on dc01.contoso.com). Give its name (sAMAccountName or CN) or its distinguished name."} }
+    'ambiguous' { [pscustomobject]@{Success=$false;Error="2 groups are named 'PRA-Wave1': give the distinguished name of the one to use."} }
+    default { throw 'Active Directory is not reachable.' } } }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect -GroupProbe $group
+$g.Form.Show()
+try {
+ $c=$g.Controls
+ Click $g 'BtnNext'; Check $g 'T_Convert'
+ if($c.Row_Group.Visibility -ne 'Collapsed'){throw 'The group row must be hidden until the source is chosen'}
+ Check $g 'S_Source_Group'
+ if($c.Row_Group.Visibility -ne 'Visible' -or $c.Row_Identity.Visibility -ne 'Collapsed' -or $c.Row_Ou.Visibility -ne 'Collapsed' -or $c.Row_Csv.Visibility -ne 'Collapsed'){throw 'The group source shows its own row only'}
+ if($c.BtnNext.IsEnabled){throw 'An empty group field must not allow Continue'}
+ $text=& (Get-Module PRA.Gui) { Get-PraGuiSourceText }
+ if($text[0] -cne 'AD group'){throw ('Source title: '+$text[0])}
+ # An empty field: the request says what to give.
+ $message=''
+ try { & (Get-Module PRA.Gui) { Get-PraGuiWindowRequest -Mode Preview } | Out-Null } catch { $message=$_.Exception.Message }
+ if($message -cne 'Type the name or the distinguished name of the AD group.'){throw ('Empty group message: '+$message)}
+ # --- the field, the command line preview, the request
+ $c.F_Group.Text='CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com'; Pump
+ if(-not $c.BtnNext.IsEnabled){throw 'A group makes the task ready'}
+ if($c.CmdLine.Text -cnotmatch "'-Group' 'CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com'"){throw ('Command line preview: '+$c.CmdLine.Text)}
+ if($c.CmdLine.Text -cmatch "'-Identity'|'-SearchBase'|'-CsvPath'"){throw 'Only -Group is passed'}
+ $summary=& (Get-Module PRA.Gui) { Get-PraGuiSourceText }
+ if($summary[1] -notmatch 'PRA-Wave1' -or $summary[1] -notmatch 'nested'){throw ('Source sentence: '+$summary[1])}
+ # --- the Check button: found, one member, missing, ambiguous, error; typing again clears the answer
+ Click $g 'BtnCheckGroup'; Pump
+ if($c.GroupInfo.Text -notmatch 'PRA-Wave1' -or $c.GroupInfo.Text -notmatch 'OU=Groups' -or $c.GroupInfo.Text -notmatch '12 members, including nested groups'){throw ('Group found: '+$c.GroupInfo.Text)}
+ $script:Mode='one'; Click $g 'BtnCheckGroup'; Pump
+ if($c.GroupInfo.Text -notmatch '1 member, including nested groups'){throw ('Group one member: '+$c.GroupInfo.Text)}
+ $script:Mode='missing'; Click $g 'BtnCheckGroup'; Pump
+ if($c.GroupInfo.Text -notmatch 'was not found in Active Directory'){throw ('Group missing: '+$c.GroupInfo.Text)}
+ $script:Mode='ambiguous'; Click $g 'BtnCheckGroup'; Pump
+ if($c.GroupInfo.Text -notmatch '2 groups are named'){throw ('Group ambiguous: '+$c.GroupInfo.Text)}
+ $script:Mode='error'; Click $g 'BtnCheckGroup'; Pump
+ if($c.GroupInfo.Text -notmatch 'Could not check: Active Directory is not reachable'){throw ('Group error: '+$c.GroupInfo.Text)}
+ $c.F_Group.Text='PRA-Wave1'; Pump
+ if($c.GroupInfo.Text -ne ''){throw 'Typing again must clear the previous answer'}
+ if($c.CmdLine.Text -cnotmatch "'-Group' 'PRA-Wave1'"){throw ('Command line preview (name): '+$c.CmdLine.Text)}
+ # --- the request that the Preview will run
+ $request=& (Get-Module PRA.Gui) { Get-PraGuiWindowRequest -Mode Preview }
+ if($request.Group -cne 'PRA-Wave1' -or $request.Identity -or $request.SearchBase -or $request.CsvPath -or $request.Action -cne 'Convert'){throw ('Request: '+($request | ConvertTo-Json -Compress))}
+ # --- back to another source: the group is not sent
+ Check $g 'S_Source_Single'
+ if($c.Row_Group.Visibility -ne 'Collapsed'){throw 'The group row must hide again'}
+ Write-Output 'WPF-313G-PASS'
+} finally { $g.Form.Close() }
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(180000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'WPF-313G-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.1.3 - the group lookup answers an ambiguous name and an empty group, and the summary names the AD group (mocked probe, no engine, no network)' -Tag 'Release313i' {
+    It 'shows the groups that share a name with their distinguished names, an empty group as a warning, and the source in the summary' {
+        $runtime = New-GuiTestRoot
+        $probe = Join-Path $runtime.Root 'wpf-probe-313i.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+function Check($Window,[string]$Name){ $Window.Controls[$Name].IsChecked=$true; Pump 30 }
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$false; Role='AD' } }
+$script:Mode='ambiguous'
+$group={ param($Group)
+  switch ($script:Mode) {
+    'ambiguous' { [pscustomobject]@{Success=$false;Error="2 groups are named 'PRA-Wave1': give the distinguished name of the one to use. They are: CN=PRA-Wave1,OU=GroupsA,DC=contoso,DC=com | CN=PRA-Wave1,OU=GroupsB,DC=contoso,DC=com."} }
+    'many' { [pscustomobject]@{Success=$false;Error="7 groups are named 'PRA-Wave1': give the distinguished name of the one to use. They are: CN=PRA-Wave1,OU=A,DC=contoso,DC=com | CN=PRA-Wave1,OU=B,DC=contoso,DC=com | CN=PRA-Wave1,OU=C,DC=contoso,DC=com | CN=PRA-Wave1,OU=D,DC=contoso,DC=com | CN=PRA-Wave1,OU=E,DC=contoso,DC=com (and 2 more)."} }
+    'empty' { [pscustomobject]@{Success=$true;Name='PRA-Empty';DistinguishedName='CN=PRA-Empty,OU=Groups,DC=contoso,DC=com';Members=0} }
+    'found' { [pscustomobject]@{Success=$true;Name='PRA-Wave1';DistinguishedName='CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com';Members=4} }
+    default { throw 'Active Directory is not reachable.' } } }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect -GroupProbe $group
+$g.Form.Show()
+try {
+ $c=$g.Controls
+ Click $g 'BtnNext'; Check $g 'T_Convert'; Check $g 'S_Source_Group'
+ $c.F_Group.Text='PRA-Wave1'; Pump
+ Click $g 'BtnCheckGroup'; Pump
+ $lines=@($c.GroupInfo.Text -split "`n")
+ if($lines[0] -cne "2 groups are named 'PRA-Wave1': give the distinguished name of the one to use"){throw ('Ambiguous first line: '+$c.GroupInfo.Text)}
+ if($lines.Count -ne 3 -or $lines[1].Trim() -cne 'CN=PRA-Wave1,OU=GroupsA,DC=contoso,DC=com' -or $lines[2].Trim() -cne 'CN=PRA-Wave1,OU=GroupsB,DC=contoso,DC=com'){throw ('Ambiguous list: '+$c.GroupInfo.Text)}
+ if($c.GroupInfo.Text -match 'Could not check'){throw 'An ambiguous name is an answer, not a failed check'}
+ $caution=$g.Form.TryFindResource('PraCaution')
+ if($null -eq $caution -or -not $c.GroupInfo.Foreground.Equals($caution)){throw 'The ambiguous answer must use the caution colour'}
+ $script:Mode='many'; Click $g 'BtnCheckGroup'; Pump
+ $lines=@($c.GroupInfo.Text -split "`n")
+ if($lines.Count -ne 6 -or $lines[5].Trim() -cne 'CN=PRA-Wave1,OU=E,DC=contoso,DC=com (and 2 more)'){throw ('Many: '+$c.GroupInfo.Text)}
+ $script:Mode='empty'; Click $g 'BtnCheckGroup'; Pump
+ if($c.GroupInfo.Text -cne 'PRA-Empty · CN=PRA-Empty,OU=Groups,DC=contoso,DC=com · no member: nothing to convert'){throw ('Empty: '+$c.GroupInfo.Text)}
+ if(-not $c.GroupInfo.Foreground.Equals($caution)){throw 'An empty group must use the caution colour'}
+ $script:Mode='found'; Click $g 'BtnCheckGroup'; Pump
+ if($c.GroupInfo.Text -notmatch '4 members, including nested groups'){throw ('Found: '+$c.GroupInfo.Text)}
+ if($c.GroupInfo.Foreground.Equals($caution)){throw 'A group with members is not a caution'}
+ $script:Mode='error'; Click $g 'BtnCheckGroup'; Pump
+ if($c.GroupInfo.Text -notmatch '^Could not check: Active Directory is not reachable'){throw ('Error: '+$c.GroupInfo.Text)}
+ $summary=& (Get-Module PRA.Gui) { Get-PraGuiSourceSummary }
+ if($summary -cne 'AD group PRA-Wave1'){throw ('Summary (group): '+$summary)}
+ Check $g 'S_Source_Single'; $c.F_Identity.Text='user1@contoso.com'; Pump
+ $summary=& (Get-Module PRA.Gui) { Get-PraGuiSourceSummary }
+ if($summary -cne 'Single identity (test) user1@contoso.com'){throw ('Summary (single): '+$summary)}
+ Check $g 'S_Source_Scope'
+ $summary=& (Get-Module PRA.Gui) { Get-PraGuiSourceSummary }
+ if($summary -cne 'Configured scope'){throw ('Summary (scope): '+$summary)}
+ Write-Output 'WPF-313I-PASS'
+} finally { $g.Form.Close() }
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(180000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'WPF-313I-PASS'
         } finally { $process.Dispose() }
     }
 }

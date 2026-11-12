@@ -27,14 +27,14 @@
     Root of the repository (default: two folders above this script).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2
+    Version : 3.1.3
     Part of : PRA Remote Mailbox (repository tool, not in the package)
 #>
 #Requires -Version 7.5
 param(
     [Parameter(Mandatory)][string]$Shots,
     [ValidateSet('Light', 'Dark')][string]$Theme = 'Light',
-    [ValidateSet('single', 'scope', 'twoserver', 'cloud', 'rollback', 'rollbackad', 'rollbackcloud', 'finalize', 'check', 'finish', 'syncfailed')][string]$Scenario = 'single',
+    [ValidateSet('single', 'scope', 'group', 'twoserver', 'cloud', 'rollback', 'rollbackad', 'rollbackcloud', 'finalize', 'check', 'finish', 'syncfailed')][string]$Scenario = 'single',
     [string]$Repository
 )
 $ErrorActionPreference = 'Stop'
@@ -125,16 +125,16 @@ try {
 
     # The probes stand in for the whole detection, the Microsoft 365 test included: a server with the programs of its side also shows the light *Microsoft 365 reachable*.
     $bothProbe = { param($r) [pscustomobject]@{ Lights = @(
-                [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Ok'; Detail = 'Installed, version 1.0.1.0.' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Ok'; Detail = 'Installed, version 3.10.0.' },
-                [ordered]@{Name = 'Microsoft.Graph'; Status = 'Ok'; Detail = 'Installed, version 2.25.0.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01.' },
+                [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Ok'; Detail = 'Installed, version 1.0.1.0.' }, [ordered]@{Name = 'Cloud modules'; Status = 'Ok'; Detail = 'Exchange Online 3.10.1, Microsoft Graph 2.41.1 (Authentication and Users).' },
+                [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01.' },
                 [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }, [ordered]@{Name = 'Microsoft 365 reachable'; Status = 'Ok'; Detail = 'Reachable from this server (login.microsoftonline.com and outlook.office365.com).' }); AD = $true; Cloud = $true; Role = 'Both' } }
     $adProbe = { param($r) [pscustomobject]@{ Lights = @(
-                [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Ok'; Detail = 'Installed, version 1.0.1.0.' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Fail'; Detail = 'Not installed (version 3.10.0 or later needed): Install-Module ExchangeOnlineManagement.' },
-                [ordered]@{Name = 'Microsoft.Graph'; Status = 'Fail'; Detail = 'Not installed (Authentication and Users): the cloud parts and Check cannot run on this server.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01.' },
+                [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Ok'; Detail = 'Installed, version 1.0.1.0.' }, [ordered]@{Name = 'Cloud modules'; Status = 'Fail'; Detail = 'Microsoft Graph: found Microsoft.Graph.Authentication not installed; Microsoft.Graph.Users not installed. The tool needs both in one same version 2.41.1 or later. Run: Install-Module Microsoft.Graph.Authentication -MinimumVersion 2.41.1 -Scope CurrentUser; Install-Module Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope CurrentUser (one command per module, the same version for both; to install for every user, use -Scope AllUsers in a window opened as administrator). ExchangeOnlineManagement: not installed; the tool needs 3.10.1 or later. Run: Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope CurrentUser (to install for every user, use -Scope AllUsers in a window opened as administrator).' },
+                [ordered]@{Name = 'Entra Connect sync'; Status = 'Ok'; Detail = 'The synchronisation is started on SRV-AADC01.' },
                 [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }); AD = $true; Cloud = $false; Role = 'AD' } }
     $cloudProbe = { param($r) [pscustomobject]@{ Lights = @(
-                [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Fail'; Detail = 'Not installed: the Active Directory parts cannot run on this server (install the RSAT feature Active Directory module).' }, [ordered]@{Name = 'ExchangeOnlineManagement'; Status = 'Ok'; Detail = 'Installed, version 3.10.0.' },
-                [ordered]@{Name = 'Microsoft.Graph'; Status = 'Ok'; Detail = 'Installed, version 2.25.0.' }, [ordered]@{Name = 'Entra Connect sync'; Status = 'NA'; Detail = 'Not used: this server does not change Active Directory.' },
+                [ordered]@{Name = 'RSAT ActiveDirectory'; Status = 'Fail'; Detail = 'Not installed: the Active Directory parts cannot run on this server (install the RSAT feature Active Directory module).' }, [ordered]@{Name = 'Cloud modules'; Status = 'Ok'; Detail = 'Exchange Online 3.10.1, Microsoft Graph 2.41.1 (Authentication and Users).' },
+                [ordered]@{Name = 'Entra Connect sync'; Status = 'NA'; Detail = 'Not used: this server does not change Active Directory.' },
                 [ordered]@{Name = 'Sign-in: Interactive (WAM)'; Status = 'Ok'; Detail = 'A Microsoft sign-in window opens when the run starts.' }, [ordered]@{Name = 'Microsoft 365 reachable'; Status = 'Ok'; Detail = 'Reachable from this server (login.microsoftonline.com and outlook.office365.com).' }); AD = $false; Cloud = $true; Role = 'Cloud' } }
     $probe = switch ($Scenario) { 'twoserver' { $adProbe } 'rollbackad' { $adProbe } 'finalize' { $adProbe } 'finish' { $adProbe } 'syncfailed' { $adProbe } 'cloud' { $cloudProbe } 'rollbackcloud' { $cloudProbe } default { $bothProbe } }
     # The Entra Connect check of the window: a server that accepts this account (nothing leaves the process).
@@ -143,8 +143,9 @@ try {
         Add-Member -InputObject $handle -MemberType ScriptMethod -Name GetResult -Value { param([bool]$TimedOut) [pscustomobject]@{ Ok = $true; Kind = 'Ok'; Server = 'SRV-AADC01'; Reason = 'SRV-AADC01 accepts this account and Entra Connect answers'; Technical = '' } }
         $handle }
     $identityProbe = { param($identity) [pscustomobject]@{ Success = $true; Found = $true; Count = 1; DisplayName = 'Alice Vance'; UserPrincipalName = 'alice.vance@contoso.com'; SamAccountName = 'alice.vance'; MailboxType = 'User mailbox' } }
+    $groupProbe = { param($group) [pscustomobject]@{ Success = $true; Name = 'PRA-Wave1'; DistinguishedName = 'CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com'; Members = 12 } }
     $toolVersion = [regex]::Match([IO.File]::ReadAllText((Join-Path $repo 'package\Invoke-PraRemoteMailbox.ps1')), '(?m)^\s*Version\s*:\s*(\d+\.\d+\.\d+)\s*$').Groups[1].Value
-    $g = New-PraGuiWindow -Root $root -ConfigPath $config -Version $toolVersion -Theme $Theme -PrerequisiteProbe $probe -IdentityProbe $identityProbe -SyncProbe $syncProbe
+    $g = New-PraGuiWindow -Root $root -ConfigPath $config -Version $toolVersion -Theme $Theme -PrerequisiteProbe $probe -IdentityProbe $identityProbe -GroupProbe $groupProbe -SyncProbe $syncProbe
 
     function Pump($ms = 120) { $f = New-Object Windows.Threading.DispatcherFrame; $t = New-Object Windows.Threading.DispatcherTimer; $t.Interval = [timespan]::FromMilliseconds($ms); $t.Tag = $f; $t.Add_Tick({ param($s) $s.Tag.Continue = $false; $s.Stop() }); $t.Start(); [Windows.Threading.Dispatcher]::PushFrame($f) }
     $syntheticRoot = 'D:\PRA\PraRemoteMailbox'
@@ -240,6 +241,13 @@ try {
             $c.StepList.SelectedIndex = 3; Pump; $c.DetObjList.SelectedIndex = 0; Pump
             Shot 'run-finished' @(, @('BtnNext', '1'))
             Click 'BtnNext'; Pump; Shot 'next' @(@('BtnReport', '1'), @('BtnLog', '2'))
+        }
+        'group' {
+            GoToTask 'T_Convert'
+            $c.S_Source_Group.IsChecked = $true; Pump
+            $c.F_Group.Text = 'CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com'; Pump
+            Click 'BtnCheckGroup'; Pump
+            Shot 'task-group' @(@('S_Source_Group', '1'), @('F_Group', '2'), @('BtnCheckGroup', '3'), @('BtnNext', '4'))
         }
         'scope' {
             GoToTask 'T_Convert'

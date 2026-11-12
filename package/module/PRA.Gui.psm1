@@ -7,7 +7,7 @@
     Local metadata is indicative; the engine remains the authority for all backup/proof checks.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2
+    Version : 3.1.3
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -90,7 +90,7 @@ function New-PraGuiRequest {
         [ValidateSet('Convert','Recover','Finalize','Check')][string]$Action = 'Convert',
         [ValidateSet('Preview','Apply')][string]$Mode = 'Preview',
         [ValidateSet('Both','AD','Cloud')][string]$Phase = 'Both',
-        [string]$Batch = '', [string]$Identity = '', [string]$SearchBase = '', [string]$CsvPath = '',
+        [string]$Batch = '', [string]$Identity = '', [string]$SearchBase = '', [string]$CsvPath = '', [string]$Group = '',
         [ValidateSet('All','UsersOnly','SharedOnly')][string]$Scope = 'All',
         [int]$MaxObjects = 0,
         [ValidateSet('Provisioned','Deprovisioned','Retained')][string]$Expect = 'Provisioned',
@@ -98,13 +98,13 @@ function New-PraGuiRequest {
         [bool]$Finish = $false
     )
     # ValidateSet is a culture comparison: 'Convert<U+0001>' would be accepted and bound as typed. The value is matched ordinally (any letter
-    # case, as before) and replaced by the official spelling; a value without an ordinal match is refused.
+    # case) and replaced by the official spelling; a value without an ordinal match is refused.
     $Action = Resolve-GuiOfficialValue $Action @('Convert','Recover','Finalize','Check')
     $Mode = Resolve-GuiOfficialValue $Mode @('Preview','Apply')
     $Phase = Resolve-GuiOfficialValue $Phase @('Both','AD','Cloud')
     $Scope = Resolve-GuiOfficialValue $Scope @('All','UsersOnly','SharedOnly')
     $Expect = Resolve-GuiOfficialValue $Expect @('Provisioned','Deprovisioned','Retained')
-    foreach ($value in @($Batch, $Identity,$SearchBase,$CsvPath)) {
+    foreach ($value in @($Batch, $Identity,$SearchBase,$CsvPath,$Group)) {
         if ($value -match '[\x00-\x1f]') { throw 'Selection contains a control character.' }
     }
     if ($MaxObjects -lt 0) { throw 'MaxObjects must be zero or positive.' }
@@ -118,11 +118,11 @@ function New-PraGuiRequest {
     if ((Test-GuiOrdinal $Action 'Check' -IgnoreCase) -and -not $Batch -and -not $Identity) { throw 'Check requires a Convert batch or one identity (prefer a UPN).' }
     if ((Test-GuiOrdinal $Action 'Check' -IgnoreCase) -and (Test-GuiOrdinal $Mode 'Apply' -IgnoreCase)) { throw 'Check is always read-only.' }
     if ($MaxObjects -and -not ((Test-GuiOrdinal $Action 'Convert' -IgnoreCase) -and (Test-GuiOrdinalIn $Phase @('AD','Both') -IgnoreCase))) { throw 'MaxObjects is only available for Convert AD/Both.' }
-    $null=Get-PraTargetOverride -SearchBase $SearchBase -CsvPath $CsvPath -Identity $Identity
-    if (($SearchBase -or $CsvPath) -and -not ((Test-GuiOrdinal $Action 'Convert' -IgnoreCase) -and (Test-GuiOrdinalIn $Phase @('AD','Both') -IgnoreCase))) { throw 'OU/CSV selection is only available for Convert AD/Both.' }
+    $null=Get-PraTargetOverride -SearchBase $SearchBase -CsvPath $CsvPath -Identity $Identity -Group $Group
+    if (($SearchBase -or $CsvPath -or $Group) -and -not ((Test-GuiOrdinal $Action 'Convert' -IgnoreCase) -and (Test-GuiOrdinalIn $Phase @('AD','Both') -IgnoreCase))) { throw 'OU/CSV/group selection is only available for Convert AD/Both.' }
     return [ordered]@{
         Action=$Action; Mode=$Mode; Phase=$(if ((Test-GuiOrdinal $Action 'Finalize' -IgnoreCase)) { 'Finalize' } elseif ((Test-GuiOrdinal $Action 'Check' -IgnoreCase)) { 'Cloud' } else { $Phase })
-        Batch=$Batch; Identity=$Identity; SearchBase=$SearchBase; CsvPath=$CsvPath; Scope=$Scope; MaxObjects=$MaxObjects
+        Batch=$Batch; Identity=$Identity; SearchBase=$SearchBase; CsvPath=$CsvPath; Group=$Group; Scope=$Scope; MaxObjects=$MaxObjects
         Expect=$(if ((Test-GuiOrdinal $Action 'Check' -IgnoreCase)) { $Expect } else { 'Provisioned' }); Once=$Once
     }
 }
@@ -163,7 +163,7 @@ function Get-PraGuiCommand {
     # from, so that the log, the report and the result list what differs from it.
     if ($BaseConfigPath) { $tokens.Add('-BaseConfigPath'); $tokens.Add($BaseConfigPath) }
     if ((Test-GuiOrdinalIn $Request.Action @('Convert','Recover') -IgnoreCase)) { $tokens.Add('-Phase'); $tokens.Add([string]$Request.Phase) }
-    foreach ($name in @('Batch','Identity','SearchBase','CsvPath')) { if ($Request[$name]) { $tokens.Add('-'+$name); $tokens.Add([string]$Request[$name]) } }
+    foreach ($name in @('Batch','Identity','SearchBase','CsvPath','Group')) { if ($Request[$name]) { $tokens.Add('-'+$name); $tokens.Add([string]$Request[$name]) } }
     if ((Test-GuiOrdinal $Request.Action 'Convert' -IgnoreCase) -and (Test-GuiOrdinalIn $Request.Phase @('AD','Both') -IgnoreCase)) { $tokens.Add('-MaxObjects'); $tokens.Add([string]$Request.MaxObjects) }
     if ((Test-GuiOrdinal $Request.Action 'Check' -IgnoreCase)) { $tokens.Add('-Expect'); $tokens.Add([string]$Request.Expect) }
     if ($Request.Once) { $tokens.Add('-Once') }
@@ -202,14 +202,14 @@ function Read-PraGuiBatch {
         if (-not (Test-GuiOrdinalIn $item.Operation @('Convert','Recover','RecoverFinalize'))) { throw 'Not a Convert, Recover or RecoverFinalize package.' }
         if (Test-GuiOrdinal (Get-PraGuiValue $data 'Kind' '') 'ADVerified' -IgnoreCase) { throw 'State/proof is not a batch.' }
         $item.Environment = [string](Get-PraGuiValue $data 'Environment' '')
-        if (-not $AnyEnvironment -and -not (Test-GuiOrdinal $item.Environment $Environment)) { $item.EnvMismatch=$true; throw 'Environment differs from configuration.' }
+        if (-not $AnyEnvironment -and -not (Test-GuiOrdinal $item.Environment $Environment -IgnoreCase)) { $item.EnvMismatch=$true; throw 'Environment differs from configuration.' }
         $schema = Get-PraGuiValue $data 'SchemaVersion' 1
         $schema = $schema -as [int]   # numeric comparisons below need an integer, not the raw JSON value (string, long or double)
         if ($null -eq $schema) { throw 'Unsupported schema.' }
         if (((Test-GuiOrdinal $item.Operation 'RecoverFinalize') -and $schema -ne 2) -or (-not (Test-GuiOrdinalIn $schema @(1,2,3) -IgnoreCase))) { throw 'Unsupported schema.' }
         $records = @(if (Test-GuiOrdinal $item.Operation 'RecoverFinalize') { Get-PraGuiValue $data 'Items' @() } else { Get-PraGuiValue $data 'Records' @() })
         if (-not $records.Count -or $null -eq $records[0]) { throw 'Empty or missing records.' }
-        if ($schema -ge 2 -and -not (Test-GuiOrdinal (ConvertTo-PraGuiHash ([IO.File]::ReadAllText($Path+'.sha256'))) (Get-PraGuiFileHash $Path))) { throw 'SHA-256 mismatch.' }
+        if ($schema -ge 2 -and -not (Test-GuiOrdinal (ConvertTo-PraGuiHash ([IO.File]::ReadAllText($Path+'.sha256'))) (Get-PraGuiFileHash $Path) -IgnoreCase)) { throw 'SHA-256 mismatch.' }
         $item.Data=$data; $item.Valid=$true; $item.Status='Readable metadata - the engine still verifies everything'
     } catch { $item.Status='INVALID: '+$_.Exception.Message }
     $item.Label='{0} · {1} · {2}' -f $item.Operation,$item.BatchId,$item.Status
@@ -239,7 +239,7 @@ function Resolve-PraGuiBatch {
     if ($Value -match '^[a-fA-F0-9]{8,32}$') {
         $found = @($State.Batches | Where-Object { $_.BatchId.StartsWith($Value,[StringComparison]::OrdinalIgnoreCase) -and (Test-GuiOrdinal $_.Operation $Operation) })
         if ($found.Count -gt 1) {
-            $hashes=@(Get-GuiOrdinalUnique @($found | ForEach-Object { Get-PraGuiFileHash $_.Path }))
+            $hashes=@(Get-GuiOrdinalUnique @($found | ForEach-Object { Get-PraGuiFileHash $_.Path }) -IgnoreCase)
             if ($hashes.Count -ne 1) { throw 'Batch ID ambiguous: matching files have different contents. Give an exact JSON path.' }
             # Ordinal ranking (folder named after the batch first, then by path): [Array]::Sort with StringComparer.Ordinal, not the culture collation.
             $rankKeys=[string[]]@(foreach ($candidate in $found) {
@@ -274,7 +274,7 @@ function Get-PraGuiGuard {
     <# Content, not timestamps: all selected batch artifacts and the original Convert source are guarded, and so are the configuration file of the
        run (the effective copy when run settings were changed in the window) and the file it was made from. #>
     param([string]$Root, [string]$ConfigPath, [Collections.IDictionary]$Request, [string]$BaseConfigPath = '')
-    $override=Get-PraTargetOverride -SearchBase ([string]$Request.SearchBase) -CsvPath ([string]$Request.CsvPath) -Identity $Request.Identity
+    $override=Get-PraTargetOverride -SearchBase ([string]$Request.SearchBase) -CsvPath ([string]$Request.CsvPath) -Identity $Request.Identity -Group ([string]$Request.Group)
     $state = Read-PraGuiState $Root $ConfigPath -ScopeOverride $override
     if ($state.ConfigError) { throw $state.ConfigError }
     $configFile = $ConfigPath
@@ -306,14 +306,14 @@ function Get-PraGuiGuard {
             $proofPath = Join-Path $batch.Folder ('State-'+$batch.Data.BatchId+'.json')
             $proof = [IO.File]::ReadAllText($proofPath) | ConvertFrom-PraJson
             if (-not (Test-GuiOrdinal (Get-PraGuiValue $proof 'Kind' '') 'ADVerified') -or -not (Test-GuiOrdinal (Get-PraGuiValue $proof 'Operation' '') $Request.Action) -or
-                -not (Test-GuiOrdinal (Get-PraGuiValue $proof 'Environment' '') $state.Config.Environment) -or
-                -not (Test-GuiOrdinal (ConvertTo-PraGuiHash ([IO.File]::ReadAllText($proofPath+'.sha256'))) (Get-PraGuiFileHash $proofPath))) { throw 'Missing, invalid or mismatched AD proof.' }
+                -not (Test-GuiOrdinal (Get-PraGuiValue $proof 'Environment' '') $state.Config.Environment -IgnoreCase) -or
+                -not (Test-GuiOrdinal (ConvertTo-PraGuiHash ([IO.File]::ReadAllText($proofPath+'.sha256'))) (Get-PraGuiFileHash $proofPath) -IgnoreCase)) { throw 'Missing, invalid or mismatched AD proof.' }
         }
         if ((Test-GuiOrdinal $Request.Action 'Recover' -IgnoreCase) -and (Test-GuiOrdinal $Request.Phase 'Cloud' -IgnoreCase)) {
             $hash = [string](Get-PraGuiValue $batch.Data 'SourceBackupHash' '')
             if (-not $hash) { throw 'Recover batch lacks its original Convert source hash.' }
             $hash=ConvertTo-PraGuiHash $hash
-            $sources = @($state.Batches | Where-Object { $_.Valid -and (Test-GuiOrdinal $_.Operation 'Convert') -and (Test-GuiOrdinal (Get-PraGuiFileHash $_.Path) $hash) })
+            $sources = @($state.Batches | Where-Object { $_.Valid -and (Test-GuiOrdinal $_.Operation 'Convert') -and (Test-GuiOrdinal (Get-PraGuiFileHash $_.Path) $hash -IgnoreCase) })
             if (-not $sources.Count) { throw 'Copy the ORIGINAL Convert folder into Storage.BackupFolder as well as the Recover folder.' }
             foreach ($source in $sources) {
                 foreach ($file in @(Get-ChildItem -LiteralPath $source.Folder -Recurse -File -ErrorAction Stop)) { $files.Add($file.FullName) }
@@ -321,7 +321,7 @@ function Get-PraGuiGuard {
         }
     }
     $selection = [ordered]@{}
-    foreach ($key in @('Action','Phase','Batch','Identity','SearchBase','CsvPath','Scope','MaxObjects','Expect','Once')) { $selection[$key]=$Request[$key] }
+    foreach ($key in @('Action','Phase','Batch','Identity','SearchBase','CsvPath','Group','Scope','MaxObjects','Expect','Once')) { $selection[$key]=$Request[$key] }
     # Canonical order of the guarded files: distinct (Windows paths are case-insensitive) then sorted by UTF-16 code unit, never by the culture collation.
     $guardedFiles = [string[]]@(Get-GuiOrdinalUnique @($files) -IgnoreCase)
     [Array]::Sort($guardedFiles, [StringComparer]::Ordinal)
@@ -752,13 +752,12 @@ function Get-PraGuiPrerequisite {
     $ad=Get-PraGuiHighestModule @('ActiveDirectory') -Refresh:$Refresh
     if ($ad) { & $light 'RSAT ActiveDirectory' 'Ok' ('Installed, version {0}.' -f $ad.Version) }
     else { & $light 'RSAT ActiveDirectory' 'Fail' 'Not installed: the Active Directory parts cannot run on this server (install the RSAT feature Active Directory module).' }
-    # The same report as the engine (Get-PraCloudModuleReport): the minimum versions, and ONE version of the Graph modules for all of them. The scan is slow: kept until -Refresh.
-    # The engine runs in a fresh process, so no module is loaded there yet.
+    # One light for the cloud modules, from the same report as the engine (Get-PraCloudModuleReport): the minimum versions, and ONE version of the Graph modules.
     $report=Get-PraGuiCloudModuleReport -MinExo $MinExoVersion -Refresh:$Refresh
     $exoOk=[bool]$report.Exo.Ok
-    if ($exoOk) { & $light 'ExchangeOnlineManagement' 'Ok' ('Installed, version {0}.' -f $report.Exo.Version) } else { & $light 'ExchangeOnlineManagement' 'Fail' $report.Exo.Message }
     $graphOk=[bool]$report.Graph.Ok
-    if ($graphOk) { & $light 'Microsoft.Graph' 'Ok' ('Installed, version {0} (Authentication and Users).' -f $report.Graph.Version) } else { & $light 'Microsoft.Graph' 'Fail' $report.Graph.Message }
+    if ($exoOk -and $graphOk) { & $light 'Cloud modules' 'Ok' ('Exchange Online {0}, Microsoft Graph {1} (Authentication and Users).' -f $report.Exo.Version,$report.Graph.Version) }
+    else { & $light 'Cloud modules' 'Fail' (@($report.Messages) -join ' ') }
     if (-not $SyncEnabled) { & $light 'Entra Connect sync' 'NA' 'Not used: EntraConnect.Sync is off in the configuration.' }
     elseif ($SyncServer) { & $light 'Entra Connect sync' 'Ok' ('The synchronisation is started on {0}.' -f $SyncServer) }
     elseif (Get-PraGuiHighestModule @('ADSync') -Refresh:$Refresh) { & $light 'Entra Connect sync' 'Ok' 'ADSync module found on this server.' }
@@ -998,12 +997,12 @@ function Add-PraGuiNetworkLight {
 
 
 #region Window: run settings (fields, overrides), phase, task, batches
-$script:GuiTextFields = @('Env','Dc','Tenant','Org','AppId','Thumb','ExpMax','ExpConfig','Identity','Ou','Csv','CheckUpn')
+$script:GuiTextFields = @('Env','Dc','Tenant','Org','AppId','Thumb','ExpMax','ExpConfig','Identity','Ou','Group','Csv','CheckUpn')
 $script:GuiChoices = [ordered]@{
     Scope=@('All','UsersOnly','SharedOnly'); Signin=@('Cert','Wam'); ExpPhase=@('Auto','AD','Cloud','Both'); ExpExpect=@('Provisioned','Deprovisioned','Retained')
-    Source=@('Single','Scope','Ou','Csv')
+    Source=@('Single','Scope','Ou','Group','Csv')
 }
-# The run settings that can differ from the configuration file (Source, Identity, Ou, Csv and CheckUpn belong to the task, not to the settings).
+# The run settings that can differ from the configuration file (Source, Identity, Ou, Group, Csv and CheckUpn belong to the task, not to the settings).
 $script:GuiSettingKeys = @('Env','Dc','Scope','Signin','Tenant','Org','AppId','Thumb','ExpPhase','ExpMax','ExpExpect','ExpOnce','Repl','ExpConfig')
 $script:GuiActionTitle = @{ Convert='Move mailboxes to Exchange Online'; Recover='Roll back a conversion'; Finalize='Complete a rollback'; Check='Check a mailbox' }
 $script:GuiActionWord = @{ Convert='CONVERT'; Recover='RECOVER'; Finalize='FINALIZE' }
@@ -1030,7 +1029,7 @@ function Set-PraGuiField {
         if ($script:GuiChoices.Contains($Key)) {
             foreach ($choice in $script:GuiChoices[$Key]) {
                 $radio=$c[('S_{0}_{1}' -f $Key,$choice)]
-                if ($radio) { $radio.IsChecked=(Test-GuiOrdinal $choice $Value) }
+                if ($radio) { $radio.IsChecked=(Test-GuiOrdinal $choice $Value -IgnoreCase) }
             }
         }
         elseif ((Test-GuiOrdinalIn $Key @('ExpOnce','Repl') -IgnoreCase)) { $c[('F_'+$Key)].IsChecked=[bool]$Value }
@@ -1062,7 +1061,7 @@ function Test-PraGuiModified {
     if (-not $g.Defaults) { return $false }
     $value=Get-PraGuiField $Key; $default=$g.Defaults[$Key]
     if ((Test-GuiOrdinalIn $Key @('ExpOnce','Repl') -IgnoreCase)) { return [bool]$value -ne [bool]$default }
-    return -not (Test-GuiOrdinal ([string]$value) ([string]$default))
+    return -not (Test-GuiOrdinal ([string]$value) ([string]$default) -IgnoreCase)
 }
 
 function Get-PraGuiOverride {
@@ -1070,17 +1069,17 @@ function Get-PraGuiOverride {
     $g=$script:Gui; $d=$g.Defaults
     $override=@{}; $cloud=@{}
     $environment=Get-PraGuiField 'Env'
-    if (-not (Test-GuiOrdinal $environment $d.Env)) { $override.Environment=$environment }
+    if (-not (Test-GuiOrdinal $environment $d.Env -IgnoreCase)) { $override.Environment=$environment }
     $controller=Get-PraGuiField 'Dc'
-    if (-not (Test-GuiOrdinal $controller $d.Dc)) { $override.DomainController=$controller }
+    if (-not (Test-GuiOrdinal $controller $d.Dc -IgnoreCase)) { $override.DomainController=$controller }
     foreach ($pair in @(@('Tenant','TenantId'),@('Org','Organization'))) {
         $value=Get-PraGuiField $pair[0]
-        if (-not (Test-GuiOrdinal $value $d[$pair[0]])) { $cloud[$pair[1]]=$value }
+        if (-not (Test-GuiOrdinal $value $d[$pair[0]] -IgnoreCase)) { $cloud[$pair[1]]=$value }
     }
     if ((Test-GuiOrdinal (Get-PraGuiField 'Signin') 'Cert' -IgnoreCase)) {
         foreach ($pair in @(@('AppId','AppId'),@('Thumb','CertificateThumbprint'))) {
             $value=Get-PraGuiField $pair[0]
-            if (-not (Test-GuiOrdinal $value $d[$pair[0]])) { $cloud[$pair[1]]=$value }
+            if (-not (Test-GuiOrdinal $value $d[$pair[0]] -IgnoreCase)) { $cloud[$pair[1]]=$value }
         }
     } else {
         # Interactive sign-in: the certificate pair of the file is not used by this run.
@@ -1172,12 +1171,12 @@ function Get-PraGuiBlocker {
 $script:GuiStepInfo = @{
     'Active Directory connection'='Connects to the domain controller and checks your rights. Nothing is changed.'
     'Targets and planned changes'='Reads each selected account in Active Directory, checks that it can be converted and works out the exact changes.'
-    'Exchange Online pre-check'='Signs in to the cloud and checks the tenant and the accounts BEFORE the first Active Directory change.'
+    'Exchange Online pre-check'='Signs in to the cloud and checks the tenant and the accounts before the first Active Directory change.'
     'Backup and Active Directory changes'='Saves the current Active Directory data of every object to the batch folder, changes the attributes, then reads each object back to verify.'
     'Entra Connect synchronisation'='Asks Entra Connect to copy the change to the cloud and waits until it is done.'
     'Active Directory replication'='Pushes each changed object from the domain controller that was written to the other domain controllers and reads it back, so that the synchronisation sees the change.'
     'Exchange Online: mailboxes, licences and permissions'='Waits for each cloud mailbox, checks its licence and puts back the permissions of the shared mailboxes.'
-    'Creating the transfer package'='Packs everything the other server needs into ONE file, with its checksums.'
+    'Creating the transfer package'='Packs everything the other server needs into ONE zip file, with its .sha256 file next to it.'
     'Loading the batch of the AD phase'='Opens the batch and the Active Directory proof brought from the AD server and verifies every checksum.'
     'Loading the Recover batch'='Opens the rollback batch and the original conversion batch and verifies every checksum.'
     'Loading the Convert batch'='Finds the original conversion batch and checks that its backup files are there and intact.'
@@ -1272,12 +1271,21 @@ function Get-PraGuiSourceText {
             return @('Configured scope',('Scope of the configuration file (read only): {0}. Change it in the file, not here.' -f $where))
         }
         'Ou' { return @('Organizational unit',('{0} (sub-OUs included).' -f (Get-PraGuiField 'Ou'))) }
+        'Group' { return @('AD group',('{0} (members of nested groups included).' -f (Get-PraGuiField 'Group'))) }
         'Csv' {
             $path=Get-PraGuiField 'Csv'; $rows=''
             try { if ($path -and (Test-Path -LiteralPath $path -PathType Leaf)) { $rows=' ' + (ConvertTo-PraGuiPlural @(Read-PraTargetCsv -Path $path).Count 'row' 'rows') + '.' } } catch { $rows=' ' + $_.Exception.Message }
             return @('CSV file',($path+'.'+$rows))
         }
     }
+}
+
+function Get-PraGuiSourceSummary {
+    <# The object source in one line: its title and what was typed or picked (identity, OU, AD group or CSV file). #>
+    $title=(Get-PraGuiSourceText)[0]
+    $value=switch (Get-PraGuiField 'Source') { 'Single' { Get-PraGuiField 'Identity' } 'Ou' { Get-PraGuiField 'Ou' } 'Group' { Get-PraGuiField 'Group' } 'Csv' { Get-PraGuiField 'Csv' } default { '' } }
+    if ($value) { return ($title + ' ' + $value) }
+    return $title
 }
 
 function Get-PraGuiBatchCreated {
@@ -1467,7 +1475,7 @@ function Update-PraGuiSettingsView {
     $c.EnvLock.Visibility=Get-PraGuiVisibility ([bool]$g.EnvLock)
     if ($g.EnvLock) {
         $text='Locked to {0}: the chosen batch was created there, and a batch only continues in its own environment.' -f $g.EnvLock
-        if ($g.State.Config -and -not (Test-GuiOrdinal $g.EnvLock $g.Defaults.Env)) { $text+=' The configuration file says {0}.' -f $g.Defaults.Env }
+        if ($g.State.Config -and -not (Test-GuiOrdinal $g.EnvLock $g.Defaults.Env -IgnoreCase)) { $text+=' The configuration file says {0}.' -f $g.Defaults.Env }
         $c.EnvLockText.Text=$text
     }
     $c.R_ExpConfig.IsEnabled=[bool](Get-PraGuiField 'ExpConfig')
@@ -1537,18 +1545,19 @@ function Get-PraGuiWindowRequest {
         if (-not $row) { throw 'Pick the batch (or the transfer package) first.' }
         $batch=[string]$row.Path
     }
-    $identity=''; $ou=''; $csv=''
+    $identity=''; $ou=''; $csv=''; $group=''
     if ((Test-GuiOrdinal $action 'Check' -IgnoreCase)) { $identity=Get-PraGuiField 'CheckUpn' }
     elseif ((Test-GuiOrdinal $action 'Convert' -IgnoreCase) -and (Test-GuiOrdinalIn $phase @('AD','Both') -IgnoreCase) -and -not $finish) {
         switch (Get-PraGuiField 'Source') {
             'Single' { $identity=Get-PraGuiField 'Identity'; if (-not $identity) { throw 'Type the identity of the account to process.' } }
             'Ou' { $ou=Get-PraGuiField 'Ou'; if (-not $ou) { throw 'Pick or type the distinguished name of the OU.' } }
+            'Group' { $group=Get-PraGuiField 'Group'; if (-not $group) { throw 'Type the name or the distinguished name of the AD group.' } }
             'Csv' { $csv=Get-PraGuiField 'Csv'; if (-not $csv) { throw 'Choose a CSV file with a column named Identity.' } }
         }
     }
     $once=[bool](Get-PraGuiField 'ExpOnce') -and ((Test-GuiOrdinal $action 'Check' -IgnoreCase) -or ((Test-GuiOrdinalIn $action @('Convert','Recover') -IgnoreCase) -and (-not (Test-GuiOrdinal $phase 'AD' -IgnoreCase))))
     $pass=if ((Test-GuiOrdinal $action 'Finalize' -IgnoreCase)) { 'AD' } else { $phase }
-    return New-PraGuiRequest -Action $action -Mode $Mode -Phase $pass -Batch $batch -Identity $identity -SearchBase $ou -CsvPath $csv -Scope (Get-PraGuiField 'Scope') -MaxObjects $limit -Expect (Get-PraGuiField 'ExpExpect') -Once $once -Finish $finish
+    return New-PraGuiRequest -Action $action -Mode $Mode -Phase $pass -Batch $batch -Identity $identity -SearchBase $ou -CsvPath $csv -Group $group -Scope (Get-PraGuiField 'Scope') -MaxObjects $limit -Expect (Get-PraGuiField 'ExpExpect') -Once $once -Finish $finish
 }
 
 function Test-PraGuiTaskReady {
@@ -1562,6 +1571,7 @@ function Test-PraGuiTaskReady {
             switch (Get-PraGuiField 'Source') {
                 'Single' { return [bool](Get-PraGuiField 'Identity') }
                 'Ou' { return [bool](Get-PraGuiField 'Ou') }
+                'Group' { return [bool](Get-PraGuiField 'Group') }
                 'Csv' { return [bool](Get-PraGuiField 'Csv') }
                 default { return $true }
             }
@@ -1623,7 +1633,7 @@ function Update-PraGuiTaskView {
     if ($newConvert) {
         $source=Get-PraGuiField 'Source'
         $c.Row_Identity.Visibility=Get-PraGuiVisibility ((Test-GuiOrdinal $source 'Single' -IgnoreCase)); $c.Row_ScopeInfo.Visibility=Get-PraGuiVisibility ((Test-GuiOrdinal $source 'Scope' -IgnoreCase))
-        $c.Row_Ou.Visibility=Get-PraGuiVisibility ((Test-GuiOrdinal $source 'Ou' -IgnoreCase)); $c.Row_Csv.Visibility=Get-PraGuiVisibility ((Test-GuiOrdinal $source 'Csv' -IgnoreCase))
+        $c.Row_Ou.Visibility=Get-PraGuiVisibility ((Test-GuiOrdinal $source 'Ou' -IgnoreCase)); $c.Row_Group.Visibility=Get-PraGuiVisibility ((Test-GuiOrdinal $source 'Group' -IgnoreCase)); $c.Row_Csv.Visibility=Get-PraGuiVisibility ((Test-GuiOrdinal $source 'Csv' -IgnoreCase))
         $text=Get-PraGuiSourceText
         $c.ScopeInfoText.Text=$text[1]
         $c.SourceInfo.Text=$(if ((Test-GuiOrdinal $source 'Csv' -IgnoreCase) -and (Get-PraGuiField 'Csv')) { $text[1] } else { '' })
@@ -1660,7 +1670,7 @@ function Update-PraGuiVerifyView {
     $c.ConfirmBox.IsEnabled=($null -ne $g.Pending) -and -not $g.Run
     $c.ConfirmText.Text=$(if ($word) { "To start, type $word in the box (capitals or not). This avoids a run started by a stray click." } else { '' })
     $c.ConfirmTick.Visibility=$(if ($g.Pending -and $word -and (Test-PraGuiConfirmed)) { 'Visible' } else { 'Hidden' })
-    $source=if ($g.SelectedBatch) { ('Batch ' + [string]$g.SelectedBatch.BatchId) } elseif ((Test-GuiOrdinal $action 'Check' -IgnoreCase)) { Get-PraGuiField 'CheckUpn' } elseif ((Test-GuiOrdinal $action 'Convert' -IgnoreCase)) { (Get-PraGuiSourceText)[0] } else { '' }
+    $source=if ($g.SelectedBatch) { ('Batch ' + [string]$g.SelectedBatch.BatchId) } elseif ((Test-GuiOrdinal $action 'Check' -IgnoreCase)) { Get-PraGuiField 'CheckUpn' } elseif ((Test-GuiOrdinal $action 'Convert' -IgnoreCase)) { Get-PraGuiSourceSummary } else { '' }
     $changed=@($script:GuiSettingKeys | Where-Object { -not ((Test-GuiOrdinal $_ 'Env' -IgnoreCase) -and $g.EnvLock) -and -not ((Test-GuiOrdinalIn $_ @('AppId','Thumb') -IgnoreCase) -and (-not (Test-GuiOrdinal (Get-PraGuiField 'Signin') 'Cert' -IgnoreCase))) -and (Test-PraGuiModified $_) }).Count
     $replicationLine=if ((Test-GuiOrdinalIn $action @('Convert','Recover','Finalize') -IgnoreCase) -and [bool](Get-PraGuiField 'Repl')) { "`nActive Directory replication before the sync: on" } else { '' }
     $c.UsedText.Text="Environment: $(Get-PraGuiField 'Env')`nDomain controller: $(if (Get-PraGuiField 'Dc') { Get-PraGuiField 'Dc' } else { 'chosen automatically' })`nObjects: $source`nMailbox scope: $(Get-PraGuiField 'Scope')`nSign-in: $(if ((Test-GuiOrdinal (Get-PraGuiField 'Signin') 'Cert' -IgnoreCase)) { 'Certificate' } else { 'Interactive (WAM)' })$replicationLine" +
@@ -1995,7 +2005,7 @@ function Invoke-PraGuiItemEvent {
     $status=ConvertTo-PraGuiStatus ([string](Get-PraGuiValue $Record 'status' 'Info'))
     $text=[string](Get-PraGuiValue $Record 'text' '')
     # The engine names the object of an item (`name`: UPN or account name). An identity that is not an object (a DN, a server, 'Batch', a bare GUID) is not
-    # listed as a mailbox. An engine that sends no `name` (older, synthetic) is read as before: the identity, when it looks like an account name.
+    # listed as a mailbox. An event without `name` is read from its identity, when that looks like an account name.
     $identity=[string](Get-PraGuiValue $Record 'name' $null)
     if ($null -eq (Get-PraGuiValue $Record 'name' $null)) {
         $raw=[string](Get-PraGuiValue $Record 'identity' '')
@@ -2505,8 +2515,8 @@ function Get-PraGuiPackageInfo {
     $g=$script:Gui
     $key=Get-PraGuiPackageKey $Path
     if ($g.PkgCache.ContainsKey($key)) { return $g.PkgCache[$key] }
-    $known=($g.PkgJob -and (Test-GuiOrdinal $g.PkgJob.Key $key))
-    foreach ($entry in $g.PkgQueue) { if (Test-GuiOrdinal $entry.Key $key) { $known=$true } }
+    $known=($g.PkgJob -and (Test-GuiOrdinal $g.PkgJob.Key $key -IgnoreCase))
+    foreach ($entry in $g.PkgQueue) { if (Test-GuiOrdinal $entry.Key $key -IgnoreCase) { $known=$true } }
     if (-not $known) { [void]$g.PkgQueue.Add(@{ Mode='Verify'; Path=$Path; Key=$key; Then=$null }); Start-PraGuiNextPackageJob }
     return [pscustomobject]@{ Valid=$false; Pending=$true; Error='Checking the checksums...'; Name=[IO.Path]::GetFileName($Path); Kind=''; Environment=''; CreatedUtc=''; BatchId=''; SizeBytes=[long]0 }
 }
@@ -2660,7 +2670,8 @@ function Update-PraGuiNext {
         Add-PraGuiNextStep 1 'Go back to the Run page and click the red step: it explains in plain words what failed.'
         Add-PraGuiNextStep 2 'Fix the cause (the message above says what to look at).'
         Add-PraGuiNextStep 3 "Click 'Start a new task', pick the same batch (or package) again, preview and run. Objects already done are recognised and skipped by the engine."
-        foreach ($line in $steps) { if (([string]$line).Contains('replication was NOT confirmed')) { Add-PraGuiNextStep 4 ([string]$line) } }
+        $extra=3
+        foreach ($line in $steps) { if (([string]$line).Contains('replication was NOT confirmed') -or ([string]$line).StartsWith('Nothing was written to Active Directory.',[StringComparison]::Ordinal) -or ([string]$line).StartsWith('The package was extracted to ',[StringComparison]::Ordinal)) { $extra++; Add-PraGuiNextStep $extra ([string]$line) } }
         $c.ResultText.Text=('Failed (native code {0}). Raw output: {1}.stdout.txt' -f $last.ExitCode,$last.Base)
         $c.BatchLine.Text=$(if ($batchId) { "$batchId · stopped" } else { 'stopped' })
         Add-PraGuiTimeline 'Active Directory' $(if ((Test-GuiOrdinalIn $phase @('AD','Both','Finalize') -IgnoreCase)) { 'Stopped' } else { 'Not part of this run' }) $(if ((Test-GuiOrdinalIn $phase @('AD','Both','Finalize') -IgnoreCase)) { 'Fail' } else { 'Skip' }) $false
@@ -2677,23 +2688,24 @@ function Update-PraGuiNext {
         $file=Get-Item -LiteralPath $package -ErrorAction SilentlyContinue
         $c.NextPillText.Text='Next step required'; Set-PraGuiPill $c.NextPill $c.NextPillText 'Warn'
         $c.NextTitle.Text=switch ($kind) { 'Convert' { 'The Active Directory part is done' } 'Recover' { 'The Active Directory rollback is done' } default { 'The cloud part of the rollback is done' } }
-        $c.NextLead.Text="Copy ONE file to the $target server: $(Split-Path $package -Leaf)"
+        $packageLeaf=Split-Path $package -Leaf
+        $c.NextLead.Text="Copy these two files to the $target server, into the same folder: $packageLeaf and $packageLeaf.sha256"
         $c.PackageBox.Visibility='Visible'
         $c.PkgName.Text=Split-Path $package -Leaf; $c.PkgPath.Text=$package
-        $c.PkgInfo.Text=if ($file) { '{0:n1} MB · checksums verified' -f ($file.Length/1MB) } else { 'The file is no longer at this path.' }
+        $c.PkgInfo.Text=if ($file) { '{0:n1} MB · checksums verified · its .sha256 file is in the same folder: copy both' -f ($file.Length/1MB) } else { 'The file is no longer at this path.' }
         $inbox=Join-Path $g.State.Config.Storage.BackupFolder 'Inbox'
         $taskName=switch ($kind) { 'Convert' { "'Move mailboxes to Exchange Online'" } 'Recover' { "'Roll back a conversion'" } default { "'Complete a rollback'" } }
-        $continue=if (Test-GuiOrdinal $kind 'Finalize') { "click 'Import package...' and pick the file" } else { "choose 'Continue an existing batch', click 'Import package...' and pick the file" }
+        $continue=if (Test-GuiOrdinal $kind 'Finalize') { "click 'Import package...' and pick the .zip file" } else { "choose 'Continue an existing batch', click 'Import package...' and pick the .zip file" }
         # The Entra Connect sync could not start after the AD changes: the package is written all the same, but the sync comes first (the engine says why and what to run).
         if ($syncLines.Count) {
             if ($syncFailed) { $c.NextTitle.Text='The Active Directory part is done, but the sync did not start' }
-            $c.NextLead.Text="Run the sync first (see the steps below), then copy ONE file to the $target server: $(Split-Path $package -Leaf)"
+            $c.NextLead.Text="Run the sync first (see the steps below), then copy these two files to the $target server, into the same folder: $packageLeaf and $packageLeaf.sha256"
         }
         $stepNumber=0
         foreach ($line in $syncLines) { $stepNumber++; Add-PraGuiNextStep $stepNumber ([string]$line) }
-        Add-PraGuiNextStep ($stepNumber+1) "Copy this one file to the $target server, anywhere you like. It carries everything the next part needs, with its checksums."
+        Add-PraGuiNextStep ($stepNumber+1) "Copy the two files $packageLeaf and $packageLeaf.sha256 to the $target server, both into the same folder, anywhere you like. The .zip carries everything the next part needs; the .sha256 file lets the tool check it. Do not rename them."
         Add-PraGuiNextStep ($stepNumber+2) "On the $target server, open this console (Invoke-PraRemoteMailbox.ps1 -Gui)."
-        Add-PraGuiNextStep ($stepNumber+3) "Choose $taskName, $continue. Or drop the file in $inbox : it is listed by itself."
+        Add-PraGuiNextStep ($stepNumber+3) "Choose $taskName, $continue. Or drop both files in $inbox : the package is listed by itself."
         $timelineKind=$kind
     } else {
         $pendingCount=[int](Get-PraGuiValue $r 'pending' 0)
@@ -2765,8 +2777,9 @@ function Open-PraGuiPath {
 }
 
 function Get-PraGuiIdentityCommand {
-    param([string]$Root, [string]$ConfigPath, [string]$Identity, [string]$ResultPath)
-    $tokens=@('-NoProfile','-NonInteractive','-STA','-File',(Join-Path $Root 'module\PRA.Gui.Directory.ps1'),'-ConfigPath',$ConfigPath,'-ResultPath',$ResultPath,'-Identity',$Identity)
+    param([string]$Root, [string]$ConfigPath, [string]$Identity, [string]$ResultPath, [string]$Group='')
+    $tokens=@('-NoProfile','-NonInteractive','-STA','-File',(Join-Path $Root 'module\PRA.Gui.Directory.ps1'),'-ConfigPath',$ConfigPath,'-ResultPath',$ResultPath)
+    if ($Group) { $tokens+=@('-Group',$Group) } else { $tokens+=@('-Identity',$Identity) }
     return [pscustomobject]@{ FilePath=(Get-PraGuiEngine); Arguments=(@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ') }
 }
 
@@ -2803,8 +2816,58 @@ function Start-PraGuiIdentityLookup {
     $base=Join-Path $folder ('id-'+[guid]::NewGuid().ToString('N'))
     $command=Get-PraGuiIdentityCommand $g.Root $g.ConfigPath $identity ($base+'.json')
     $child=Start-PraGuiChildProcess $command $g.Root ($base+'.events.jsonl')
-    $g.IdLookup=@{ Process=$child.Process; Output=$child.Output; Errors=$child.Errors; Path=($base+'.json'); Identity=$identity; Clock=[Diagnostics.Stopwatch]::StartNew() }
+    $g.IdLookup=@{ Process=$child.Process; Output=$child.Output; Errors=$child.Errors; Path=($base+'.json'); Identity=$identity; Kind='Identity'; Clock=[Diagnostics.Stopwatch]::StartNew() }
     Set-PraGuiIdentityInfo 'Looking it up in Active Directory (read only)...'
+    $g.Timer.Start()
+}
+
+function Set-PraGuiGroupInfo {
+    param([string]$Text, [string]$Level='Info')
+    $c=$script:Gui.Controls
+    $c.GroupInfo.Text=$Text
+    $key=switch ($Level) { 'Ok' { 'PraSuccess' } 'Warn' { 'PraCaution' } 'Fail' { 'PraCritical' } default { 'TextFillColorSecondaryBrush' } }
+    $c.GroupInfo.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty,$key)
+}
+
+function Show-PraGuiGroupResult {
+    <# What the read-only lookup found: the group and its number of members, or the plain reason. #>
+    param([string]$Group, $Result)
+    if (-not [bool](Get-PraGuiValue $Result 'Success' $false)) {
+        $reason=[string](Get-PraGuiValue $Result 'Error' 'the lookup failed.')
+        if ($reason -match 'was not found in Active Directory') { Set-PraGuiGroupInfo $reason 'Fail' }
+        elseif ($reason -match '^(?<head>\d+ groups are named .+?: give the distinguished name of the one to use)\.(?: They are: (?<list>.*?)\.?)?$') {
+            # Several groups have the name: that is an answer, with the distinguished name of each.
+            $lines=@($Matches['head'])
+            if ($Matches['list']) { $lines+=@(($Matches['list'] -split ' \| ') | ForEach-Object { '  ' + $_ }) }
+            Set-PraGuiGroupInfo ($lines -join "`n") 'Warn'
+        }
+        else { Set-PraGuiGroupInfo ('Could not check: ' + $reason) 'Warn' }
+        return
+    }
+    if ([int](Get-PraGuiValue $Result 'Members' 0) -lt 1) {
+        Set-PraGuiGroupInfo ('{0} · {1} · no member: nothing to convert' -f [string](Get-PraGuiValue $Result 'Name' ''),[string](Get-PraGuiValue $Result 'DistinguishedName' '')) 'Warn'
+        return
+    }
+    Set-PraGuiGroupInfo ('{0} · {1} · {2}' -f [string](Get-PraGuiValue $Result 'Name' ''),[string](Get-PraGuiValue $Result 'DistinguishedName' ''),(ConvertTo-PraGuiPlural ([int](Get-PraGuiValue $Result 'Members' 0)) 'member, including nested groups' 'members, including nested groups')) 'Ok'
+}
+
+function Start-PraGuiGroupLookup {
+    <# Looks the group up (read only): its name, its distinguished name and its number of members. Tests and screenshots pass -GroupProbe; otherwise a child process does it. #>
+    $g=$script:Gui
+    $group=Get-PraGuiField 'Group'
+    if (-not $group) { Set-PraGuiGroupInfo ''; return }
+    if ($g.Run -or $g.OuLookup -or $g.IdLookup) { return }
+    if ($g.GroupProbe) {
+        try { Show-PraGuiGroupResult $group (& $g.GroupProbe $group) } catch { Show-PraGuiGroupResult $group ([pscustomobject]@{ Success=$false; Error=$_.Exception.Message }) }
+        return
+    }
+    $folder=Join-Path $g.Root 'logs\gui'
+    Initialize-PraPrivateFolder (Join-Path $g.Root 'logs'); Initialize-PraPrivateFolder $folder
+    $base=Join-Path $folder ('grp-'+[guid]::NewGuid().ToString('N'))
+    $command=Get-PraGuiIdentityCommand $g.Root $g.ConfigPath '' ($base+'.json') -Group $group
+    $child=Start-PraGuiChildProcess $command $g.Root ($base+'.events.jsonl')
+    $g.IdLookup=@{ Process=$child.Process; Output=$child.Output; Errors=$child.Errors; Path=($base+'.json'); Identity=$group; Kind='Group'; Clock=[Diagnostics.Stopwatch]::StartNew() }
+    Set-PraGuiGroupInfo 'Looking it up in Active Directory (read only)...'
     $g.Timer.Start()
 }
 
@@ -2820,7 +2883,10 @@ function Complete-PraGuiIdentityLookup {
     } catch { $result=[pscustomobject]@{ Success=$false; Error=$_.Exception.Message } }
     finally { $lookup.Process.Dispose(); $g.IdLookup=$null; Sync-PraGuiTimer }
     # An answer for text that was changed meanwhile is dropped.
-    if (Test-GuiOrdinal (Get-PraGuiField 'Identity') $lookup.Identity) { Show-PraGuiIdentityResult $lookup.Identity $result } else { Set-PraGuiIdentityInfo '' }
+    if (Test-GuiOrdinal $lookup.Kind 'Group') {
+        if (Test-GuiOrdinal (Get-PraGuiField 'Group') $lookup.Identity -IgnoreCase) { Show-PraGuiGroupResult $lookup.Identity $result } else { Set-PraGuiGroupInfo '' }
+    }
+    elseif (Test-GuiOrdinal (Get-PraGuiField 'Identity') $lookup.Identity -IgnoreCase) { Show-PraGuiIdentityResult $lookup.Identity $result } else { Set-PraGuiIdentityInfo '' }
 }
 
 function Get-PraGuiOuCommand {
@@ -2975,6 +3041,7 @@ function Invoke-PraGuiClick {
             'BtnCopyCmd' { [Windows.Clipboard]::SetText($c.CmdLine.Text) }
             'BtnPickOu' { Start-PraGuiOuLookup }
             'BtnCheckIdentity' { Start-PraGuiIdentityLookup }
+            'BtnCheckGroup' { Start-PraGuiGroupLookup }
             'BtnPickCsv' {
                 $dialog=New-Object Microsoft.Win32.OpenFileDialog; $dialog.Filter='List (*.csv)|*.csv'
                 if ($dialog.ShowDialog($g.Form)) { Set-PraGuiField 'Csv' $dialog.FileName; Invoke-PraGuiChange }
@@ -3073,7 +3140,7 @@ function New-PraGuiXmlNamespace {
 function New-PraGuiWindow {
     <# Constructs and binds the window without ShowDialog and without starting an operation. -PrerequisiteProbe replaces the real detection (tests, screenshots); with it, Microsoft 365 is not tested unless -NetworkProbe (a task per host) is given too; the Entra Connect check is likewise made only with -SyncProbe. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Root, [string]$ConfigPath='', [string]$Version='', [ValidateSet('System','Light','Dark')][string]$Theme='System', [scriptblock]$PrerequisiteProbe, [scriptblock]$IdentityProbe, [scriptblock]$NetworkProbe, [double]$NetworkSeconds=3, [scriptblock]$SyncProbe, [double]$SyncSeconds=20)
+    param([Parameter(Mandatory)][string]$Root, [string]$ConfigPath='', [string]$Version='', [ValidateSet('System','Light','Dark')][string]$Theme='System', [scriptblock]$PrerequisiteProbe, [scriptblock]$IdentityProbe, [scriptblock]$GroupProbe, [scriptblock]$NetworkProbe, [double]$NetworkSeconds=3, [scriptblock]$SyncProbe, [double]$SyncSeconds=20)
     if ((-not (Test-GuiOrdinal ([Threading.Thread]::CurrentThread.GetApartmentState()) 'STA' -IgnoreCase))) { throw 'WPF requires an STA host (pwsh.exe -STA).' }
     if ($script:Gui -and $script:Gui.Run) { throw 'Cannot replace a window while its engine is running.' }
     if ($script:Gui -and $script:Gui.Form.IsVisible) { throw 'A PRA window is already open in this host.' }
@@ -3097,7 +3164,7 @@ function New-PraGuiWindow {
     $script:Gui=@{
         Form=$form; Controls=$controls; Timer=$timer; Root=[IO.Path]::GetFullPath($Root); ConfigPath=$ConfigPath; InitialConfigPath=$ConfigPath
         PkgCache=@{}; PkgQueue=(New-Object 'Collections.Generic.List[object]'); PkgJob=$null
-        State=$null; Run=$null; OuLookup=$null; IdLookup=$null; IdentityProbe=$IdentityProbe; Pending=$null; LastResult=$null; LastRun=$null; Model=$null; Updating=1; InTick=$false; Page=1
+        State=$null; Run=$null; OuLookup=$null; IdLookup=$null; IdentityProbe=$IdentityProbe; GroupProbe=$GroupProbe; Pending=$null; LastResult=$null; LastRun=$null; Model=$null; Updating=1; InTick=$false; Page=1
         Action=''; Mode='New'; SelectedBatch=$null; EnvLock=$null; EnvSaved=$null; Defaults=$null; Detect=$null; Probe=$probe; NetProbe=$netProbe; NetSeconds=$NetworkSeconds; NetJob=$null; NetResult=$null
         SyncProbe=$syncProbe; SyncSeconds=$SyncSeconds; SyncJob=$null; SyncResult=$null
         Previewed=$false; PreviewError=''; Filter='All'; HasFinalize=$false; KnownEnvironments=@()
@@ -3150,6 +3217,9 @@ function New-PraGuiWindow {
     $c.F_Identity.Add_TextChanged({ if ($script:Gui.Updating -eq 0) { Set-PraGuiIdentityInfo '' } })
     $c.F_Identity.Add_LostFocus({ if ($script:Gui.Updating -eq 0 -and $script:Gui.Page -eq 2) { try { Start-PraGuiIdentityLookup } catch { Set-PraGuiIdentityInfo $_.Exception.Message 'Warn' } } })
     $c.F_Identity.Add_KeyDown({ param($sender,$keyArguments) if ([int]$keyArguments.Key -eq [int][Windows.Input.Key]::Return) { try { Start-PraGuiIdentityLookup } catch { Set-PraGuiIdentityInfo $_.Exception.Message 'Warn' } } })
+    $c.F_Group.Add_TextChanged({ if ($script:Gui.Updating -eq 0) { Set-PraGuiGroupInfo '' } })
+    $c.F_Group.Add_LostFocus({ if ($script:Gui.Updating -eq 0 -and $script:Gui.Page -eq 2) { try { Start-PraGuiGroupLookup } catch { Set-PraGuiGroupInfo $_.Exception.Message 'Warn' } } })
+    $c.F_Group.Add_KeyDown({ param($sender,$keyArguments) if ([int]$keyArguments.Key -eq [int][Windows.Input.Key]::Return) { try { Start-PraGuiGroupLookup } catch { Set-PraGuiGroupInfo $_.Exception.Message 'Warn' } } })
     $c.ConfirmBox.Add_TextChanged({ Update-PraGuiView })
     $c.BatchList.Add_SelectionChanged({
         $gui=$script:Gui
@@ -3195,8 +3265,8 @@ Export-ModuleMember -Function Show-PraGui,New-PraGuiWindow,New-PraGuiRequest,Get
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBQ/WZsRANupUje
-# xv8IPbuTVY3VSlKr9LAQ0mZvuKZMXKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD3nI+ntdiOlVBt
+# mo886shkLVukJ9KkH467GecJng9XIqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -3273,23 +3343,23 @@ Export-ModuleMember -Function Show-PraGui,New-PraGuiWindow,New-PraGuiRequest,Get
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAyRL9yyYXG
-# UiCkY0YpzU82alQ4Ejg+qEsiyvyH35h1szANBgkqhkiG9w0BAQEFAASCAgCXsztI
-# fZSRYfXcYiw54itEShYUTSLuqh6idhc+u1Fsc9bfE9esRxisM75baatcfMm0NMvl
-# Qv+yH8BIezsUxWh7tBfTCrkXWazOnlzqBOLB4TXqjSBmnapr5rVsc5lWojohpJk3
-# hUn97siUT0SATdl/Fz9wfgxIg6PAiOdXiPbL6J1I+19wN6m1FxdrxAlqne9RKiU1
-# YltQanadOtgPKRis7vwKYzJO3HM01zsK6qFb9TKI/0Uk6CR4HHpS1/ceHjeDyiNC
-# K5uDNpVZuDC8cTatMeV4nyWm1gXVK/vgFfZKUCdHLwWQBkBGep4BE4J1n8KVs6Sk
-# mSBAxdqVb5Q1BNdL+0jTypS7C0YqVVmki0MvrKkUMGeCz8epjslrNVbXw2lJYLwT
-# SNbXxvM9jUPnZqxG7SZAGzjZc2WOCUaA4bDRD9KQpNOtozUJAI+i0EbYvhqwlcph
-# 5bQUGYF+b/AGO/48gu/PTAfUcz0rk/U+HZjkNWAUsYbbYDKwOuL4m378ZUsuLflV
-# oaXK6siFwX2K6QzqzA+I2B2tRvpr3NPO9lw3PFk/KnbezDJNfkYcgnry4nqucViY
-# hY8WKX23rXtMA1j3lESYwrqtk+CuaDbwYN4HboAmlehqp9GA7IeahcCb+NVVP7Lx
-# Cajz7iqdOs+Xgi5DuW3C5u5JcLejd6dvoCuh+qGCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCw9/I0QZ7Q
+# 509ysK6eBYtkbOyNE5N739TeWMWMiQxL7jANBgkqhkiG9w0BAQEFAASCAgBB/1dk
+# Ky0yHViIE/xS6IWnh3eHXUmq0UbeUVAqArXBJWPBR+96jYdd3X9EshH6IvEJYglI
+# ZvtWbL18OtDO3xcdsrxqfJY6hIc+o/2CqIP9RrHfMGTsPtdz/rtCzvHn3cs2kjx+
+# T3OEdFMpfdTHMbglTgzYwAZIsprVQe+UoFOoP2RBlhVZsBLB2jV2nOMayKNw4qgG
+# yI9SqVGyPnoithMPzm1EYBwP9US0BLB8zAPuaerNIbo7LoFsOA8GgiOBOnX+WJX+
+# pO9jvVoC3nwobaUkeMusVYqB7rzTqZxQrvSR47WDU/25Sch+efHIxepvdz+Lnd7V
+# IJEH8sDG8LxU2C7qbygJDvSCA96TfOA0UQbV6EoX0WXT/xJbPb/g5AVFLB+jH4n9
+# nY9EP36JKE7lIEmNS6Um5NmXM3Ri6xnyuaV9wVrhJp3uaepqV1mmZ6MpXC8AOqR/
+# midISHstiAkTdMu22jVx+KU9slEWILsLZiNk6PLHcXvYqR2zx5UAyFdhKlNlQYlt
+# V7+6QePwu6txlEU0w0z78e+Mmxsm3Dhwk9qLjbyTQi7yHXAamEtl/r990rTu0/GA
+# oB3+BVVRlJANrFHuKBR+/XS2PL8KEruXSgo3ZV3xrVam197TW20eOB0y7TnOF0AY
+# lDTUXwm9/VxWRiSot7TGwMQ2xQLcLDydXuFBPKGCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEINcOv/KsPcWkgZHuyPh/sG/2hxjtRyuS2ma+jiYQ0K4RAggUM1GyO6iV
-# vhgPMjAyNjExMTAwODMzNTVaMAMCAQECEG+a4uyO+Ssxw1uNGpiUoXigghGnMIIE
+# BAIBBQAEIO3FfojaCkByupt2aaRt8b34qACKknTNxEI2eiF83L9RAggNGVfRYjq6
+# dhgPMjAyNjExMTIxODAyMTBaMAMCAQECEC88sKniRLN/A5AXQ2A+PBqgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3388,13 +3458,13 @@ Export-ModuleMember -Function Show-PraGui,New-PraGuiWindow,New-PraGuiRequest,Get
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMDA4MzM1NVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEINUK
-# USYnH19N6kpCHQdy5cdEzNhPq9C4PKI84I1g0bhZMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMjE4MDIxMFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIIu6
+# 0n+bRGIK++5SfWsQVU1Wqrac5mI03rQ9ZANcwNIvMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEA8fRT0eztDuo4qatTHZ6fCjBKU6C+aUiVijEX2+9QiCICIAq5
-# 7s4z3lXMtahdsl/kiZ2oYGu1qZ0upFkQIeLSCBX2
+# zj0EAwIERzBFAiEArmPHEc6Uv4SPmL9xud07QNOL3vZ4vg3AUwcuSOBZcjACIGdU
+# rXVAxS0H6GhcFLiImzMjKJzcxkdGGniGNgq9sZJ3
 # SIG # End signature block

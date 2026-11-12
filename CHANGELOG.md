@@ -4,6 +4,19 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
+## 3.1.3 — 2026-11-12
+
+### Added
+- Convert the members of an AD group for one run (`-Group <name or DN>`, or **AD group** in the console Task page): nested groups included, every member not converted listed with its reason.
+
+### Fixed
+- Every value you type or pick ignores letter case (parameters, configuration values, Environment, CSV, batch and package names).
+- The install commands given by the tool and the guides work (one `Install-Module` per module).
+- A run refused before any change shows 0 done and writes no global report; an answer "no" ends `RESULT: CANCELLED`. A Preview says "ready" and "planned", never "done".
+- Every failed run ends with a next step and a command that works: refused options, a refused AD write, an unreachable domain controller, a cloud wait that timed out, an object already converted (its current batch).
+- Two servers: copy the zip **and** its `.sha256` file; the rollback command after a cloud step is the AD phase.
+- Plain messages for a failed Entra Connect cycle, a Check and the Exchange Online session check. The Setup page shows one "Cloud modules" light.
+
 ## 3.1.2 — 2026-11-10
 
 ### Fixed

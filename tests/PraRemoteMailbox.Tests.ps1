@@ -9,7 +9,7 @@
     No legacy Assert-MockCalled: counters are mutable objects.
 .NOTES
     Author : Nicolas Fabert
-    Version: 3.1.2
+    Version: 3.1.3
     Run it through tests\Invoke-TestGate.ps1 (evidence, PSScriptAnalyzer, mandatory tests).
 #>
 #Requires -Version 7.5
@@ -148,10 +148,13 @@ function Assert-GateBackupBarrier {
     }
     if (-not $verified) { throw 'GATE: no complete validated backup before mutation.' }
 }
+if (-not ('GateSynthetic.ADServerDownException' -as [type])) { Add-Type -TypeDefinition 'namespace GateSynthetic { public class ADServerDownException : System.Exception { public ADServerDownException(string message) : base(message) { } } }' }
 function Get-ADDomainController {
     [CmdletBinding()]
     param([switch]$Discover,[switch]$Writable,[string]$Identity,[string]$Server)
     if (-not $Discover) { Assert-GateServer $Server }
+    # The domain controller does not answer (the text is in another language than English: the type tells).
+    if ($global:PraGateAd.Case -eq 'AdServerDown' -and -not $Discover) { throw [GateSynthetic.ADServerDownException]::new('Impossible de contacter le serveur. Cela peut etre parce que ce serveur n''existe pas.') }
     Write-GateEvent 'Get-ADDomainController' $Identity $Server @{Discover=[bool]$Discover; HostNameType='System.String'}
     [pscustomobject]@{ HostName=[string]$global:PraGateAd.Server; IsReadOnly=$false }
 }
@@ -182,7 +185,7 @@ function Get-ADUser {
         if ($Identity) { $match=([string]$Identity -in @([string]$user.ObjectGUID,$user.SamAccountName,$user.DistinguishedName)) }
         elseif ($LDAPFilter -like '(userPrincipalName=*') {
             $encoded=$user.UserPrincipalName.Replace('\','\5c').Replace('*','\2a').Replace('(','\28').Replace(')','\29').Replace([string][char]0,'\00')
-            $match=$LDAPFilter -ceq ('(userPrincipalName='+$encoded+')')
+            $match=$LDAPFilter -ieq ('(userPrincipalName='+$encoded+')')
         } else { $match=[bool]$user.homeMDB }
         if ($match) { Copy-GateUser $user -Capture:('*' -in $Properties) }
     }
@@ -314,6 +317,71 @@ function Invoke-PraCloudPhase {
         foreach ($row in $Rows) { $row.CloudStatus='Success'; $row.CloudMailbox=$true; $row.CloudLicense=$true; $row.DeprovisionConfirmed=$true; $row.FinalStatus='Success'; $row.CloudDetail='SYNTHETIC cloud confirmation followed by concurrent AD edit.' }
     } elseif ($state.Case -eq 'CloudConfirmed13') {
         foreach ($row in $Rows) { $row.CloudStatus='Success'; $row.CloudMailbox=$false; $row.CloudLicense=$false; $row.DeprovisionConfirmed=$true; $row.FinalStatus='Success'; $row.CloudDetail='SYNTHETIC: explicitly confirmed absent shared mailbox, no connection.' }
+    } elseif ($state.Case -eq 'CloudNetworkFailure') {
+        # What the real cloud phase does when Microsoft 365 does not answer: a run error on each row, in plain words.
+        $Context.NetworkFailure=$true; $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='CloudCheck'
+        foreach ($row in $Rows) {
+            $row.CloudStatus='Error'; $row.FinalStatus='Error'; $row.CloudDetail='SYNTHETIC: connection attempt failed (graph.example.invalid:443)'
+            Add-Member -InputObject $row -NotePropertyName RunError -NotePropertyValue $true -Force
+            $Context.CurrentIdentity=[string]$row.ObjectGuid
+            $text=[string]$row.UserPrincipalName+': Microsoft 365 did not answer (network): graph.example.invalid:443. Run again.'
+            [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase='Cloud'; Source='Cloud'; Operation='CloudCheck'; Identity=[string]$row.ObjectGuid; Message=$text })
+            Write-PraItem -Context $Context -Status Fail -Text $text
+        }
+    } elseif ($state.Case -eq 'CloudConnectFailure') {
+        # What the real cloud phase does when it cannot sign in: the same error on each row, and the sign-in as the operation that stopped.
+        $Context.NetworkFailure=$true; $Context.CloudConnectFailed=$true; $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='Connect-MgGraph'
+        foreach ($row in $Rows) {
+            $row.CloudStatus='Error'; $row.FinalStatus='Error'; $row.CloudDetail='SYNTHETIC: connection attempt failed (graph.example.invalid:443)'
+            Add-Member -InputObject $row -NotePropertyName RunError -NotePropertyValue $true -Force
+            $Context.CurrentIdentity=[string]$row.ObjectGuid
+            $text=[string]$row.UserPrincipalName+': Microsoft 365 did not answer (network): graph.example.invalid:443. Run again.'
+            [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase='Cloud'; Source='Cloud'; Operation='Connect-MgGraph'; Identity=[string]$row.ObjectGuid; Message=$text })
+            Write-PraItem -Context $Context -Status Fail -Text $text
+        }
+    } elseif ($state.Case -eq 'CloudWaitTimeout') {
+        # What the real cloud phase does when the objects are still not in the expected state after the wait: a cloud error on each row (not a run error) and their number.
+        $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='CloudCheck'; $Context.CloudNotReached=0
+        foreach ($row in $Rows) {
+            $row.CloudStatus='Error'; $row.FinalStatus='Error'; $row.CloudDetail='SYNTHETIC: expected state not reached.'
+            $Context.CloudNotReached=[int]$Context.CloudNotReached+1
+            $Context.CurrentIdentity=[string]$row.ObjectGuid
+            $text=[string]$row.UserPrincipalName+': still not in the expected state after waiting 3 min: no mailbox in Exchange Online yet.'
+            [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase='Cloud'; Source='Cloud'; Operation='CloudCheck'; Identity=[string]$row.ObjectGuid; Message=$text })
+            Write-PraItem -Context $Context -Status Fail -Text $text
+        }
+    } elseif ($state.Case -eq 'CloudOtherFailure') {
+        # A cloud failure that is not a network failure: an error on each row.
+        $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='CloudCheck'
+        foreach ($row in $Rows) {
+            $row.CloudStatus='Error'; $row.FinalStatus='Error'; $row.CloudDetail='SYNTHETIC: the answer is not valid.'
+            Add-Member -InputObject $row -NotePropertyName RunError -NotePropertyValue $true -Force
+            $Context.CurrentIdentity=[string]$row.ObjectGuid
+            $text=[string]$row.UserPrincipalName+': SYNTHETIC: the answer is not valid.'
+            [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase='Cloud'; Source='Cloud'; Operation='CloudCheck'; Identity=[string]$row.ObjectGuid; Message=$text })
+            Write-PraItem -Context $Context -Status Fail -Text $text
+        }
+    } elseif ($state.Case -eq 'CloudFirstFails') {
+        # The check of the first object fails, the others are read afterwards: the loop ends on the last object.
+        $Context.CurrentPhase='Cloud'
+        $failed=$false
+        foreach ($row in $Rows) {
+            if (-not $failed) {
+                $failed=$true
+                $row.CloudStatus='Error'; $row.FinalStatus='Error'; $row.CloudDetail='SYNTHETIC: the session check failed.'
+                $text=[string]$row.UserPrincipalName+': Exchange Online session: connection state ''Disconnected'', expected Connected.'
+                [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase='Cloud'; Source='Cloud'; Operation='CloudCheck'; Identity=[string]$row.ObjectGuid; Message=$text })
+                Write-PraItem -Context $Context -Status Fail -Text $text
+            } else { $row.CloudStatus='Planned'; $row.FinalStatus='Planned'; $row.CloudDetail='SYNTHETIC: ready.' }
+            $Context.CurrentIdentity=[string]$row.ObjectGuid; $Context.CurrentOperation='X500Check'
+        }
+    } elseif ($state.Case -eq 'CloudNotYet' -and -not $Context.AllowMutation -and $Context.Action -in @('Convert','Recover')) {
+        foreach ($row in $Rows) { $row.CloudStatus='Pending'; $row.FinalStatus='Planned'; $row.CloudDetail='SYNTHETIC: not yet in the expected state.'; $Context.NotYetExpected=[int](Get-PraValue $Context 'NotYetExpected' 0)+1 }
+    } elseif ($state.Case -eq 'CheckNotExpected' -and $Context.Action -eq 'Check') {
+        foreach ($row in $Rows) {
+            $row.CloudStatus='Error'; $row.FinalStatus='Error'; $row.CloudDetail='SYNTHETIC: MBX:EXO type='
+            [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase='Cloud'; Source='Cloud'; Operation='CloudCheck'; Identity=[string]$row.UserPrincipalName; Message=([string]$row.UserPrincipalName+': not in the expected state: no mailbox in Exchange Online yet (SYNTHETIC).') })
+        }
     } elseif ($Context.Action -eq 'Check') {
         foreach ($row in $Rows) { $row.CloudStatus='Success'; $row.CloudMailbox=$true; $row.CloudLicense=$true; $row.FinalStatus='Success'; $row.CloudDetail='SYNTHETIC: read-only check satisfied.' }
     } elseif (-not $Context.AllowMutation -and $Context.Action -in @('Convert','Recover')) {
@@ -496,7 +564,7 @@ foreach (`$name in @('Microsoft.PowerShell.Utility','Microsoft.PowerShell.Manage
 function global:Invoke-WebRequest { throw 'SYNTHETIC BLOCK: network' }
 function global:Invoke-RestMethod { throw 'SYNTHETIC BLOCK: network' }
 function global:New-PSSession { throw 'SYNTHETIC BLOCK: remoting' }
-# Remoting is blocked unless the state file scripts it (RemoteSync: Ok, Denied, Unreachable, OkThenFail): then a fake job answers for EntraConnect.Server, nothing leaves the process.
+# Remoting is blocked unless the state file scripts it (RemoteSync: Ok, Denied, Unreachable, OkThenFail, RawFail, RawFailOther): then a fake job answers for EntraConnect.Server, nothing leaves the process.
 function global:Invoke-Command { [CmdletBinding()] param([string]`$ComputerName,[scriptblock]`$ScriptBlock,[object[]]`$ArgumentList,`$SessionOption,[switch]`$AsJob)
     `$mode = if (`$global:PraGateAd.ContainsKey('RemoteSync')) { [string]`$global:PraGateAd.RemoteSync } else { 'Blocked' }
     if (`$mode -ceq 'Blocked') { throw 'SYNTHETIC BLOCK: remoting' }
@@ -504,7 +572,9 @@ function global:Invoke-Command { [CmdletBinding()] param([string]`$ComputerName,
 function global:Wait-Job { [CmdletBinding()] param(`$Job,`$Timeout) `$Job }
 function global:Stop-Job { [CmdletBinding()] param(`$Job) }
 function global:Remove-Job { [CmdletBinding()] param(`$Job,[switch]`$Force) }
-function global:Receive-Job { [CmdletBinding()] param(`$Job)
+function global:Receive-Job { [CmdletBinding()] param(`$Job,[switch]`$Keep)
+    if (`$Job.Mode -ceq 'RawFailOther' -and `$Job.IsCycle) { throw 'System.InvalidOperationException: The sync engine returned an unexpected result. at Microsoft.MetadirectoryServices.Scheduler.Scheduler.StartSyncCycle(String overridePolicy) at SchedulerUtils.StartSyncCycle(String policy)' }
+    if (`$Job.Mode -ceq 'RawFail' -and `$Job.IsCycle) { throw 'System.InvalidOperationException: Scheduler is already suspended via global parameters. at Microsoft.MetadirectoryServices.Scheduler.Scheduler.StartSyncCycle(String overridePolicy, Boolean interactiveMode) at SchedulerUtils.StartSyncCycle(String policy)' }
     if (`$Job.Mode -ceq 'Denied' -or (`$Job.Mode -ceq 'OkThenFail' -and `$Job.IsCycle)) { throw ('Connecting to remote server ' + `$Job.Computer + ' failed with the following error message : Access is denied. For more information, see the about_Remote_Troubleshooting Help topic.') }
     if (`$Job.Mode -ceq 'Unreachable') { throw 'The WinRM client cannot process the request because the server name cannot be resolved.' }
     if (`$Job.IsCycle) { [pscustomobject]@{ Result='Success'; Seconds=1; Computer=`$Job.Computer } } else { [pscustomobject]@{ Computer=`$Job.Computer; CycleEnabled=`$true } } }
@@ -923,7 +993,7 @@ Describe 'Directory internal invariants - synthetic modules only' {
         $global:PraGateAd.Users[0].mDBUseDefaults | Should -BeFalse
         $global:PraGateAd.Users[0].extensionAttribute1 | Should -Be 'OriginalTag-1'
     }
-    It 'lot 2d: Recover keeps the cloud X500 written back by Entra Connect (user and shared), once, and still removes any other added address' -Tag 'Lot2d' {
+    It 'Recover keeps the cloud X500 written back by Entra Connect (user and shared), once, and still removes any other added address' -Tag 'Lot2d' {
         $context=$global:PraGate.Context
         $global:PraGateAd.Users[1].msExchRecipientTypeDetails=[long]4
         $convert=@(New-PraPlan $context 'user1' 'Convert';New-PraPlan $context 'user2' 'Convert')
@@ -952,7 +1022,7 @@ Describe 'Directory internal invariants - synthetic modules only' {
         @($saved.Data.Records[0].KeptX500) | Should -BeExactly @($cloudOne)
         @($saved.Data.Records[1].KeptX500) | Should -BeExactly @($cloudTwo)
     }
-    It 'lot 2d: nothing is kept when no X500 was added, and an X500 that is already original is not duplicated' -Tag 'Lot2d' {
+    It 'nothing is kept when no X500 was added, and an X500 that is already original is not duplicated' -Tag 'Lot2d' {
         $context=$global:PraGate.Context
         $convert=@(New-PraPlan $context 'user1' 'Convert';New-PraPlan $context 'user2' 'Convert')
         $source=Invoke-PraAdBatch $context $convert 'Convert'
@@ -962,7 +1032,7 @@ Describe 'Directory internal invariants - synthetic modules only' {
         (@($plan.Desired.proxyAddresses.Value | Sort-Object { $_ } -CaseSensitive) -join '|') | Should -BeExactly ((@((New-GateUser 1).proxyAddresses) | Sort-Object { $_ } -CaseSensitive) -join '|')
         $plan.Row.Detail | Should -Not -Match 'X500'
     }
-    It 'lot 2d: a record written before 3.0.0 (no KeptX500) is read, and a kept list that is not X500 is refused' -Tag 'Lot2d' {
+    It 'a record written before 3.0.0 (no KeptX500) is read, and a kept list that is not X500 is refused' -Tag 'Lot2d' {
         InModuleScope PRA.Directory {
             $plan=New-PraPlan $global:PraGate.Context 'user1' 'Convert'
             $record=($plan.Record | ConvertTo-Json -Depth 20 | ConvertFrom-Json -DateKind String)
@@ -972,7 +1042,7 @@ Describe 'Directory internal invariants - synthetic modules only' {
             { Assert-PraStoredRecord $record } | Should -Throw '*kept X500*'
         }
     }
-    It 'lot 2d: Finalize accepts a writeback that only added X500 entries since the AD proof, and refuses anything else' -Tag 'Lot2d' -ForEach @(
+    It 'Finalize accepts a writeback that only added X500 entries since the AD proof, and refuses anything else' -Tag 'Lot2d' -ForEach @(
         @{Case='X500Only'; Throws=''}, @{Case='X500PlusOtherAddress'; Throws='*AD proof is out of date*'},
         @{Case='X500PlusAttribute'; Throws='*homeMDB differs from the AD proof*'}, @{Case='VersionOnly'; Throws='*AD proof is out of date*'}
     ) {
@@ -2677,6 +2747,7 @@ function Get-ConnectionInformation {
     if ($s.Case -eq 'ChangedSession' -and $s.Pauses.Count -gt 0) { $id='30000000-0000-0000-0000-000000000099' }
     $state='Connected'; $token='Active'
     if ($s.Case -eq 'Disconnected') { $state='Disconnected' }
+    if ($s.Case -eq 'DisconnectedOnce' -and $s.ConnectionReads -le 1) { $state='Disconnected' }
     if ($s.Case -eq 'Expired') { $token='Expired' }
     [pscustomobject]@{TenantID=$tenant;State=$state;TokenStatus=$token;ModuleName=$location;ConnectionId=$id;UserPrincipalName='operator@gate.invalid';AppId=$s.SessionAppId}
     if ($s.Case -eq 'MultipleSessions') { [pscustomobject]@{TenantID=$tenant;State=$state;TokenStatus=$token;ModuleName=$location;ConnectionId='other';UserPrincipalName='operator@gate.invalid';AppId=$s.SessionAppId} }
@@ -2904,13 +2975,37 @@ Export-ModuleMember -Function Get-ConnectionInformation,Get-EXORecipient,Get-EXO
         }
         $global:PraGate.Native.Writes | Should -Be 0
         $global:PraGate.Native.SessionAppId='22222222-2222-2222-2222-222222222222'
-        InModuleScope PRA.Cloud { { & $script:PraExoWorker 'Grant' $global:PraGate.NativeParams $global:PraGate.NativePermit $global:PraGate.NativeBinding { [void]$global:PraGate.Native.Journal.Add('Applied') } } | Should -Throw '*wrong tenant*' }
+        InModuleScope PRA.Cloud { { & $script:PraExoWorker 'Grant' $global:PraGate.NativeParams $global:PraGate.NativePermit $global:PraGate.NativeBinding { [void]$global:PraGate.Native.Journal.Add('Applied') } } | Should -Throw '*wrong application ID (22222222-2222-2222-2222-222222222222), expected 11111111-1111-1111-1111-111111111111*' }
         $global:PraGate.Native.Writes | Should -Be 0
     }
     It 'rejects unusable tenant/session/provenance <Case> before Add' -ForEach @(@{Case='NoSession'},@{Case='MultipleSessions'},@{Case='WrongTenant'},@{Case='WrongProvenance'},@{Case='ModuleNameOnly'},@{Case='Disconnected'},@{Case='Expired'}) {
         $global:PraGate.Native.Case=$Case
         InModuleScope PRA.Cloud { { & $script:PraExoWorker 'Grant' $global:PraGate.NativeParams $global:PraGate.NativePermit $global:PraGate.NativeBinding { [void]$global:PraGate.Native.Journal.Add('Applied') } } | Should -Throw }
         $global:PraGate.Native.Writes | Should -Be 0
+    }
+    It 'names only the check that failed: <Case>' -Tag 'Release313i' -ForEach @(
+        @{Case='WrongTenant'; Message="Exchange Online session: wrong tenant (90000000-0000-0000-0000-000000000009), expected *."; Not='*connection state*'; Pauses=0},
+        @{Case='Disconnected'; Message="Exchange Online session: connection state 'Disconnected', expected Connected."; Not='*wrong tenant*'; Pauses=1},
+        @{Case='Expired'; Message="Exchange Online session: token status 'Expired', expected Active."; Not='*wrong tenant*'; Pauses=1}) {
+        $global:PraGate.Native.Case=$Case
+        $text = InModuleScope PRA.Cloud {
+            try { & $script:PraExoWorker 'Grant' $global:PraGate.NativeParams $global:PraGate.NativePermit $global:PraGate.NativeBinding { [void]$global:PraGate.Native.Journal.Add('Applied') }; '' } catch { $_.Exception.Message }
+        }
+        $text | Should -BeLike $Message
+        $text | Should -Not -BeLike $Not
+        $text | Should -Not -BeLike '*token*connection ID*module path*'
+        $global:PraGate.Native.Writes | Should -Be 0
+        $global:PraGate.Native.Pauses.Count | Should -Be $Pauses
+    }
+    It 'reads the connection again once after a short pause when its state is not right yet, and goes on when the second read is right' -Tag 'Release313i' {
+        $global:PraGate.Native.Case='DisconnectedOnce'; $global:PraGate.Native.Present=$true
+        InModuleScope PRA.Cloud {
+            $result=& $script:PraExoWorker 'Grant' $global:PraGate.NativeParams $global:PraGate.NativePermit $global:PraGate.NativeBinding { [void]$global:PraGate.Native.Journal.Add('Applied') }
+            $result.Verified | Should -BeTrue
+        }
+        $global:PraGate.Native.Pauses.Count | Should -Be 1
+        $global:PraGate.Native.Pauses[0] | Should -Be 2
+        $global:PraGate.Native.ConnectionReads | Should -BeGreaterOrEqual 2
     }
     It 'accepts the exact loaded ModuleBase rather than requiring ModuleName to be a module name' {
         $global:PraGate.Native.Case='ModuleBase';$global:PraGate.NativeBinding.ModuleLocation=Split-Path $global:PraGate.NativeModulePath -Parent
@@ -3026,7 +3121,7 @@ Export-ModuleMember -Function Get-ConnectionInformation,Get-EXORecipient,Get-EXO
         }
         It 'stops Graph <Case> before EXO without creating connections or disconnecting unrelated sessions' -ForEach @(
             @{Case='GraphConnectFailure';Message='*Graph connection failed before any context was created*'},
-            @{Case='GraphAssemblyConflict';Message='*assembly conflict*new PowerShell 7 window*GetTokenAsync*'},
+            @{Case='GraphAssemblyConflict';Message='*could not load an assembly*new PowerShell 7 window*GetTokenAsync*'},
             @{Case='GraphPreexistingContext';Message='*Graph session already exists*'}
         ) {
             $global:PraGate.Native.ConnectLifecycle=$true;$global:PraGate.Native.Case=$Case
@@ -3509,7 +3604,7 @@ Describe 'Whole main in an isolated PowerShell 7 process' {
         $runtime=New-GateRuntime -Name 'main-apply'
         $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath}
         $run.ExitCode | Should -Be 2 -Because ('the synthetic process must return the expected code (a phase AD that ends with a package: next step required); evidence case '+(Split-Path $runtime.Root -Leaf))
-        $run.Output | Should -Match 'RESULT: PASS'
+        $run.Output | Should -Match 'RESULT: PENDING'
         ($run.MainResult.NextSteps -join ' ') | Should -Match '-Phase Cloud'
         ($run.MainResult.NextSteps -join ' ') | Should -Not -Match '-ConfigPath'
         @(Get-GateWrites $runtime).Count | Should -Be 4
@@ -3747,7 +3842,6 @@ Describe 'Runtime output folders versus the authenticated package' -Tag 'Integri
         @{Name='backup folder beside the code';Backup='.\config';Log='.\logs';Report='.\reports'}
         @{Name='folder overlapping templates';Backup='.\Backups';Log='.\templates\logs';Report='.\reports'}
         @{Name='package root itself';Backup='.\Backups';Log='.\logs';Report='.'}
-        @{Name='wrong case of the canonical folder';Backup='.\backups';Log='.\logs';Report='.\reports'}
         @{Name='canonical folder of another setting';Backup='.\logs';Log='.\logs';Report='.\reports'}
         @{Name='parent segments back into the code';Backup='.\Backups\..\module';Log='.\logs';Report='.\reports'}
     ) {
@@ -3776,6 +3870,29 @@ Describe 'Runtime output folders versus the authenticated package' -Tag 'Integri
         (Test-Path -LiteralPath (Join-Path $runtime.Package 'logs')) | Should -BeTrue
         @(Get-ChildItem -LiteralPath $external -File).Count | Should -BeGreaterThan 0
         { Import-Module (Join-Path $runtime.Package 'module\PRA.Cloud.psm1') -Force } | Should -Not -Throw
+        $again=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+        $again.ExitCode | Should -Be 0
+    }
+    It 'accepts the canonical folders in any letter case and creates them with the canonical spelling (<Name>)' -ForEach @(
+        @{Name='lower case backup folder';Backup='.\backups';ExpectedBackup='Backups';Log='.\logs';Report='.\reports'}
+        @{Name='upper case log folder';Backup='.\Backups';ExpectedBackup='Backups';Log='.\LOGS';Report='.\reports'}
+        @{Name='capitalised report folder and sub-folder of the backup folder';Backup='.\BACKUPS\Site-A';ExpectedBackup='Backups\Site-A';Log='.\logs';Report='.\Reports'}
+        @{Name='every folder in another case';Backup='.\backups';ExpectedBackup='Backups';Log='.\LOGS';Report='.\Reports'}
+    ) {
+        $runtime=New-GateRuntime -Name ('outputs-case-'+($Name -replace '\W','-'))
+        Set-GateOutputFolders $runtime $Backup $Log $Report
+        $before=Get-GatePackageFiles $runtime
+        $config=Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package
+        $config.Storage.BackupFolder | Should -BeExactly (Join-Path $runtime.Package $ExpectedBackup)
+        $config.Logging.Folder | Should -BeExactly (Join-Path $runtime.Package 'logs')
+        $config.Report.Folder | Should -BeExactly (Join-Path $runtime.Package 'reports')
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        $names=@(Get-ChildItem -LiteralPath $runtime.Package -Directory | ForEach-Object Name)
+        ($names -ccontains 'logs') | Should -BeTrue
+        ($names -ccontains 'reports') | Should -BeTrue
+        @($names | Where-Object { $_ -match '^(backups|logs|reports)$' -and $_ -cnotmatch '^(Backups|logs|reports)$' }) | Should -BeNullOrEmpty
+        @(Get-GatePackageFiles $runtime | Where-Object { $_ -notin $before -and $_ -cnotmatch '^\\(Backups|logs|reports)(\\|$)' }) | Should -BeNullOrEmpty
         $again=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
         $again.ExitCode | Should -Be 0
     }
@@ -4394,6 +4511,24 @@ Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single 
             $context.ConfirmPreference | Should -BeExactly 'High'
         } finally { Remove-Variable -Name ConfirmPreference -Scope Script -ErrorAction SilentlyContinue }
     }
+    It 'a cancel and a console that cannot ask both mark the run as one that changed nothing' -Tag 'Release313j' {
+        try {
+            $caller=New-Object psobject
+            $caller | Add-Member ScriptMethod ShouldContinue ({ param($Query,$Caption) $false }.GetNewClosure())
+            $Force=$false; $script:ConfirmBound=$false
+            $context=@{ AllowMutation=$true; CurrentOperation=''; CurrentIdentity=''; ConfirmPreference='High'; LogFile=''; Warnings=0; Issues=(New-Object 'Collections.Generic.List[object]') }
+            . ([scriptblock]::Create((Get-EntryFunctionText 'Confirm-PraApply')))
+            { Confirm-PraApply 'Roll back?' } | Should -Throw '*Cancelled by the operator*'
+            $context.NoChangeMade | Should -BeTrue
+            $unavailable=New-Object psobject
+            $unavailable | Add-Member ScriptMethod ShouldContinue ({ param($Query,$Caption) throw 'no console' }.GetNewClosure())
+            $caller=$unavailable
+            $context=@{ AllowMutation=$true; CurrentOperation=''; CurrentIdentity=''; ConfirmPreference='High'; LogFile=''; Warnings=0; Issues=(New-Object 'Collections.Generic.List[object]') }
+            { Confirm-PraApply 'Roll back?' } | Should -Throw '*cannot ask for one*'
+            $context.NoChangeMade | Should -BeTrue
+            $context.ConfirmationUnavailable | Should -BeTrue
+        } finally { Remove-Variable -Name ConfirmPreference -Scope Script -ErrorAction SilentlyContinue }
+    }
     It 'never asks with <Name> (documented behaviour, including -Confirm:$false)' -ForEach @(@{Name='-Force';ForceOn=$true;Bound=$false},@{Name='an explicit -Confirm';ForceOn=$false;Bound=$true}) {
         try {
             $caller=New-Object psobject
@@ -4417,12 +4552,13 @@ Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single 
         $quotes=-join (@(0x2018,0x2019,0x201A,0x201B) | ForEach-Object { [char]$_ })
         . ([scriptblock]::Create((Get-EntryFunctionText 'ConvertTo-PraLiteral')))
         . ([scriptblock]::Create((Get-EntryFunctionText 'Get-PraCommandLine')))
-        $Identity="o'brien@gate.invalid"; $Scope='SharedOnly'; $MaxObjects=5; $BaseConfigPath=''
+        $Identity="o'brien@gate.invalid"; $Scope='SharedOnly'; $MaxObjects=5; $BaseConfigPath=''; $Group="PRA O'Brien $($quotes.Substring(0,1))team$($quotes.Substring(1,1))"; $Expect='Provisioned'; $Once=$false
         $SearchBase="OU=O'Neil,DC=gate,DC=invalid"; $CsvPath="C:\lists\o'x $quotes.csv"; $ConfigPath="C:\cfg\it's.psd1"; $script:ConfigPathBound=$true
         $line=Get-PraCommandLine -ActionName Convert -PhaseName AD -KeepFilters
         $line | Should -BeLike "*-Identity 'o''brien@gate.invalid'*"
         $line | Should -BeLike "*-SearchBase 'OU=O''Neil,DC=gate,DC=invalid'*"
         $line | Should -BeLike "*-ConfigPath 'C:\cfg\it''s.psd1'"
+        $line | Should -BeLike ("*-Group 'PRA O''Brien "+$quotes.Substring(0,1)+$quotes.Substring(0,1)+"team"+$quotes.Substring(1,1)+$quotes.Substring(1,1)+"'*")
         $line | Should -Match ([regex]::Escape("o''x "+$quotes.Substring(0,1)+$quotes.Substring(0,1)))
         $batch=Get-PraCommandLine -ActionName Recover -PhaseName Cloud -BatchId "C:\x y\it's\batch.json"
         $batch | Should -BeLike "*-Batch 'C:\x y\it''s\batch.json'*"
@@ -4439,7 +4575,7 @@ Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single 
         $version | Should -Match '^\d+\.\d+\.\d+$'
         # External anchors: the version is not only compared with the files that quote it. It must be the release that this tree is
         # (update this literal with the release) and the newest heading of the change log.
-        $version | Should -BeExactly '3.1.2'
+        $version | Should -BeExactly '3.1.3'
         $heading=[regex]::Match([IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'CHANGELOG.md')),'(?m)^## (\d+\.\d+\.\d+)\b')
         $heading.Success | Should -BeTrue
         $heading.Groups[1].Value | Should -BeExactly $version -Because 'the first "## x.y.z" heading of CHANGELOG.md is the version of the tree'
@@ -4843,8 +4979,9 @@ Describe 'Release 3.0.0 - the PowerShell 7.5+ engine' -Tag 'Release300' {
                 Mock Start-Sleep { }
                 # Self-contained (it also runs in the Windows PowerShell 5.1 endpoint of EntraConnect.Server): an ordinal comparison without PRA.Common.
                 $script:PraSyncCycle.ToString() | Should -Match "if \(\[string\]::Equals\(\[string\]\`$PSVersionTable\.PSEdition, 'Core', \[StringComparison\]::Ordinal\)\) \{ \`$import\.UseWindowsPowerShell = \`$true \}"
-                $result = & $script:PraSyncCycle 'Delta' 1
-                $result.Result | Should -BeExactly 'Success'
+                $answer = @(& $script:PraSyncCycle 'Delta' 1)
+                @($answer | Where-Object { $null -ne $_.PSObject.Properties['Started'] }).Count | Should -Be 1 -Because 'a remote job tells that the cycle started through a marker object'
+                @($answer | Where-Object { $null -ne $_.PSObject.Properties['Result'] })[-1].Result | Should -BeExactly 'Success'
             }
             $global:PraGateSync.Imports.Count | Should -Be 1
             $global:PraGateSync.Imports[0].Name | Should -BeExactly 'ADSync'
@@ -5238,6 +5375,37 @@ Describe 'Release 3.0.0 - transfer package: verification, extraction and refusal
         function script:Get-TpChildren([string]$Folder) { @(Get-ChildItem -LiteralPath $Folder -Force -ErrorAction SilentlyContinue).Count }
     }
 
+    It 'accepts a package whose folder prefix, Environment, batch id, file name and checksum file are written in another case' -Tag 'Release313h' {
+        $w = New-TpWork
+        $batch = 'aaaaaaaa11111111aaaaaaaa11111111'
+        $entries = [ordered]@{}
+        $entries[('BATCH-' + $batch.ToUpperInvariant() + '/State-x.json')] = Get-TpBytes '{"a":1}'
+        $zipPath = Join-Path $w.Root 'PRA-LAB-CONVERT-AAAAAAAA-FOR-CLOUD.ZIP'
+        New-TpZip -Path $zipPath -Entries $entries -Environment 'lab' -Kind 'Convert' -BatchId $batch.ToUpperInvariant()
+        [IO.File]::WriteAllText($zipPath + '.sha256', (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToUpperInvariant())
+        $info = Get-PraTransferPackage -Path $zipPath -Environment 'Lab'
+        $info.Valid | Should -BeTrue -Because $info.Error
+        $imported = Import-PraTransferPackage -Path $zipPath -BackupFolder $w.Backups -Environment 'LAB' -ExpectedKind 'Convert'
+        $imported.Created.Count | Should -Be 1
+        Test-Path -LiteralPath (Join-Path $w.Backups ('batch-' + $batch)) -PathType Container | Should -BeTrue
+        $again = Import-PraTransferPackage -Path $zipPath -BackupFolder $w.Backups -Environment 'lab' -ExpectedKind 'Convert'
+        $again.Existing.Count | Should -Be 1
+    }
+    It 'refuses a package that holds two folders whose names differ only by case, and still refuses another Environment' -Tag 'Release313h' {
+        $w = New-TpWork
+        $batch = 'aaaaaaaa11111111aaaaaaaa11111111'
+        $entries = [ordered]@{}
+        $entries[('Batch-' + $batch + '/a.json')] = Get-TpBytes '{"a":1}'
+        $entries[('batch-' + $batch.ToUpperInvariant() + '/b.json')] = Get-TpBytes '{"b":1}'
+        $twice = Join-Path $w.Root 'twice.zip'
+        New-TpZip -Path $twice -Entries $entries -Environment 'LAB' -Kind 'Convert' -BatchId $batch
+        (Get-PraTransferPackage -Path $twice -Environment 'LAB').Error | Should -Match 'same name apart from letter case'
+        $one = [ordered]@{}
+        $one[('Batch-' + $batch + '/a.json')] = Get-TpBytes '{"a":1}'
+        $other = Join-Path $w.Root 'other.zip'
+        New-TpZip -Path $other -Entries $one -Environment 'LAB' -Kind 'Convert' -BatchId $batch
+        (Get-PraTransferPackage -Path $other -Environment 'LAB2').Error | Should -Match "made for Environment 'LAB'"
+    }
     It 'names the package after its purpose' {
         Get-PraTransferPackageName -Kind Convert -Environment PROD -BatchId 8547AB040273474BA2C720ADE6240FC5 | Should -BeExactly 'PRA-PROD-Convert-8547ab04-for-Cloud.zip'
         Get-PraTransferPackageName -Kind Recover -Environment LAB_1 -BatchId 8547ab04 | Should -BeExactly 'PRA-LAB_1-Recover-8547ab04-for-Cloud.zip'
@@ -5618,7 +5786,7 @@ Describe 'Release 3.0.0 - transfer package through the real main (hand-off and i
         Split-Path $zip -Parent | Should -BeExactly (Join-Path $runtime.State.BackupFolder 'Outbox')
         Test-Path -LiteralPath ($zip + '.sha256') | Should -BeTrue
         $run.MainResult.TransferPackage | Should -BeExactly $zip
-        ($run.MainResult.NextSteps -join "`n") | Should -Match 'Copy .*PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip to the cloud server'
+        ($run.MainResult.NextSteps -join "`n") | Should -Match 'Copy these two files, together in the same folder, to the cloud server \(anywhere\): .*PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip and .*PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip\.sha256\. Then run there:'
         ($run.MainResult.NextSteps -join "`n") | Should -Match "-Batch 'PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip'"
         ($run.MainResult.NextSteps -join "`n") | Should -Not -Match 'Copy the folder'
         $steps = @($events | Where-Object { $_.kind -eq 'step' -and $_.title -eq 'Creating the transfer package' })
@@ -5749,7 +5917,7 @@ Describe 'Release 3.0.0 - Recover cloud phase writes the Finalize transfer packa
             $result = @(Get-Content -LiteralPath $env:PRA_EVENT_FILE -Encoding UTF8 | ForEach-Object { $_ | ConvertFrom-Json -DateKind String } | Where-Object kind -eq 'result')[0]
             $result.transferPackageKind | Should -BeExactly 'Finalize'
             $result.transferPackage | Should -Match 'PRA-SYNTHETIC_GATE-Finalize-[0-9a-f]{8}-for-AD\.zip$'
-            ($cloud.MainResult.NextSteps -join "`n") | Should -Match 'to the AD server \(anywhere\)'
+            ($cloud.MainResult.NextSteps -join "`n") | Should -Match 'to the AD server \(anywhere\): .*for-AD\.zip and .*for-AD\.zip\.sha256\.'
             ($cloud.MainResult.NextSteps -join "`n") | Should -Match "-Action Finalize .*-Batch 'PRA-SYNTHETIC_GATE-Finalize-[0-9a-f]{8}-for-AD\.zip'"
             $info = Get-PraTransferPackage -Path $result.transferPackage -Environment SYNTHETIC_GATE
             $info.Valid | Should -BeTrue -Because $info.Error
@@ -5910,7 +6078,7 @@ Describe 'Release 3.0.0 - native process binding: SetLastError on every import, 
     }
 }
 
-Describe 'Release 3.0.0 lot 2b - phase data and the global report across the two servers' -Tag 'GlobalReport' {
+Describe 'Release 3.0.0 - phase data and the global report across the two servers' -Tag 'GlobalReport' {
     BeforeAll {
         Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
         $script:GrRoot = Join-Path $global:PraGate.Root ('lot2b-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -6201,7 +6369,7 @@ Describe 'Release 3.0.0 lot 2b - phase data and the global report across the two
     }
 }
 
-Describe 'Release 3.0.0 lot 2b - optional forced Active Directory replication (Directory.ForceReplication)' -Tag 'AdReplication' {
+Describe 'Release 3.0.0 - optional forced Active Directory replication (Directory.ForceReplication)' -Tag 'AdReplication' {
     BeforeAll {
         Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
         $script:RepRuntime = New-GateRuntime -Name 'replication'
@@ -6301,7 +6469,7 @@ Describe 'Release 3.0.0 lot 2b - optional forced Active Directory replication (D
     }
 }
 
-Describe 'Release 3.0.0 lot 2b - plan counts and the replication step through the real main' -Tag 'Lot2bMain' {
+Describe 'Release 3.0.0 - plan counts and the replication step through the real main' -Tag 'Lot2bMain' {
     BeforeEach {
         $oldEventPath = $env:PRA_EVENT_FILE
         $runtime = New-GateRuntime -Name 'lot2b-main'
@@ -6333,7 +6501,7 @@ Describe 'Release 3.0.0 lot 2b - plan counts and the replication step through th
     }
 }
 
-Describe 'Release 3.0.0 lot 2c - review fixes: licence group replication, staging extraction, phase order, Next steps, Preview folder' -Tag 'Lot2c' {
+Describe 'Release 3.0.0 - licence group replication, staging extraction, phase order, Next steps, Preview folder' -Tag 'Lot2c' {
     BeforeAll {
         Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
         $script:C2Root = Join-Path $global:PraGate.Root ('lot2c-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -6427,7 +6595,7 @@ Describe 'Release 3.0.0 lot 2c - review fixes: licence group replication, stagin
     }
 }
 
-Describe 'Release 3.0.0 lot 2c - the window switch -ForceAdReplication and -BaseConfigPath together' -Tag 'Lot2cMain' {
+Describe 'Release 3.0.0 - the window switch -ForceAdReplication and -BaseConfigPath together' -Tag 'Lot2cMain' {
     It 'lists both the switch and the differences with the configuration file' {
         $old = $env:PRA_EVENT_FILE
         try {
@@ -6970,7 +7138,7 @@ Describe 'Release 3.1.2 - the Entra Connect check proves the account, not the ne
         @{ Name = 'access denied (French Windows)'; Message = 'Accès refusé.'; Kind = 'Denied'; Reason = 'this account has no right on SRV-SYNC01' }
         @{ Name = 'server not reachable'; Message = 'The WinRM client cannot process the request because the server name cannot be resolved.'; Kind = 'Unreachable'; Reason = 'SRV-SYNC01 does not answer to PowerShell remoting \(WinRM, port 5985\): check the server name in EntraConnect.Server' }
         @{ Name = 'no ADSync module there'; Message = "The specified module 'ADSync' was not loaded because no valid module file was found in any module directory."; Kind = 'NoModule'; Reason = 'SRV-SYNC01 answered but the ADSync module is not installed there: it is not the Entra Connect server' }
-        @{ Name = 'something else'; Message = 'Something unexpected happened.'; Kind = 'Failed'; Reason = 'the Entra Connect check on SRV-SYNC01 failed \(Something unexpected happened\.\)' }
+        @{ Name = 'something else'; Message = 'Something unexpected happened.'; Kind = 'Failed'; Reason = '^Entra Connect could not be checked on SRV-SYNC01: Something unexpected happened$' }
     ) {
         $global:PraGateT312.Message = $Message; $global:PraGateT312.Kind = $Kind; $global:PraGateT312.Reason = $Reason
         InModuleScope PRA.Directory {
@@ -7096,10 +7264,10 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         $zip | Should -Match 'PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip$'
         Test-Path -LiteralPath $zip -PathType Leaf | Should -BeTrue -Because 'the package is written although the sync failed'
         $steps = @($run.MainResult.NextSteps)
-        $steps[0] | Should -Match '^AD is changed and verified\. The Entra Connect sync could not start: this account has no right on SRV-SYNC01'
+        $steps[0] | Should -Match '^AD is changed and verified\. The Entra Connect sync did not run: this account has no right on SRV-SYNC01'
         $steps[1] | Should -BeExactly 'Run a delta sync on SRV-SYNC01 (Start-ADSyncSyncCycle -PolicyType Delta) or wait for the next automatic cycle (about 30 minutes).'
-        ($steps -join "`n") | Should -Match 'Copy .*PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip to the cloud server'
-        $run.Output | Should -Match 'Entra Connect sync could not run on SRV-SYNC01: this account has no right'
+        ($steps -join "`n") | Should -Match 'Copy these two files, together in the same folder, to the cloud server \(anywhere\): .*PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip and .*PRA-SYNTHETIC_GATE-Convert-[0-9a-f]{8}-for-Cloud\.zip\.sha256\. Then run there:'
+        $run.Output | Should -Match 'The Entra Connect sync did not run: this account has no right'
         $folder = @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory | Where-Object Name -Like 'Batch-*')[0].FullName
         $journal = @(Get-Content -LiteralPath (Get-ChildItem -LiteralPath $folder -Filter 'Journal-*.jsonl')[0].FullName | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
         @($journal | Where-Object { $_.Operation -ceq 'ADSync' -and $_.Status -ceq 'Failed' }).Count | Should -Be 1
@@ -7125,7 +7293,7 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         $finished.ExitCode | Should -Be 2 -Because ($finished.Output + $finished.Error)
         @(Get-GateWrites $runtime).Count | Should -Be $writes -Because 'AD is not changed again'
         Test-Path -LiteralPath $finished.MainResult.TransferPackage -PathType Leaf | Should -BeTrue
-        ($finished.MainResult.NextSteps -join "`n") | Should -Match 'Copy .*for-Cloud\.zip to the cloud server'
+        ($finished.MainResult.NextSteps -join "`n") | Should -Match 'Copy these two files, together in the same folder, to the cloud server \(anywhere\): .*for-Cloud\.zip and .*for-Cloud\.zip\.sha256\.'
         $finished.Output | Should -Match 'Entra Connect cycle finished on SRV-SYNC01'
         $journal = @(Get-Content -LiteralPath (Get-ChildItem -LiteralPath $folder -Filter 'Journal-*.jsonl')[0].FullName | ForEach-Object { $_ | ConvertFrom-Json -DateKind String })
         @($journal | Where-Object { $_.Operation -ceq 'ADSync' -and $_.Status -ceq 'Completed' }).Count | Should -Be 1
@@ -7184,11 +7352,11 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         @($run.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 0 -Because 'the cloud part waits for the synchronisation'
         # Phase Both ends the chain: the global report line comes first, then the plain steps.
         $steps = @($run.MainResult.NextSteps | Where-Object { $_ -notmatch '^Global report' })
-        $steps[0] | Should -Match '^AD is changed and verified\. The Entra Connect sync could not start'
+        $steps[0] | Should -Match '^AD is changed and verified\. The Entra Connect sync did not run'
         $steps[1] | Should -Match 'Run a delta sync on SRV-SYNC01'
         $steps[2] | Should -Match '^Then continue this batch from here .*-Action Convert -Phase Cloud -Mode Apply -Batch [0-9a-f]{8}'
         ($steps -join "`n") | Should -Not -Match 'To roll back this batch later'
-        $run.Output | Should -Match 'Not run: the Entra Connect synchronisation could not start'
+        $run.Output | Should -Match 'Not run: the Entra Connect sync cycle could not run'
         @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0
     }
     It 'refuses -Batch with Convert -Phase Both and says which command to use' {
@@ -7209,8 +7377,11 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         [IO.File]::WriteAllText($csv, "Identity`r`nuser1`r`nuser2`r`n", (New-Object Text.UTF8Encoding($true)))
         $run = Invoke-GateProcess $later @{Action='Convert';Phase='AD';Mode='Preview';CsvPath=$csv;ConfigPath=$later.ConfigPath} -TimeoutSeconds 120
         $run.ExitCode | Should -Be 1
-        $run.Output | Should -Match "user1 is already converted by batch $short \(it is a remote mailbox now\): nothing was changed\."
-        $run.Output | Should -Match "run: \.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Batch $short"
+        $run.Output | Should -Match "user1 is already converted by batch $short \(it is a remote mailbox now\): nothing was changed\. That batch can be continued: see the next steps\."
+        $run.Output | Should -Match "run:\s+\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Batch $short"
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'To continue that batch (Entra Connect sync and transfer package; AD is not changed again), run:'
+        $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Batch $short -ConfigPath '.+'$" -Because 'the command is in the next steps in full, not cut'
         $run.Output | Should -Match 'object user1\)' -Because 'the stop message names the object of the text, not the last object read'
         $run.Output | Should -Not -Match 'object user2\)'
         @(Get-GateWrites $later).Count | Should -Be 0
@@ -7218,7 +7389,8 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
         $env:PRA_EVENT_FILE = Join-Path $later.Root 'engine.events.jsonl'
         $window = Invoke-GateProcess $later @{Action='Convert';Phase='AD';Mode='Preview';CsvPath=$csv;ConfigPath=$later.ConfigPath} -TimeoutSeconds 120
         $window.ExitCode | Should -Be 1
-        $window.Output | Should -Match "user1 is already converted by batch $short \(it is a remote mailbox now\): nothing was changed\. To continue that batch .*go to the Task page, choose Move mailboxes to Exchange Online, then Continue a batch, and pick batch $short\."
+        $window.Output | Should -Match "user1 is already converted by batch $short \(it is a remote mailbox now\): nothing was changed\. That batch can be continued: see the next steps\."
+        @($window.MainResult.NextSteps)[0] | Should -Match "^To continue that batch .*go to the Task page, choose Move mailboxes to Exchange Online, then Continue a batch, and pick batch $short\.$"
         $window.Output | Should -Not -Match 'run: \.\\Invoke-PraRemoteMailbox'
         $env:PRA_EVENT_FILE = $oldEventPath
         # Without such a batch the message stays the plain one.
@@ -7256,7 +7428,9 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         @{ Name = 'the lab: Authentication 2.40.0, Users 2.35.1'; Auth = '2.40.0,2.35.1'; Users = '2.35.1'; Found = 'Microsoft.Graph.Authentication 2.40.0, 2.35.1; Microsoft.Graph.Users 2.35.1' }
         @{ Name = 'Users one version behind'; Auth = '2.41.1'; Users = '2.41.0'; Found = 'Microsoft.Graph.Authentication 2.41.1; Microsoft.Graph.Users 2.41.0' }
         @{ Name = 'too old'; Auth = '2.35.1'; Users = '2.35.1'; Found = 'Microsoft.Graph.Authentication 2.35.1; Microsoft.Graph.Users 2.35.1' }
-        @{ Name = 'Users missing'; Auth = '2.41.1'; Users = ''; Found = 'Microsoft.Graph.Authentication 2.41.1; Microsoft.Graph.Users not installed' }
+        @{ Name = 'Users missing'; Auth = '2.41.1'; Users = ''; Found = 'found Microsoft.Graph.Authentication 2.41.1; Microsoft.Graph.Users is not installed' }
+        @{ Name = 'Authentication missing'; Auth = ''; Users = '2.41.1'; Found = 'found Microsoft.Graph.Users 2.41.1; Microsoft.Graph.Authentication is not installed' }
+        @{ Name = 'both missing'; Auth = ''; Users = ''; Found = 'Microsoft Graph: Microsoft.Graph.Authentication is not installed; Microsoft.Graph.Users is not installed' }
     ) {
         $global:PraGateT312.Avail = @(
             @($Auth.Split(',', [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]$_ } }) +
@@ -7270,8 +7444,9 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         $report.Graph.Ok | Should -BeFalse
         $report.Exo.Ok | Should -BeTrue
         $report.Graph.Message | Should -Match ([regex]::Escape($Found))
+        $report.Graph.Message | Should -Not -Match 'found Microsoft\.Graph\.\w+ (is )?not installed'
         $report.Graph.Message | Should -Match 'one same version 2\.41\.1 or later'
-        $report.Graph.Message | Should -Match ([regex]::Escape('Run: Install-Module Microsoft.Graph.Authentication,Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope AllUsers'))
+        $report.Graph.Message | Should -Match ([regex]::Escape('Run: Install-Module Microsoft.Graph.Authentication -MinimumVersion 2.41.1 -Scope CurrentUser; Install-Module Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope CurrentUser'))
     }
     It 'refuses an ExchangeOnlineManagement that is too old or missing, with the exact command' -ForEach @(
         @{ Found = '3.10.0'; Text = 'found 3.10.0; the tool needs 3.10.1 or later' }
@@ -7285,7 +7460,7 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         $report.Ok | Should -BeFalse
         $report.Graph.Ok | Should -BeTrue
         $report.Exo.Message | Should -Match ([regex]::Escape('ExchangeOnlineManagement: ' + $Text))
-        $report.Exo.Message | Should -Match ([regex]::Escape('Run: Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers'))
+        $report.Exo.Message | Should -Match ([regex]::Escape('Run: Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope CurrentUser'))
     }
     It 'refuses another Graph version that is already loaded in the session, and accepts the one that is loaded when it is complete' {
         $installed = @(
@@ -7316,24 +7491,25 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         $text | Should -Match 'if \(-not \$modules\.Graph\.Ok\) \{ throw \$modules\.Graph\.Message \}'
         [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'config\PraRemoteMailbox.config.psd1')) | Should -Match "MinModuleVersion\s*=\s*'3\.10\.1'"
     }
-    It 'the window shows the same answer on the Graph and Exchange Online lights' {
+    It 'the window shows ONE Cloud modules light, with the same answer as the engine' {
         $guiModule = Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Gui.psm1') -Force -PassThru | Select-Object -Last 1
         $old = & $guiModule {
             $script:GuiCloudModules = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.40.0' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.35.1' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.0' })
             Get-PraGuiPrerequisite -Signin Wam -SyncEnabled $false
         }
-        $graph = $old.Lights | Where-Object Name -eq 'Microsoft.Graph'; $exo = $old.Lights | Where-Object Name -eq 'ExchangeOnlineManagement'
-        $graph.Status | Should -BeExactly 'Fail'
-        $graph.Detail | Should -Match 'found Microsoft.Graph.Authentication 2\.40\.0; Microsoft.Graph.Users 2\.35\.1.*2\.41\.1 or later.*Install-Module Microsoft\.Graph\.Authentication,Microsoft\.Graph\.Users -MinimumVersion 2\.41\.1 -Scope AllUsers'
-        $exo.Status | Should -BeExactly 'Fail'
-        $exo.Detail | Should -Match 'found 3\.10\.0; the tool needs 3\.10\.1 or later.*Install-Module ExchangeOnlineManagement -MinimumVersion 3\.10\.1 -Scope AllUsers'
+        @($old.Lights | Where-Object { $_.Name -in @('Microsoft.Graph', 'ExchangeOnlineManagement') }).Count | Should -Be 0 -Because 'the two modules share one light'
+        @($old.Lights | Where-Object Name -eq 'Cloud modules').Count | Should -Be 1
+        $cloud = $old.Lights | Where-Object Name -eq 'Cloud modules'
+        $cloud.Status | Should -BeExactly 'Fail'
+        $cloud.Detail | Should -Match 'found Microsoft.Graph.Authentication 2\.40\.0; Microsoft.Graph.Users 2\.35\.1.*2\.41\.1 or later.*Install-Module Microsoft\.Graph\.Authentication -MinimumVersion 2\.41\.1 -Scope CurrentUser; Install-Module Microsoft\.Graph\.Users -MinimumVersion 2\.41\.1 -Scope CurrentUser'
+        $cloud.Detail | Should -Match 'found 3\.10\.0; the tool needs 3\.10\.1 or later.*Install-Module ExchangeOnlineManagement -MinimumVersion 3\.10\.1 -Scope CurrentUser'
         $old.Cloud | Should -BeFalse
         $good = & $guiModule {
             $script:GuiCloudModules = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.41.1' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' })
             Get-PraGuiPrerequisite -Signin Wam -SyncEnabled $false
         }
-        ($good.Lights | Where-Object Name -eq 'Microsoft.Graph').Status | Should -BeExactly 'Ok'
-        ($good.Lights | Where-Object Name -eq 'ExchangeOnlineManagement').Detail | Should -BeExactly 'Installed, version 3.10.1.'
+        ($good.Lights | Where-Object Name -eq 'Cloud modules').Status | Should -BeExactly 'Ok'
+        ($good.Lights | Where-Object Name -eq 'Cloud modules').Detail | Should -BeExactly 'Exchange Online 3.10.1, Microsoft Graph 2.41.1 (Authentication and Users).'
     }
 
     It 'Apply with phase Both stops before any write when no complete Graph set is installed; Preview only warns; a phase Cloud Preview stops too' {
@@ -7347,7 +7523,7 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         $apply = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
         $apply.ExitCode | Should -Be 1
         $apply.Output | Should -Match 'The cloud part cannot run on this server\. Microsoft Graph: found Microsoft\.Graph\.Authentication 2\.40\.0; Microsoft\.Graph\.Users 2\.35\.1\.'
-        $apply.Output | Should -Match ([regex]::Escape('Run: Install-Module Microsoft.Graph.Authentication,Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope AllUsers'))
+        $apply.Output | Should -Match ([regex]::Escape('Run: Install-Module Microsoft.Graph.Authentication -MinimumVersion 2.41.1 -Scope CurrentUser; Install-Module Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope CurrentUser'))
         $apply.Output | Should -Match 'Nothing was changed\.'
         @(Get-GateWrites $runtime).Count | Should -Be 0
         @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'no backup either'
@@ -7369,7 +7545,7 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         [IO.File]::WriteAllText((Join-Path $runtime.Modules 'ExchangeOnlineManagement\ExchangeOnlineManagement.psd1'), "@{ ModuleVersion='3.9.0'; GUID='$([guid]::NewGuid())'; Author='SYNTHETIC' }", (New-Object Text.UTF8Encoding($true)))
         $stopped = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
         $stopped.ExitCode | Should -Be 1
-        $stopped.Output | Should -Match ([regex]::Escape('ExchangeOnlineManagement: found 3.9.0; the tool needs 3.10.1 or later. Run: Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers'))
+        $stopped.Output | Should -Match ([regex]::Escape('ExchangeOnlineManagement: found 3.9.0; the tool needs 3.10.1 or later. Run: Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope CurrentUser ('))
         @(Get-GateWrites $runtime).Count | Should -Be 0
         $good = New-GateRuntime -Name 'modules-ok'
         $ran = Invoke-GateProcess $good @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$good.ConfigPath} -TimeoutSeconds 120
@@ -7389,7 +7565,7 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         $steps = @($run.MainResult.NextSteps)
         # EntraConnect.Sync = $false in this configuration: the sync is the first of the numbered steps, then the copy of the package.
         $steps[0] | Should -Match '^Run a delta sync on \S+ \(Start-ADSyncSyncCycle -PolicyType Delta\) or wait for the next automatic cycle \(about 30 minutes\)\.$'
-        $steps[1] | Should -Match '^Copy .*for-Cloud\.zip to the cloud server'
+        $steps[1] | Should -Match '^Copy these two files, together in the same folder, to the cloud server \(anywhere\): .*for-Cloud\.zip and .*for-Cloud\.zip\.sha256\.'
         $steps.Count | Should -Be 3
         # Preview: nothing is pending, nothing to do on the other server yet.
         $preview = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
@@ -7411,6 +7587,11 @@ Describe 'Release 3.1.2 - cloud module versions, hand-over exit code, refused wr
         [string]$run.MainResult.TransferPackage | Should -BeExactly ''
         $folder = @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Directory | Where-Object Name -Like 'Batch-*')
         $folder.Count | Should -Be 1 -Because 'the backup is kept'
+        $next = @($run.MainResult.NextSteps)
+        $next[0] | Should -BeExactly ('Nothing was written to Active Directory. The backup folder {0} is marked NOT-APPLIED: you can delete it, or keep it as evidence. It is not a batch to continue or to roll back.' -f $folder[0].FullName)
+        $next[1] | Should -BeExactly 'Run the step again on the domain controller dc01.gate.invalid, or with an account that has the right to write there (see Prerequisites). Run the Preview first, then the same command with -Mode Apply:'
+        $next[2] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD$' -Because 'the Preview comes first, and the other server has its own configuration file'
+        $run.Output | Should -Match 'Nothing was written to Active Directory\. The backup folder' -Because 'the summary of a refused run carries the next step'
         Test-Path -LiteralPath (Join-Path $folder[0].FullName 'NOT-APPLIED.txt') | Should -BeTrue
         [IO.File]::ReadAllText((Join-Path $folder[0].FullName 'NOT-APPLIED.txt')) | Should -Match 'NOT a batch to continue and NOT a batch to roll back'
         @(Get-ChildItem -LiteralPath $folder[0].FullName -Filter 'Convert-*.json').Count | Should -Be 1
@@ -7482,7 +7663,7 @@ Describe 'Release 3.1.2 - the Next steps of a package Preview, and the scope tha
         $none = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
         $none.ExitCode | Should -Be 1
         $none.Output | Should -Match 'Configuration: Scope\.Mode = OU requires Scope\.SearchBase: no OU is set, so the tool does not know which mailboxes to convert\.'
-        $none.Output | Should -Match 'Fill it in the configuration file, or give -Identity \(one account\), -CsvPath \(a CSV file with an Identity column\) or -SearchBase \(an OU\) for this run, or set Scope\.Mode = Auto'
+        $none.Output | Should -Match 'Fill it in the configuration file, or give -Identity \(one account\), -CsvPath \(a CSV file with an Identity column\), -SearchBase \(an OU\) or -Group \(an AD group\) for this run, or set Scope\.Mode = Auto'
         @(Get-GateEvents $runtime | Where-Object Operation -Match '^Get-AD').Count | Should -Be $readsBefore -Because 'the run stops before it reads Active Directory'
         $override = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';SearchBase='OU=Tests,DC=gate,DC=invalid';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
         $override.ExitCode | Should -Be 0 -Because ($override.Output + $override.Error)
@@ -7508,6 +7689,1629 @@ Describe 'Release 3.1.2 - the Next steps of a package Preview, and the scope tha
     }
 }
 
+Describe 'Release 3.1.3 - the install commands are valid, a refused run touched nothing, a Preview does not say done' -Tag 'Release313' {
+    BeforeEach {
+        $global:PraGateT313 = @{ Avail = @(); Loaded = @() }
+        function script:Use-RemoteSync313($Runtime, [string]$Mode) {
+            $Runtime.State.RemoteSync = $Mode
+            [IO.File]::WriteAllText($Runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($Runtime.State, 35))
+        }
+        function script:Enable-SyncConfig313($Runtime) {
+            Set-GateConfigText $Runtime { param($t) $t.Replace('EntraConnect=@{Sync=$false;Server='''';', 'EntraConnect=@{Sync=$true;Server=''SRV-SYNC01'';') }
+        }
+    }
+    AfterEach { Remove-Variable PraGateT313 -Scope Global -ErrorAction SilentlyContinue }
+
+    It 'every Install-Module command of a refusal parses and carries ONE module name (PowerShellGet refuses -MinimumVersion with several)' {
+        $global:PraGateT313.Avail = @([pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.40.0' }, [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.9.0' })
+        $report = InModuleScope PRA.Common { Mock Get-Module { param($Name, [switch]$ListAvailable) if ($ListAvailable) { $global:PraGateT313.Avail } else { $global:PraGateT313.Loaded } }; Get-PraCloudModuleReport }
+        $report.Graph.Message | Should -Not -Match 'Microsoft\.Graph\.Authentication,\s*Microsoft\.Graph\.Users'
+        $texts = @{
+            Graph = [regex]::Match($report.Graph.Message, 'Run: (.+?) \(').Groups[1].Value
+            Exo = [regex]::Match($report.Exo.Message, 'Run: (.+?) \(').Groups[1].Value
+        }
+        $texts.Graph | Should -Not -BeNullOrEmpty; $texts.Exo | Should -Not -BeNullOrEmpty
+        $names = @()
+        foreach ($text in $texts.Values) {
+            $errors = $null
+            $ast = [Management.Automation.Language.Parser]::ParseInput($text, [ref]$null, [ref]$errors)
+            $errors.Count | Should -Be 0 -Because $text
+            $commands = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] }, $true))
+            $commands.Count | Should -BeGreaterThan 0
+            foreach ($command in $commands) {
+                $command.GetCommandName() | Should -BeExactly 'Install-Module'
+                $elements = @($command.CommandElements | Select-Object -Skip 1)
+                $bare = New-Object 'Collections.Generic.List[string]'; $parameters = @{}
+                for ($i = 0; $i -lt $elements.Count; $i++) {
+                    if ($elements[$i] -is [Management.Automation.Language.CommandParameterAst]) { $parameters[$elements[$i].ParameterName] = [string]$elements[$i + 1].Value; $i++ }
+                    else { $bare.Add([string]$elements[$i].Value) }
+                }
+                $bare.Count | Should -Be 1 -Because "one name per Install-Module: $text"
+                $parameters['MinimumVersion'] | Should -Match '^\d+\.\d+\.\d+$'
+                $parameters['Scope'] | Should -BeExactly 'CurrentUser'
+                $names += $bare[0]
+            }
+        }
+        $names | Should -Contain 'Microsoft.Graph.Authentication'
+        $names | Should -Contain 'Microsoft.Graph.Users'
+        $names | Should -Contain 'ExchangeOnlineManagement'
+        $report.Graph.Message | Should -Match 'the same version for both'
+        $report.Graph.Message | Should -Match '-Scope AllUsers in a window opened as administrator\)\.$' -Because 'the message ends with a full stop after the command'
+    }
+    It 'a refusal for the cloud modules never runs "Nothing was changed" into the command, and reports no object (0 done, 0 skipped, no global report)' {
+        $runtime = New-GateRuntime -Name 'modules-313'
+        Remove-Item -LiteralPath (Join-Path $runtime.Modules 'Microsoft.Graph.Authentication'), (Join-Path $runtime.Modules 'Microsoft.Graph.Users') -Recurse -Force
+        foreach ($pair in @(@('Microsoft.Graph.Authentication', '2.40.0'), @('Microsoft.Graph.Users', '2.35.1'))) {
+            $folder = Join-Path $runtime.Modules $pair[0]; $null = New-Item -ItemType Directory -Path $folder -Force
+            [IO.File]::WriteAllText((Join-Path $folder ($pair[0] + '.psd1')), "@{ ModuleVersion='$($pair[1])'; GUID='$([guid]::NewGuid())'; Author='SYNTHETIC' }", (New-Object Text.UTF8Encoding($true)))
+        }
+        $apply = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $apply.ExitCode | Should -Be 1
+        $apply.Output | Should -Match ([regex]::Escape('Run: Install-Module Microsoft.Graph.Authentication -MinimumVersion 2.41.1 -Scope CurrentUser; Install-Module Microsoft.Graph.Users -MinimumVersion 2.41.1 -Scope CurrentUser (one command per module'))
+        $apply.Output | Should -Match '\)\. Nothing was changed\.'
+        $apply.Output | Should -Not -Match 'CurrentUser Nothing was changed|AllUsers Nothing was changed'
+        $apply.MainResult.SuccessCount | Should -Be 0
+        $apply.MainResult.SkippedCount | Should -Be 0
+        [string]$apply.MainResult.GlobalHtmlReport | Should -BeExactly ''
+    }
+    It 'Apply refused by the Entra Connect check: 0 done, nothing counted as skipped, no global report, and the error names the run, not an object ID' {
+        $runtime = New-GateRuntime -Name 'sync-refused-313'
+        Enable-SyncConfig313 $runtime; Use-RemoteSync313 $runtime 'Denied'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1
+        $run.MainResult.SuccessCount | Should -Be 0
+        $run.MainResult.SkippedCount | Should -Be 0
+        $run.MainResult.PendingCount | Should -Be 0
+        $run.MainResult.ErrorCount | Should -Be 1
+        $run.MainResult.TotalCount | Should -Be 1
+        [string]$run.MainResult.GlobalHtmlReport | Should -BeExactly ''
+        [string]$run.MainResult.GlobalCsvReport | Should -BeExactly ''
+        $run.Output | Should -Match '0 done'
+        $run.Output | Should -Match ' 0 skipped' -Because 'untouched objects are not counted as skipped'
+        $run.Output | Should -Not -Match 'object [0-9a-f]{8}-[0-9a-f]{4}-' -Because 'the stop names the run, not the last object looked at'
+        $rows = @(Import-Csv -LiteralPath $run.MainResult.CsvReport -Delimiter ';')
+        $rows.Count | Should -Be 1
+        $rows[0].UserPrincipalName | Should -BeExactly '(run)'
+        $rows[0].FinalStatus | Should -BeExactly 'Error'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'a resume (-Phase AD -Batch) refused by the Entra Connect check: 0 done, no global report, the error names the batch' {
+        $runtime = New-GateRuntime -Name 'resume-refused-313'
+        Enable-SyncConfig313 $runtime; Use-RemoteSync313 $runtime 'OkThenFail'
+        $first = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $first.ExitCode | Should -Be 2 -Because ($first.Output + $first.Error)
+        $short = [string]$first.MainResult.BatchId
+        $writes = @(Get-GateWrites $runtime).Count
+        Use-RemoteSync313 $runtime 'Denied'
+        $denied = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $denied.ExitCode | Should -Be 1
+        $denied.Output | Should -Match 'Entra Connect sync will not be possible'
+        $denied.MainResult.SuccessCount | Should -Be 0 -Because 'the refused run did not do anything'
+        $denied.MainResult.SkippedCount | Should -Be 0
+        $denied.MainResult.ErrorCount | Should -Be 1
+        $denied.MainResult.TotalCount | Should -Be 1
+        [string]$denied.MainResult.GlobalHtmlReport | Should -BeExactly ''
+        [string]$denied.MainResult.GlobalCsvReport | Should -BeExactly ''
+        $denied.Output | Should -Match '0 done'
+        $denied.Output | Should -Not -Match '[2-9] done'
+        $rows = @(Import-Csv -LiteralPath $denied.MainResult.CsvReport -Delimiter ';')
+        $rows.Count | Should -Be 1
+        $rows[0].UserPrincipalName | Should -BeExactly "(batch $short)"
+        @(Get-GateWrites $runtime).Count | Should -Be $writes
+    }
+    It 'a Preview says "preview" and counts "ready" and "planned" objects, never "done"; an Apply still says "done"' {
+        $runtime = New-GateRuntime -Name 'preview-words-313'
+        $preview = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $preview.ExitCode | Should -Be 0 -Because ($preview.Output + $preview.Error)
+        $preview.Output | Should -Match 'Convert preview finished - nothing was changed'
+        $preview.Output | Should -Match '[0-9]+ ready . [0-9]+ planned . [0-9]+ error\(s\) . [0-9]+ skipped'
+        $preview.Output | Should -Not -Match '[0-9]+ done|Convert finished'
+        # A Preview of the cloud phase whose mailboxes are already there: the objects are "ready", the title says "preview finished".
+        $made = New-GateRuntime -Name 'preview-words-ad-313'
+        $ad = Invoke-GateProcess $made @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$made.ConfigPath} -TimeoutSeconds 120
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $ad.Output | Should -Match '[0-9]+ done . [0-9]+ pending' -Because 'an Apply keeps its words'
+        $cloud = Invoke-GateProcess $made @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$made.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 120
+        $cloud.ExitCode | Should -BeIn @(0, 2) -Because ($cloud.Output + $cloud.Error)
+        $cloud.Output | Should -Not -Match 'Convert finished'
+        $cloud.Output | Should -Not -Match '[0-9]+ done'
+        $cloud.Output | Should -Match 'Convert preview finished - nothing was changed'
+        $cloud.Output | Should -Match '[0-9]+ ready'
+    }
+}
+
+Describe 'Release 3.1.3 - Check: one error for one failure, a plain line at each wait (production Cloud module, mocked boundaries, no network)' -Tag 'Release313' {
+    BeforeAll {
+        $global:PraGate.X500NetworkPath=Join-Path $global:PraGate.Root 'PraGateCheck313Network.psm1'
+        $networkSource=@'
+if ($env:PRA_GATE_NONET -cne 'SYNTHETIC-NO-NETWORK') { throw 'Synthetic interlock absent.' }
+function Get-EXOMailbox { [CmdletBinding()]param($Filter,$Properties,$ResultSize,[switch]$InactiveMailboxOnly) throw 'SYNTHETIC BLOCK: EXO mailbox' }
+function Get-EXORecipient { [CmdletBinding()]param($UserPrincipalName,$Filter,$Properties,$ResultSize) throw 'SYNTHETIC BLOCK: EXO recipient' }
+function Get-MgUser { [CmdletBinding()]param($UserId,$Property) throw 'SYNTHETIC BLOCK: Graph user' }
+function Get-MgUserLicenseDetail { [CmdletBinding()]param($UserId,[switch]$All) throw 'SYNTHETIC BLOCK: Graph license' }
+function Get-MgContext { [CmdletBinding()]param() [pscustomobject]@{TenantId='20000000-0000-0000-0000-000000000002';ContextScope='Process'} }
+function Get-ConnectionInformation { [CmdletBinding()]param() [pscustomobject]@{TenantID='20000000-0000-0000-0000-000000000002';State='Connected';TokenStatus='Active';ConnectionId='30000000-0000-0000-0000-000000000003';ModuleName=$global:PraGate.X500NetworkPath} }
+Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgUserLicenseDetail,Get-ConnectionInformation,Get-MgContext
+'@
+        [IO.File]::WriteAllText($global:PraGate.X500NetworkPath,$networkSource,(New-Object Text.UTF8Encoding($true)))
+        Get-Module PRA.Cloud -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module $global:PraGate.X500NetworkPath -Global -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+        $global:PraGate.X500Legacy='X500:/o=Synthetic/ou=Gate/cn=Recipients/cn=user1'
+        $global:PraGate.X500Oldest='X500:/o=Contoso/ou=First Administrative Group/cn=Recipients/cn=user1'
+    }
+    BeforeEach {
+        $global:PraGate.Runtime=New-GateRuntime -Name 'check-313'
+        $context=New-GateContext $global:PraGate.Runtime -Mode Preview -Action Check
+        $context.Phase='Cloud'; $context.Once=$false; $context.CheckScope='Both'; $context.IntervalMinutes=1; $context.TimeoutMinutes=3
+        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';TenantId='20000000-0000-0000-0000-000000000002'}
+        $context.Config.SharedMailbox.GrantFullAccess=$false
+        $context.LogFile=Join-Path $global:PraGate.Runtime.Root 'logs\check-313.log'
+        $global:PraGate.CloudContext=$context
+        $global:PraGate.X500Binding=@{TenantId='20000000-0000-0000-0000-000000000002';ConnectionId='30000000-0000-0000-0000-000000000003';ModuleLocation=$global:PraGate.X500NetworkPath;ModulePath=$global:PraGate.X500NetworkPath}
+        $record=[pscustomobject][ordered]@{ObjectGuid='';SamAccountName='user1@gate.invalid';UserPrincipalName='user1@gate.invalid';IsShared=$false}
+        $global:PraGate.CheckRow=New-PraRow $context $record
+        $context.Rows.Add($global:PraGate.CheckRow)
+    }
+    AfterAll {
+        Remove-Module PRA.Cloud,PraGateCheck313Network -Force -ErrorAction SilentlyContinue
+    }
+    It 'a Check given a UPN that fails counts ONE error, not one per layer (<Name>)' -ForEach @(
+        @{ Name = 'no mailbox at all'; Reply = $null }
+        @{ Name = 'a MailUser: the mailbox is not there yet (-Once)'; Reply = [pscustomobject]@{ RecipientTypeDetails = 'MailUser'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid') } }
+    ) {
+        $global:PraGate.CloudContext.Once=$true; $global:PraGate.X500Reply=$Reply
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { if ($null -ne $global:PraGate.X500Reply) { $global:PraGate.X500Reply } }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CheckRow) 'Convert'
+        }
+        $context=$global:PraGate.CloudContext
+        $global:PraGate.CheckRow.FinalStatus | Should -BeExactly 'Error'
+        $outcome = Get-PraOutcome $context
+        $outcome.Counts.Error | Should -Be 1 -Because (($outcome.Rows | ForEach-Object { $_.FinalStatus + ' ' + $_.UserPrincipalName + ' ' + $_.Detail }) -join ' // ')
+        $outcome.Rows.Count | Should -Be 1
+        # The error says it in plain words; the technical string is only in the CloudDetail of the row and in the log; the same text is not also a warning.
+        $message = [string]$context.Issues[0].Message
+        $message | Should -Match '^user1@gate\.invalid: not in the expected state: '
+        $message | Should -Not -Match 'MBX:|LIC:|type='
+        $global:PraGate.CheckRow.CloudDetail | Should -Match 'MBX:EXO type='
+        @(Get-PraList $context 'WarningList' | Where-Object { [string]$_.Message -like '*user1@gate.invalid*' }).Count | Should -Be 0 -Because 'an error is not repeated as a warning'
+        [IO.File]::ReadAllText($context.LogFile) | Should -Match 'Technical detail: Expected state not reached .*MBX:EXO type='
+    }
+    It 'a Check of an object that is still an on-premises mailbox says so in words (no mailbox in Exchange Online yet)' {
+        $global:PraGate.CloudContext.Once=$true; $global:PraGate.X500Reply=$null
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CheckRow) 'Convert'
+        }
+        [string]$global:PraGate.CloudContext.Issues[0].Message | Should -BeExactly 'user1@gate.invalid: not in the expected state: no mailbox in Exchange Online yet (the object is still an on-premises mailbox, or the sync has not run).'
+    }
+    It 'licence states are told in words, not as a key=value string' -ForEach @(
+        @{ Facts = @{ LicenseCount = 0; Enabled = $false; RequiredSku = ''; RequiredSkuOk = $true }; Words = 'no licence is assigned' }
+        @{ Facts = @{ LicenseCount = 1; Enabled = $false; RequiredSku = 'ENTERPRISEPACK'; RequiredSkuOk = $false }; Words = 'the required licence \(ENTERPRISEPACK\) is not assigned' }
+        @{ Facts = @{ LicenseCount = 1; Enabled = $false; RequiredSku = ''; RequiredSkuOk = $true }; Words = 'Exchange Online is not enabled in the licence' }
+    ) {
+        $global:PraGate.CloudContext.Once=$true; $global:PraGate.CloudContext.Config.Cloud.CheckLicense=$true; $global:PraGate.CloudContext.Config.Cloud.CheckMailbox=$false
+        $global:PraGate.CloudFacts=$Facts
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$true;Exo=$false;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-PraGraphFact { [pscustomobject]$global:PraGate.CloudFacts }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CheckRow) 'Convert'
+        }
+        $global:PraGate.CloudContext.Issues.Count | Should -Be 1
+        [string]$global:PraGate.CloudContext.Issues[0].Message | Should -Match $Words
+        [string]$global:PraGate.CloudContext.Issues[0].Message | Should -Not -Match 'LIC:|SKUPresent|ExpectedSKU'
+        $global:PraGate.CheckRow.CloudDetail | Should -Match 'LIC:OK=False'
+    }
+    It 'while a Check waits, each wait line says what is awaited and that -Once checks once; the X500 wait lines carry an icon' {
+        $icon = & (Get-Module PRA.Common) { Get-PraIcon 'Clock' }
+        # A short real wait (about a second): the loop is paced by the clock, the sleep itself is replaced.
+        $global:PraGate.CloudContext.Once=$false; $global:PraGate.CloudContext.TimeoutMinutes=0.02
+        $records = @(InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { [Threading.Thread]::Sleep(250) }
+            Mock Get-EXOMailbox { }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CheckRow) 'Convert' 6>&1
+        })
+        $text = ($records | ForEach-Object { [string]$_ }) -join "`n"
+        $text | Should -Match 'Not ready yet: user1@gate\.invalid - next check in [0-9]+ s'
+        $text | Should -Match 'Waiting for the mailbox to exist in Exchange Online\. A mailbox that is still on-premises never gets there without a Convert; with -Once the check looks once and stops\.'
+        $text | Should -Match ([regex]::Escape($icon + 'Not ready yet')) -Because 'a wait line has its icon'
+        # The X500 wait lines (mailbox ready, addresses not all there yet).
+        $global:PraGate.CloudContext.Action = 'Convert'
+        $global:PraGate.CheckRow = New-PraRow $global:PraGate.CloudContext ([pscustomobject][ordered]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; SamAccountName = 'user1@gate.invalid'; UserPrincipalName = 'user1@gate.invalid'; IsShared = $false
+            ExpectedX500 = [string[]]@($global:PraGate.X500Legacy, $global:PraGate.X500Oldest) })
+        $global:PraGate.X500Reply=[pscustomobject]@{RecipientTypeDetails='UserMailbox';EmailAddresses=[string[]]@('SMTP:user1@gate.invalid',$global:PraGate.X500Legacy)}
+        $records = @(InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { [Threading.Thread]::Sleep(250) }
+            Mock Get-EXOMailbox { $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CheckRow) 'Convert' 6>&1
+        })
+        $text = ($records | ForEach-Object { [string]$_ }) -join "`n"
+        $text | Should -Match ([regex]::Escape($icon + 'user1@gate.invalid: mailbox ready;') + ' X500 addresses not all visible yet, check [23] of 3 in [0-9]+ s')
+    }
+}
+
+Describe 'Release 3.1.3 - package files, sync wording, rollback command, Preview blockers, Check words (real main, synthetic)' -Tag 'Release313b' {
+    BeforeEach {
+        function script:Use-RemoteSync313b($Runtime, [string]$Mode) {
+            $Runtime.State.RemoteSync = $Mode
+            [IO.File]::WriteAllText($Runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($Runtime.State, 35))
+        }
+        function script:Enable-SyncConfig313b($Runtime) {
+            Set-GateConfigText $Runtime { param($t) $t.Replace('EntraConnect=@{Sync=$false;Server='''';', 'EntraConnect=@{Sync=$true;Server=''SRV-SYNC01'';') }
+        }
+    }
+
+    It 'the Next step names the zip AND its .sha256 file, and a missing sidecar is refused with what to copy' {
+        $runtime = New-GateRuntime -Name 'sidecar-313b'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+        $zip = [string]$run.MainResult.TransferPackage
+        $name = [IO.Path]::GetFileName($zip)
+        (@($run.MainResult.NextSteps) -join "`n") | Should -Match ([regex]::Escape("Copy these two files, together in the same folder, to the cloud server (anywhere): $zip and $zip.sha256. Then run there:"))
+        $cloud = New-GateRuntime -Name 'sidecar-313b-cloud'
+        $drop = Join-Path $cloud.Root 'dropped'; $null = New-Item -ItemType Directory -Path $drop
+        Copy-Item -LiteralPath $zip -Destination $drop
+        $second = Invoke-GateProcess $cloud @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$cloud.ConfigPath;Batch=(Join-Path $drop $name)} -TimeoutSeconds 120
+        $second.ExitCode | Should -Be 1
+        $second.Output | Should -Match ([regex]::Escape("the .sha256 file next to the package is missing. Copy $name.sha256 from the Outbox folder of the AD server that wrote the package, into the same folder as the .zip, then run again."))
+    }
+    It 'a suspended sync scheduler is told with its remedy, with no .NET text, and the cycle is not announced as started' {
+        $runtime = New-GateRuntime -Name 'sync-suspended-313b'
+        Enable-SyncConfig313b $runtime; Use-RemoteSync313b $runtime 'RawFail'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape('The Entra Connect sync did not run: the synchronisation scheduler is suspended on SRV-SYNC01: run Set-ADSyncScheduler -SchedulerSuspended $false on that server, then run the sync. The AD changes are already made and verified'))
+        $run.Output | Should -Not -Match 'InvalidOperationException|MetadirectoryServices|StartSyncCycle'
+        $run.Output | Should -Not -Match 'cycle started'
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'AD is changed and verified. The Entra Connect sync did not run: the synchronisation scheduler is suspended on SRV-SYNC01: run Set-ADSyncScheduler -SchedulerSuspended $false on that server, then run the sync.'
+        [IO.File]::ReadAllText([string]$run.MainResult.LogFile) | Should -Match 'technical message: System\.InvalidOperationException: Scheduler is already suspended'
+    }
+    It 'any other failure of the cycle shows the first line of the message only, never the exception type or the call stack' {
+        $runtime = New-GateRuntime -Name 'sync-raw-313b'
+        Enable-SyncConfig313b $runtime; Use-RemoteSync313b $runtime 'RawFailOther'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'AD is changed and verified. The Entra Connect sync did not run: the synchronisation cycle could not start on SRV-SYNC01: The sync engine returned an unexpected result.'
+        $run.Output | Should -Not -Match 'InvalidOperationException|MetadirectoryServices|StartSyncCycle|cycle started'
+        ($steps -join "`n") | Should -Not -Match '\bcheck\b'
+        [IO.File]::ReadAllText([string]$run.MainResult.LogFile) | Should -Match 'technical message: System\.InvalidOperationException: The sync engine returned'
+    }
+    It 'a sync cycle that runs is announced as started before it is reported finished' {
+        $runtime = New-GateRuntime -Name 'sync-order-313b'
+        Enable-SyncConfig313b $runtime; Use-RemoteSync313b $runtime 'Ok'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+        $started = $run.Output.IndexOf('cycle started on SRV-SYNC01')
+        $finished = $run.Output.IndexOf('Entra Connect cycle finished on SRV-SYNC01')
+        $started | Should -BeGreaterThan -1
+        $finished | Should -BeGreaterThan $started
+        $run.Output | Should -Match 'RESULT: PENDING' -Because 'an exit code 2 is not a pass'
+        $run.Output | Should -Not -Match 'RESULT: PASS'
+        [IO.File]::ReadAllText([string]$run.MainResult.LogFile) | Should -Match 'RESULT: PENDING'
+    }
+    It 'a server without the RSAT ActiveDirectory module says so in plain words, under its own operation label' {
+        $runtime = New-GateRuntime -Name 'rsat-313b'
+        $global:PraGate.RsatContext = New-GateContext $runtime -Mode Preview -Action Convert
+        $thrown = InModuleScope PRA.Directory {
+            Mock Import-Module { throw 'Le module ActiveDirectory est introuvable.' }
+            Mock Get-Module { @() }
+            try { Initialize-PraDirectory $global:PraGate.RsatContext; '' } catch { $_.Exception.Message }
+        }
+        $thrown | Should -Match '^The RSAT ActiveDirectory module is not installed on this server: the Active Directory part cannot run here \(install the RSAT feature Active Directory module, or run the AD part on a server that has it\)\.$'
+        $global:PraGate.RsatContext.CurrentOperation | Should -BeExactly 'Import-ActiveDirectory'
+        Remove-Variable RsatContext -Scope Global -ErrorAction SilentlyContinue
+    }
+    It 'after a two-server Convert Cloud, the rollback command is the AD phase of the batch' {
+        $runtime = New-GateRuntime -Name 'rollback-313b'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $zip = [string]$ad.MainResult.TransferPackage
+        $cloud = New-GateRuntime -Name 'rollback-313b-cloud'
+        $drop = Join-Path $cloud.Root 'dropped'; $null = New-Item -ItemType Directory -Path $drop
+        Copy-Item -LiteralPath $zip, ($zip + '.sha256') -Destination $drop
+        $second = Invoke-GateProcess $cloud @{Action='Convert';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$cloud.ConfigPath;Batch=(Join-Path $drop ([IO.Path]::GetFileName($zip)))} -TimeoutSeconds 120
+        $second.ExitCode | Should -BeIn @(0, 2) -Because ($second.Output + $second.Error)
+        (@($second.MainResult.NextSteps) -join "`n") | Should -Match 'To roll back this batch later, on the AD server \(Preview first, then the same command with -Mode Apply\): \.\\Invoke-PraRemoteMailbox\.ps1 -Action Recover -Phase AD -Batch [0-9a-f]{8}$'
+        # A single-server batch keeps the plain rollback command (the one server does both parts).
+        $both = New-GateRuntime -Name 'rollback-313b-both'
+        $done = Invoke-GateProcess $both @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$both.ConfigPath} -TimeoutSeconds 120
+        (@($done.MainResult.NextSteps) -join "`n") | Should -Match 'To roll back this batch later: \.\\Invoke-PraRemoteMailbox\.ps1 -Action Recover -Batch [0-9a-f]{8}'
+    }
+    It 'a Preview that knows that the Apply will be refused says what to fix before it proposes the Apply (<Mode>)' -ForEach @(
+        @{ Mode = 'Denied';      Fix = 'give this account the rights named in the warning above' }
+        @{ Mode = 'Unreachable'; Fix = 'fix the problem named in the warning above' }
+    ) {
+        $runtime = New-GateRuntime -Name 'preview-blocker-313b'
+        Enable-SyncConfig313b $runtime; Use-RemoteSync313b $runtime $Mode
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly ('The Apply would be refused as things stand. First {0}, or set EntraConnect.Sync = $false in the configuration file and run the Entra Connect sync yourself after the AD changes.' -f $Fix)
+        $steps[1] | Should -BeExactly 'Then run the Apply:'
+        $steps[2] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply'
+        # When the sync check passes, the Preview proposes the Apply straight away.
+        Use-RemoteSync313b $runtime 'Ok'
+        $fine = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        (@($fine.MainResult.NextSteps) -join "`n") | Should -Not -Match 'would be refused'
+    }
+    It 'a Preview with unusable cloud modules says to install them before it proposes the Apply' {
+        $runtime = New-GateRuntime -Name 'preview-modules-313b'
+        Remove-Item -LiteralPath (Join-Path $runtime.Modules 'Microsoft.Graph.Authentication'), (Join-Path $runtime.Modules 'Microsoft.Graph.Users') -Recurse -Force
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Preview';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'The Apply would be refused as things stand. First install or update the cloud modules with the commands in the warning above.'
+        $steps[1] | Should -BeExactly 'Then run the Apply:'
+        $steps[2] | Should -Match '-Action Convert -Phase Both -Mode Apply'
+    }
+    It 'a Check says "as expected" and never "done"; a Check that finds a difference says so, and nothing was changed' {
+        $runtime = New-GateRuntime -Name 'check-words-313b'
+        $good = Invoke-GateProcess $runtime @{Action='Check';Identity='user1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $good.ExitCode | Should -BeIn @(0, 2) -Because ($good.Output + $good.Error)
+        $good.Output | Should -Match '[0-9]+ as expected . 0 not as expected . [0-9]+ skipped'
+        $good.Output | Should -Not -Match '[0-9]+ done'
+        $bad = New-GateRuntime -Name 'check-not-expected-313b' -Case 'CheckNotExpected'
+        $run = Invoke-GateProcess $bad @{Action='Check';Identity='user1';ConfigPath=$bad.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape('Check finished: 1 object(s) not in the expected state. Nothing was changed.'))
+        $run.Output | Should -Match ([regex]::Escape('Check finished - 1 object(s) not in the expected state'))
+        $run.Output | Should -Not -Match 'Check stopped'
+        $run.Output | Should -Not -Match 'no restore or clean-up is done'
+        $run.Output | Should -Match '0 as expected . 1 not as expected'
+        @(Get-GateWrites $bad).Count | Should -Be 0
+    }
+}
+Describe 'Release 3.1.3 - a network failure and an unreachable domain controller are said in plain words (production Cloud and Directory modules, mocked boundaries)' -Tag 'Release313c' {
+    BeforeAll {
+        $global:PraGate.X500NetworkPath=Join-Path $global:PraGate.Root 'PraGateCheck313cNetwork.psm1'
+        $networkSource=@'
+if ($env:PRA_GATE_NONET -cne 'SYNTHETIC-NO-NETWORK') { throw 'Synthetic interlock absent.' }
+function Get-EXOMailbox { [CmdletBinding()]param($Filter,$Properties,$ResultSize,[switch]$InactiveMailboxOnly) throw 'SYNTHETIC BLOCK: EXO mailbox' }
+function Get-EXORecipient { [CmdletBinding()]param($UserPrincipalName,$Filter,$Properties,$ResultSize) throw 'SYNTHETIC BLOCK: EXO recipient' }
+function Get-ConnectionInformation { [CmdletBinding()]param() [pscustomobject]@{TenantID='20000000-0000-0000-0000-000000000002';State='Connected';TokenStatus='Active';ConnectionId='30000000-0000-0000-0000-000000000003';ModuleName=$global:PraGate.X500NetworkPath} }
+Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-ConnectionInformation
+'@
+        [IO.File]::WriteAllText($global:PraGate.X500NetworkPath,$networkSource,(New-Object Text.UTF8Encoding($true)))
+        Get-Module PRA.Cloud -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module $global:PraGate.X500NetworkPath -Global -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+    }
+    BeforeEach {
+        $global:PraGate.Runtime=New-GateRuntime -Name 'network-313c'
+        $context=New-GateContext $global:PraGate.Runtime -Mode Preview -Action Check
+        $context.Phase='Cloud'; $context.Once=$true; $context.CheckScope='Both'; $context.IntervalMinutes=1; $context.TimeoutMinutes=3
+        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';TenantId='20000000-0000-0000-0000-000000000002'}
+        $context.Config.SharedMailbox.GrantFullAccess=$false
+        $context.LogFile=Join-Path $global:PraGate.Runtime.Root 'logs\network-313c.log'
+        $global:PraGate.CloudContext=$context
+        $global:PraGate.X500Binding=@{TenantId='20000000-0000-0000-0000-000000000002';ConnectionId='30000000-0000-0000-0000-000000000003';ModuleLocation=$global:PraGate.X500NetworkPath;ModulePath=$global:PraGate.X500NetworkPath}
+        $record=[pscustomobject][ordered]@{ObjectGuid='';SamAccountName='user1@gate.invalid';UserPrincipalName='user1@gate.invalid';IsShared=$false}
+        $global:PraGate.CheckRow=New-PraRow $context $record
+        $context.Rows.Add($global:PraGate.CheckRow)
+    }
+    AfterAll {
+        Remove-Module PRA.Cloud,PraGateCheck313cNetwork -Force -ErrorAction SilentlyContinue
+    }
+    It 'a network failure of the cloud check is one plain line with the UPN and the host, and the raw text only in the technical detail (<Name>)' -ForEach @(
+        @{ Name = 'a connection that does not answer (localized text)'; Kind = 'Http'; Text = 'Une tentative de connexion a échoué car le parti connecté n''a pas répondu au-delà d''une certaine durée (graph.microsoft.com:443)'; Expected = 'user1@gate.invalid: Microsoft 365 did not answer (network): graph.microsoft.com:443. Run again.' }
+        @{ Name = 'a timeout without a host'; Kind = 'Timeout'; Text = 'The operation has timed out.'; Expected = 'user1@gate.invalid: Microsoft 365 did not answer (network). Run again.' }
+        @{ Name = 'only the text tells (the Exchange Online child process)'; Kind = 'Text'; Text = 'Exchange Online child process code=1, stderr=[No such host is known. (outlook.office365.com:443)], stdout=[]'; Expected = 'user1@gate.invalid: Microsoft 365 did not answer (network): outlook.office365.com:443. Run again.' }
+    ) {
+        $global:PraGate.NetworkFailure=@{ Kind=$Kind; Text=$Text }
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox {
+                $f=$global:PraGate.NetworkFailure
+                switch ($f.Kind) {
+                    'Http' { throw [System.Net.Http.HttpRequestException]::new($f.Text, [System.Net.Sockets.SocketException]::new(10060)) }
+                    'Timeout' { throw [TimeoutException]::new($f.Text) }
+                    default { throw $f.Text }
+                }
+            }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CheckRow) 'Convert'
+        }
+        $context=$global:PraGate.CloudContext
+        $context.Issues.Count | Should -Be 1
+        [string]$context.Issues[0].Message | Should -BeExactly $Expected
+        [string]$context.Issues[0].Message | Should -Not -Match '\|\s*$'
+        $global:PraGate.CheckRow.CloudDetail | Should -Be $Text -Because 'the raw text is the technical detail of the row'
+        $context.NetworkFailure | Should -BeTrue
+        $outcome = Get-PraOutcome $context
+        $outcome.Counts.Error | Should -Be 1
+        $outcome.Counts.RunError | Should -Be 1 -Because 'an object that could not be read is not "not in the expected state"'
+        [IO.File]::ReadAllText($context.LogFile) | Should -Match ('Technical detail: ' + [regex]::Escape($Text))
+    }
+    It 'another failure keeps its own message and never ends with an empty " | "' {
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession']=@{Graph=$false;Exo=$true;Subprocess=$false;Binding=$global:PraGate.X500Binding} }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { throw 'SYNTHETIC: the answer is not valid.' }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CheckRow) 'Convert'
+        }
+        $context=$global:PraGate.CloudContext
+        [string]$context.Issues[0].Message | Should -BeExactly 'SYNTHETIC: the answer is not valid.'
+        [bool](Get-PraValue $context 'NetworkFailure' $false) | Should -BeFalse
+    }
+    It 'Get-PraNetworkFailure tells network errors from the others (<Name>)' -ForEach @(
+        @{ Name = 'socket'; Make = { [System.Net.Sockets.SocketException]::new(10061) }; Network = $true }
+        @{ Name = 'http without status, inside an aggregate'; Make = { [AggregateException]::new([System.Net.Http.HttpRequestException]::new('x', [System.Net.Sockets.SocketException]::new(11001))) }; Network = $true }
+        @{ Name = 'an HTTP answer with a status is not a network failure'; Make = { [System.Net.Http.HttpRequestException]::new('Response status code does not indicate success: 403 (Forbidden).', $null, [System.Net.HttpStatusCode]::Forbidden) }; Network = $false }
+        @{ Name = 'a plain error'; Make = { [InvalidOperationException]::new('Microsoft Graph: user not found or not unique (a@b.c).') }; Network = $false }
+        @{ Name = 'the write timeout of the child process is not a network failure'; Make = { [InvalidOperationException]::new('Exchange Online timeout; write state unknown. stderr=[], stdout=[]') }; Network = $false }
+    ) {
+        $global:PraGate.NetworkErrorMaker=$Make
+        $result = InModuleScope PRA.Cloud {
+            $exception=& $global:PraGate.NetworkErrorMaker
+            Get-PraNetworkFailure ([Management.Automation.ErrorRecord]::new($exception, 'x', [Management.Automation.ErrorCategory]::NotSpecified, $null))
+        }
+        ($null -ne $result) | Should -Be $Network
+    }
+    It 'a domain controller that does not answer is said in plain words (by type, whatever the language); the raw text stays in the log' {
+        $runtime = New-GateRuntime -Name 'dc-down-313c'
+        $global:PraGate.DcContext = New-GateContext $runtime -Mode Preview -Action Check
+        $global:PraGate.DcContext.Server = 'dc01.gate.invalid'
+        $global:PraGate.DcContext.LogFile = Join-Path $runtime.Root 'logs\dc-down-313c.log'
+        if (-not ('GateSynthetic.ADServerDownException' -as [type])) { Add-Type -TypeDefinition 'namespace GateSynthetic { public class ADServerDownException : System.Exception { public ADServerDownException(string message) : base(message) { } } }' }
+        $thrown = InModuleScope PRA.Directory {
+            try { $null = Invoke-PraRead $global:PraGate.DcContext 'Get-ADDomainController' 'dc01.gate.invalid' { throw [GateSynthetic.ADServerDownException]::new('Impossible de contacter le serveur.') }; '' } catch { $_.Exception.Message }
+        }
+        $thrown | Should -BeExactly 'The domain controller dc01.gate.invalid does not answer from this machine (Active Directory Web Services, TCP 9389): run the Check on a machine that reaches it, or give the UPN of the mailbox as -Identity.'
+        $global:PraGate.DcContext.Issues.Count | Should -Be 0 -Because 'the stop of the run is the one error'
+        $global:PraGate.DcContext.DcUnreachable | Should -BeTrue
+        $global:PraGate.DcContext.CurrentIdentity | Should -BeExactly ''
+        [IO.File]::ReadAllText($global:PraGate.DcContext.LogFile) | Should -Match 'AD read failed \| Get-ADDomainController \| DC=dc01\.gate\.invalid .*GateSynthetic\.ADServerDownException \| Impossible de contacter le serveur\.'
+        $other = InModuleScope PRA.Directory {
+            try { $null = Invoke-PraRead $global:PraGate.DcContext 'Get-ADUser/Identity' 'x' { throw 'SYNTHETIC: other read failure' }; '' } catch { $_.Exception.Message }
+        }
+        $other | Should -BeExactly 'SYNTHETIC: other read failure'
+        $global:PraGate.DcContext.Issues.Count | Should -Be 1 -Because 'any other failure of a read is still logged as an error with its details'
+        Remove-Variable DcContext -Scope Global -ErrorAction SilentlyContinue
+    }
+    It 'the module report says that a Graph module is not installed, and lists versions only for the modules that exist' {
+        $global:PraGate.T313c=@([pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' })
+        $report = InModuleScope PRA.Common { Mock Get-Module { param($Name, [switch]$ListAvailable) if ($ListAvailable) { $global:PraGate.T313c } else { @() } }; Get-PraCloudModuleReport }
+        $report.Graph.Message | Should -Match '^Microsoft Graph: Microsoft\.Graph\.Authentication is not installed; Microsoft\.Graph\.Users is not installed\. The tool needs both'
+        $report.Graph.Message | Should -Not -Match 'found'
+    }
+}
+Describe 'Release 3.1.3 - failures told in words, a Check that ran to the end, the rerun commands (real main, synthetic)' -Tag 'Release313c' {
+    It 'a Check that cannot reach Microsoft 365 says so with the UPN, counts an error and not "not as expected", changed nothing and proposes the Check again' {
+        $runtime = New-GateRuntime -Name 'check-network-313c' -Case 'CloudNetworkFailure'
+        $run = Invoke-GateProcess $runtime @{Action='Check';Identity='user1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape('user1@gate.invalid: Microsoft 365 did not answer (network): graph.example.invalid:443. Run again.'))
+        $run.Output | Should -Match "Stopped at step 'Cloud' \(operation CloudCheck, object user1@gate\.invalid\): Microsoft 365 did not answer\. Nothing was changed\. Run the Check again\."
+        $run.Output | Should -Not -Match 'no restore or clean-up is done'
+        $run.Output | Should -Not -Match 'object [0-9a-f]{8}-[0-9a-f]{4}'
+        $run.Output | Should -Match '0 as expected . 0 not as expected . 1 error\(s\) . 0 skipped'
+        $run.Output | Should -Match 'Check stopped - see the errors below'
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'Microsoft 365 did not answer from this machine. Nothing was changed: run the Check again when the connection works:'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Identity ''user1'''
+        $run.Output | Should -Match 'run the Check again when the connection works' -Because 'the summary carries the next step'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'a Convert cloud Preview that cannot reach Microsoft 365 says that nothing was changed, never "no restore or clean-up", and proposes the Preview again' {
+        $runtime = New-GateRuntime -Name 'preview-network-313c' -Case 'CloudNetworkFailure'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$runtime.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'Microsoft 365 did not answer\. Nothing was changed\. Run the Preview again\.'
+        $run.Output | Should -Not -Match 'no restore or clean-up is done'
+        $run.Output | Should -Match 'Convert stopped - see the errors below'
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'Microsoft 365 did not answer from this machine. Nothing was changed: run the Preview again when the connection works:'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Batch [0-9a-f]{8}'
+        $steps[1] | Should -Not -Match '-Mode Apply'
+    }
+    It 'an Apply of the cloud phase that cannot reach Microsoft 365 keeps an accurate message and proposes the same command again' {
+        $runtime = New-GateRuntime -Name 'apply-network-313c'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $zip = [string]$ad.MainResult.TransferPackage
+        $cloud = New-GateRuntime -Name 'apply-network-313c-cloud' -Case 'CloudNetworkFailure'
+        $drop = Join-Path $cloud.Root 'dropped'; $null = New-Item -ItemType Directory -Path $drop
+        Copy-Item -LiteralPath $zip, ($zip + '.sha256') -Destination $drop
+        $run = Invoke-GateProcess $cloud @{Action='Convert';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$cloud.ConfigPath;Batch=(Join-Path $drop ([IO.Path]::GetFileName($zip)))} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape('Microsoft 365 did not answer: the cloud part of this batch is not complete; run it again with the same command.'))
+        $run.Output | Should -Not -Match 'Nothing was changed'
+        $steps = @($run.MainResult.NextSteps)
+        $at = [array]::IndexOf($steps, 'Microsoft 365 did not answer from this machine. What this run already did is kept: run the same command again when the connection works:')
+        $at | Should -BeGreaterOrEqual 0 -Because ($steps -join "`n")
+        $steps[$at + 1] | Should -Match ('^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch ' + [regex]::Escape("'" + (Join-Path $drop ([IO.Path]::GetFileName($zip))) + "'")) -Because 'the command is the one that was typed: the package path, not the batch ID'
+        $steps[$at + 1] | Should -Not -Match '-Batch [0-9a-f]{32}'
+    }
+    It 'a Check given an account name whose domain controller does not answer: plain message, an error and not "not as expected", the raw text in the log only, the Next steps' {
+        $runtime = New-GateRuntime -Name 'check-dc-down-313c' -Case 'AdServerDown'
+        $run = Invoke-GateProcess $runtime @{Action='Check';Identity='user1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape('The domain controller dc01.gate.invalid does not answer from this machine (Active Directory Web Services, TCP 9389): run the Check on a machine that reaches it, or give the UPN of the mailbox as -Identity.'))
+        $run.Output | Should -Not -Match 'AD read failed|ADServerDownException|Impossible de contacter|ErrorId='
+        $run.Output | Should -Match '0 as expected . 0 not as expected . 1 error\(s\) . 0 skipped'
+        [IO.File]::ReadAllText([string]$run.MainResult.LogFile) | Should -Match 'AD read failed \| Get-ADDomainController .*ADServerDownException \| Impossible de contacter le serveur'
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'Nothing was changed. Run the Check again from a machine that reaches the domain controller:'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Identity ''user1'''
+        $steps[3] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Identity ''<UPN>'''
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'a Preview of the cloud phase run before the Entra Connect sync reminds, first in its Next steps, to run the sync' {
+        $runtime = New-GateRuntime -Name 'preview-notyet-313c' -Case 'CloudNotYet'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$runtime.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -Match '^[0-9]+ object\(s\) are not yet in the expected state in Exchange Online\. If the Entra Connect sync has not run since the Active Directory changes, run it first \(Start-ADSyncSyncCycle -PolicyType Delta on the Entra Connect server, or wait for the next automatic cycle, about 30 minutes\), then run this Preview again\.$'
+        $steps[1] | Should -BeExactly 'When the objects are ready, run the Apply:'
+        $steps[2] | Should -Match '-Action Convert -Phase Cloud -Mode Apply'
+        $run.Output | Should -Match 'Convert preview finished - nothing was changed'
+    }
+}
+Describe 'Release 3.1.3 - the batch named for an object already converted is the current one (production Directory module, synthetic folders)' -Tag 'Release313d' {
+    BeforeAll {
+        function global:New-Batch313d {
+            param([string]$Root, [string]$Id, [string]$Operation, [datetime]$Created, [string]$Guid, [string]$Hash, [string]$Source = '', [string]$Environment = 'SYNTHETIC_GATE', [string]$Prefix = 'Batch')
+            $folder = Join-Path $Root ($Prefix + '-' + $Id)
+            $null = New-Item -ItemType Directory -Path $folder -Force
+            $state = [ordered]@{ SchemaVersion = 2; Operation = $Operation; Kind = 'ADVerified'; Environment = $Environment; BackupFile = ($Operation + '-x.json'); BackupHash = $Hash; SourceBackupHash = $Source
+                CreatedUtc = $Created.ToUniversalTime().ToString('o'); Records = @([ordered]@{ ObjectGuid = $Guid; Operation = $Operation; ADVerified = $true }, [ordered]@{ ObjectGuid = '7c2d4e10-3a55-4b0e-9f6a-0d1e2f3a4b5c'; Operation = $Operation; ADVerified = $true }) }
+            [IO.File]::WriteAllText((Join-Path $folder ('State-' + $Id + '.json')), ($state | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($true)))
+            if ($Operation -ceq 'Convert') {
+                $backup = [ordered]@{ SchemaVersion = 3; Operation = 'Convert'; BatchId = $Id; Environment = $Environment; Records = @([ordered]@{ ObjectGuid = $Guid }) }
+                [IO.File]::WriteAllText((Join-Path $folder ('Convert-' + $Environment + '-' + $Id.Substring(0, 8) + '.json')), ($backup | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($true)))
+            }
+            (Get-Item -LiteralPath $folder).LastWriteTimeUtc = $Created.ToUniversalTime()
+        }
+        function global:Find-Batch313d {
+            param([string]$Root, [string]$Guid)
+            $global:PraGate.T313d = @{ Root = $Root; Guid = $Guid }
+            InModuleScope PRA.Directory {
+                $context = @{ Config = @{ Environment = 'SYNTHETIC_GATE'; Storage = @{ BackupFolder = $global:PraGate.T313d.Root } } }
+                Find-PraConvertedBatch $context $global:PraGate.T313d.Guid
+            }
+        }
+        $global:PraGate.G313d = '5b17e952-08de-42d2-974d-bf578b5b5a1c'
+    }
+    BeforeEach { $global:PraGate.R313d = Join-Path $global:PraGate.Root ('find-' + [guid]::NewGuid().ToString('N').Substring(0, 6)); $null = New-Item -ItemType Directory -Path $global:PraGate.R313d }
+    AfterAll {
+        foreach ($name in @('New-Batch313d', 'Find-Batch313d')) { Remove-Item -LiteralPath ('Function:\' + $name) -ErrorAction SilentlyContinue }
+        Remove-Variable T313d, G313d, R313d -Scope Global -ErrorAction SilentlyContinue
+    }
+    It 'names the current batch, not an old batch that was rolled back and that comes last in the alphabet' {
+        $root = $global:PraGate.R313d; $guid = $global:PraGate.G313d
+        # ff...: converted in January, rolled back by bb... in February; cc...: converted again in March (the current state of the object).
+        New-Batch313d $root ('ff000001'.PadRight(32, '0')) 'Convert' ([datetime]'2026-01-10T10:00:00Z') $guid ('a1' * 32)
+        New-Batch313d $root ('bb000002'.PadRight(32, '0')) 'Recover' ([datetime]'2026-02-10T10:00:00Z') $guid ('b2' * 32) ('a1' * 32)
+        New-Batch313d $root ('cc000003'.PadRight(32, '0')) 'Convert' ([datetime]'2026-03-10T10:00:00Z') $guid ('c3' * 32)
+        $found = Find-Batch313d $root $guid
+        $found.ShortId | Should -BeExactly 'cc000003'
+        $found.BatchId | Should -BeExactly ('cc000003'.PadRight(32, '0'))
+    }
+    It 'takes the newest by time, whatever the alphabetical order of the folders' {
+        $root = $global:PraGate.R313d; $guid = $global:PraGate.G313d
+        New-Batch313d $root ('aa000001'.PadRight(32, '0')) 'Convert' ([datetime]'2026-04-10T10:00:00Z') $guid ('a1' * 32)
+        New-Batch313d $root ('ff000002'.PadRight(32, '0')) 'Convert' ([datetime]'2026-01-10T10:00:00Z') $guid ('f2' * 32)
+        New-Batch313d $root ('cc000003'.PadRight(32, '0')) 'Convert' ([datetime]'2026-02-10T10:00:00Z') $guid ('c3' * 32)
+        (Find-Batch313d $root $guid).ShortId | Should -BeExactly 'aa000001'
+    }
+    It 'ignores a batch of another Environment, even the newest' {
+        $root = $global:PraGate.R313d; $guid = $global:PraGate.G313d
+        New-Batch313d $root ('cc000001'.PadRight(32, '0')) 'Convert' ([datetime]'2026-03-10T10:00:00Z') $guid ('c3' * 32)
+        New-Batch313d $root ('dd000002'.PadRight(32, '0')) 'Convert' ([datetime]'2026-04-10T10:00:00Z') $guid ('d4' * 32) -Environment 'OTHER_ENVIRONMENT'
+        (Find-Batch313d $root $guid).ShortId | Should -BeExactly 'cc000001'
+        Remove-Item -LiteralPath (Join-Path $root ('Batch-' + 'cc000001'.PadRight(32, '0'))) -Recurse -Force
+        Find-Batch313d $root $guid | Should -BeNullOrEmpty -Because 'the only batch left belongs to another Environment'
+    }
+    It 'gives nothing when the only batch of the object was rolled back, whether the proof of the rollback is a Batch folder or a Finalize folder' {
+        $root = $global:PraGate.R313d; $guid = $global:PraGate.G313d
+        New-Batch313d $root ('cc000001'.PadRight(32, '0')) 'Convert' ([datetime]'2026-03-10T10:00:00Z') $guid ('c3' * 32)
+        (Find-Batch313d $root $guid).ShortId | Should -BeExactly 'cc000001'
+        New-Batch313d $root ('ee000002'.PadRight(32, '0')) 'Recover' ([datetime]'2026-03-11T10:00:00Z') $guid ('e5' * 32) ('c3' * 32) -Prefix 'Finalize'
+        Find-Batch313d $root $guid | Should -BeNullOrEmpty
+    }
+    It 'does not care about the case of the Environment, of the folder prefix, of the batch id or of the hashes' -Tag 'Release313h' {
+        $root = $global:PraGate.R313d; $guid = $global:PraGate.G313d
+        New-Batch313d $root ('CC000001'.PadRight(32, '0')) 'Convert' ([datetime]'2026-03-10T10:00:00Z') $guid ('C3' * 32) -Environment 'synthetic_gate' -Prefix 'BATCH'
+        $found = Find-Batch313d $root $guid
+        $found.ShortId | Should -BeExactly 'CC000001'
+        New-Batch313d $root ('ee000002'.PadRight(32, '0')) 'Recover' ([datetime]'2026-03-11T10:00:00Z') $guid ('e5' * 32) ('c3' * 32) -Environment 'Synthetic_Gate' -Prefix 'finalize'
+        Find-Batch313d $root $guid | Should -BeNullOrEmpty -Because 'the rollback names the batch by a hash written in the other case'
+    }
+    It 'a batch of another Environment is still ignored when the case is the only thing that is the same' -Tag 'Release313h' {
+        $root = $global:PraGate.R313d; $guid = $global:PraGate.G313d
+        New-Batch313d $root ('dd000002'.PadRight(32, '0')) 'Convert' ([datetime]'2026-04-10T10:00:00Z') $guid ('d4' * 32) -Environment 'SYNTHETIC_GATE_2'
+        Find-Batch313d $root $guid | Should -BeNullOrEmpty
+    }
+    It 'a rollback of another object does not hide the batch' {
+        $root = $global:PraGate.R313d; $guid = $global:PraGate.G313d
+        New-Batch313d $root ('cc000001'.PadRight(32, '0')) 'Convert' ([datetime]'2026-03-10T10:00:00Z') $guid ('c3' * 32)
+        New-Batch313d $root ('bb000002'.PadRight(32, '0')) 'Recover' ([datetime]'2026-03-11T10:00:00Z') '9d1c0c2e-7a33-4f5e-8f0a-1f2e3d4c5b6a' ('b2' * 32) ('c3' * 32)
+        (Find-Batch313d $root $guid).ShortId | Should -BeExactly 'cc000001'
+    }
+}
+Describe 'Release 3.1.3 - rerun commands and error counts after a failure (real main, synthetic)' -Tag 'Release313d' {
+    It 'a cloud Apply that cannot reach Microsoft 365 proposes the batch as typed: the short ID when the ID was typed' {
+        $runtime = New-GateRuntime -Name 'apply-network-313d' -Case 'CloudNetworkFailure'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $short = [string]$ad.MainResult.BatchId
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $at = [array]::IndexOf($steps, 'Microsoft 365 did not answer from this machine. What this run already did is kept: run the same command again when the connection works:')
+        $at | Should -BeGreaterOrEqual 0 -Because ($steps -join "`n")
+        $steps[$at + 1] | Should -Match ('^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch ' + $short + ' -ConfigPath ')
+    }
+    It 'the Error block and the Result line count the same errors, and the stop line of a sign-in failure names the service, not the last object' {
+        $runtime = New-GateRuntime -Name 'count-313d' -Case 'CloudConnectFailure'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$runtime.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match '0 ready . 0 planned . 2 error\(s\) . 0 skipped'
+        $run.Output | Should -Match '2 error\(s\) in total, see the log and the report'
+        $run.Output | Should -Not -Match '3 error\(s\) in total'
+        $run.Output | Should -Match "Stopped at step 'Cloud' \(operation Connect-MgGraph, service Microsoft Graph\): Microsoft 365 did not answer\. Nothing was changed\. Run the Preview again\."
+        $run.Output | Should -Not -Match 'operation Connect-MgGraph, object'
+        # An object-level failure still names its object.
+        $object = New-GateRuntime -Name 'count-object-313d' -Case 'CloudNetworkFailure'
+        $adObject = Invoke-GateProcess $object @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$object.ConfigPath} -TimeoutSeconds 120
+        $runObject = Invoke-GateProcess $object @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$object.ConfigPath;Batch=[string]$adObject.MainResult.BatchId} -TimeoutSeconds 120
+        $runObject.Output | Should -Match 'operation CloudCheck, object user[0-9]@gate\.invalid'
+        $runObject.Output | Should -Match '0 ready . 0 planned . 2 error\(s\) . 0 skipped'
+        $runObject.Output | Should -Match '2 error\(s\) in total'
+    }
+    It 'a Check that cannot reach the domain controller proposes the Check again with its own options, without this machine''s -ConfigPath for the other machine' {
+        $runtime = New-GateRuntime -Name 'check-dc-down-313d' -Case 'AdServerDown'
+        $run = Invoke-GateProcess $runtime @{Action='Check';Identity='user1';Once=$true;Expect='Deprovisioned';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'Nothing was changed. Run the Check again from a machine that reaches the domain controller:'
+        $steps[1] | Should -BeExactly ".\Invoke-PraRemoteMailbox.ps1 -Action Check -Identity 'user1' -Expect Deprovisioned -Once"
+        $steps[3] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Identity '<UPN>' -Expect Deprovisioned -Once -ConfigPath '"
+    }
+    It 'an AD write refused for a run with -CsvPath says to copy the file to the domain controller and writes its name only' {
+        $runtime = New-GateRuntime -Name 'csv-denied-313d' -Case 'AccessDenied'
+        $csv = Join-Path $runtime.Root 'targets.csv'
+        [IO.File]::WriteAllText($csv, "Identity`r`nuser1`r`nuser2`r`n", (New-Object Text.UTF8Encoding($true)))
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;CsvPath=$csv;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $next = @($run.MainResult.NextSteps)
+        $next[1] | Should -BeExactly 'Copy the file targets.csv (the -CsvPath of this run) to the domain controller dc01.gate.invalid, to the folder where you run the command.'
+        $next[1] | Should -Not -Match 'that server'
+        $next[2] | Should -Match '^Run the step again on the domain controller '
+        $next[3] | Should -BeExactly ".\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -CsvPath 'targets.csv'"
+
+    }
+    It 'a Phase Both Apply that loses Microsoft 365 after the AD part says that AD is done and continues the batch by its ID' {
+        $runtime = New-GateRuntime -Name 'both-network-313d' -Case 'CloudNetworkFailure'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0 -Because 'the AD part was written'
+        $run.Output | Should -Match ([regex]::Escape('Microsoft 365 did not answer: the cloud part of this batch is not complete; Active Directory is done, see the next steps.'))
+        $steps = @($run.MainResult.NextSteps | Where-Object { $_ -notmatch '^Global report' })
+        $steps[0] | Should -BeExactly 'Microsoft 365 did not answer from this machine. What this run already did is kept (Active Directory is changed and verified): run the Exchange Online part when the connection works:'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch [0-9a-f]{8} -ConfigPath '
+        $steps[1] | Should -Not -Match '-Phase Both'
+        $run.Output | Should -Match 'run the Exchange Online part when the connection works'
+    }
+    It 'a Phase Both Apply with another cloud failure after the AD part has the same continuation, and a failure before the AD part keeps its own guidance' {
+        $runtime = New-GateRuntime -Name 'both-other-313d' -Case 'CloudOtherFailure'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0 -Because 'the AD part was written'
+        $run.Output | Should -Match ([regex]::Escape('the cloud part of this batch is not complete; Active Directory is done, see the next steps.'))
+        $run.Output | Should -Not -Match 'run it again with the same command'
+        $steps = @($run.MainResult.NextSteps | Where-Object { $_ -notmatch '^Global report' })
+        $steps[0] | Should -BeExactly 'What this run already did is kept (Active Directory is changed and verified). Fix the problem named above, then run the Exchange Online part:'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch [0-9a-f]{8} -ConfigPath '
+        # The cloud pre-check that refuses before any AD write is another case: nothing was written and the existing text stays.
+        $before = New-GateRuntime -Name 'both-before-313d' -Case 'CloudPreflightFailure'
+        $refused = Invoke-GateProcess $before @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$before.ConfigPath} -TimeoutSeconds 120
+        $refused.ExitCode | Should -Be 1 -Because ($refused.Output + $refused.Error)
+        @(Get-GateWrites $before).Count | Should -Be 0
+        $refused.Output | Should -Not -Match 'Active Directory is done'
+    }
+    It 'a Phase Both Recover that loses the cloud part after the AD part continues with the Recover batch by its ID' {
+        $runtime = New-GateRuntime -Name 'both-recover-313d' -Case 'CloudOtherFailure'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape('the cloud part of this batch is not complete; Active Directory is done, see the next steps.'))
+        $steps = @($run.MainResult.NextSteps | Where-Object { $_ -notmatch '^Global report' })
+        $steps[0] | Should -BeExactly 'What this run already did is kept (Active Directory is changed and verified). Fix the problem named above, then run the Exchange Online part:'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Recover -Phase Cloud -Mode Apply -Batch [0-9a-f]{8} -ConfigPath '
+        $steps[1] | Should -Not -Match ('-Batch ' + [string]$ad.MainResult.BatchId) -Because 'the Recover batch is continued, not the Convert batch'
+    }
+}
+Describe 'Release 3.1.3 - every stop ends with a next step, and the Error block shows the errors (real main, synthetic)' -Tag 'Release313e' {
+    BeforeAll {
+        $global:PraGate.Sync313e = 'If the Entra Connect sync has not run since the Active Directory changes, run it first (Start-ADSyncSyncCycle -PolicyType Delta on the Entra Connect server, or wait for the next automatic cycle, about 30 minutes).'
+        function global:Assert-Next313e {
+            param($Run, [string]$First, [string]$CommandPattern)
+            $steps = @($Run.MainResult.NextSteps | Where-Object { $_ -notmatch '^Global report' })
+            $steps.Count | Should -BeGreaterOrEqual 2 -Because ($Run.Output + $Run.Error)
+            $steps[0] | Should -BeExactly $First
+            $steps[1] | Should -Match $CommandPattern
+            $Run.Output | Should -Match ([regex]::Escape($First)) -Because 'the Next block is printed'
+        }
+    }
+    AfterAll {
+        Remove-Item -LiteralPath 'Function:\Assert-Next313e' -ErrorAction SilentlyContinue
+        Remove-Variable Sync313e -Scope Global -ErrorAction SilentlyContinue
+    }
+    It 'a Convert cloud Apply that waits for the mailboxes and times out says to run the sync, and to run the same command again; the stop names the number of objects, not one object' {
+        $runtime = New-GateRuntime -Name 'timeout-convert-313e' -Case 'CloudWaitTimeout'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $short = [string]$ad.MainResult.BatchId
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape("Stopped at step 'Cloud' (operation CloudCheck, 2 object(s)): Exchange Online check failed: the cloud part of this batch is not complete; run it again with the same command."))
+        $run.Output | Should -Not -Match 'operation CloudCheck, object'
+        $steps = @($run.MainResult.NextSteps | Where-Object { $_ -notmatch '^Global report' })
+        $steps.Count | Should -Be 3 -Because ($steps -join "`n")
+        $steps[0] | Should -BeExactly $global:PraGate.Sync313e
+        $steps[1] | Should -BeExactly 'What this run already did is kept: run the same command again:'
+        $steps[2] | Should -Match ('^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch ' + $short + ' -ConfigPath ')
+        $run.Output | Should -Match ([regex]::Escape('What this run already did is kept: run the same command again:')) -Because 'the Next block is printed'
+        # The Error block lists the errors of the objects first, the stop of the run last.
+        $first = $run.Output.LastIndexOf('user1@gate.invalid: still not in the expected state'); $second = $run.Output.LastIndexOf('user2@gate.invalid: still not in the expected state'); $stop = $run.Output.LastIndexOf("Stopped at step 'Cloud'")
+        $first | Should -BeGreaterThan 0; $second | Should -BeGreaterThan $first; $stop | Should -BeGreaterThan $second
+    }
+    It 'a Recover cloud Apply that times out says that the cloud part is not complete, to run the sync and to run the same command again' {
+        $runtime = New-GateRuntime -Name 'timeout-recover-313e' -Case 'CloudWaitTimeout'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $recover = Invoke-GateProcess $runtime @{Action='Recover';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 120
+        $recover.ExitCode | Should -Be 2 -Because ($recover.Output + $recover.Error)
+        $short = [string]$recover.MainResult.BatchId
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape("Stopped at step 'Cloud' (operation CloudCheck, 2 object(s)): Exchange Online check failed: the cloud part of this batch is not complete, so the final restore and clean-up are not done; run it again with the same command."))
+        $run.Output | Should -Not -Match 'no restore or clean-up is done'
+        $steps = @($run.MainResult.NextSteps | Where-Object { $_ -notmatch '^Global report' })
+        $steps[0] | Should -BeExactly $global:PraGate.Sync313e
+        $steps[1] | Should -BeExactly 'What this run already did is kept: run the same command again:'
+        $steps[2] | Should -Match ('^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Recover -Phase Cloud -Mode Apply -Batch ' + $short + ' -ConfigPath ')
+    }
+    It 'the Error block shows the object errors first (five, then how many more) and the stop of the run last' {
+        $runtime = New-GateRuntime -Name 'many-errors-313e' -Shared13 -TrusteeCount 3 -Case 'CloudWaitTimeout'
+        Set-GateConfigText $runtime { param($t) $t.Replace('Report=@{Enabled=$true;', 'Report=@{Enabled=$false;') }
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 180
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 180
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match '13 error\(s\) in total, see the log and the report'
+        $run.Output | Should -Match ([regex]::Escape("... and 8 more, see the report"))
+        $more = $run.Output.LastIndexOf('... and 8 more, see the report'); $stop = $run.Output.LastIndexOf("Stopped at step 'Cloud' (operation CloudCheck, 13 object(s))")
+        $more | Should -BeGreaterThan 0; $stop | Should -BeGreaterThan $more
+        $run.Output.Substring($more) | Should -Not -Match 'user[0-9]+@gate\.invalid: still not in the expected state' -Because 'the lines of the objects all come before the count of the others'
+    }
+    It 'a Convert cloud Preview that fails for another reason than the network proposes the Preview again' {
+        $runtime = New-GateRuntime -Name 'preview-other-313e' -Case 'CloudOtherFailure'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $short = [string]$ad.MainResult.BatchId
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$runtime.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        Assert-Next313e $run 'Nothing was changed. Fix the problem named above, then run the Preview again:' ('^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Batch ' + $short + ' -ConfigPath ')
+    }
+    It 'a Check that finds objects not in the expected state proposes the sync, then the Check again' {
+        $runtime = New-GateRuntime -Name 'check-not-expected-313e' -Case 'CheckNotExpected'
+        $run = Invoke-GateProcess $runtime @{Action='Check';Identity='user1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly ($global:PraGate.Sync313e.TrimEnd('.') + ', then run the Check again:')
+        $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Identity 'user1' -ConfigPath "
+        $run.Output | Should -Match 'then run the Check again:'
+    }
+    It 'a partial AD batch says which objects may be changed and proposes the Preview, never the Apply again' {
+        $runtime = New-GateRuntime -Name 'partial-ad-313e' -Case 'SecondMutationFailure'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -Match '^Active Directory was changed for [0-9]+ object\(s\) before the stop \(see the journal and the backup named above\)\. Do not run the Apply again before reading what is left: run the Preview of the same command:$'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -ConfigPath '
+        $steps[1] | Should -Not -Match '-Mode Apply'
+        $run.Output | Should -Match 'run the Preview of the same command'
+    }
+    It 'a stop before anything was written ends with the same command, as typed (usage, batch not found, cloud pre-check)' {
+        $usage = New-GateRuntime -Name 'usage-313e'
+        $run = Invoke-GateProcess $usage @{Action='Convert';Phase='Both';Mode='Preview';ConfigPath=$usage.ConfigPath;Batch='deadbeef'} -TimeoutSeconds 60
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        Assert-Next313e $run 'Fix the problem named above, then run the same command again:' '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Both -Batch deadbeef -ConfigPath '
+        $missing = New-GateRuntime -Name 'missing-313e'
+        $run = Invoke-GateProcess $missing @{Action='Recover';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$missing.ConfigPath;Batch='deadbeef'} -TimeoutSeconds 60
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        Assert-Next313e $run 'Fix the problem named above, then run the same command again:' '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Recover -Phase AD -Mode Apply -Batch deadbeef -ConfigPath '
+        $before = New-GateRuntime -Name 'preflight-313e' -Case 'CloudPreflightFailure'
+        $run = Invoke-GateProcess $before @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$before.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        @(Get-GateWrites $before).Count | Should -Be 0
+        Assert-Next313e $run 'Fix the problem named above, then run the same command again:' '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Both -Mode Apply -ConfigPath '
+    }
+    It 'the Finalize, cloud-phase and Check stops end with a next step too' {
+        $finalize = New-GateRuntime -Name 'finalize-313e'
+        $run = Invoke-GateProcess $finalize @{Action='Finalize';Mode='Apply';Force=$true;ConfigPath=$finalize.ConfigPath;Batch='deadbeef'} -TimeoutSeconds 60
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        Assert-Next313e $run 'Fix the problem named above, then run the same command again:' '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Finalize -Mode Apply -Batch deadbeef -ConfigPath '
+        $cloud = New-GateRuntime -Name 'cloud-missing-313e'
+        $run = Invoke-GateProcess $cloud @{Action='Convert';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$cloud.ConfigPath;Batch='deadbeef'} -TimeoutSeconds 60
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        Assert-Next313e $run 'Fix the problem named above, then run the same command again:' '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch deadbeef -ConfigPath '
+        $check = New-GateRuntime -Name 'check-usage-313e'
+        $run = Invoke-GateProcess $check @{Action='Check';ConfigPath=$check.ConfigPath} -TimeoutSeconds 60
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        Assert-Next313e $run 'Fix the problem named above, then run the same command again:' '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -ConfigPath '
+    }
+    It 'a failed run whose own next steps are hidden still ends with the fallback, and one that set its own keeps them' {
+        $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.3'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
+            CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
+            Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $true; ReportFolder = (Join-Path $global:PraGate.Root 'reports-313e'); NoReport = $true; BatchId = 'abcd1234'; LogFile = ''; TranscriptStarted = $false
+            NextSteps = @('Copy these two files to the cloud server.'); ExitCode = 1; CloudConnectFailed = $false; ResultStatus = ''; FallbackNext = @('Fix the problem named above, then run the same command again:', '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply') }
+        $ctx.Issues.Add([pscustomobject]@{ Timestamp = 't'; Phase = 'p'; Operation = 'Cloud sign-out'; Identity = ''; Source = 'Cloud'; Message = 'Cloud sign-out: refused' })
+        $hidden = Complete-PraRun -Context $ctx
+        $hidden.ExitCode | Should -Be 1
+        $hidden.NextSteps[0] | Should -BeExactly 'Fix the problem named above, then run the same command again:'
+        $own = @{} + $ctx; $own.Issues = (New-Object 'Collections.Generic.List[object]'); $own.NextOnFailure = $true; $own.NextSteps = @('Run the cloud part:', '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Mode Apply -Batch abcd1234'); $own.ExitCode = 1; $own.RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N'))
+        $own.Issues.Add([pscustomobject]@{ Timestamp = 't'; Phase = 'p'; Operation = 'x'; Identity = ''; Source = 'Execution'; Message = 'Stopped at step ''Cloud'' (operation x): failed' })
+        $kept = Complete-PraRun -Context $own
+        $kept.NextSteps[0] | Should -BeExactly 'Run the cloud part:'
+    }
+}
+Describe 'Release 3.1.3 - the members of an AD group for one run (-Group): parameter, resolution, nested members, skipped members (synthetic AD fixture)' -Tag 'Release313g' {
+    BeforeAll {
+        $global:PraGate.GroupFixture313g = @'
+function Get-ADGroup {
+    [CmdletBinding()]
+    param([object]$Identity,[string]$LDAPFilter,[string[]]$Properties,[string]$Server)
+    Assert-GateServer $Server
+    Write-GateEvent 'Get-ADGroup' $Identity $Server @{LDAPFilter=$LDAPFilter}
+    if ($global:PraGateAd.Case -eq 'GroupFailure') { throw 'SYNTHETIC: group preflight refused.' }
+    if (-not $LDAPFilter) { Copy-GateUser $global:PraGateAd.Group; return }
+    foreach ($group in @($global:PraGateAd.Groups)) {
+        $hit = $false
+        if ($LDAPFilter -match 'distinguishedName=([^)]*)\)\)$') { $hit = ($group.DistinguishedName -ieq $Matches[1]) }
+        elseif ($LDAPFilter -match 'sAMAccountName=([^)]*)\)\(cn=([^)]*)\)') { $hit = ($group.SamAccountName -ieq $Matches[1]) -or ($group.Name -ieq $Matches[2]) }
+        if ($hit) { Copy-GateUser $group }
+    }
+}
+function Expand-GateGroup {
+    param($Group,[switch]$Recursive,$Seen)
+    foreach ($dn in @($Group.member)) {
+        $sub = @($global:PraGateAd.Groups | Where-Object { $_.DistinguishedName -ieq $dn })
+        if ($sub.Count) {
+            if ($Recursive) { Expand-GateGroup $sub[0] -Recursive -Seen $Seen } else { [pscustomobject]@{objectClass='group';DistinguishedName=$sub[0].DistinguishedName;SamAccountName=$sub[0].SamAccountName;Name=$sub[0].Name} }
+            continue
+        }
+        if ($Seen.ContainsKey($dn)) { continue }
+        $Seen[$dn] = $true
+        $object = @(@($global:PraGateAd.Users) + @($global:PraGateAd.Others) | Where-Object { $_.DistinguishedName -ieq $dn })[0]
+        [pscustomobject]@{objectClass=$object.objectClass;DistinguishedName=$object.DistinguishedName;SamAccountName=$object.SamAccountName;Name=$object.Name}
+    }
+}
+function Get-ADObject {
+    [CmdletBinding()]
+    param([object]$Identity,[string]$Filter,[string]$LDAPFilter,[string[]]$Properties,[string]$Server,[string]$SearchBase)
+    Assert-GateServer $Server
+    Write-GateEvent 'Get-ADObject' $Identity $Server @{Filter=$Filter;LDAPFilter=$LDAPFilter;Properties=$Properties}
+    if ($LDAPFilter -match '^\(&\(memberOf:1\.2\.840\.113556\.1\.4\.1941:=(.*)\)\(!\(objectClass=group\)\)\)$') {
+        $group = @($global:PraGateAd.Groups | Where-Object { [string]$_.DistinguishedName -ieq $Matches[1] })[0]
+        Expand-GateGroup $group -Recursive -Seen @{}
+        return
+    }
+    [pscustomobject]@{ DistinguishedName=[string]$Identity; objectClass='organizationalUnit' }
+}
+Write-GateEvent 'Import-SyntheticAD'
+'@
+        function global:New-GroupAd313g {
+            <# A runtime whose synthetic AD knows groups and their members. #>
+            param([string]$Name, [string]$Case = 'Normal')
+            $runtime = New-GateRuntime -Name $Name -Case $Case
+            $users = @(1..5 | ForEach-Object { New-GateUser $_ })
+            $users[2].msExchRecipientTypeDetails = [long]4
+            $users[3].homeMDB = $null
+            $users[4].msExchRecipientTypeDetails = [long]4
+            $dn = { param($cn, $ou) 'CN=' + $cn + ',OU=' + $ou + ',DC=gate,DC=invalid' }
+            $group = { param($index, $cn, $ou, $members) [pscustomobject]@{ ObjectGUID = [guid]('30000000-0000-0000-0000-{0:000000000000}' -f $index); DistinguishedName = (& $dn $cn $ou); Name = $cn; SamAccountName = $cn; objectClass = 'group'; member = [string[]]$members } }
+            $others = @([pscustomobject]@{ objectClass = 'computer'; DistinguishedName = (& $dn 'PC01' 'Tests'); SamAccountName = 'PC01$'; Name = 'PC01' },
+                [pscustomobject]@{ objectClass = 'contact'; DistinguishedName = (& $dn 'Bob Contact' 'Tests'); SamAccountName = ''; Name = 'Bob Contact' })
+            $groups = @(
+                (& $group 1 'PRA-Wave1' 'Groups' @($users[0].DistinguishedName, $users[1].DistinguishedName, (& $dn 'PRA-Nested' 'Groups'), $others[0].DistinguishedName, $others[1].DistinguishedName, $users[4].DistinguishedName)),
+                (& $group 2 'PRA-Nested' 'Groups' @($users[2].DistinguishedName, $users[3].DistinguishedName, $users[0].DistinguishedName)),
+                (& $group 3 'PRA-Empty' 'Groups' @()),
+                (& $group 4 'PRA-Twin' 'GroupsA' @($users[0].DistinguishedName)),
+                (& $group 5 'PRA-Twin' 'GroupsB' @($users[1].DistinguishedName)))
+            $runtime.State.Users = $users; $runtime.State.Originals = [Management.Automation.PSSerializer]::Deserialize([Management.Automation.PSSerializer]::Serialize($users, 30))
+            $runtime.State.Groups = $groups; $runtime.State.Others = $others
+            [IO.File]::WriteAllText($runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($runtime.State, 35))
+            $modulePath = Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1'
+            $source = [IO.File]::ReadAllText($modulePath)
+            $marker = "Write-GateEvent 'Import-SyntheticAD' '' '' `$PSCommandPath"
+            if (-not $source.Contains($marker)) { throw 'Group fixture splice boundary missing.' }
+            [IO.File]::WriteAllText($modulePath, $source.Replace($marker, $global:PraGate.GroupFixture313g.Replace("Write-GateEvent 'Import-SyntheticAD'", $marker)), (New-Object Text.UTF8Encoding($true)))
+            return $runtime
+        }
+        function global:Use-GroupContext313g {
+            <# The runtime loaded in this process (the way the ScopeOU tests do it), and a Preview context whose scope is a group. #>
+            param($Runtime, [string]$Group, [bool]$IncludeShared = $false)
+            $env:PRA_GATE_STATE = $Runtime.StatePath
+            $env:PSModulePath = $Runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+            Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+            Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction SilentlyContinue
+            Import-Module (Join-Path $Runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global -ErrorAction Stop
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global -ErrorAction Stop
+            $context = New-GateContext $Runtime -Mode Preview
+            $scope = $context.Config.Scope
+            $scope.Mode = 'Group'; $scope.GroupDN = $Group; $scope.SearchBase = ''; $scope.CsvPath = ''
+            $scope.IncludeShared = $IncludeShared; $scope.IncludeRoom = $false; $scope.IncludeEquip = $false
+            $context
+        }
+        function global:Set-Runtime313i {
+            <# Edits the state of a group runtime (members, mailbox types) and writes it back for the synthetic directory. #>
+            param($Runtime, [scriptblock]$Edit)
+            & $Edit $Runtime.State
+            [IO.File]::WriteAllText($Runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($Runtime.State, 35))
+        }
+        function global:New-ConvertedBatch313i {
+            <# A Convert batch folder of the backup folder: the AD proof (State file) and the Convert backup, both naming the given objects. #>
+            param([string]$Root, [string]$Id, [string[]]$Guids)
+            $folder = Join-Path $Root ('Batch-' + $Id)
+            $null = New-Item -ItemType Directory -Path $folder -Force
+            $state = [ordered]@{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'SYNTHETIC_GATE'; BackupFile = 'Convert-x.json'; BackupHash = ('a1' * 32); SourceBackupHash = ''
+                CreatedUtc = (Get-Date).ToUniversalTime().ToString('o'); Records = @($Guids | ForEach-Object { [ordered]@{ ObjectGuid = $_; Operation = 'Convert'; ADVerified = $true } }) }
+            [IO.File]::WriteAllText((Join-Path $folder ('State-' + $Id + '.json')), ($state | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($true)))
+            $backup = [ordered]@{ SchemaVersion = 3; Operation = 'Convert'; BatchId = $Id; Environment = 'SYNTHETIC_GATE'; Records = @($Guids | ForEach-Object { [ordered]@{ ObjectGuid = $_ } }) }
+            [IO.File]::WriteAllText((Join-Path $folder ('Convert-SYNTHETIC_GATE-' + $Id.Substring(0, 8) + '.json')), ($backup | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($true)))
+        }
+        function global:Convert-Members313i {
+            <# Makes the given users (by index) remote mailboxes already, and puts them in the given batches. #>
+            param($Runtime, [int[]]$Index, [hashtable]$Batches)
+            Set-Runtime313i $Runtime { param($State) foreach ($i in $Index) { $State.Users[$i].homeMDB = $null; $State.Users[$i].msExchRecipientTypeDetails = [long]2147483648 } }
+            foreach ($id in $Batches.Keys) { New-ConvertedBatch313i $Runtime.State.BackupFolder $id @($Batches[$id] | ForEach-Object { [string]$Runtime.State.Users[$_].ObjectGUID }) }
+        }
+    }
+    AfterAll {
+        foreach ($name in @('New-GroupAd313g', 'Use-GroupContext313g', 'Set-Runtime313i', 'New-ConvertedBatch313i', 'Convert-Members313i')) { Remove-Item -LiteralPath ('Function:\' + $name) -ErrorAction SilentlyContinue }
+        Remove-Variable GroupFixture313g -Scope Global -ErrorAction SilentlyContinue
+    }
+    It 'turns -Group into the group scope of this run, and refuses it with another source' {
+        $override = Get-PraTargetOverride -Group '  CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com '
+        $override.Mode | Should -BeExactly 'Group'
+        $override.GroupDN | Should -BeExactly 'CN=PRA-Wave1,OU=Groups,DC=contoso,DC=com'
+        $override.SearchBase | Should -BeExactly ''
+        $override.CsvPath | Should -BeExactly ''
+        (Get-PraTargetOverride -Group 'PRA-Wave1').GroupDN | Should -BeExactly 'PRA-Wave1'
+        { Get-PraTargetOverride -Group 'PRA-Wave1' -SearchBase 'OU=Selected,DC=contoso,DC=com' } | Should -Throw '*Choose one source*'
+        { Get-PraTargetOverride -Group 'PRA-Wave1' -CsvPath 'targets.csv' } | Should -Throw '*Choose one source*'
+        { Get-PraTargetOverride -Group 'PRA-Wave1' -Identity 'one@contoso.com' } | Should -Throw '*Identity cannot be combined*'
+        { Get-PraTargetOverride -Group "bad`nvalue" } | Should -Throw '*control character*'
+        { Get-PraTargetOverride -Group '   ' } | Should -Throw '*empty value*'
+        (Get-PraTargetOverride).Count | Should -Be 0
+    }
+    It 'the override is a scope of the run only: the configuration file is not rewritten' {
+        $runtime = New-GateRuntime -Name 'override-313g'
+        $before = [IO.File]::ReadAllText($runtime.ConfigPath)
+        $config = Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -ScopeOverride (Get-PraTargetOverride -Group 'PRA-Wave1') -DeferScopeCheck
+        $config.Scope.Mode | Should -BeExactly 'Group'
+        $config.Scope.GroupDN | Should -BeExactly 'PRA-Wave1'
+        [IO.File]::ReadAllText($runtime.ConfigPath) | Should -BeExactly $before
+    }
+    It 'resolves a name (sAMAccountName or CN) and a distinguished name to the same one group' {
+        $runtime = New-GroupAd313g -Name 'resolve-313g'
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        $expected = 'CN=PRA-Wave1,OU=Groups,DC=gate,DC=invalid'
+        foreach ($value in @('PRA-Wave1', $expected)) {
+            $found = Resolve-PraGroup -Context $context -Name $value
+            [string]$found.DistinguishedName | Should -BeExactly $expected
+        }
+        @(Get-GateEvents $runtime | Where-Object Operation -eq 'Get-ADGroup')[-1].Detail.LDAPFilter | Should -Match '^\(&\(objectCategory=group\)\(distinguishedName='
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'resolves a group typed in lower case or upper case, by name and by distinguished name, to the same one group' -Tag 'Release313h' {
+        $runtime = New-GroupAd313g -Name 'resolve-case-313h'
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        $expected = 'CN=PRA-Wave1,OU=Groups,DC=gate,DC=invalid'
+        foreach ($value in @('pra-wave1', 'PRA-WAVE1', 'Pra-Wave1', $expected.ToLowerInvariant(), $expected.ToUpperInvariant(), ('  ' + $expected.ToLowerInvariant() + ' '))) {
+            $found = Resolve-PraGroup -Context $context -Name $value
+            [string]$found.DistinguishedName | Should -BeExactly $expected -Because $value
+        }
+        { Resolve-PraGroup -Context $context -Name 'pra-twin' } | Should -Throw "*2 groups are named 'pra-twin'*"
+        [string](Resolve-PraGroup -Context $context -Name 'cn=pra-twin,ou=groupsb,dc=gate,dc=invalid').DistinguishedName | Should -BeExactly 'CN=PRA-Twin,OU=GroupsB,DC=gate,DC=invalid'
+    }
+    It 'takes the members of a group given in lower case, with the exclusion list typed in another case' -Tag 'Release313h' {
+        $runtime = New-GroupAd313g -Name 'members-case-313h'
+        $context = Use-GroupContext313g $runtime 'pra-wave1' -IncludeShared $true
+        $context.Config.Scope.Mode = 'group'
+        @(Get-PraTarget -Context $context | ForEach-Object SamAccountName | Sort-Object) -join ',' | Should -BeExactly 'user1,user2,user3,user5'
+        $context.Config.Scope.ExcludeSamAccountNames = @('USER2', 'User5')
+        @(Get-PraTarget -Context $context | ForEach-Object SamAccountName | Sort-Object) -join ',' | Should -BeExactly 'user1,user3'
+        @($context.SkippedMembers) | Should -Contain 'user2 (excluded (a system mailbox, or listed in Scope.ExcludeSamAccountNames))'
+        $context.ObjectsText | Should -BeExactly 'members of PRA-Wave1 (7, including nested groups)'
+    }
+    It 'a licence group typed in lower case is found, and its members are matched whatever the case of their distinguished name' -Tag 'Release313h' {
+        $runtime = New-GateRuntime -Name 'licence-case-313h' -Preexisting
+        $runtime.State.Group.member = @($runtime.State.Group.member | ForEach-Object { ([string]$_).ToLowerInvariant() })
+        [IO.File]::WriteAllText($runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($runtime.State, 35))
+        $context = Use-GroupContext313g $runtime 'x'
+        $context.Config.Licensing.GroupDN = 'cn=license,ou=tests,dc=gate,dc=invalid'
+        $plan = New-PraPlan $context 'USER1' 'Convert'
+        $plan.Record.Licensing.WasMember | Should -BeTrue
+        $plan.Record.Licensing.GroupDN | Should -BeExactly 'CN=License,OU=Tests,DC=gate,DC=invalid'
+        $plan.Record.SamAccountName | Should -BeExactly 'user1'
+    }
+    It 'a run typed in lower case (-Action, -Phase, -Mode, -Group by name and by distinguished name) selects the members and keeps the official spelling in the next command' -Tag 'Release313h' {
+        $runtime = New-GroupAd313g -Name 'main-case-313h'
+        foreach ($group in @('pra-wave1', 'cn=pra-wave1,ou=groups,dc=gate,dc=invalid')) {
+            $run = Invoke-GateProcess $runtime @{Action='convert';Phase='ad';Mode='preview';Group=$group;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+            $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+            $run.Output | Should -Match ([regex]::Escape('Group PRA-Wave1: 7 member(s), including nested groups'))
+            $run.Output | Should -Match ([regex]::Escape('PC01$: not converted, a computer, not a mailbox'))
+            $steps = @($run.MainResult.NextSteps)
+            $steps[0] | Should -Match ('^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Group ' + [regex]::Escape("'" + $group + "'"))
+            @(Get-GateWrites $runtime).Count | Should -Be 0
+        }
+    }
+    It 'says plainly that a group is not found, or that several groups have the name' {
+        $runtime = New-GroupAd313g -Name 'resolve-errors-313g'
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        { Resolve-PraGroup -Context $context -Name 'PRA-Nope' } | Should -Throw "*The group 'PRA-Nope' was not found in Active Directory*Give its name (sAMAccountName or CN) or its distinguished name.*"
+        { Resolve-PraGroup -Context $context -Name 'CN=PRA-Nope,OU=Groups,DC=gate,DC=invalid' } | Should -Throw '*was not found in Active Directory*'
+        { Resolve-PraGroup -Context $context -Name 'PRA-Twin' } | Should -Throw "*2 groups are named 'PRA-Twin': give the distinguished name of the one to use.*"
+        [string](Resolve-PraGroup -Context $context -Name 'CN=PRA-Twin,OU=GroupsB,DC=gate,DC=invalid').DistinguishedName | Should -BeExactly 'CN=PRA-Twin,OU=GroupsB,DC=gate,DC=invalid'
+        { Resolve-PraGroup -Context $context -Name 'CN=PRA-Wave1,OU=Groups,DC=other,DC=invalid' } | Should -Throw '*was not found in Active Directory*'
+    }
+    It 'takes the members of nested groups too, and skips the others with the reason of each, counting all the members' {
+        $runtime = New-GroupAd313g -Name 'members-313g'
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        $selected = @(Get-PraTarget -Context $context)
+        # user1 and user2 directly, user1 again and user3 (shared, not included) and user4 (no mailbox) through the nested group, a computer, a contact, user5 (shared).
+        @($selected | ForEach-Object SamAccountName | Sort-Object) -join ',' | Should -BeExactly 'user1,user2'
+        $context.ObjectsText | Should -BeExactly 'members of PRA-Wave1 (7, including nested groups)'
+        $skipped = @($context.SkippedMembers)
+        $skipped.Count | Should -Be 5
+        $skipped | Should -Contain 'PC01$ (a computer, not a mailbox)'
+        $skipped | Should -Contain 'Bob Contact (a contact, not an on-premises mailbox)'
+        $skipped | Should -Contain 'user3 (a shared mailbox, not included in this run)'
+        $skipped | Should -Contain 'user4 (no on-premises mailbox)'
+        $skipped | Should -Contain 'user5 (a shared mailbox, not included in this run)'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'applies the existing filters to the members: shared mailboxes with IncludeShared, the exclusion list, and the -Scope filter' {
+        $runtime = New-GroupAd313g -Name 'filters-313g'
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1' -IncludeShared $true
+        @(Get-PraTarget -Context $context | ForEach-Object SamAccountName | Sort-Object) -join ',' | Should -BeExactly 'user1,user2,user3,user5'
+        $context.SkippedMembers.Count | Should -Be 3
+        $context.Config.Scope.ExcludeSamAccountNames = @('user2')
+        $selected = @(Get-PraTarget -Context $context)
+        @($selected | ForEach-Object SamAccountName | Sort-Object) -join ',' | Should -BeExactly 'user1,user3,user5'
+        @($context.SkippedMembers) | Should -Contain 'user2 (excluded (a system mailbox, or listed in Scope.ExcludeSamAccountNames))'
+        $users = @(Get-PraTarget -Context $context -MailboxScope UsersOnly)
+        @($users | ForEach-Object SamAccountName) -join ',' | Should -BeExactly 'user1'
+        @($context.SkippedMembers) | Should -Contain 'user5 (a shared mailbox, not included in this run)'
+    }
+    It 'an empty group is said in plain words and nothing is selected' {
+        $runtime = New-GroupAd313g -Name 'empty-313g'
+        $context = Use-GroupContext313g $runtime 'PRA-Empty'
+        @(Get-PraTarget -Context $context).Count | Should -Be 0
+        $context.TargetsReported | Should -BeTrue
+        $context.ObjectsText | Should -BeExactly 'members of PRA-Empty (0, including nested groups)'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'a run with -Group names the group in the header, skips the non-mailboxes, and writes its own command in the Next steps' {
+        $runtime = New-GroupAd313g -Name 'main-313g'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Group='PRA-Wave1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'members of PRA-Wave1'
+        $run.Output | Should -Match ([regex]::Escape('Group PRA-Wave1: 7 member(s), including nested groups'))
+        $run.Output | Should -Match ([regex]::Escape('PC01$: not converted, a computer, not a mailbox'))
+        $run.Output | Should -Match ([regex]::Escape('members of PRA-Wave1 (7, including nested groups)'))
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Group 'PRA-Wave1' -ConfigPath "
+        # The report carries the same line and the skipped members.
+        $report = @(Get-ChildItem -LiteralPath (Join-Path $runtime.Root 'reports') -Filter '*.html' | Select-Object -First 1)
+        $html = [IO.File]::ReadAllText($report[0].FullName)
+        $html | Should -Match ([regex]::Escape('members of PRA-Wave1 (7, including nested groups)'))
+        $html | Should -Match ([regex]::Escape('PC01$ (a computer, not a mailbox)'))
+    }
+    It 'an empty group, an unknown group and two groups of one name stop or warn in plain words, before any change' {
+        $runtime = New-GroupAd313g -Name 'main-errors-313g'
+        $empty = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;Group='PRA-Empty';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $empty.Output | Should -Match ([regex]::Escape('The group PRA-Empty has no member: nothing to convert.'))
+        $empty.Output | Should -Not -Match 'No on-premises mailbox found in the scope'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        $unknown = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;Group='PRA-Nope';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $unknown.ExitCode | Should -Be 1 -Because ($unknown.Output + $unknown.Error)
+        $unknown.Output | Should -Match ([regex]::Escape("The group 'PRA-Nope' was not found in Active Directory"))
+        @($unknown.MainResult.NextSteps)[1] | Should -Match "-Action Convert -Phase AD -Mode Apply -Group 'PRA-Nope' -ConfigPath "
+        $twin = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;Group='PRA-Twin';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $twin.ExitCode | Should -Be 1 -Because ($twin.Output + $twin.Error)
+        $twin.Output | Should -Match ([regex]::Escape("2 groups are named 'PRA-Twin': give the distinguished name of the one to use."))
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'refuses -Group with another source, with a batch, or for another action, in plain words' {
+        $runtime = New-GroupAd313g -Name 'exclusive-313g'
+        $csv = Join-Path $runtime.Root 'targets.csv'
+        [IO.File]::WriteAllText($csv, "Identity`r`nuser1`r`n", (New-Object Text.UTF8Encoding($true)))
+        $cases = @(
+            @{ Arguments = @{Action='Convert';Phase='AD';Group='PRA-Wave1';Identity='user1'}; Message = 'Identity cannot be combined with a selected OU, CSV or group' },
+            @{ Arguments = @{Action='Convert';Phase='AD';Group='PRA-Wave1';CsvPath=$csv}; Message = 'Choose one source: -SearchBase (OU), -CsvPath or -Group, not several.' },
+            @{ Arguments = @{Action='Convert';Phase='AD';Group='PRA-Wave1';SearchBase='OU=Tests,DC=gate,DC=invalid'}; Message = 'Choose one source: -SearchBase (OU), -CsvPath or -Group, not several.' },
+            @{ Arguments = @{Action='Convert';Phase='AD';Group='PRA-Wave1';Batch='deadbeef'}; Message = '-Phase AD with -Batch finishes a batch as a whole: -Identity, -SearchBase, -CsvPath and -Group cannot be combined with it.' },
+            @{ Arguments = @{Action='Convert';Phase='Cloud';Group='PRA-Wave1';Batch='deadbeef'}; Message = 'SearchBase/CsvPath/Group are only available for Convert -Phase AD or Both.' },
+            @{ Arguments = @{Action='Check';Group='PRA-Wave1';Identity=''}; Message = 'SearchBase/CsvPath/Group are only available for Convert -Phase AD or Both.' })
+        foreach ($case in $cases) {
+            $arguments = @{Mode='Preview';ConfigPath=$runtime.ConfigPath} + $case.Arguments
+            $run = Invoke-GateProcess $runtime $arguments -TimeoutSeconds 60
+            $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+            $run.Output | Should -Match ([regex]::Escape($case.Message))
+        }
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'an AD write refused for a run with -Group repeats -Group in the command for the other server' {
+        $runtime = New-GroupAd313g -Name 'denied-313g' -Case 'AccessDenied'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;Group='CN=PRA-Wave1,OU=Groups,DC=gate,DC=invalid';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps | Should -Contain ".\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Group 'CN=PRA-Wave1,OU=Groups,DC=gate,DC=invalid'" -Because ($steps -join "`n")
+    }
+    It 'the manifest exports the group resolver that the window uses, and the help and the usage name -Group' {
+        @((Import-PowerShellDataFile -LiteralPath (Join-Path $global:PraGate.Package 'PraRemoteMailbox.psd1')).FunctionsToExport) | Should -Contain 'Resolve-PraGroup'
+        $script = [IO.File]::ReadAllText((Join-Path $global:PraGate.Package 'Invoke-PraRemoteMailbox.ps1'))
+        $script | Should -Match '\.PARAMETER Group'
+        $script | Should -Match '-Action Convert -Group PRA-Wave1'
+    }
+    It 'reads the members with the chain of memberships, so a contact or a computer is a member, a group is not, and Get-ADGroupMember is not used' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'chain-313i'
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        $group = Resolve-PraGroup -Context $context -Name 'PRA-Wave1'
+        $members = @(Get-PraGroupMember -Context $context -Group $group)
+        $members.Count | Should -Be 7
+        @($members | ForEach-Object { [string]$_.objectClass } | Sort-Object -Unique) -join ',' | Should -BeExactly 'computer,contact,user'
+        @($members | Where-Object { $_.Name -ceq 'Bob Contact' }).Count | Should -Be 1
+        $calls = @(Get-GateEvents $runtime | Where-Object Operation -eq 'Get-ADObject' | Where-Object { $_.Detail.LDAPFilter })
+        $calls.Count | Should -Be 1
+        $calls[0].Detail.LDAPFilter | Should -BeExactly '(&(memberOf:1.2.840.113556.1.4.1941:=CN=PRA-Wave1,OU=Groups,DC=gate,DC=invalid)(!(objectClass=group)))'
+        @(Get-GateEvents $runtime | Where-Object Operation -eq 'Get-ADGroupMember').Count | Should -Be 0
+    }
+    It 'counts a contact that is the only member, with its reason, and the number of members says so' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'contact-only-313i'
+        Set-Runtime313i $runtime { param($State) $State.Groups[2].member = @([string]$State.Others[1].DistinguishedName) }
+        $context = Use-GroupContext313g $runtime 'PRA-Empty'
+        @(Get-PraTarget -Context $context).Count | Should -Be 0
+        $context.ObjectsText | Should -BeExactly 'members of PRA-Empty (1, including nested groups)'
+        @($context.SkippedMembers) | Should -Be @('Bob Contact (a contact, not an on-premises mailbox)')
+    }
+    It 'counts the skipped members in the Result line and in the result object' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'skipped-313i'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Group='PRA-Wave1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match '2 planned . 0 error\(s\) . 5 skipped'
+        $run.MainResult.SkippedCount | Should -Be 5
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'gives the way to continue the batch of the members that are already remote mailboxes, one line per batch' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'continue-313i'
+        $a = 'aa000001'.PadRight(32, '0'); $b = 'bb000002'.PadRight(32, '0')
+        Convert-Members313i $runtime @(0, 1, 3) @{ $a = @(0, 1); $b = @(3) }
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        @(Get-PraTarget -Context $context).Count | Should -Be 0
+        @($context.SkippedMembers | Where-Object { $_ -match 'already a remote mailbox' }).Count | Should -Be 3
+        $steps = @($context.NextSteps)
+        $steps.Count | Should -Be 3
+        $steps[0] | Should -BeExactly 'To continue these batches (Entra Connect sync and transfer package; AD is not changed again), run one command per batch:'
+        $steps[1] | Should -BeExactly '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch aa000001'
+        $steps[2] | Should -BeExactly '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch bb000002'
+        # One batch only: the sentence of an explicit target.
+        $one = New-GroupAd313g -Name 'continue-one-313i'
+        Convert-Members313i $one @(0, 1) @{ $a = @(0, 1) }
+        $oneContext = Use-GroupContext313g $one 'PRA-Wave1'
+        $null = Get-PraTarget -Context $oneContext
+        @($oneContext.NextSteps)[0] | Should -BeExactly 'To continue that batch (Entra Connect sync and transfer package; AD is not changed again), run:'
+        @($oneContext.NextSteps).Count | Should -Be 2
+        # Started from the window the way is the Task page.
+        $env:PRA_EVENT_FILE = Join-Path $global:PraGate.Root 'events-313i.jsonl'
+        try {
+            $window = Use-GroupContext313g $runtime 'PRA-Wave1'
+            $null = Get-PraTarget -Context $window
+            $lines = @($window.NextSteps)
+            $lines.Count | Should -Be 2
+            $lines[0] | Should -BeExactly 'To continue batch aa000001 (Entra Connect sync and transfer package; AD is not changed again), go to the Task page, choose Move mailboxes to Exchange Online, then Continue a batch, and pick batch aa000001.'
+            $lines[1] | Should -Match 'pick batch bb000002\.$'
+        } finally { Remove-Item Env:\PRA_EVENT_FILE -ErrorAction SilentlyContinue }
+    }
+    It 'a member that is a remote mailbox without a batch of this folder gives no way to continue' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'continue-none-313i'
+        Set-Runtime313i $runtime { param($State) $State.Users[3].homeMDB = $null; $State.Users[3].msExchRecipientTypeDetails = [long]2147483648 }
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        $null = Get-PraTarget -Context $context
+        @($context.SkippedMembers) | Should -Contain 'user4 (already a remote mailbox)'
+        @(Get-PraList $context 'NextSteps').Count | Should -Be 0
+    }
+    It 'a rerun on a group whose members are all converted ends with the command that continues their batches' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'rerun-313i'
+        $a = 'aa000001'.PadRight(32, '0'); $b = 'bb000002'.PadRight(32, '0')
+        Convert-Members313i $runtime @(0, 1, 3) @{ $a = @(0, 1); $b = @(3) }
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Group='PRA-Wave1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'To continue these batches (Entra Connect sync and transfer package; AD is not changed again), run one command per batch:'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Batch aa000001 -ConfigPath '
+        $steps[2] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Batch bb000002 -ConfigPath '
+        $run.Output | Should -Match 'To continue these batches'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'an option combination that is refused never gets the refused command back: one corrected command per valid choice, the other options kept' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'refusals-313i'
+        $csv = Join-Path $runtime.Root 'targets.csv'
+        [IO.File]::WriteAllText($csv, "Identity`r`nuser1`r`n", (New-Object Text.UTF8Encoding($true)))
+        # -Identity with -Group: one command with -Group only, one with -Identity only.
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Group='PRA-Wave1';Identity='user1';Scope='UsersOnly';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'These options select the objects in different ways and cannot be combined (-Identity, -Group): keep one of them. Run the command with the one you want:'
+        $steps[1] | Should -BeExactly 'Only -Identity (remove -Group):'
+        $steps[2] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Identity 'user1' -Scope UsersOnly -ConfigPath "
+        $steps[2] | Should -Not -Match '-Group'
+        $steps[3] | Should -BeExactly 'Only -Group (remove -Identity):'
+        $steps[4] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Scope UsersOnly -Group 'PRA-Wave1' -ConfigPath "
+        $steps[4] | Should -Not -Match '-Identity'
+        $run.Output | Should -Match 'Only -Group \(remove -Identity\)'
+        # Several sources: one command per source.
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Group='PRA-Wave1';CsvPath=$csv;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[1] | Should -BeExactly 'Only -CsvPath (remove -Group):'
+        $steps[2] | Should -Match '-CsvPath ' ; $steps[2] | Should -Not -Match '-Group'
+        $steps[3] | Should -BeExactly 'Only -Group (remove -CsvPath):'
+        $steps[4] | Should -Match "-Group 'PRA-Wave1'" ; $steps[4] | Should -Not -Match '-CsvPath'
+        # -Group with -Phase Cloud: the -Phase AD command (no batch), or the cloud command without -Group.
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Preview';Group='PRA-Wave1';Batch='deadbeef';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -Match '^-Group only selects the mailboxes of a new conversion, which is the AD phase \(or Both\) and takes no batch\. Run it with -Phase AD:$'
+        $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Group 'PRA-Wave1' -ConfigPath "
+        $steps[1] | Should -Not -Match '-Batch'
+        $steps[2] | Should -BeExactly 'Or keep -Phase Cloud and remove -Group:'
+        $steps[3] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Batch deadbeef -ConfigPath '
+        $steps[3] | Should -Not -Match '-Group'
+        # -Group for another action: the command without it, and the conversion of the group.
+        $run = Invoke-GateProcess $runtime @{Action='Check';Group='PRA-Wave1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Identity '<UPN>' -ConfigPath "
+        $steps[3] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Group 'PRA-Wave1' -ConfigPath "
+        # -Phase AD -Batch with a selector: the batch alone, or the new conversion without -Batch.
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Group='PRA-Wave1';Batch='deadbeef';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Batch deadbeef -ConfigPath '
+        $steps[1] | Should -Not -Match '-Group'
+        $steps[3] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Group 'PRA-Wave1' -ConfigPath "
+        $steps[3] | Should -Not -Match '-Batch'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'says which groups share a name, with their distinguished names (five at most, then how many more)' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'twins-313i'
+        Set-Runtime313i $runtime { param($State)
+            $template = $State.Groups[3]
+            $State.Groups = @($State.Groups) + @(3..7 | ForEach-Object {
+                    [pscustomobject]@{ ObjectGUID = [guid]('30000000-0000-0000-0000-{0:000000000000}' -f (10 + $_)); DistinguishedName = ('CN=PRA-Twin,OU=GroupsX{0},DC=gate,DC=invalid' -f $_); Name = 'PRA-Twin'; SamAccountName = 'PRA-Twin'; objectClass = 'group'; member = [string[]]@() } })
+        }
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        $message = ''
+        try { $null = Resolve-PraGroup -Context $context -Name 'PRA-Twin' } catch { $message = $_.Exception.Message }
+        $message | Should -Match "^7 groups are named 'PRA-Twin': give the distinguished name of the one to use\. They are: CN=PRA-Twin,OU=Groups[A-Z0-9]+,DC=gate,DC=invalid( \| CN=PRA-Twin,OU=Groups[A-Z0-9]+,DC=gate,DC=invalid){4} \(and 2 more\)\.$"
+        $few = New-GroupAd313g -Name 'twins-two-313i'
+        $fewContext = Use-GroupContext313g $few 'PRA-Wave1'
+        $fewMessage = ''
+        try { $null = Resolve-PraGroup -Context $fewContext -Name 'PRA-Twin' } catch { $fewMessage = $_.Exception.Message }
+        $fewMessage | Should -BeExactly "2 groups are named 'PRA-Twin': give the distinguished name of the one to use. They are: CN=PRA-Twin,OU=GroupsA,DC=gate,DC=invalid | CN=PRA-Twin,OU=GroupsB,DC=gate,DC=invalid."
+    }
+    It 'an Apply that needs a confirmation the console cannot ask for proposes the same command with -Force, or an interactive console' -Tag 'Release313i' {
+        $runtime = New-GroupAd313g -Name 'noconfirm-313i'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Group='PRA-Wave1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        ($run.MainResult.Issues.Message -join ' ') | Should -Match 'Apply needs a confirmation'
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'Nothing was written. This console cannot ask for the confirmation: add -Force to the command, or run it in an interactive console and answer yes:'
+        $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Group 'PRA-Wave1' -ConfigPath .* -Force$"
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'an Apply refused for lack of confirmation writes no global report and counts only the skipped group members, not the planned objects' -Tag 'Release313j' {
+        $runtime = New-GroupAd313g -Name 'noconfirm-313j'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Group='PRA-Wave1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.MainResult.SkippedCount | Should -Be 5
+        $run.MainResult.PlannedCount | Should -Be 0
+        $run.Output | Should -Match '0 done . 0 pending . 1 error\(s\) . 5 skipped'
+        @(Get-ChildItem -LiteralPath (Join-Path $runtime.Root 'reports') -Filter '*.global.*' -ErrorAction SilentlyContinue).Count | Should -Be 0
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'two groups of one name give one command per distinguished name, and a -Batch with a selector names the option check' -Tag 'Release313j' {
+        $runtime = New-GroupAd313g -Name 'twins-next-313j'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Group='PRA-Twin';Scope='UsersOnly';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps.Count | Should -Be 3
+        $steps[0] | Should -BeExactly 'To use one of these groups, run the command with its distinguished name (one command per group):'
+        $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Scope UsersOnly -Group 'CN=PRA-Twin,OU=GroupsA,DC=gate,DC=invalid' -ConfigPath "
+        $steps[2] | Should -Match "-Group 'CN=PRA-Twin,OU=GroupsB,DC=gate,DC=invalid' -ConfigPath "
+        $steps[1] | Should -Not -Match "-Group 'PRA-Twin'"
+        $refused = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Group='PRA-Wave1';Batch='deadbeef';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $refused.ExitCode | Should -Be 1 -Because ($refused.Output + $refused.Error)
+        $refused.Output | Should -Match 'Stopped at step .* \(operation Check-Options'
+        $refused.Output | Should -Not -Match 'Check-ReportFolder'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'a batch short id on a machine without a Backups folder gives a plain message and the package or the copy of the batch folder as next steps' -Tag 'Release313j' {
+        $runtime = New-GroupAd313g -Name 'nobackups-313j'
+        if (Test-Path -LiteralPath $runtime.State.BackupFolder) { Remove-Item -LiteralPath $runtime.State.BackupFolder -Recurse -Force }
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Preview';Batch='deadbeef';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape('No batch is stored on this machine yet: the backup folder'))
+        $run.Output | Should -Not -Match 'Backup folder not found'
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -Match '^On the server that received a transfer package, give the package itself'
+        $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase Cloud -Batch '<folder>\\<package name>-for-Cloud\.zip' -ConfigPath "
+        $steps[2] | Should -Match '^Otherwise copy the batch folder \(Batch-deadbeef\.\.\. or Finalize-deadbeef\.\.\.\) into '
+        $steps[3] | Should -Match '-Action Convert -Phase Cloud -Batch deadbeef -ConfigPath '
+    }
+    It 'the window variant of the ambiguous group name says to type the distinguished name in the AD group field' -Tag 'Release313j' {
+        $runtime = New-GroupAd313g -Name 'twins-window-313j'
+        $context = Use-GroupContext313g $runtime 'PRA-Wave1'
+        $saved = $env:PRA_EVENT_FILE
+        try {
+            $env:PRA_EVENT_FILE = Join-Path $runtime.Root 'events-window.jsonl'
+            try { $null = Resolve-PraGroup -Context $context -Name 'PRA-Twin' } catch { $null = $_ }
+        } finally { if ($null -eq $saved) { Remove-Item Env:\PRA_EVENT_FILE -ErrorAction SilentlyContinue } else { $env:PRA_EVENT_FILE = $saved } }
+        @($context.NextSteps).Count | Should -Be 3
+        @($context.NextSteps)[0] | Should -BeExactly 'Type the distinguished name of the group to use in the AD group field. One of:'
+        @($context.NextSteps)[1] | Should -BeExactly 'CN=PRA-Twin,OU=GroupsA,DC=gate,DC=invalid'
+        $context.NextOnFailure | Should -BeTrue
+    }
+}
+Describe 'Release 3.1.3 - the stop names the object that failed, a cancel is not an error, configuration values and the unreachable controller are told in words (real main and production modules, synthetic)' -Tag 'Release313i' {
+    It 'the stop of a cloud check names the object that failed, not the last object the loop looked at' {
+        $runtime = New-GateRuntime -Name 'first-fails-313i' -Case 'CloudFirstFails'
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $short = [string]$ad.MainResult.BatchId
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Cloud';Mode='Preview';ConfigPath=$runtime.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape("user1@gate.invalid: Exchange Online session: connection state 'Disconnected', expected Connected."))
+        $run.Output | Should -Match "Stopped at step 'Cloud' \(operation CloudCheck, object user1@gate\.invalid\): Exchange Online check failed\. Nothing was changed\. Run the Preview again\."
+        $run.Output | Should -Not -Match 'object user2@gate\.invalid'
+    }
+    It 'a run cancelled by the operator is reported as cancelled: no error, RESULT: CANCELLED, exit code 1, and the command to run it again' {
+        $log = Join-Path $global:PraGate.Root 'cancel-313i.log'
+        [IO.File]::WriteAllText($log, 'log' + [Environment]::NewLine)
+        $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.3'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
+            CurrentPhase = 'Start'; CurrentOperation = 'Confirm-Apply'; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
+            Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $false; ReportFolder = (Join-Path $global:PraGate.Root 'reports-313i'); NoReport = $true; BatchId = ''; LogFile = $log; TranscriptPath = $log; _PraTranscriptCreated = $true; TranscriptStarted = $false
+            NextSteps = @(); ExitCode = 1; CloudConnectFailed = $false; ResultStatus = ''; Cancelled = $true
+            FallbackNext = @('Nothing was written. To run it, give the same command again and answer yes to the confirmation:', '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply') }
+        $skipped = New-Object 'Collections.Generic.List[string]'; $skipped.Add('PC01$ (a computer, not a mailbox)'); $ctx.SkippedMembers = $skipped
+        $result = Complete-PraRun -Context $ctx
+        $result.Status | Should -BeExactly 'Cancelled' -Because (@($result.Issues | ForEach-Object { $_.Message }) -join ' / ')
+        $result.ExitCode | Should -Be 1
+        $result.ErrorCount | Should -Be 0
+        $result.SkippedCount | Should -Be 1
+        @($result.Issues).Count | Should -Be 0
+        $result.NextSteps[0] | Should -BeExactly 'Nothing was written. To run it, give the same command again and answer yes to the confirmation:'
+        $text = [IO.File]::ReadAllText($log)
+        $text | Should -Match 'RESULT: CANCELLED'
+        $text | Should -Not -Match 'RESULT: FAIL'
+    }
+    It 'a configuration value that is none of the accepted words is quoted, with the accepted words and the configuration file' {
+        $runtime = New-GateRuntime -Name 'badvalues-313i'
+        $cases = @(
+            @{ From = "Mode='Auto'"; To = "Mode='Groupe'"; Key = 'Scope.Mode'; Accepted = 'Auto, OU, Group or Csv'; Value = 'Groupe' },
+            @{ From = "PermissionSource='None'"; To = "PermissionSource='Ldap'"; Key = 'SharedMailbox.PermissionSource'; Accepted = 'AD, Csv, CustomAttribute or None'; Value = 'Ldap' },
+            @{ From = "PolicyType='Delta'"; To = "PolicyType='Full'"; Key = 'EntraConnect.PolicyType'; Accepted = 'Delta or Initial'; Value = 'Full' },
+            @{ From = "Execution=@{Phase='Both'}"; To = "Execution=@{Phase='Cloudy'}"; Key = 'Execution.Phase'; Accepted = 'Both, AD or Cloud'; Value = 'Cloudy' })
+        foreach ($case in $cases) {
+            $text = [IO.File]::ReadAllText($runtime.ConfigPath)
+            $text.Contains($case.From) | Should -BeTrue -Because $case.From
+            $path = Join-Path $runtime.Root ('bad-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.psd1')
+            [IO.File]::WriteAllText($path, $text.Replace($case.From, $case.To))
+            $expected = ('Configuration: {0} must be {1}: the value is ''{2}'' in {3}.' -f $case.Key, $case.Accepted, $case.Value, $path)
+            { Import-PraConfiguration -Path $path -Root $runtime.Package -DeferScopeCheck } | Should -Throw -ExpectedMessage $expected -ExceptionType ([System.Management.Automation.RuntimeException]) -Because $case.Key
+        }
+        $emptyPath = Join-Path $runtime.Root 'empty-mode.psd1'
+        [IO.File]::WriteAllText($emptyPath, [IO.File]::ReadAllText($runtime.ConfigPath).Replace("Mode='Auto'", "Mode=''"))
+        { Import-PraConfiguration -Path $emptyPath -Root $runtime.Package -DeferScopeCheck } | Should -Throw '*Scope.Mode must be Auto, OU, Group or Csv: the value is empty in *'
+    }
+    It 'a Convert Preview whose domain controller does not answer points at the controller, the configuration and the machine to run from' {
+        $runtime = New-GateRuntime -Name 'dc-down-313i' -Case 'AdServerDown'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';Identity='user1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'Nothing was changed. Active Directory did not answer on the domain controller dc01.gate.invalid: check that it is running and reachable from this machine (TCP 9389), or set another one in DomainController of Gate.psd1. Then run the same command again:'
+        $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Identity 'user1' -ConfigPath "
+        $steps[2] | Should -BeExactly 'Or run the same command on a machine that reaches dc01.gate.invalid, or on the domain controller itself (the configuration file of that machine is used):'
+        $steps[3] | Should -BeExactly ".\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Identity 'user1'"
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+}
+Describe 'Release 3.1.3 - letter case never matters: configuration, CSV, batch ids, packages and addresses (real main and production modules, synthetic)' -Tag 'Release313h' {
+    BeforeAll {
+        function global:Use-Context313h {
+            <# The runtime loaded in this process (the way the ScopeOU tests do it), and a Preview context. #>
+            param($Runtime)
+            $env:PRA_GATE_STATE = $Runtime.StatePath
+            $env:PSModulePath = $Runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+            Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+            Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction SilentlyContinue
+            Import-Module (Join-Path $Runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global -ErrorAction Stop
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global -ErrorAction Stop
+            New-GateContext $Runtime -Mode Preview
+        }
+        function global:Set-LowerConfig313h {
+            <# Every enumerated value of the configuration written in lower case. #>
+            param($Runtime)
+            Set-GateConfigText $Runtime { param($t) $t.Replace("Environment='SYNTHETIC_GATE'", "Environment='synthetic_gate'").Replace("Mode='Auto'", "Mode='auto'").Replace("PermissionSource='None'", "PermissionSource='none'").Replace("PolicyType='Delta'", "PolicyType='delta'").Replace("Execution=@{Phase='Both'}", "Execution=@{Phase='both'}; Cloud=@{MailboxCheckVia='exo'}") }
+        }
+    }
+    AfterAll {
+        foreach ($name in @('Use-Context313h', 'Set-LowerConfig313h')) { Remove-Item -LiteralPath ('Function:\' + $name) -ErrorAction SilentlyContinue }
+    }
+    It 'reads every enumerated configuration value in any letter case and keeps the official spelling' {
+        $runtime = New-GateRuntime -Name 'config-case-313h'
+        Set-LowerConfig313h $runtime
+        $config = Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck
+        $config.Scope.Mode | Should -BeExactly 'Auto'
+        $config.SharedMailbox.PermissionSource | Should -BeExactly 'None'
+        $config.EntraConnect.PolicyType | Should -BeExactly 'Delta'
+        $config.Cloud.MailboxCheckVia | Should -BeExactly 'Exo'
+        $config.Execution.Phase | Should -BeExactly 'Both'
+        $config.Environment | Should -BeExactly 'synthetic_gate'
+        $override = Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -ScopeOverride @{ mode = 'group'; groupdn = 'pra-wave1' } -DeferScopeCheck
+        $override.Scope.Mode | Should -BeExactly 'Group'
+        $override.Scope.GroupDN | Should -BeExactly 'pra-wave1'
+        Set-GateConfigText $runtime { param($t) $t.Replace("Mode='auto'", "Mode='autox'") }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck } | Should -Throw '*Scope.Mode must be Auto, OU, Group or Csv*'
+    }
+    It 'a Convert typed and configured in lower case (-Action, -Mode, Environment, Scope.Mode, Execution.Phase, ...) runs to the end' {
+        $runtime = New-GateRuntime -Name 'main-lower-313h'
+        Set-LowerConfig313h $runtime
+        $run = Invoke-GateProcess $runtime @{Action='convert';Mode='apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -BeIn @(0, 2) -Because ($run.Output + $run.Error)
+        @($run.MainResult.Issues).Count | Should -Be 0
+        $run.MainResult.ErrorCount | Should -Be 0
+        $run.MainResult.Phase | Should -BeExactly 'Both'
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0
+    }
+    It 'accepts every ValidateSet parameter in lower case: -Scope, -Expect, -Phase, -Mode, -Action' {
+        $runtime = New-GateRuntime -Name 'validate-lower-313h'
+        $scope = Invoke-GateProcess $runtime @{Action='convert';Phase='ad';Mode='preview';Scope='usersonly';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $scope.ExitCode | Should -Be 0 -Because ($scope.Output + $scope.Error)
+        $scope.Output | Should -MatchExactly 'users only'
+        foreach ($expect in @('provisioned', 'deprovisioned', 'RETAINED')) {
+            $check = Invoke-GateProcess $runtime @{Action='check';Identity='user1';Expect=$expect;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+            $check.ExitCode | Should -BeIn @(0, 2) -Because ($check.Output + $check.Error)
+            $check.Output | Should -MatchExactly ('expect ' + [regex]::Escape((Get-Culture).TextInfo.ToTitleCase($expect.ToLowerInvariant())))
+        }
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'reads a target CSV whose header and values are written in another case' {
+        $runtime = New-GateRuntime -Name 'csv-case-313h'
+        $csv = Join-Path $runtime.Root 'targets.csv'
+        [IO.File]::WriteAllText($csv, "IDENTITY;Other`r`nUSER1;x`r`nUSER2@GATE.INVALID;y`r`n", (New-Object Text.UTF8Encoding($true)))
+        (@(Read-PraTargetCsv -Path $csv) | ForEach-Object Identity) -join '|' | Should -BeExactly 'USER1|USER2@GATE.INVALID'
+        [IO.File]::WriteAllText($csv, "`"identity`",Other`r`nUser1,x`r`n", (New-Object Text.UTF8Encoding($true)))
+        (@(Read-PraTargetCsv -Path $csv) | ForEach-Object Identity) -join '|' | Should -BeExactly 'User1'
+        [IO.File]::WriteAllText($csv, "IDENTITY;Other`r`nUSER1;x`r`nUSER2@GATE.INVALID;y`r`n", (New-Object Text.UTF8Encoding($true)))
+        $context = Use-Context313h $runtime
+        $context.Config.Scope.Mode = 'csv'; $context.Config.Scope.CsvPath = $csv; $context.Config.Scope.SearchBase = ''
+        @(Get-PraTarget -Context $context | ForEach-Object SamAccountName | Sort-Object) -join ',' | Should -BeExactly 'user1,user2'
+        $run = Invoke-GateProcess $runtime @{Action='convert';Phase='ad';Mode='preview';CsvPath=$csv;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'user1'
+        $run.Output | Should -Match 'user2'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'an exclusion typed in another case excludes the account' {
+        $runtime = New-GateRuntime -Name 'exclude-case-313h'
+        $csv = Join-Path $runtime.Root 'targets.csv'
+        [IO.File]::WriteAllText($csv, "Identity`r`nuser1`r`nuser2`r`n", (New-Object Text.UTF8Encoding($true)))
+        $context = Use-Context313h $runtime
+        $context.Config.Scope.Mode = 'CSV'; $context.Config.Scope.CsvPath = $csv; $context.Config.Scope.SearchBase = ''
+        $context.Config.Scope.ExcludeSamAccountNames = @('USER2')
+        { Get-PraTarget -Context $context } | Should -Throw '*Explicit target not eligible*excluded: user2*'
+    }
+    It 'a batch typed with an upper-case id, and a package named in another case, are found and verified (two servers, real main)' {
+        $adRuntime = New-GateRuntime -Name 'pkg-case-313h-ad'
+        $run = Invoke-GateProcess $adRuntime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$adRuntime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -BeIn @(0, 2) -Because ($run.Output + $run.Error)
+        $zip = [string]$run.MainResult.TransferPackage
+        Test-Path -LiteralPath $zip -PathType Leaf | Should -BeTrue
+        $short = [regex]::Match([IO.Path]::GetFileName($zip), '-([0-9a-f]{8})-for-Cloud\.zip$').Groups[1].Value
+        $short.Length | Should -Be 8
+        # The AD server: the short id in upper case, one object by its sAMAccountName in upper case.
+        $recover = Invoke-GateProcess $adRuntime @{Action='recover';Phase='ad';Mode='preview';Batch=$short.ToUpperInvariant();Identity='USER1';ConfigPath=$adRuntime.ConfigPath} -TimeoutSeconds 120
+        $recover.ExitCode | Should -Be 0 -Because ($recover.Output + $recover.Error)
+        $recover.Output | Should -Match 'user1'
+        # The cloud server: the file is named in capitals on disk, its checksum file too, the configuration writes the Environment in lower case.
+        $cloud = New-GateRuntime -Name 'pkg-case-313h-cloud'
+        Set-GateConfigText $cloud { param($t) $t.Replace("Environment='SYNTHETIC_GATE'", "Environment='synthetic_gate'") }
+        $inbox = Join-Path $cloud.State.BackupFolder 'Inbox'; $null = New-Item -ItemType Directory -Path $inbox
+        $onDisk = [IO.Path]::GetFileName($zip).ToUpperInvariant().Replace('.ZIP', '.zip')
+        Copy-Item -LiteralPath $zip -Destination (Join-Path $inbox $onDisk)
+        [IO.File]::WriteAllText((Join-Path $inbox ($onDisk + '.SHA256')), (Get-Content -LiteralPath ($zip + '.sha256') -Raw).Trim().ToUpperInvariant())
+        $typed = [IO.Path]::GetFileName($zip).ToLowerInvariant()
+        $second = Invoke-GateProcess $cloud @{Action='convert';Phase='cloud';Mode='apply';Force=$true;ConfigPath=$cloud.ConfigPath;Batch=$typed} -TimeoutSeconds 120
+        (@($second.MainResult.Issues | ForEach-Object { [string]$_.Message }) -join ' ') | Should -Not -Match 'Transfer package|does not match|AD proof|Environment'
+        $second.ExitCode | Should -BeIn @(0, 2) -Because ($second.Output + $second.Error)
+        $second.Output | Should -Match 'Transfer package .* verified'
+        @($second.Events | Where-Object Operation -eq 'CloudPhase-SyntheticBarrier').Count | Should -Be 1
+        # The batch is now in the backup folder of the cloud server: its id in upper case finds it.
+        $again = Invoke-GateProcess $cloud @{Action='CONVERT';Phase='CLOUD';Mode='PREVIEW';ConfigPath=$cloud.ConfigPath;Batch=$short.ToUpperInvariant()} -TimeoutSeconds 120
+        $again.ExitCode | Should -BeIn @(0, 2) -Because ($again.Output + $again.Error)
+        (@($again.MainResult.Issues | ForEach-Object { [string]$_.Message }) -join ' ') | Should -Not -Match 'not found|ambiguous|Invalid batch'
+        @(Get-GateWrites $cloud).Count | Should -Be 0
+    }
+    It 'compares proxy addresses by their address part and keeps the primary flag in the case of the type prefix' {
+        $result = InModuleScope PRA.Directory {
+            $state = { param($values) @{ Present = $true; Kind = 'MultiString'; Value = [string[]]$values } }
+            $reference = & $state @('SMTP:Alice@Contoso.com', 'smtp:alice.a@contoso.com', 'X500:/o=Org/cn=Alice')
+            $recased = & $state @('SMTP:alice@contoso.COM', 'smtp:ALICE.A@contoso.com', 'x500:/O=ORG/CN=ALICE')
+            $demoted = & $state @('smtp:Alice@Contoso.com', 'smtp:alice.a@contoso.com', 'X500:/o=Org/cn=Alice')
+            $added = & $state @('SMTP:ALICE@CONTOSO.COM', 'smtp:alice.a@contoso.com', 'X500:/O=Org/CN=Alice', 'x500:/o=org/cn=New', 'X500:/O=ORG/CN=NEW')
+            $removed = & $state @('SMTP:Alice@Contoso.com', 'smtp:alice.a@contoso.com')
+            $context = @{ Config = @{ Routing = @{ RoutingDomain = 'CONTOSO.mail.onmicrosoft.COM'; AutoDetect = $true } } }
+            $proxies = @('smtp:Alice@contoso.com', 'smtp:bob@contoso.com', 'smtp:ALICE@CONTOSO.MAIL.ONMICROSOFT.COM', 'smtp:bob@contoso.mail.onmicrosoft.com')
+            $primaryAlice = [pscustomobject]@{ SamAccountName = 'bob'; mail = 'bob@contoso.com'; mailNickname = 'bob'; proxyAddresses = @('SMTP:Alice@contoso.com') + $proxies[1..3] }
+            $noPrimary = [pscustomobject]@{ SamAccountName = 'bob'; mail = 'bob@contoso.com'; mailNickname = 'bob'; proxyAddresses = $proxies }
+            [pscustomobject]@{
+                Recased = (Get-PraX500Difference $recased $reference)
+                Demoted = (Get-PraX500Difference $demoted $reference)
+                Added = (Get-PraX500Difference $added $reference)
+                Removed = (Get-PraX500Difference $removed $reference)
+                RoutingFromPrimary = (Get-PraRoutingAddress $context $primaryAlice)
+                RoutingWithoutPrimary = (Get-PraRoutingAddress $context $noPrimary)
+                Expected = @(Get-PraExpectedX500 -LegacyExchangeDN '/o=Org/cn=Alice' -ProxyAddresses @('x500:/O=ORG/CN=ALICE', 'X500:/o=org/cn=older', 'SMTP:a@b.com'))
+                Key = @('SMTP:Alice@Contoso.COM', 'smtp:Alice@Contoso.COM', 'noprefix' | ForEach-Object { Get-PraProxyAddressKey $_ })
+            }
+        }
+        $result.Recased.OtherEqual | Should -BeTrue
+        @($result.Recased.Added).Count | Should -Be 0
+        @($result.Recased.Removed).Count | Should -Be 0
+        $result.Demoted.OtherEqual | Should -BeFalse -Because 'SMTP: (primary) becoming smtp: is a difference'
+        $result.Added.OtherEqual | Should -BeTrue
+        @($result.Added.Added) | Should -Be @('x500:/o=org/cn=New')
+        @($result.Added.Removed).Count | Should -Be 0
+        $result.Removed.OtherEqual | Should -BeTrue
+        @($result.Removed.Removed) | Should -Be @('X500:/o=Org/cn=Alice')
+        $result.RoutingFromPrimary | Should -BeExactly 'ALICE@CONTOSO.MAIL.ONMICROSOFT.COM' -Because 'the SMTP: entry is the primary address: its local part chooses the routing address'
+        $result.RoutingWithoutPrimary | Should -BeExactly 'bob@contoso.mail.onmicrosoft.com' -Because 'no entry has the SMTP: prefix: the mail attribute chooses'
+        @($result.Expected) | Should -Be @('X500:/o=Org/cn=Alice', 'X500:/o=org/cn=older')
+        @($result.Key) | Should -Be @('SMTP:alice@contoso.com', 'smtp:alice@contoso.com', 'noprefix')
+        $found = Compare-PraX500Address -Expected @('X500:/o=A/cn=Bob', 'X500:/o=A/cn=Carl') -Actual @('x500:/O=A/CN=BOB', 'SMTP:x@y.com')
+        @($found.Present) | Should -Be @('X500:/o=A/cn=Bob')
+        @($found.Missing) | Should -Be @('X500:/o=A/cn=Carl')
+    }
+}
 AfterAll {
     $env:PSModulePath=$global:PraGate.OriginalModulePath
     $env:PRA_GATE_NONET=$global:PraGate.OriginalNonet
