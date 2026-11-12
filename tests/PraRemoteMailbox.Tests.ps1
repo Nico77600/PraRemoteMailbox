@@ -3842,7 +3842,6 @@ Describe 'Runtime output folders versus the authenticated package' -Tag 'Integri
         @{Name='backup folder beside the code';Backup='.\config';Log='.\logs';Report='.\reports'}
         @{Name='folder overlapping templates';Backup='.\Backups';Log='.\templates\logs';Report='.\reports'}
         @{Name='package root itself';Backup='.\Backups';Log='.\logs';Report='.'}
-        @{Name='wrong case of the canonical folder';Backup='.\backups';Log='.\logs';Report='.\reports'}
         @{Name='canonical folder of another setting';Backup='.\logs';Log='.\logs';Report='.\reports'}
         @{Name='parent segments back into the code';Backup='.\Backups\..\module';Log='.\logs';Report='.\reports'}
     ) {
@@ -3871,6 +3870,29 @@ Describe 'Runtime output folders versus the authenticated package' -Tag 'Integri
         (Test-Path -LiteralPath (Join-Path $runtime.Package 'logs')) | Should -BeTrue
         @(Get-ChildItem -LiteralPath $external -File).Count | Should -BeGreaterThan 0
         { Import-Module (Join-Path $runtime.Package 'module\PRA.Cloud.psm1') -Force } | Should -Not -Throw
+        $again=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+        $again.ExitCode | Should -Be 0
+    }
+    It 'accepts the canonical folders in any letter case and creates them with the canonical spelling (<Name>)' -ForEach @(
+        @{Name='lower case backup folder';Backup='.\backups';ExpectedBackup='Backups';Log='.\logs';Report='.\reports'}
+        @{Name='upper case log folder';Backup='.\Backups';ExpectedBackup='Backups';Log='.\LOGS';Report='.\reports'}
+        @{Name='capitalised report folder and sub-folder of the backup folder';Backup='.\BACKUPS\Site-A';ExpectedBackup='Backups\Site-A';Log='.\logs';Report='.\Reports'}
+        @{Name='every folder in another case';Backup='.\backups';ExpectedBackup='Backups';Log='.\LOGS';Report='.\Reports'}
+    ) {
+        $runtime=New-GateRuntime -Name ('outputs-case-'+($Name -replace '\W','-'))
+        Set-GateOutputFolders $runtime $Backup $Log $Report
+        $before=Get-GatePackageFiles $runtime
+        $config=Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package
+        $config.Storage.BackupFolder | Should -BeExactly (Join-Path $runtime.Package $ExpectedBackup)
+        $config.Logging.Folder | Should -BeExactly (Join-Path $runtime.Package 'logs')
+        $config.Report.Folder | Should -BeExactly (Join-Path $runtime.Package 'reports')
+        $run=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
+        $run.ExitCode | Should -Be 0
+        $names=@(Get-ChildItem -LiteralPath $runtime.Package -Directory | ForEach-Object Name)
+        ($names -ccontains 'logs') | Should -BeTrue
+        ($names -ccontains 'reports') | Should -BeTrue
+        @($names | Where-Object { $_ -match '^(backups|logs|reports)$' -and $_ -cnotmatch '^(Backups|logs|reports)$' }) | Should -BeNullOrEmpty
+        @(Get-GatePackageFiles $runtime | Where-Object { $_ -notin $before -and $_ -cnotmatch '^\\(Backups|logs|reports)(\\|$)' }) | Should -BeNullOrEmpty
         $again=Invoke-GateProcess $runtime @{Action='Convert';Mode='Preview';Phase='Both';ConfigPath=$runtime.ConfigPath}
         $again.ExitCode | Should -Be 0
     }
@@ -4530,12 +4552,13 @@ Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single 
         $quotes=-join (@(0x2018,0x2019,0x201A,0x201B) | ForEach-Object { [char]$_ })
         . ([scriptblock]::Create((Get-EntryFunctionText 'ConvertTo-PraLiteral')))
         . ([scriptblock]::Create((Get-EntryFunctionText 'Get-PraCommandLine')))
-        $Identity="o'brien@gate.invalid"; $Scope='SharedOnly'; $MaxObjects=5; $BaseConfigPath=''
+        $Identity="o'brien@gate.invalid"; $Scope='SharedOnly'; $MaxObjects=5; $BaseConfigPath=''; $Group="PRA O'Brien $($quotes.Substring(0,1))team$($quotes.Substring(1,1))"; $Expect='Provisioned'; $Once=$false
         $SearchBase="OU=O'Neil,DC=gate,DC=invalid"; $CsvPath="C:\lists\o'x $quotes.csv"; $ConfigPath="C:\cfg\it's.psd1"; $script:ConfigPathBound=$true
         $line=Get-PraCommandLine -ActionName Convert -PhaseName AD -KeepFilters
         $line | Should -BeLike "*-Identity 'o''brien@gate.invalid'*"
         $line | Should -BeLike "*-SearchBase 'OU=O''Neil,DC=gate,DC=invalid'*"
         $line | Should -BeLike "*-ConfigPath 'C:\cfg\it''s.psd1'"
+        $line | Should -BeLike ("*-Group 'PRA O''Brien "+$quotes.Substring(0,1)+$quotes.Substring(0,1)+"team"+$quotes.Substring(1,1)+$quotes.Substring(1,1)+"'*")
         $line | Should -Match ([regex]::Escape("o''x "+$quotes.Substring(0,1)+$quotes.Substring(0,1)))
         $batch=Get-PraCommandLine -ActionName Recover -PhaseName Cloud -BatchId "C:\x y\it's\batch.json"
         $batch | Should -BeLike "*-Batch 'C:\x y\it''s\batch.json'*"
