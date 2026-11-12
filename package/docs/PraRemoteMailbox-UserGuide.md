@@ -1,7 +1,7 @@
 ﻿---
 title: PRA Remote Mailbox
 subtitle: User guide
-version: 3.1.2
+version: 3.1.3
 author: Nicolas Fabert
 updated: 2026-11-10
 runtime: PowerShell 7.5+ (engine and window)
@@ -81,9 +81,9 @@ Not sure? Ask your administrator this one question. Do not guess.
 
 ### The whole journey
 
-This is the whole story on one page. First you move the mailboxes to the cloud. Weeks later, you go back. With two servers, one file goes from one server to the other each time.
+This is the whole story on one page. First you move the mailboxes to the cloud. Weeks later, you go back. With two servers, one package goes from one server to the other each time. It is a zip file and its `.sha256` file.
 
-![Two servers, one file. Move the mailboxes: the directory server writes one zip file, you carry it, the cloud server finishes and writes the global report. Go back: the directory server, then the cloud server, then the directory server again, with a Recover package and a Finalize package](images/readme-transfer-light.png)
+![Two servers, two files to copy. Move the mailboxes: the directory server writes a zip file and its sha256 file, you carry both, the cloud server finishes and writes the global report. Go back: the directory server, then the cloud server, then the directory server again, with a Recover package and a Finalize package](images/readme-transfer-light.png)
 
 Read the table from the top. Each row is one step. Do the steps in this order.
 
@@ -222,24 +222,23 @@ pwsh -STA -File D:\PRA\PraRemoteMailbox\Invoke-PraRemoteMailbox.ps1 -Gui
 
 **You should see:** the console opens. It starts on the **Setup** page. Look at the **lights**. A light is a small box with a mark. A **green check** means "this is ready". A **red cross** means "this is missing".
 
-![The Setup page. Six lights: all six are green or grey. Number 1 marks the lights](images/console-setup-light.png)
+![The Setup page. Five lights: all five are green or grey. Number 1 marks the lights](images/console-setup-light.png)
 
 Here is what each light checks.
 
-![The six lights, one by one, in green](images/console-setup-lights-light.png)
+![The five lights, one by one, in green](images/console-setup-lights-light.png)
 
 | Light | In plain words |
 |---|---|
 | **RSAT ActiveDirectory** | The program that talks to the company directory. |
-| **ExchangeOnlineManagement** | The program that talks to the cloud mail. |
-| **Microsoft.Graph** | The program that reads people in Microsoft 365. Both parts must be in the same version, 2.41.1 or newer. If a light is red, its text gives the versions found and the command to run. |
+| **Cloud modules** | The programs that talk to the cloud. One is for the cloud mail (Exchange Online). One reads people in Microsoft 365 (Microsoft Graph). Green says the versions found, for example *Exchange Online 3.10.1, Microsoft Graph 2.41.1*. If the light is red, its text says what is missing and gives the commands to run. |
 | **Entra Connect sync** | The way to send the changes to the cloud. Grey means "not used". When the sync is done on another server, the console tries it **with your account** (a few seconds). Orange means that it will not work: read the text, it says why. |
 | **Sign-in** | How the tool signs in to Microsoft 365. |
 | **Microsoft 365 reachable** | Can this server reach Microsoft 365 through the Internet? The console tries for 3 seconds. This light shows only when the cloud programs are installed. If the connection is blocked, the text says so in plain words (firewall or proxy) and keeps the technical message for your administrator. |
 
 **If a light is red:** read the red text inside it. It says what is missing. Ask your administrator to fix it. Then press **Check again**.
 
-![A Setup page where two lights are red because the cloud programs are not installed on this server](images/console-setup-red-light.png)
+![A Setup page where the light Cloud modules is red because the cloud programs are not installed on this server](images/console-setup-red-light.png)
 
 > [!NOTE]
 > A red light is **not always a problem**. In the middle box, **This server can run**, a big word says what *this* server can do. **AD + Cloud** means everything. **AD** means the directory part only. **Cloud** means the cloud part only. **Nothing yet** means a light must be fixed first. The word comes from the programs installed here and from a short test of the Internet. If Microsoft 365 cannot be reached, the word is **AD**, even when every program is installed. The cloud part must then run on another machine that reaches the Internet (two servers). On the directory server, the cloud lights stay red. On the cloud server, the **RSAT ActiveDirectory** light stays red. That is normal. You do the other part on the other server.
@@ -357,7 +356,9 @@ Use this path **only after** Path 1 worked, and only if **one server** reaches b
 
 **You should see:** a line that tells which group of people will be moved.
 
-**If not:** for another group, use the buttons **OU** or **CSV**. An **OU** is one folder of the directory. A **CSV** is a list in a file. Ask your administrator before you use them.
+**If not:** for another group of people, use the buttons **OU**, **AD group** or **CSV**. An **OU** is one folder of the directory. An **AD group** is a group of people in the directory: type its name, then press **Check** to see its name and how many people it holds. A **CSV** is a list in a file. Ask your administrator before you use them.
+
+![The Task page with AD group chosen. Number 1 marks the button AD group, number 2 the box for the name, number 3 the button Check](images/console-task-group-light.png)
 
 ### 2 · Preview and confirm
 
@@ -404,7 +405,7 @@ Use this path when **no single server** reaches both Active Directory and Micros
 - A safe disk for the `Backups` folder.
 - The Microsoft 365 and Exchange Online rights of [chapter 2](#2-before-you-start). No right on Active Directory is needed.
 
-Two servers work one after the other. A **single file** goes from the first server to the second one. The tool creates this file by itself. It is called the **transfer package**.
+Two servers work one after the other. A **package** goes from the first server to the second one. It is a zip file with a small `.sha256` file next to it. The tool creates both by itself. Together they are called the **transfer package**.
 
 The [whole journey](#the-whole-journey), in the first chapter, shows both servers and each file on one page.
 
@@ -423,8 +424,8 @@ Press **What next? →**. The page shows the **name of the package**. The tool m
 **Do:**
 
 1. Press **Open folder**. The folder with the file opens.
-2. **Copy this one file** to the cloud server. Use a USB key, a shared folder, or any way your company allows. Do not rename it.
-3. Keep the file. Do not delete it on the first server.
+2. **Copy these two files** to the cloud server, into the same folder. They are the `.zip` file and the `.zip.sha256` file. Use a USB key, a shared folder, or any way your company allows. Do not rename them. Without the `.sha256` file, the cloud server refuses the package.
+3. Keep the files. Do not delete them on the first server.
 
 **If not:** if the page says **Pending**, this is **normal**. It means: "The directory part is done. The cloud part remains." It is not an error.
 
@@ -438,7 +439,7 @@ Press **What next? →**. The page shows the **name of the package**. The tool m
 
 **You should see:** the line turns pink. At the bottom of the **Task** page, in the card **What will happen on this server**, a pink pill says **Phase: Cloud** (number 2 in the picture).
 
-**If not:** if you see no pill, click a big card first: the card appears at the bottom after that. A red line **Invalid** means the file is damaged or comes from another environment. Copy it again. Check that both servers have the same `Environment` in their settings file. If it still fails, stop and ask.
+**If not:** if you see no pill, click a big card first: the card appears at the bottom after that. A red line **Invalid** means the file is damaged or comes from another environment. Copy it again, with its `.sha256` file. Check that both servers have the same `Environment` in their settings file. If it still fails, stop and ask.
 
 **Do:** press **Continue to verification →**, **Preview**, type **CONVERT**, and press **Convert the mailboxes**.
 
@@ -477,7 +478,7 @@ Go back only when your administrator says that the old mail servers work again. 
 
 ![The batch selected. Number 1 marks the line. Number 2 marks the button to continue](images/console-task-rollback-selected-light.png)
 
-On a directory server of a two-server rollback, the pink pill at the bottom says **Phase: AD** (number 2 in the next picture). It means that this server does the directory part and then writes one file for the cloud server. A server that does both parts says **Phase: Both**.
+On a directory server of a two-server rollback, the pink pill at the bottom says **Phase: AD** (number 2 in the next picture). It means that this server does the directory part and then writes a package for the cloud server. A server that does both parts says **Phase: Both**.
 
 ![The Task page of the directory server. Number 1: the batch. Number 2: the pink pill Phase: AD. Number 3: the button to continue](images/console-task-rollback-ad-light.png)
 
@@ -509,7 +510,7 @@ On a directory server of a two-server rollback, the pink pill at the bottom says
 
 ![The Next steps page of the directory server after a rollback. Number 1: the name of the Recover package. Number 2: the button Open folder. Number 3: the command for the cloud server](images/console-next-rollback-package-light.png)
 
-**Do:** press **Open folder**. **Copy this one file** to the cloud server. Keep the file. Do not delete it on this server.
+**Do:** press **Open folder**. **Copy these two files** (the `.zip` and its `.zip.sha256`) to the cloud server, into the same folder. Keep the files. Do not delete them on this server.
 
 ### Path 5 · Complete the rollback (two servers)
 
@@ -537,7 +538,7 @@ The **Next steps** page of the directory server told you to choose *Continue an 
 
 **You should see:** the line turns pink. The pink pill says **Phase: Cloud** (number 2 in the picture). The card **What will happen on this server** says that this server checks the rollback in the cloud. It also says that this server never writes to Active Directory.
 
-**If not:** a Convert package does not show in this list. Only a Recover package does. A red line **Invalid** means the file is damaged or comes from another environment. Copy it again. Check that both servers have the same `Environment`. If the list is empty, the file is not in `Backups\Inbox`. If it still fails, stop and ask.
+**If not:** a Convert package does not show in this list. Only a Recover package does. A red line **Invalid** means the file is damaged or comes from another environment. Copy it again, with its `.sha256` file. Check that both servers have the same `Environment`. If the list is empty, the file is not in `Backups\Inbox`. If it still fails, stop and ask.
 
 **Do:** press **Continue to verification →**, then **Preview**. A black window may ask you to sign in to Microsoft. Sign in with your own account. Read the title: *… will be rolled back*. Is it the right number of people? Type the word **RECOVER**. Press the red button **Roll back the mailboxes**.
 
@@ -557,15 +558,15 @@ The **Next steps** page of the directory server told you to choose *Continue an 
 
 **Do:** press **What next? →**. Two cases are possible.
 
-**First case: a Finalize package was written.** The page says **The cloud part of the rollback is done**. It asks you to copy one file to the AD server. The name looks like `PRA-PROD-Finalize-b7d41a9c-for-AD.zip`. Its ID is new too. It is not the ID of the move.
+**First case: a Finalize package was written.** The page says **The cloud part of the rollback is done**. It asks you to copy two files to the AD server. They are the package and its `.sha256` file. The name looks like `PRA-PROD-Finalize-b7d41a9c-for-AD.zip`. Its ID is new too. It is not the ID of the move.
 
 ![The Next steps page of the cloud server. Number 1: the name of the Finalize package. Number 2: the button Open folder. Number 3: the command for the directory server](images/console-next-rollback-cloud-light.png)
 
 **Do:**
 
 1. Press **Open folder**. The folder with the file opens.
-2. **Copy this one file** to the directory server. Do not rename it.
-3. Keep the file. Do not delete it on this server.
+2. **Copy these two files** (the `.zip` and its `.zip.sha256`) to the directory server, into the same folder. Do not rename them.
+3. Keep the files. Do not delete them on this server.
 4. Go to Part 3 on the directory server.
 
 **Second case: no package was written.** The page says **The run is complete**. It shows the button **Open global report**. Nothing remains for the directory. The rollback is **finished**. Press **Open global report** to read it. There is no Part 3.
@@ -642,7 +643,7 @@ On two servers, the **last** server writes a **global report**. It follows each 
 <!-- icon: lifebuoy -->
 ## 7. When something goes wrong
 
-![Two red lights on the Setup page: the cloud programs are not installed on this server](images/console-setup-red-lights-light.png)
+![A red light on the Setup page: the cloud programs are not installed on this server](images/console-setup-red-lights-light.png)
 
 Find what you **see** in the left column. The middle column says what it **means**. The right column says what to **do**. If you are not sure, **stop and ask**.
 
@@ -652,7 +653,9 @@ Find what you **see** in the left column. The middle column says what it **means
 | The button **Choose a task** is **grey** | A needed light is red, or the settings file is wrong. | Fix the red light. If a message talks about the settings file, open the file and look at the line named. |
 | The **sign-in window does not open** | The tool opens its own window for Microsoft. It may hide behind another window. | Look at the Windows taskbar for a black window named *PRA Remote Mailbox - cloud sign-in*. Click it. Sign in. Do not close it. |
 | *Microsoft Graph: found … The tool needs both in one same version 2.41.1 or later* | The Microsoft 365 programs on this server are too old, or not in the same version. **Nothing was changed.** | Ask your administrator to run the command written in the message. Press **Check again**. |
-| *Nothing was changed in AD. This account cannot write to …* | The directory server refused your account. | Run the tool on that directory server, or with an account that has the rights. The backup folder that was written is kept: it is not a batch to continue. |
+| *Nothing was changed in AD. This account cannot write to …* | The directory server refused your account. | Run the tool on that directory server, or with an account that has the rights. The **Next steps** give the command: run the **Preview** first, then the same command with `-Mode Apply`. The backup folder that was written is kept: it is not a batch to continue. |
+| *… Microsoft 365 did not answer (network)* | The connection to Microsoft 365 did not work for a moment. **Nothing was changed** by a Preview or a Check. | Press the button again, or run the command of the **Next steps** again when the connection works. If it comes back, ask your administrator to check the network. |
+| *The domain controller … does not answer from this machine* | This server cannot reach the directory server. **Nothing was changed.** | Run the check on a server that reaches the directory server, or give the e-mail address of the mailbox instead of the account name. |
 | *A Microsoft Graph session already exists in this console* | A cloud session is already open in the same window. | Close all PowerShell windows. Open a new one. Start again. |
 | **The red button stays grey** on **Verify** | The preview is not done, or the word is not typed. | Press **Preview**. Type the word **CONVERT**, **RECOVER** or **FINALIZE**. Spaces and capitals do not matter. |
 | *N blocking* in red after **Preview** | The tool refuses some people. | Click the line. Read the reason. Remove the person from the list, or stop and ask. |
@@ -660,12 +663,13 @@ Find what you **see** in the left column. The middle column says what it **means
 | I do not see **Phase: …** on the **Task** page | You did not click a big card yet. | Click a big card. The card **What will happen on this server** appears at the bottom. The pink pill is on its left. |
 | The **wait is long** (*attempt 5 of 13*) | The directory is sending the news to the cloud. | Wait. It is normal up to **15 minutes**. The mailboxes can take up to **an hour** to appear. Do not close the window. |
 | A **step turns red** during the run | The tool stopped on purpose, at the first error. | Do not click anything. Take a photo. Stop and ask. The people already done are kept. |
-| A package line is red: **Invalid** | The file is damaged, or comes from another environment. | Copy the file again, without renaming it. Check that both servers have the same `Environment`. |
+| A package line is red: **Invalid** | The file is damaged, comes from another environment, or its `.zip.sha256` file is not next to it. | Copy the `.zip` and the `.zip.sha256` files again, together in the same folder, without renaming them. Check that both servers have the same `Environment`. |
 | *Active Directory replication was NOT confirmed on …* | One directory server did not receive the change in time. | Read the **Next steps** page. It says to start the synchronisation again later. Ask your administrator. |
 | The result says **Pending** | A part remains. It is **not** an error. | Do what the **Next steps** page says. On two servers: carry the package to the other server. |
 | *Entra Connect sync will not be possible: …* | Before it changed anything, the tool tried the Entra Connect server with your account. The server refused your account, or did not answer. **Nothing was changed.** | Read the reason in the message. Ask your administrator to give your account the right it names, or to check the server name and the remote connection. Or ask to switch the sync off (`EntraConnect.Sync`) and to start the sync by hand after the move. Then start again. |
-| The result says **Pending** and the **Next steps** begin with *AD is changed and verified. The Entra Connect sync could not start* | The people are moved in the directory and checked. The sync to the cloud could not start (for example the right was removed). The package is made anyway. | **Do not start the move again.** Start a sync on the Entra Connect server (the message gives the command), or wait about 30 minutes. Then do the next line: carry the package to the cloud server. |
-| *… is already converted by batch …* | You started the move again for a person who is already moved. **Nothing was changed.** | Do not move this person again. To finish the batch (sync and package, the directory is not changed again), use the command written in the message: `.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch <batch ID>`. |
+| The **Next steps** of a **Preview** begin with *The Apply would be refused as things stand* | The preview already knows that the real run will stop. For example, your account has no right on the Entra Connect server, or the cloud programs are missing. **Nothing was changed.** | Do what the line says first. Then run the command that comes after it. |
+| The result says **Pending** and the **Next steps** begin with *AD is changed and verified. The Entra Connect sync did not run* | The people are moved in the directory and checked. The sync to the cloud could not run (for example the right was removed). The package is made anyway. | **Do not start the move again.** Start a sync on the Entra Connect server (the message gives the command), or wait about 30 minutes. Then do the next line: carry the package to the cloud server. |
+| *… is already converted by batch …* | You started the move again for a person who is already moved. **Nothing was changed.** | Do not move this person again. To finish the batch (sync and package, the directory is not changed again), use the command given in the Next steps: `.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch <batch ID>`. |
 | An orange line says *X500 missing in Exchange Online* | The new mailbox is ready and works, but it does not have an old address of the person yet. An answer to a very **old message** could come back to the sender as an error until it appears. | It is not serious: the move is done. Ask your administrator to run a sync, then a **Check**. |
 | *Scope.Mode = OU requires Scope.SearchBase: no OU is set* | You started a move, and the settings file does not say which people to take. **Nothing was changed.** | Ask your administrator to fill the setting named in the message, or give one account. A cloud server never needs it. |
 | Nothing in the list of batches or packages | The files are not on this server. | Copy the folder or the package here. Use **Import package…**. |

@@ -4,10 +4,10 @@
     Reads the OU list for the WPF selector on the configured writable DC. No directory writes.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2
+    Version : 3.1.3
 #>
 [CmdletBinding()]
-param([Parameter(Mandatory)][string]$ConfigPath, [Parameter(Mandatory)][string]$ResultPath, [string]$Identity = '', [string]$PackagePath = '', [string]$Environment = '', [string]$BackupFolder = '', [switch]$Import)
+param([Parameter(Mandatory)][string]$ConfigPath, [Parameter(Mandatory)][string]$ResultPath, [string]$Identity = '', [string]$Group = '', [string]$PackagePath = '', [string]$Environment = '', [string]$BackupFolder = '', [switch]$Import)
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 # >>> PRA package integrity bootstrap: identical in every runtime PowerShell file (checked by the tests).
@@ -59,6 +59,15 @@ try {
     $context.Config = Import-PraConfiguration -Path $ConfigPath -Root $root -ScopeOverride @{Mode='Auto';SearchBase='';CsvPath='';GroupDN=''}
     $context.Server = $context.Config.DomainController
     Initialize-PraDirectory -Context $context
+    if ($Group) {
+        # One group, read only: what the group box of the window shows under the field.
+        $context.CurrentPhase = 'LookupGroup'
+        $found = Resolve-PraGroup $context $Group
+        $members = @(Get-PraGroupMember $context $found)
+        $answer = @{ Success = $true; Name = [string](Get-PraValue $found 'Name' (Get-PraValue $found 'SamAccountName' '')); DistinguishedName = [string]$found.DistinguishedName; Members = $members.Count }
+        [IO.File]::WriteAllText($ResultPath, ($answer | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+        exit 0
+    }
     if ($Identity) {
         # One account, read only: what the Identity box of the window shows under the field.
         $context.CurrentPhase = 'LookupIdentity'
@@ -93,10 +102,10 @@ catch {
 finally { Initialize-PraPermissionCache -Context $context }
 
 # SIG # Begin signature block
-# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD9OjG/oIh6DLIe
-# 68lZERyJlVLw6juIU1aCIR/brY8AEqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCBO5D7nW8CubOvu
+# t9EVkkLvBASbyYUcMrLOqeXbhIZKCaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -168,28 +177,28 @@ finally { Initialize-PraPermissionCache -Context $context }
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCK6rBOZw1K
-# Eo6Ixxn8ZtpeKbaMIlefDUzGjIPtL0T/mzANBgkqhkiG9w0BAQEFAASCAgCUf2ay
-# CVUkwP9X1POOIy+Jjj8Zzc7Pi+dwVQoM3TK5gUI7IxXVeOUWjWjCdspcfwhwnph2
-# sTjV2y6eL7anDAmTKatUcMH+ibAdEuWxbv3Y5odbsqrYo2ShzHeCoNNRzjpRy3+K
-# oPoUuVFty34rMFyUPv4l1eJq7/dCdxwdOqhArYAes/aazeanojKFX6quHAxWFn8S
-# CRO0Nx9NwkSLRCoHti9/YFkdPvL8DKLOcphUJajSr2c16JL5aY2EbC9H1XVFruPB
-# 8RJY3T7ERWQxbtqsrCyKpeRsVb/zjxKYG3Gqct6Sq8RIzyiQQKfKSKyyI8SyTypJ
-# sTKkn1qRkTkGBdKXwLx8KideTXssnNcOm2WjbVGM8ShpuX2dyzHwVE+9EcZtrLPZ
-# EaHGtk3daW1l9TeF9L7zjvHvUGXw+xeBR6mmB5tWkiQ0Cr3jPrQ0FafjVva7hshr
-# B0vlnyp6HOygc1FvWGJpLQMpytnPrYF9Oa0MOLUv1VjCAQHOMwluXYvWH4M05Q5C
-# 1udLaY7pZ7dpAJur1C1aZWM7i/NtfDySzbIkMKxV1IcbhRkCUgNQ3xtGaOfIRsgo
-# CwbQw4DL+uBEorrq88irk4IKebrGY1GpDD0TkqJZBD0lIX9wdZc4gj60h9vEj/Q5
-# G23G74d5MUDhf2kHeMktF+pGeInHHGKj9nQa2aGCFM8wghTLBgorBgEEAYI3AwMB
-# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCYHd0q1KaM
+# 7QUEn6vQwqsZ0ZRIPgodZBN1WB9U2W1PQjANBgkqhkiG9w0BAQEFAASCAgBWuscb
+# WY051l9esfUUXL/CRyvpQAcd8V4sZhHc91EFBnN2lSZoIx0ps4KKW8zIWg8M39lb
+# Y3JKMA86PyvnMD4zYukshxxtQAQvFOIvE/J1+TCFFTZNzXOnfK6qvun+6ZuLfRuY
+# b59TOOf9e5qnFVqP3m1b3G66mjrl4323CqmCelYK7i//hT8HPA3DSbrpptGU/lId
+# LF8uoGuI4uJvn4TUh6uSqE1S7dLSV0RiqselnKTrIz4dS6+4cgcQrnSDagwI9YTQ
+# qRo9gL+369OJZrV+zDB/l2eP1HTWLolaXRRiL9Ud8YSYkpmcPsF92/QRwhPpGEue
+# QwwKfqXjiCL7xydF9XdxKBZNJzsdyVqNlmFtMnHufEI/J2l4osvCVVD6nZV859Cy
+# JU4WbHOZQPOwMRxcjDLiFUkV4oyiO1E2ASdIBG4tl4FSZiLA19QjHak13pmZtDry
+# Fw+Q9EAX6jvnqtocDkm31nW52W29DYdv2t93R9NpVqixyxRJsp22SdmE5iQ63f10
+# MbEo8QjQpF0hmY/0iCA5Ax0Uquq6qvSd2LPtR6WVCF6BQSjdi+9q3b+rHDRxQde0
+# x0eKEs04vzw3+Nj9I50FbZP614+uIKPDCES8h2U1UeUXHnAYHT6B2qosBUWX3erm
+# Gi9uMkzXhQb6wIlx2ev+H38FEQO9acJmleqhh6GCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIJQ3romxiR+ApTfS6yjyNdCtlMsBOUSplQEMooXkS8DKAghrqjH9GIxm
-# URgPMjAyNjExMTAwODMzNDdaMAMCAQECEGvD0YNoIZL8HABXTygsfL+gghGnMIIE
+# BAIBBQAEIFkjF22yDqz2c5pITemf/O8Zf85DV21MrKmrG+1PT482AggHExJMHtKQ
+# ExgPMjAyNjExMTIxODAyMDZaMAMCAQECEAfZ66K1Sv0jSm5/nx1OGVKgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -284,17 +293,17 @@ finally { Initialize-PraPermissionCache -Context $context }
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMDA4MzM0N1owKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEINwx
-# WKyeKYmsZcjcZemwaVsDrN5eZblzh9bLwQsWYBCrMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMjE4MDIwNlowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIMU9
+# oO2XsIOww7s8XwDgm1ZJrlH2eEzbqDf+BDiQi8J0MIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIESDBGAiEA2njXJvrzgtn5WB6IVwD2fIT7VytI+M4n9xI6atN1hmMCIQCI
-# 8pyqT80iT3f6WkhfO/I7ivj1nrJrJ45lh8o+mZ7ubw==
+# zj0EAwIERzBFAiEA0wRXZnczAjZqJBZONM2odbqvWn0Fb+/IouuY8PQLrkcCICx8
+# gzZ8jeZoGbHlUfPXm2f4DerT8ZiRmDVmhbLES6TZ
 # SIG # End signature block

@@ -2,7 +2,7 @@
 #  PRA Remote Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 3.1.2
+#  Version : 3.1.3
 #
 #  This file is read by Invoke-PraRemoteMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -120,7 +120,7 @@
     # Entra Connect synchronisation after the AD changes (Apply).
     #   Sync = $true : one cycle is run and the tool waits for its end before the cloud part.
     #                  On this server (ADSync module) or on Server through PowerShell remoting.
-    #                  Checked BEFORE any AD change.
+    #                  Checked before any AD change.
     #   Sync = $false: the operator runs it (Start-ADSyncSyncCycle -PolicyType Delta).
     # ---------------------------------------------------------------------
     EntraConnect = @{

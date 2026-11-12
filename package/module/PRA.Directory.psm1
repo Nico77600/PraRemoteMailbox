@@ -15,7 +15,7 @@
         7. Writes                  Invoke-PraAdPreview, Invoke-PraAdBatch (the only AD writes)
         8. Entra Connect           Invoke-PraSync (local or remote delta cycle)
 
-    Safety contract (unchanged since 1.3.0):
+    Safety contract:
       - every target is read and planned before the first write;
       - a complete backup (typed JSON + data-only CLIXML + SHA-256) of the whole batch is written,
         closed and re-read before the first write;
@@ -26,7 +26,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2
+    Version : 3.1.3
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -211,8 +211,8 @@ function Assert-PraReceiptIntegrity {
     [CmdletBinding()]
     param([hashtable]$Context, $Entry)
     $receipt = $Entry.Receipt
-    if (-not (Test-PraOrdinalEqual $Entry.Environment $Context.Config.Environment) -or -not (Test-PraOrdinalEqual $receipt.Path $Entry.Path) -or
-        -not (Test-PraOrdinalEqual $receipt.Data.Environment $Entry.Environment) -or -not (Test-PraOrdinalEqual $receipt.Data.Operation $Entry.Operation) -or
+    if (-not (Test-PraOrdinalIgnoreCaseEqual $Entry.Environment $Context.Config.Environment) -or -not (Test-PraOrdinalIgnoreCaseEqual $receipt.Path $Entry.Path) -or
+        -not (Test-PraOrdinalIgnoreCaseEqual $receipt.Data.Environment $Entry.Environment) -or -not (Test-PraOrdinalEqual $receipt.Data.Operation $Entry.Operation) -or
         [int](Get-PraValue $receipt.Data 'SchemaVersion' 1) -ne $Entry.SchemaVersion -or
         -not (Test-PraOrdinalEqual ([string](Get-PraValue $receipt.Data 'RawFormat' '')) $Entry.RawFormat) -or
         $receipt.Legacy -isnot [bool] -or (-not (Test-PraOrdinalIgnoreCaseEqual $receipt.Legacy $Entry.Legacy)) -or
@@ -223,9 +223,9 @@ function Assert-PraReceiptIntegrity {
     if (-not (Test-PraOrdinalEqual (Get-PraHash -Path $Entry.Path) $Entry.Hash)) { throw 'Backup JSON file changed since its validation.' }
     if ($Entry.SchemaVersion -ge 2) {
         $sidecar = (Get-Content -LiteralPath ($Entry.Path + '.sha256') -Raw -ErrorAction Stop).Trim()
-        if (-not (Test-PraOrdinalEqual $sidecar $Entry.Hash)) { throw 'Backup .sha256 file changed since its validation.' }
-        if (-not (Test-PraOrdinalEqual $receipt.Data.RawHash $Entry.RawHash) -or
-            -not (Test-PraOrdinalEqual ([IO.Path]::GetFileName($Entry.RawPath)) $receipt.Data.RawFile) -or
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $sidecar $Entry.Hash)) { throw 'Backup .sha256 file changed since its validation.' }
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $receipt.Data.RawHash $Entry.RawHash) -or
+            -not (Test-PraOrdinalIgnoreCaseEqual ([IO.Path]::GetFileName($Entry.RawPath)) $receipt.Data.RawFile) -or
             -not (Test-PraOrdinalEqual (Get-PraHash -Path $Entry.RawPath) $Entry.RawHash)) { throw 'Backup CLIXML file changed since its validation.' }
     }
 }
@@ -275,7 +275,7 @@ function New-PraPrivateDirectory {
         Creates a backup folder readable only by the current account, SYSTEM and Administrators
         (no inherited permission). The folder must not exist.
     .PARAMETER Root
-        The configured Storage.BackupFolder. As with 2.x, every folder that has to be created from Root (included) down to
+        The configured Storage.BackupFolder. Every folder that has to be created from Root (included) down to
         Path is born private, so a missing Storage.BackupFolder is private too; folders above Root keep the inheritance of
         their own parent. Without Root only the last folder gets the private ACL.
     #>
@@ -330,8 +330,20 @@ function Write-PraJournal {
 
 #region 2. Directory reads --------------------------------------------------------------------
 
+function Test-PraAdServerDown {
+    <# True when an Active Directory error means that the domain controller does not answer (Active Directory Web Services unreachable): the exception types and the error text in English; the localized text of Windows is not needed. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][Management.Automation.ErrorRecord]$Failure)
+    $cursor = $Failure.Exception
+    while ($null -ne $cursor) {
+        if (Test-PraOrdinalIn $cursor.GetType().Name @('ADServerDownException', 'EndpointNotFoundException')) { return $true }
+        $cursor = $cursor.InnerException
+    }
+    return ([string]$Failure.Exception.Message -match '(?i)unable to contact the server|Active Directory Web Services running')
+}
+
 function Invoke-PraRead {
-    <# Runs one AD read, logs it (debug) and logs any failure with its details. #>
+    <# Runs one AD read, logs it (debug) and logs any failure with its details. A domain controller that does not answer is said in plain words (the raw text stays in the log). #>
     [CmdletBinding()]
     param([hashtable]$Context, [string]$Operation, [string]$Identity, [scriptblock]$Read)
     $Context.CurrentOperation = $Operation; $Context.CurrentIdentity = $Identity
@@ -343,6 +355,12 @@ function Invoke-PraRead {
         return $result
     }
     catch {
+        if (Test-PraAdServerDown $_) {
+            Write-PraLog -Context $Context -Message "AD read failed | $Operation | DC=$($Context.Server) | Identity=$Identity | $($_.Exception.GetType().FullName) | $($_.Exception.Message) | ErrorId=$($_.FullyQualifiedErrorId) | Category=$($_.CategoryInfo.Category)" -Level Detail
+            $Context.DcUnreachable = $true; $Context.CurrentIdentity = ''
+            $hint = if ((Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $Context 'Action' '')) 'Check')) { 'run the Check on a machine that reaches it, or give the UPN of the mailbox as -Identity' } else { 'run the tool on a machine that reaches it, or on the domain controller itself' }
+            throw ('The domain controller {0} does not answer from this machine (Active Directory Web Services, TCP 9389): {1}.' -f $Context.Server, $hint)
+        }
         Write-PraLog -Context $Context -Message "AD read failed | $Operation | DC=$($Context.Server) | Identity=$Identity | $($_.Exception.GetType().FullName) | $($_.Exception.Message) | ErrorId=$($_.FullyQualifiedErrorId) | Category=$($_.CategoryInfo.Category)" -Level Error
         Write-PraLog -Context $Context -Message "$($_.InvocationInfo.PositionMessage)`n$($_.ScriptStackTrace)" -Level Debug
         throw
@@ -361,7 +379,13 @@ function Initialize-PraDirectory {
     if (-not [Environment]::Is64BitProcess) { Write-PraLog -Context $Context -Message '32-bit PowerShell: less memory for large batches. Use the 64-bit PowerShell 7.' -Level Warning }
     # No AD: drive (it would connect to a default domain controller, not the one of the run).
     $env:ADPS_LoadDefaultDrive = 0
-    Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false -WarningAction SilentlyContinue
+    $Context.CurrentOperation = 'Import-ActiveDirectory'
+    try { Import-Module ActiveDirectory -ErrorAction Stop -Verbose:$false -WarningAction SilentlyContinue }
+    catch {
+        if (@(Get-Module -ListAvailable -Name ActiveDirectory -SkipEditionCheck -ErrorAction SilentlyContinue).Count) { throw }
+        Write-PraLog -Context $Context -Message ('ActiveDirectory module, technical message: {0}' -f $_.Exception.Message) -Level Detail
+        throw 'The RSAT ActiveDirectory module is not installed on this server: the Active Directory part cannot run here (install the RSAT feature Active Directory module, or run the AD part on a server that has it).'
+    }
     if ([string]::IsNullOrWhiteSpace($Context.Server)) {
         $dc = Get-ADDomainController -Discover -Writable -ErrorAction Stop
         $names = @($dc.HostName | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
@@ -442,23 +466,80 @@ function Get-PraGroup {
     return $groups[0]
 }
 
+function Resolve-PraGroup {
+    <#
+    .SYNOPSIS
+        One group from its name (sAMAccountName or CN) or its distinguished name. Not found, or several groups of that name: a plain error.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [Parameter(Mandatory)][string]$Name)
+    $text = $Name.Trim()
+    $server = $Context.Server
+    $escaped = ConvertTo-PraLdapValue $text
+    $filter = if ($text -match '^(CN|OU|DC)=') { "(&(objectCategory=group)(distinguishedName=$escaped))" } else { "(&(objectCategory=group)(|(sAMAccountName=$escaped)(cn=$escaped)))" }
+    $groups = @(Invoke-PraRead $Context 'Get-ADGroup/Name' $text { Get-ADGroup -LDAPFilter $filter -Properties 'member' -Server $server -ErrorAction Stop })
+    if (-not $groups.Count) { throw ("The group '{0}' was not found in Active Directory (checked on {1}). Give its name (sAMAccountName or CN) or its distinguished name." -f $text, $server) }
+    if ($groups.Count -gt 1) {
+        $listed = @($groups | Select-Object -First 5 | ForEach-Object { [string]$_.DistinguishedName })
+        $more = if ($groups.Count -gt $listed.Count) { ' (and {0} more)' -f ($groups.Count - $listed.Count) } else { '' }
+        $groupHook = Get-PraValue $Context 'GroupCommandLineFor' $null
+        $steps = @()
+        if ($env:PRA_EVENT_FILE) {
+            $steps = @('Type the distinguished name of the group to use in the AD group field. One of:') + $listed
+        } elseif ($groupHook -is [scriptblock]) {
+            $steps = @('To use one of these groups, run the command with its distinguished name (one command per group):')
+            foreach ($distinguishedName in $listed) { $steps += [string](& $groupHook $distinguishedName) }
+        }
+        if ($steps.Count) { $Context.NextSteps = $steps; $Context.NextOnFailure = $true }
+        throw ("{0} groups are named '{1}': give the distinguished name of the one to use. They are: {2}{3}." -f $groups.Count, $text, ($listed -join ' | '), $more)
+    }
+    Assert-PraDomain $Context ([string]$groups[0].DistinguishedName)
+    if ([guid]$groups[0].ObjectGUID -eq [guid]::Empty) { throw "Group without GUID: $text" }
+    return $groups[0]
+}
+
 function Find-PraConvertedBatch {
     <#
     .SYNOPSIS
-        The most recent Convert batch of the backup folder that holds an object and has its AD proof (State file), or $null. A hint for the operator
-        only: the batch is verified in full when it is used.
+        The most recent Convert batch of the backup folder that holds an object, has its AD proof (State file) and is still the current state of the
+        object, or $null. A hint for the operator only: the batch is verified in full when it is used.
+    .DESCRIPTION
+        A batch of another Environment is ignored. A Convert batch that a later Recover batch of this object rolled back (its State file names the Convert
+        backup as its source) is ignored too: the object is not converted by it any more.
     #>
     [CmdletBinding()]
     param([hashtable]$Context, [string]$ObjectGuid)
     try {
         $root = [string]$Context.Config.Storage.BackupFolder
         if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { return $null }
-        $folders = [object[]]@(Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction Stop | Where-Object { $_.Name -match '^Batch-[0-9a-f]{32}$' })
-        $ticks = [long[]]@($folders | ForEach-Object { $_.LastWriteTimeUtc.Ticks })
-        [Array]::Sort($ticks, $folders); [Array]::Reverse($folders)
-        foreach ($folder in $folders) {
+        $environment = [string]$Context.Config.Environment
+        $candidates = New-Object 'Collections.Generic.List[object]'
+        $rolledBack = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($folder in @(Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction Stop | Where-Object { $_.Name -match '^(Batch|Finalize)-[0-9a-f]{32}$' })) {
+            foreach ($stateFile in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter 'State-*.json' -ErrorAction Stop)) {
+                try { $state = Get-Content -LiteralPath $stateFile.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson } catch { continue }
+                $stateEnvironment = [string](Get-PraValue $state 'Environment' '')
+                if ($stateEnvironment -and -not (Test-PraOrdinalIgnoreCaseEqual $stateEnvironment $environment)) { continue }
+                $stateRecords = Get-PraValue $state 'Records' @()
+                if (@($stateRecords | Where-Object { Test-PraOrdinalIgnoreCaseEqual ([string]$_.ObjectGuid) $ObjectGuid }).Count -ne 1) { continue }
+                $operation = [string](Get-PraValue $state 'Operation' '')
+                if (Test-PraOrdinalEqual $operation 'Recover') {
+                    $source = [string](Get-PraValue $state 'SourceBackupHash' '')
+                    if ($source) { $null = $rolledBack.Add($source) }
+                }
+                elseif ((Test-PraOrdinalEqual $operation 'Convert') -and $folder.Name.StartsWith('Batch-', [StringComparison]::OrdinalIgnoreCase)) {
+                    $created = [datetime]::MinValue
+                    if (-not [datetime]::TryParse([string](Get-PraValue $state 'CreatedUtc' ''), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$created)) { $created = $folder.LastWriteTimeUtc }
+                    $candidates.Add([pscustomobject]@{ Folder = $folder; Ticks = $created.ToUniversalTime().Ticks; BackupHash = [string](Get-PraValue $state 'BackupHash' '') })
+                }
+            }
+        }
+        # Newest first (the name breaks a tie); the sort is on the time, not on the folder name.
+        $newestFirst = @($candidates | ForEach-Object { [pscustomobject]@{ Key = (([int64]::MaxValue - $_.Ticks).ToString('D20', [Globalization.CultureInfo]::InvariantCulture) + '|' + $_.Folder.Name); Item = $_ } } | Get-PraOrdinalSorted -Property Key | ForEach-Object Item)
+        foreach ($candidate in $newestFirst) {
+            if ($candidate.BackupHash -and $rolledBack.Contains($candidate.BackupHash)) { continue }
+            $folder = $candidate.Folder
             $batchId = $folder.Name.Substring(6)
-            if (-not (Test-Path -LiteralPath (Join-Path $folder.FullName ('State-' + $batchId + '.json')) -PathType Leaf)) { continue }
             foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter 'Convert-*.json' -ErrorAction Stop)) {
                 try { $data = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson } catch { continue }
                 if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $data 'Operation' '')) 'Convert')) { continue }
@@ -470,6 +551,71 @@ function Find-PraConvertedBatch {
     }
     catch { Write-PraLog -Context $Context -Message ('The backup folder could not be searched for a batch of this object: {0}' -f $_.Exception.Message) -Level Detail }
     return $null
+}
+
+function Get-PraSkipReason {
+    <# Plain reason why a user of a selected group is not converted. #>
+    param($User, [bool]$Excluded)
+    if ($Excluded) { return 'excluded (a system mailbox, or listed in Scope.ExcludeSamAccountNames)' }
+    $code = [long](Get-PraValue $User 'msExchRecipientTypeDetails' 0)
+    if (-not (Get-PraValue $User 'homeMDB' '')) {
+        if ($code -eq 2147483648 -or $code -eq 34359738368) { return 'already a remote mailbox' }
+        return 'no on-premises mailbox'
+    }
+    switch ($code) {
+        4 { return 'a shared mailbox, not included in this run' }
+        16 { return 'a room mailbox, not included in this run' }
+        32 { return 'an equipment mailbox, not included in this run' }
+        1 { return 'a user mailbox, not included in this run' }
+        default { return ('mailbox type {0} is not converted' -f $code) }
+    }
+}
+
+function Add-PraSkippedMember {
+    <# A member of the selected group that is not converted: one line on the console and in the log, and in the list of the report. #>
+    param([hashtable]$Context, [string]$Name, [string]$Reason)
+    $Context.SkippedMembers.Add(('{0} ({1})' -f $Name, $Reason))
+    Write-PraItem -Context $Context -Status Skip -Text ('{0}: not converted, {1}' -f $Name, $Reason)
+}
+
+function Get-PraContinueStep {
+    <#
+    .SYNOPSIS
+        The next steps that continue the Convert batch(es) that already hold converted objects (Entra Connect sync and transfer package; AD is not changed again): one line per batch.
+    .DESCRIPTION
+        The way to continue is a next step, written in full. Started from the window (it sets PRA_EVENT_FILE) the operator has no command line: the way is the Task page.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [Parameter(Mandatory)][string[]]$BatchId)
+    $hook = Get-PraValue $Context 'CommandLineFor' $null
+    $what = 'Entra Connect sync and transfer package; AD is not changed again'
+    $ids = @($BatchId)
+    if ($env:PRA_EVENT_FILE) {
+        return @($ids | ForEach-Object { '{0}, go to the Task page, choose Move mailboxes to Exchange Online, then Continue a batch, and pick batch {1}.' -f $(if ($ids.Count -gt 1) { 'To continue batch ' + $_ + ' (' + $what + ')' } else { 'To continue that batch (' + $what + ')' }), $_ })
+    }
+    $lines = @($(if ($ids.Count -gt 1) { 'To continue these batches ({0}), run one command per batch:' -f $what } else { 'To continue that batch ({0}), run:' -f $what }))
+    foreach ($id in $ids) {
+        $lines += $(if ($hook -is [scriptblock]) { [string](& $hook 'Convert' 'AD' $id) } else { '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch ' + $id })
+    }
+    return $lines
+}
+
+function Get-PraGroupMember {
+    <#
+    .SYNOPSIS
+        Every member of a group that is not a group itself, nested groups included: users, contacts, computers and any other object.
+    .DESCRIPTION
+        One read of the chain of memberships (LDAP matching rule in chain), so contacts and other non-user objects are returned too
+        (Get-ADGroupMember -Recursive leaves them out). An object that belongs to several nested groups appears once.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [Parameter(Mandatory)]$Group)
+    $server = $Context.Server
+    $groupDn = [string]$Group.DistinguishedName
+    $filter = '(&(memberOf:1.2.840.113556.1.4.1941:={0})(!(objectClass=group)))' -f (ConvertTo-PraLdapValue $groupDn)
+    $members = @(Invoke-PraRead $Context 'Get-ADObject/GroupMembers' $groupDn {
+            Get-ADObject -LDAPFilter $filter -Properties @('objectClass', 'sAMAccountName', 'name') -Server $server -ErrorAction Stop })
+    return @($members | Where-Object { -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $_ 'objectClass' '')) 'group') })
 }
 
 function Get-PraTarget {
@@ -498,6 +644,8 @@ function Get-PraTarget {
     }
     $users = New-Object 'Collections.Generic.List[object]'
     $explicit = $false
+    $groupMode = $false
+    $Context.SkippedMembers = New-Object 'Collections.Generic.List[string]'
     if ($Identity) { $explicit = $true; $users.Add((Get-PraUser $Context $Identity)) }
     elseif (Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Csv') {
         $explicit = $true
@@ -509,10 +657,25 @@ function Get-PraTarget {
         }
     }
     elseif (Test-PraOrdinalIgnoreCaseEqual $scope.Mode 'Group') {
-        $group = Get-PraGroup $Context $scope.GroupDN
-        $members = @(Invoke-PraRead $Context 'Get-ADGroupMember/Scope' $group.DistinguishedName {
-                Get-ADGroupMember -Identity $group.ObjectGUID -Recursive -Server $server -ErrorAction Stop })
-        foreach ($member in $members | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.objectClass 'user' }) { $users.Add((Get-PraUser $Context ([string]$member.DistinguishedName))) }
+        $group = Resolve-PraGroup $Context $scope.GroupDN
+        $groupName = [string](Get-PraValue $group 'Name' (Get-PraValue $group 'SamAccountName' ([string]$scope.GroupDN)))
+        $members = @(Get-PraGroupMember $Context $group)
+        $Context.ObjectsText = 'members of {0} ({1}, including nested groups)' -f $groupName, $members.Count
+        if (-not $members.Count) {
+            Write-PraItem -Context $Context -Status Warn -Text ('The group {0} has no member: nothing to convert.' -f $groupName)
+            $Context.TargetsReported = $true
+            return @()
+        }
+        Write-PraItem -Context $Context -Status Info -Icon Directory -Text ('Group {0}: {1} member(s), including nested groups' -f $groupName, $members.Count)
+        $groupMode = $true
+        foreach ($member in $members) {
+            $class = [string](Get-PraValue $member 'objectClass' '')
+            if (Test-PraOrdinalIgnoreCaseEqual $class 'user') { $users.Add((Get-PraUser $Context ([string]$member.DistinguishedName))); continue }
+            $label = [string]@(@((Get-PraValue $member 'SamAccountName' ''), (Get-PraValue $member 'Name' ''), [string]$member.DistinguishedName) | Where-Object { $_ })[0]
+            $kind = if (Test-PraOrdinalIgnoreCaseEqual $class 'computer') { 'a computer, not a mailbox' } elseif (Test-PraOrdinalIgnoreCaseEqual $class 'contact') { 'a contact, not an on-premises mailbox' }
+                else { ('a {0} object, not a mailbox' -f $class) }
+            Add-PraSkippedMember $Context $label $kind
+        }
     }
     else {
         $filter = '(&(homeMDB=*)(|' + (($types | ForEach-Object { "(msExchRecipientTypeDetails=$_)" }) -join '') + '))'
@@ -521,6 +684,7 @@ function Get-PraTarget {
         foreach ($user in @(Invoke-PraRead $Context 'Get-ADUser/Scope' ([string]$scope.SearchBase) { Get-ADUser @parameters })) { $users.Add($user) }
     }
     $seen = @{}; $selected = New-Object 'Collections.Generic.List[object]'
+    $alreadyRemote = New-Object 'Collections.Generic.List[string]'
     foreach ($user in $users) {
         $id = ([guid]$user.ObjectGUID).ToString()
         if ($seen.ContainsKey($id)) { throw "The same object is listed twice (GUID $id). Fix the scope first." }
@@ -536,19 +700,31 @@ function Get-PraTarget {
                 $converted = $null
                 if (-not $eligible -and -not $excluded) { $converted = Find-PraConvertedBatch $Context $id }
                 if ($null -ne $converted) {
-                    $hook = Get-PraValue $Context 'CommandLineFor' $null
-                    # Started from the window (it sets PRA_EVENT_FILE) the operator has no command line: the way is the Task page.
-                    if ($env:PRA_EVENT_FILE) {
-                        throw ("{0} is already converted by batch {1} (it is a remote mailbox now): nothing was changed. To continue that batch (Entra Connect sync and transfer package; AD is not changed again), go to the Task page, choose Move mailboxes to Exchange Online, then Continue a batch, and pick batch {1}." -f $samName, $converted.ShortId)
-                    }
-                    $command = if ($hook -is [scriptblock]) { [string](& $hook 'Convert' 'AD' $converted.ShortId) } else { '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply -Batch ' + $converted.ShortId }
-                    throw ("{0} is already converted by batch {1} (it is a remote mailbox now): nothing was changed. To continue that batch (Entra Connect sync and transfer package; AD is not changed again) run: {2}" -f $samName, $converted.ShortId, $command)
+                    $Context.NextSteps = @(Get-PraContinueStep $Context @($converted.ShortId))
+                    $Context.NextOnFailure = $true
+                    throw ("{0} is already converted by batch {1} (it is a remote mailbox now): nothing was changed. That batch can be continued: see the next steps." -f $samName, $converted.ShortId)
                 }
                 throw "Explicit target not eligible (not an on-premises mailbox of an accepted type) or excluded: $samName. Nothing converted."
+            }
+            if ($groupMode) {
+                $reason = Get-PraSkipReason $user $excluded
+                Add-PraSkippedMember $Context $samName $reason
+                if (-not $excluded -and (Test-PraOrdinalEqual $reason 'already a remote mailbox')) { $alreadyRemote.Add($id) }
             }
             continue
         }
         $selected.Add($user)
+    }
+    if ($alreadyRemote.Count) {
+        $batchIds = New-Object 'Collections.Generic.List[string]'
+        foreach ($remoteId in $alreadyRemote) {
+            $holder = Find-PraConvertedBatch $Context $remoteId
+            if ($null -ne $holder -and -not (Test-PraOrdinalIn -IgnoreCase $holder.ShortId @($batchIds))) { $batchIds.Add([string]$holder.ShortId) }
+        }
+        if ($batchIds.Count) {
+            $Context.ContinueSteps = @(Get-PraContinueStep $Context @($batchIds))
+            $Context.NextSteps = @($Context.ContinueSteps)
+        }
     }
     # Canonical, culture-free order (Sort-Object uses the ICU collation): sAMAccountName upper-cased, then the GUID, compared by code unit.
     $orderedItems = $selected.ToArray()
@@ -843,6 +1019,16 @@ function Test-PraX500Address {
     return (-not [string]::IsNullOrEmpty($Value)) -and $Value.StartsWith('X500:', [StringComparison]::OrdinalIgnoreCase)
 }
 
+function Get-PraProxyAddressKey {
+    <# Comparison key of a proxy address: the type prefix as written (SMTP: is the primary address, smtp: a secondary one), the address after the colon in lower case. #>
+    [OutputType([string])]
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { return '' }
+    $colon = $Value.IndexOf(':', [StringComparison]::Ordinal)
+    if ($colon -lt 0) { return $Value.ToLowerInvariant() }
+    return $Value.Substring(0, $colon + 1) + $Value.Substring($colon + 1).ToLowerInvariant()
+}
+
 function Get-PraX500Difference {
     <#
     .SYNOPSIS
@@ -851,7 +1037,7 @@ function Get-PraX500Difference {
         While an object is a remote mailbox, Entra Connect (Exchange hybrid writeback) adds an X500 address of the cloud mailbox to proxyAddresses.
         Added   = X500 entries of Current that are not in Reference (ordinal, ignoring case, on the whole value)
         Removed = X500 entries of Reference that are not in Current
-        OtherEqual = every entry that is not X500 is identical (sorted ordinal sets): the only difference left, if any, is X500.
+        OtherEqual = every entry that is not X500 is identical (sorted sets; the type prefix as written, the address ignoring case): the only difference left, if any, is X500.
     #>
     [CmdletBinding()]
     param($Current, $Reference)
@@ -861,7 +1047,7 @@ function Get-PraX500Difference {
     $added = New-Object 'Collections.Generic.List[string]'
     foreach ($value in $nowX) { if (-not (Test-PraOrdinalIn $value $wasX -IgnoreCase) -and -not (Test-PraOrdinalIn $value $added.ToArray() -IgnoreCase)) { $added.Add([string]$value) } }
     $removed = @($wasX | Where-Object { -not (Test-PraOrdinalIn $_ $nowX -IgnoreCase) })
-    $a = @($now | Where-Object { -not (Test-PraX500Address $_) } | Get-PraOrdinalSorted); $b = @($was | Where-Object { -not (Test-PraX500Address $_) } | Get-PraOrdinalSorted)
+    $a = @($now | Where-Object { -not (Test-PraX500Address $_) } | ForEach-Object { Get-PraProxyAddressKey $_ } | Get-PraOrdinalSorted); $b = @($was | Where-Object { -not (Test-PraX500Address $_) } | ForEach-Object { Get-PraProxyAddressKey $_ } | Get-PraOrdinalSorted)
     $same = ($a.Count -eq $b.Count)
     if ($same) { for ($i = 0; $i -lt $a.Count; $i++) { if (-not (Test-PraOrdinalEqual ([string]$a[$i]) ([string]$b[$i]))) { $same = $false; break } } }
     return [pscustomobject]@{ OtherEqual = $same; Added = [string[]]$added.ToArray(); Removed = [string[]]@($removed) }
@@ -1260,7 +1446,7 @@ function New-PraPlan {
     if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'RestoreTag') -or ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover') -and $RestoreRetention -and $tagEnabled)) {
         $original = $SourceRecord.Attributes.$tagAttr
         if (-not (Test-PraStateEqual $before[$tagAttr] $original) -and
-            (-not $before[$tagAttr].Present -or -not (Test-PraOrdinalEqual ([string]$before[$tagAttr].Value) ([string]$tag.Value)))) {
+            (-not $before[$tagAttr].Present -or -not (Test-PraOrdinalIgnoreCaseEqual ([string]$before[$tagAttr].Value) ([string]$tag.Value)))) {
             throw "Retention tag $tagAttr changed by someone else: restore refused."
         }
         $desired[$tagAttr] = $original
@@ -1330,10 +1516,10 @@ function Assert-PraStoredRecord {
         }
         $null = ConvertFrom-PraStoredValue $state
     }
-    # Cloud X500 addresses kept by a Recover (absent in a batch written before 3.0.0: none).
+    # Cloud X500 addresses kept by a Recover (absent from a batch written without them: none).
     $keptStored = Get-PraValue $Record 'KeptX500' $null
     if ($null -ne $keptStored) { foreach ($value in @($keptStored)) { if ($value -isnot [string] -or -not (Test-PraX500Address $value)) { throw 'Backup: invalid list of kept X500 addresses.' } } }
-    # X500 addresses expected in Exchange Online (absent in a batch written before 3.1.0: the control is skipped).
+    # X500 addresses expected in Exchange Online (absent from a batch written without them: the control is skipped).
     $expectedStored = Get-PraValue $Record 'ExpectedX500' $null
     if ($null -ne $expectedStored) {
         if ($expectedStored -isnot [string] -and $expectedStored -isnot [array]) { throw 'Backup: invalid list of expected X500 addresses.' }
@@ -1374,7 +1560,7 @@ function Import-PraBackup {
     $Context.CurrentOperation = 'Read-BackupJson'
     $hashBeforeRead = Get-PraHash -Path $pathResolved
     $data = Get-Content -LiteralPath $pathResolved -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson
-    if (-not (Test-PraOrdinalEqual $data.Environment $Context.Config.Environment)) { throw "Backup of another Environment: '$($data.Environment)' (configuration: '$($Context.Config.Environment)')." }
+    if (-not (Test-PraOrdinalIgnoreCaseEqual $data.Environment $Context.Config.Environment)) { throw "Backup of another Environment: '$($data.Environment)' (configuration: '$($Context.Config.Environment)')." }
     $version = Get-PraValue $data 'SchemaVersion' 1
     if ((-not (Test-PraOrdinalIn $version @(1, 2, 3) -IgnoreCase))) { throw "Backup schema not supported: $version" }
     $version = [int]$version   # numeric comparisons below need an integer, not the raw JSON value
@@ -1394,11 +1580,11 @@ function Import-PraBackup {
     $rawPath = ''; $rawHash = ''
     if ($version -ge 2) {
         $storedHash = (Get-Content -LiteralPath ($pathResolved + '.sha256') -Raw -ErrorAction Stop).Trim()
-        if (-not (Test-PraOrdinalEqual $storedHash $hash)) { throw 'Backup SHA-256 does not match its .sha256 file.' }
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $storedHash $hash)) { throw 'Backup SHA-256 does not match its .sha256 file.' }
         if (-not (Test-PraOrdinalEqual ([IO.Path]::GetFileName($data.RawFile)) $data.RawFile)) { throw 'Backup CLIXML path is not in the batch folder.' }
         $rawPath = Join-Path (Split-Path $pathResolved -Parent) $data.RawFile
         $rawHash = Get-PraHash -Path $rawPath
-        if (-not (Test-PraOrdinalEqual $rawHash $data.RawHash)) { throw 'Backup CLIXML SHA-256 mismatch.' }
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $rawHash $data.RawHash)) { throw 'Backup CLIXML SHA-256 mismatch.' }
         $format = if ($version -eq 3) { [string]$data.RawFormat } else { '' }
         $Context.CurrentOperation = 'Validate-RawCapture'
         Write-PraMemoryStage -Context $Context -Stage 'RAW VALIDATE BEGIN' -Detail ("schema=$version objects=$($records.Count) file=$rawPath")
@@ -1457,7 +1643,7 @@ function Assert-PraRecordMatchesPlan {
 function Save-PraBatch {
     <#
     .SYNOPSIS
-        Writes the backup of the whole batch BEFORE any write: private folder Batch-<id> with
+        Writes the backup of the whole batch before any write: private folder Batch-<id> with
         <Operation>-<Environment>-<date>-<id>.json (typed records), .clixml (every AD value),
         .sha256, then re-reads and compares everything with the plans. Also opens the batch journal.
     #>
@@ -1533,14 +1719,14 @@ function Assert-PraCurrentState {
     $user = Get-PraUser $Context $Plan.Record.ObjectGuid -ExtraProperties @($Plan.Kinds.Keys)
     $version = Get-PraUsn $user
     if (-not $AcceptNewVersion -and -not (Test-PraOrdinalEqual $version $Plan.ExpectedUsnChanged)) { throw 'uSNChanged changed: the object was modified since it was planned or last verified.' }
-    if (-not (Test-PraOrdinalEqual ([string]$user.DistinguishedName) $Plan.Record.DistinguishedName)) { throw 'The DN changed since the capture: plan the batch again.' }
+    if (-not (Test-PraOrdinalIgnoreCaseEqual ([string]$user.DistinguishedName) $Plan.Record.DistinguishedName)) { throw 'The DN changed since the capture: plan the batch again.' }
     $actual = Get-PraAttributeState $user $Plan.Kinds
     foreach ($name in $Expected.Keys) {
         if (-not (Test-PraStateEqual $Expected[$name] $actual[$name])) { throw "AD state differs from the expected state | GUID=$($Plan.Record.ObjectGuid) | attribute=$name | DC=$($Context.Server)" }
     }
     if ($Plan.Record.Licensing.Enabled) {
         $group = Get-PraGroup $Context $Plan.Record.Licensing.GroupGuid
-        if (-not (Test-PraOrdinalEqual $group.DistinguishedName $Plan.Record.Licensing.GroupDN) -or
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $group.DistinguishedName $Plan.Record.Licensing.GroupDN) -or
             (-not (Test-PraOrdinalIgnoreCaseEqual (Test-PraOrdinalIn -IgnoreCase ([string]$user.DistinguishedName) @($group.member)) $ExpectedMember))) { throw 'Licence group membership differs from the backup/plan.' }
     }
     if ($AcceptNewVersion) { $Plan.ExpectedUsnChanged = $version }
@@ -1554,7 +1740,7 @@ function Invoke-PraAdWrite {
     .SYNOPSIS
         One AD write (Set-ADUser, Add-ADGroupMember or Remove-ADGroupMember) with every guard:
         no previous error, Apply mode, ShouldProcess, validated backup covering the object,
-        operator approval, current state re-read AFTER the approval, journal Started/Applied.
+        operator approval, current state re-read after the approval, journal Started/Applied.
     #>
     [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
     param([hashtable]$Context, $Receipt, $Plan, [string]$Operation, [scriptblock]$Write)
@@ -1563,7 +1749,7 @@ function Invoke-PraAdWrite {
     if (-not $PSCmdlet.ShouldProcess($Plan.Record.ObjectGuid, $Operation)) { throw 'AD write not authorised (ShouldProcess).' }
     Assert-PraReceipt $Context $Receipt $Plan.Record.ObjectGuid
     if (-not (& $Context.Approval $Plan.Record.DistinguishedName $Operation)) { throw "Operation refused: $Operation. Batch stopped." }
-    # An interactive confirmation can take time: re-check the object and the backup AFTER it.
+    # An interactive confirmation can take time: the object and the backup are re-checked after it.
     $expected = if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Set-ADUser')) { $Plan.Record.Attributes } else { $Plan.Desired }
     Assert-PraCurrentState $Context $Plan $expected $Plan.Record.Licensing.WasMember
     Assert-PraReceipt $Context $Receipt $Plan.Record.ObjectGuid
@@ -1702,8 +1888,11 @@ function Invoke-PraAdBatch {
                 Write-PraImmutableFile (Join-Path $folder 'NOT-APPLIED.txt') ("Nothing was written to Active Directory by this batch (run {0}): the account was refused by {1}.`r`nThe backup in this folder is complete and was never used. This folder is NOT a batch to continue and NOT a batch to roll back.`r`n" -f $Context.RunId, $Context.Server)
                 Write-PraJournal $Context '*' 'ADBatch' 'NotApplied' 'access refused before the first write; nothing was changed in AD'
                 $Context.StateFiles.Add((Join-Path $folder 'NOT-APPLIED.txt'))
+                $Context.NotAppliedFolder = $folder
             }
             catch { Write-PraLog -Context $Context -Message ('The folder of the backup could not be marked as not applied: {0}' -f $_.Exception.Message) -Level Detail }
+            # Nothing was written: no object is reported as done, skipped or failed, and the error does not name the last object looked at.
+            $Context.NoChangeMade = $true; $Context.CurrentIdentity = ''
             try { Write-PraLog -Context $Context -Message $plain -Level Error }
             catch { $Context.Issues.Add([pscustomobject]@{ Message = $plain; Source = 'ADBatch' }) }
             throw $plain
@@ -1728,14 +1917,14 @@ function Import-PraProof {
     param([hashtable]$Context, [string]$Path, $Source, [string]$Operation)
     $data = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson
     $hash = Get-PraHash $Path
-    if (-not (Test-PraOrdinalEqual (Get-Content -LiteralPath ($Path + '.sha256') -Raw -ErrorAction Stop).Trim() $hash)) { throw 'AD proof (State file): SHA-256 mismatch.' }
-    if ($data.SchemaVersion -ne 2 -or -not (Test-PraOrdinalEqual $data.Kind 'ADVerified') -or -not (Test-PraOrdinalEqual $data.Environment $Context.Config.Environment) -or -not (Test-PraOrdinalEqual $data.Operation $Operation)) { throw "AD proof (State file) does not match: operation $($data.Operation) instead of $Operation, or another Environment." }
+    if (-not (Test-PraOrdinalIgnoreCaseEqual (Get-Content -LiteralPath ($Path + '.sha256') -Raw -ErrorAction Stop).Trim() $hash)) { throw 'AD proof (State file): SHA-256 mismatch.' }
+    if ($data.SchemaVersion -ne 2 -or -not (Test-PraOrdinalEqual $data.Kind 'ADVerified') -or -not (Test-PraOrdinalIgnoreCaseEqual $data.Environment $Context.Config.Environment) -or -not (Test-PraOrdinalEqual $data.Operation $Operation)) { throw "AD proof (State file) does not match: operation $($data.Operation) instead of $Operation, or another Environment." }
     if (-not (Test-PraOrdinalEqual ([IO.Path]::GetFileName($data.BackupFile)) $data.BackupFile)) { throw 'AD proof: invalid backup path.' }
     $receipt = Import-PraBackup $Context (Join-Path (Split-Path $Path -Parent) $data.BackupFile)
-    if (-not (Test-PraOrdinalEqual $receipt.Hash $data.BackupHash) -or -not (Test-PraOrdinalEqual $receipt.Data.Operation $Operation) -or -not (Test-PraOrdinalEqual $receipt.Data.RunId $data.RunId) -or -not (Test-PraOrdinalEqual $receipt.Data.SourceBackupHash $data.SourceBackupHash)) { throw 'AD proof does not match its backup, operation or source.' }
+    if (-not (Test-PraOrdinalIgnoreCaseEqual $receipt.Hash $data.BackupHash) -or -not (Test-PraOrdinalEqual $receipt.Data.Operation $Operation) -or -not (Test-PraOrdinalEqual $receipt.Data.RunId $data.RunId) -or -not (Test-PraOrdinalIgnoreCaseEqual $receipt.Data.SourceBackupHash $data.SourceBackupHash)) { throw 'AD proof does not match its backup, operation or source.' }
     if (@($data.Records).Count -ne @($receipt.Data.Records).Count) { throw 'AD proof incomplete compared with its backup.' }
     $expectedSource = if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert')) { $data.BackupHash } else { $data.SourceBackupHash }
-    if (-not (Test-PraOrdinalEqual $expectedSource $Source.Hash)) { throw 'AD proof built from another Convert batch.' }
+    if (-not (Test-PraOrdinalIgnoreCaseEqual $expectedSource $Source.Hash)) { throw 'AD proof built from another Convert batch.' }
     $seen = @{}
     foreach ($record in @($data.Records)) {
         if ($record.ADVerified -isnot [bool] -or -not $record.ADVerified -or -not (Test-PraOrdinalIn -IgnoreCase $record.ObjectGuid @($Source.Data.Records.ObjectGuid)) -or $seen.ContainsKey($record.ObjectGuid)) { throw 'AD proof: invalid or duplicated object.' }
@@ -1765,7 +1954,7 @@ function Assert-PraFollowupState {
     $previous = $captured[0]
     if ($previous.Licensing.Enabled) {
         $group = Get-PraGroup $Context $previous.Licensing.GroupGuid
-        if (-not (Test-PraOrdinalEqual $group.DistinguishedName $previous.Licensing.GroupDN) -or
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $group.DistinguishedName $previous.Licensing.GroupDN) -or
             (-not (Test-PraOrdinalIgnoreCaseEqual (Test-PraOrdinalIn -IgnoreCase ([string]$Plan.User.DistinguishedName) @($group.member)) ($previous.Licensing.DesiredMember)))) { throw 'Finalize: licence group membership differs from the AD proof.' }
     }
     # Already finished (replay): only the complete original state is accepted, it needs no write.
@@ -1858,7 +2047,7 @@ function Invoke-PraAdReplication {
     Write-PraItem -Context $Context -Status Info -Icon Directory -Text ("Replicating {0} changed object(s) from {1} to {2} domain controller(s): {3}" -f $changed.Count, $source, $targets.Count, ($targets -join ', '))
     # The licence group change (member added or removed) lives on the GROUP object: it is pushed and read back like the users.
     $groupPlans = @($changed | Where-Object { Test-PraOrdinalIn ([string](Get-PraValue $_.Row 'GroupAction' '')) @('Added', 'Removed') })
-    $groupDns = @($groupPlans | ForEach-Object { [string]$_.Record.Licensing.GroupDN } | Get-PraOrdinalUnique)
+    $groupDns = @($groupPlans | ForEach-Object { [string]$_.Record.Licensing.GroupDN } | Get-PraOrdinalUnique -IgnoreCase)
     $destinationNumber = 0
     foreach ($destination in $targets) {
         $destinationNumber++
@@ -1887,7 +2076,7 @@ function Invoke-PraAdReplication {
                 Sync-ADObject -Object $groupDn -Source $source -Destination $destination -ErrorAction Stop | Out-Null
             }
             catch {
-                foreach ($member in @($groupPlans | Where-Object { Test-PraOrdinalEqual ([string]$_.Record.Licensing.GroupDN) $groupDn })) { if (-not $failed.Contains([string]$member.Record.ObjectGuid)) { $failed.Add([string]$member.Record.ObjectGuid) } }
+                foreach ($member in @($groupPlans | Where-Object { Test-PraOrdinalIgnoreCaseEqual ([string]$_.Record.Licensing.GroupDN) $groupDn })) { if (-not $failed.Contains([string]$member.Record.ObjectGuid)) { $failed.Add([string]$member.Record.ObjectGuid) } }
                 Write-PraLog -Context $Context -Message ("Replication of the licence group to {0} failed: {1}" -f $destination, $_.Exception.Message) -Level Warning
             }
         }
@@ -1943,7 +2132,7 @@ function Invoke-PraAdReplication {
 
 # Runs one synchronisation cycle and waits for its end. Self-contained: also sent to a remote server.
 $script:PraSyncCycle = {
-    param([string]$PolicyType, [int]$TimeoutMinutes, [scriptblock]$OnPoll)
+    param([string]$PolicyType, [int]$TimeoutMinutes, [scriptblock]$OnPoll, [scriptblock]$OnStarted)
     $ErrorActionPreference = 'Stop'
     # ADSync is a Windows PowerShell (.NET Framework) module: PowerShell 7 loads it through the Windows PowerShell
     # compatibility session. On EntraConnect.Server this block runs in the Windows PowerShell 5.1 endpoint, which has no such switch.
@@ -1961,6 +2150,8 @@ $script:PraSyncCycle = {
     }
     $result = Start-ADSyncSyncCycle -PolicyType $PolicyType -ErrorAction Stop
     if (-not [string]::Equals([string]$result.Result, 'Success', [StringComparison]::OrdinalIgnoreCase)) { throw "Entra Connect refused the cycle: $($result.Result)" }
+    # Once the cycle has started, the caller is told by the callback, or (in a remote job, which has none) by a marker object before the final answer.
+    if ($null -ne $OnStarted) { $null = & $OnStarted } else { [pscustomobject]@{ Started = $true } }
     Start-Sleep -Seconds 10
     $polls = 0
     while ((Get-ADSyncScheduler -ErrorAction Stop).SyncCycleInProgress) {
@@ -1994,13 +2185,20 @@ function New-PraSyncResult {
 function Get-PraSyncFailure {
     <#
     .SYNOPSIS
-        Plain words for a failed Entra Connect check or cycle: Kind (Denied, Unreachable, NoModule, Timeout or Failed), Reason (what happened and what to do)
-        and Technical (the raw message). The account that is refused is the usual cause, so it is tested first.
+        Plain words for a failed Entra Connect check or cycle: Kind (Denied, Unreachable, NoModule, Suspended, Timeout or Failed), Reason (what happened and what to do)
+        and Technical (the raw message, for the log: the Reason of a Failed answer only carries its first line). The account that is refused is the usual cause, so it is tested first.
+    .PARAMETER Stage
+        Check (the read-only check before the run) or Cycle (the sync cycle itself): it decides the words of a Failed answer.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][object]$Failure, [string]$Server = '')
+    param([Parameter(Mandatory)][object]$Failure, [string]$Server = '', [ValidateSet('Check', 'Cycle')][string]$Stage = 'Check')
     $exception = if ($Failure -is [Management.Automation.ErrorRecord]) { $Failure.Exception } else { [Exception]$Failure }
     $technical = ([string]$exception.Message -replace '\s+', ' ').Trim()
+    # The first line of the message is what the operator reads: without the exception type and without the call stack.
+    $firstLine = ([string]$exception.Message -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 1)
+    $firstLine = ([regex]::Replace([string]$firstLine, '^\s*(?:[\w.]+Exception:\s*)', '') -replace '\s+at\s+[\w.]+\(.*$', '').Trim()
+    $firstLine = $firstLine.TrimEnd('.')
+    if ($firstLine.Length -gt 200) { $firstLine = $firstLine.Substring(0, 197) + '...' }
     $errorId = if ($Failure -is [Management.Automation.ErrorRecord]) { [string]$Failure.FullyQualifiedErrorId } else { '' }
     $where = if ($Server) { $Server } else { 'this server' }
     if (([int](Get-PraValue $exception 'ErrorCode' 0) -eq 5) -or $technical -match '(?i)access is denied|access denied|acc[eè]s refus|unauthorized|not authorized|logon failure|authentication|permission') {
@@ -2019,7 +2217,13 @@ function Get-PraSyncFailure {
     if ($Server -and ($exception.GetType().Name.Contains('PSRemotingTransportException') -or $technical -match '(?i)cannot connect|could not connect|cannot be resolved|cannot find the computer|no such host|network path|network name|timed out|did not respond|unreachable|WinRM|WS-Management|connection (was )?(refused|closed)|actively refused|server is unavailable')) {
         return New-PraSyncResult -Ok $false -Kind 'Unreachable' -Server $Server -Reason ('{0} does not answer to PowerShell remoting (WinRM, port 5985): check the server name in EntraConnect.Server, the network and the firewall' -f $Server) -Technical $technical
     }
-    New-PraSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason ('the Entra Connect check on {0} failed ({1})' -f $where, $technical) -Technical $technical
+    if ($technical -match '(?i)scheduler is already suspended') {
+        $reason = 'the synchronisation scheduler is suspended on {0}: run Set-ADSyncScheduler -SchedulerSuspended $false on that server, then run the sync' -f $where
+        return New-PraSyncResult -Ok $false -Kind 'Suspended' -Server $Server -Reason $reason -Technical $technical
+    }
+    $reason = if ((Test-PraOrdinalEqual $Stage 'Cycle')) { 'the synchronisation cycle could not start on {0}: {1}' -f $where, $firstLine }
+        else { 'Entra Connect could not be checked on {0}: {1}' -f $where, $firstLine }
+    New-PraSyncResult -Ok $false -Kind 'Failed' -Server $Server -Reason $reason -Technical $technical
 }
 
 function Resolve-PraSyncProbe {
@@ -2133,9 +2337,14 @@ function Invoke-PraSync {
     $Context.CurrentOperation = 'Start-ADSyncSyncCycle'; $Context.CurrentIdentity = $target
     if (-not (& $Context.Approval $target 'Start-ADSyncSyncCycle')) { throw 'Synchronisation refused.' }
     Write-PraJournal $Context '*' 'ADSync' 'Started' $target
-    Write-PraItem -Context $Context -Status Info -Icon Sync -Text ("{0} cycle started on {1}, waiting for its end (max {2} min)..." -f $settings.PolicyType, $target, $settings.TimeoutMinutes)
-    Write-PraProgress -Context $Context -Text ('Waiting for the Entra Connect {0} cycle to finish on {1} (up to {2} min)' -f $settings.PolicyType, $target, $settings.TimeoutMinutes) -Current 0 -Total ([int]$settings.TimeoutMinutes * 60)
+    Write-PraProgress -Context $Context -Text ('Starting the Entra Connect {0} cycle on {1}' -f $settings.PolicyType, $target) -Current 0 -Total ([int]$settings.TimeoutMinutes * 60)
     $timeoutSeconds = [int]$settings.TimeoutMinutes * 60
+    $started = @{ Shown = $false }
+    $announce = {
+        if ($started.Shown) { return }
+        $started.Shown = $true
+        Write-PraItem -Context $Context -Status Info -Icon Sync -Text ("{0} cycle started on {1}, waiting for its end (max {2} min)..." -f $settings.PolicyType, $target, $settings.TimeoutMinutes)
+    }.GetNewClosure()
     try {
         if ($settings.Server) {
             # The cycle runs on the Entra Connect server as a job: this side reports a wait (attempt, next check) every 5 s until it ends.
@@ -2144,21 +2353,26 @@ function Invoke-PraSync {
                 $clock = [Diagnostics.Stopwatch]::StartNew(); $poll = 0
                 while ($null -eq (Wait-Job -Job $job -Timeout 5)) {
                     $poll++
+                    try { if (@(Receive-Job -Job $job -Keep -ErrorAction SilentlyContinue | Where-Object { $_.PSObject.Properties['Started'] }).Count) { & $announce } } catch { $null = $_ }
                     Write-PraProgress -Context $Context -Text ('Entra Connect synchronisation cycle in progress on {0}' -f $target) -Current ([int]$clock.Elapsed.TotalSeconds) -Total $timeoutSeconds -Attempt $poll -MaxAttempts ([int][Math]::Ceiling($timeoutSeconds / 5.0)) -NextInSeconds 5
                 }
-                $result = Receive-Job -Job $job -ErrorAction Stop
+                $answer = @(Receive-Job -Job $job -ErrorAction Stop)
             }
             finally { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
         }
         else {
             $report = { param($Text, $Attempt, $MaxAttempts, $Elapsed) Write-PraProgress -Context $Context -Text $Text -Current $Elapsed -Total $timeoutSeconds -Attempt $Attempt -MaxAttempts $MaxAttempts -NextInSeconds 5 }.GetNewClosure()
-            $result = & $script:PraSyncCycle $settings.PolicyType $settings.TimeoutMinutes $report
+            $answer = @(& $script:PraSyncCycle $settings.PolicyType $settings.TimeoutMinutes $report $announce)
         }
+        $result = @($answer | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['Result'] } | Select-Object -Last 1)[0]
+        if ($null -eq $result) { throw 'Entra Connect gave no answer for the synchronisation cycle.' }
+        & $announce
     }
     catch {
         # The AD changes are made and verified: the run does not fail here. The objects wait for the synchronisation (Pending, exit code 2) and the
         # entry script writes the next steps; the transfer package is still produced.
-        $failure = Get-PraSyncFailure $_ ([string]$settings.Server)
+        $failure = Get-PraSyncFailure $_ ([string]$settings.Server) -Stage Cycle
+        Write-PraLog -Context $Context -Message ('Entra Connect sync cycle, technical message: {0}' -f $failure.Technical) -Level Detail
         try { Write-PraJournal $Context '*' 'ADSync' 'Failed' $failure.Technical } catch { Write-PraLog -Context $Context -Message ('The journal cannot be written: {0}' -f $_.Exception.Message) -Level Detail }
         $Context['SyncFailure'] = [pscustomobject]@{ Server = $target; Kind = $failure.Kind; Reason = $failure.Reason; Technical = $failure.Technical }
         foreach ($row in $Context.Rows) {
@@ -2166,7 +2380,7 @@ function Invoke-PraSync {
                 $row.FinalStatus = 'Pending'; $row.Detail = ([string]$row.Detail + ' | AD changed and verified; the Entra Connect sync has to be run').Trim(' ', '|')
             }
         }
-        Write-PraItem -Context $Context -Status Warn -Icon Sync -Text ('Entra Connect sync could not run on {0}: {1}. The AD changes are already made and verified; the sync is the next step.' -f $target, $failure.Reason) -Detail $failure.Technical
+        Write-PraItem -Context $Context -Status Warn -Icon Sync -Text ('The Entra Connect sync did not run: {0}. The AD changes are already made and verified; the sync is the next step.' -f $failure.Reason) -Detail $failure.Technical
         return
     }
     Write-PraJournal $Context '*' 'ADSync' 'Completed' $target
@@ -2176,14 +2390,14 @@ function Invoke-PraSync {
 #endregion
 
 Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmutableFile, New-PraPrivateDirectory, Write-PraJournal,
-    Initialize-PraDirectory, Get-PraUser, Get-PraExpectedX500, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
+    Initialize-PraDirectory, Get-PraUser, Resolve-PraGroup, Get-PraGroupMember, Get-PraExpectedX500, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
     Import-PraProof, Invoke-PraSync, Test-PraSyncServer, Start-PraSyncProbe, Invoke-PraAdReplication, Assert-PraReceipt, Test-PraStateEqual, Assert-PraFollowupState, Initialize-PraPermissionCache
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCAxBdXsBfPaB5ug
-# UAzt0efRmshzEW7gsIJMYvjel90NtqCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDdlUyKLcKbILxA
+# 8WrYk9VVgJltbYQIXaJTdH/ytXGp66CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -2255,28 +2469,28 @@ Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmu
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBbnFMWFnLt
-# bSCl+UaWf/EGaVzKOZYxczhbFs8PFpAFHDANBgkqhkiG9w0BAQEFAASCAgAxaJCw
-# PTapYSqfUv2NzBx35tbuw1ZdZncZxWQx5nJeW0K03OE9x9Yrk2x/oUA7P1zEHkV1
-# EAwxroqFFUkRncOf5KjwO4IMQ1r2eHzR7vgrFC8oByWs8BvNCdBkMpAXQSvSHMx2
-# kwabEieLE3DnjpBkgE6H6rzbHRoil69DKl00SvEdbnXetpOa52/2a5B9eE9NP+NT
-# SOdzTt4ExQk5sI/UN0LkFuvrrFGyej7pW/3lWEnMAtpAJjidQHEDhqHcNkQFtNW2
-# YGd9nlIoUjewYyAXb3VMeHqg71BhaFME0Xb2X36rRGRJee6TxMSpmripuTrNVtfu
-# nT0XDDGWUmaw3nXCNA20cKOK3MUm19T/169ItoqilSmreVBwvaf3Z8hWiCdxIIOp
-# hu1TNafl2Xn4q6vWf4cbVmCsc+f9K9evoAqLN3Qwb0pmqJVugXXN9e0wixWn4RCA
-# Yo4HUiqbu2HWTRARx5PD5kL0qlzmb4yNu3I46cwA6lBgjaveqBGUisIwuPq/Xel3
-# ILzgf8ClmU0V6WYchmVgQ7IZ1xdsg1ALBkBskN21R8e4gIBM7kXsHFNYZOhSi4TU
-# v1z1vMUi3xNpLakv8ZTWyZgt/Pwiekjdv1wuBVYbyLxK5yOdZpDGHEyOyU8lySTO
-# 4Zk3hMPiXx8QOm1BKF77WLleg8mhTV5+EAEf96GCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBSC5pete+i
+# o83HVI/lyLVqLP5esTF55N3Dx8xMNUQrgTANBgkqhkiG9w0BAQEFAASCAgCGMLq0
+# aAawROdzTXo+XxfQ0l0iO4v5H45sfwwICn+yP2RR6V/5PicPxZ0u8TstWRL/cqXt
+# QG/q/7HuHVq46MGINBY8wtbzeLROBSSci+TqD2W6ktZGdaNtIEmYsRFuI9+/ekcN
+# NXBTiKFBQhUP925kYGUYThyesfDvjuQS78zsF7RZfZCbUeJzWI7wTq8Cyt27EeHB
+# RNm9KRSuY/UjfvYJpooLmU7d2R820g1T2W0BKPC9t6U06HMqHUqRR+Rt/4DjmeLG
+# ywv4qYWaR+336SEiaLLfOOOqTL/QSd/k63GKJAlYlPd9AvM8pZ3uansGxzkjKtN4
+# nkbvtgyNt67pM+1SSWQE2hUqK2LDXOxLE7m/EP5AkxP2mkrkeNDHQGqNmzffsuhJ
+# w5urj1lJOAnkqSkVEpS0tKE0GU5uOs0Vyix1khvnjWX0lbaamIoP20cm1H5Hwq85
+# laBxI2ee+2Rt64/DSqEhJSr+Tm4zsUQRPFcQ7LAKNY3oSSOOWLxH0BFH74M8AShS
+# ya2NyxYSSBoLqBv40LRkMKa8In69y7QmuA0nNrk1yzFVSn6+G788T9Uk1J3U3Ko2
+# GcxjdgmtQVXGkloLtSSNKnP+g0+sdKgtSEmOWqRW0yZ1XXcB5AYCV9JV5p3uXx6v
+# X3AfNT7dtuS5IRx1T7hpd9TSjBmqi8mxL0+XV6GCFM8wghTLBgorBgEEAYI3AwMB
+# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIJpkqGlTAPGPB3TS35hW0s8aeAFGzO+EAKyLcB385UeIAghEh5i3vx+M
-# zxgPMjAyNjExMTAwODMzMzlaMAMCAQECEDW9bvQmzHT/ojKQliAQqfSgghGnMIIE
+# BAIBBQAEIJ/5EAsDXTTWYGqi+3bpEBrWUmMhUmORE+xzO8/vFztGAghzw6ueeFyH
+# ARgPMjAyNjExMTIxODAyMDNaMAMCAQECECudyKrYrlxMHeQz3Zvjy+ugghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -2371,17 +2585,17 @@ Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmu
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMDA4MzMzOVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIPkr
-# toySmHwWScFkFEBp8/AAqf++FJxcVte9VFrRVNiVMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMjE4MDIwM1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIE1t
+# TCupN37cU4BTSJ9ocokO+P7FpWC+UKjcNRW1AuZFMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEAznOYEUV2DmlcVfGa3TBiUhyte5u9+VTkYCO9i+tJkhQCIFCW
-# 3XdqBr3av3J/9phBhaJ+C0Q73g+/5wUoaeKtB23K
+# zj0EAwIESDBGAiEA3BpXfXUU+K4CYERx72WAo6HPBQDdiNm/sEmrEYvRcooCIQCF
+# UU8Tsftxg6ZDx/D7dMbPJvxUNE7JdW9INW7lIbvxWw==
 # SIG # End signature block

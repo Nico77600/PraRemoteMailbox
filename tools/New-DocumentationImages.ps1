@@ -30,7 +30,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2
+    Version : 3.1.3
     Part of : PRA Remote Mailbox (repository tool, not in the package). Needs PowerShell 7.5+, Microsoft Edge, Windows (WPF).
 #>
 #Requires -Version 7.5
@@ -93,7 +93,7 @@ if ($all -or $Part -eq 'Console') {
     $harness = Join-Path $PSScriptRoot 'DocumentationImages\Show-ConsoleScreens.ps1'
     $jobs = @(
         @{ Scenario = 'single'; Theme = 'Light' }, @{ Scenario = 'single'; Theme = 'Dark' }
-        @{ Scenario = 'scope'; Theme = 'Light' }, @{ Scenario = 'twoserver'; Theme = 'Light' }, @{ Scenario = 'cloud'; Theme = 'Light' }
+        @{ Scenario = 'scope'; Theme = 'Light' }, @{ Scenario = 'group'; Theme = 'Light' }, @{ Scenario = 'twoserver'; Theme = 'Light' }, @{ Scenario = 'cloud'; Theme = 'Light' }
         @{ Scenario = 'rollback'; Theme = 'Light' }, @{ Scenario = 'rollbackad'; Theme = 'Light' }, @{ Scenario = 'rollbackcloud'; Theme = 'Light' }, @{ Scenario = 'finalize'; Theme = 'Light' }, @{ Scenario = 'check'; Theme = 'Light' }
         @{ Scenario = 'finish'; Theme = 'Light' }, @{ Scenario = 'syncfailed'; Theme = 'Light' }
     )
@@ -113,7 +113,7 @@ if ($all -or $Part -eq 'Console') {
     # The pictures the documents use. The dark ones are for the README (picture elements).
     $keepLight = @(
         'setup', 'setup-lights', 'settings', 'setup-next', 'task', 'task-identity', 'verify-before', 'verify', 'run-early', 'run-waiting', 'run-finished', 'next'
-        'task-scope', 'verify-scope', 'run-grant', 'next-global'
+        'task-scope', 'task-group', 'verify-scope', 'run-grant', 'next-global'
         'setup-red', 'setup-red-lights', 'task-ad', 'run-package', 'next-package'
         'task-continue', 'task-package-selected', 'verify-cloud', 'run-cloud', 'next-cloud'
         'task-rollback', 'task-rollback-selected', 'verify-rollback', 'run-rollback', 'next-rollback'
@@ -397,16 +397,16 @@ body { display: block; margin: 0; padding: 0; }
     New-ReadmeGraphic -Name 'flows' -Body ("<div class=""rb-caption"">Convert <span>$mid on one server</span></div>" + (ConvertTo-ReadmeFlow (Get-GuideBlock 'flow' 'Read AD')) +
         "<div class=""rb-space""></div><div class=""rb-caption"">Recover <span>$mid the way back, from the Convert batch</span></div>" + (ConvertTo-ReadmeFlow (Get-GuideBlock 'flow' 'Convert batch')))
 
-    # Two servers: one zip file travels.
-    New-ReadmeGraphic -Name 'transfer' -Body ("<div class=""rb-caption"">Move the mailboxes <span>$mid two servers, one file</span></div>" + (ConvertTo-ReadmeFlow @(
+    # Two servers: a zip file and its .sha256 file travel.
+    New-ReadmeGraphic -Name 'transfer' -Body ("<div class=""rb-caption"">Move the mailboxes <span>$mid two servers, two files to copy</span></div>" + (ConvertTo-ReadmeFlow @(
                 'directory | AD server | Move mailboxes, Phase AD'
-                'arrow | writes | one zip file'
-                'folder | Transfer package | `PRA-LAB-Convert-490cc62e-for-Cloud.zip`'
+                'arrow | writes | a zip and its .sha256'
+                'folder | Transfer package | `PRA-LAB-Convert-490cc62e-for-Cloud.zip` + `.zip.sha256`'
                 'arrow | you carry it | USB key, shared folder'
                 'cloud | Cloud server | Continue a batch, Import package'
                 'arrow | writes |'
                 'chart | Global report | every person, end to end'
-            )) + "<div class=""rb-space""></div><div class=""rb-caption"">Go back <span>$mid three parts, two files</span></div>" + (ConvertTo-ReadmeFlow @(
+            )) + "<div class=""rb-space""></div><div class=""rb-caption"">Go back <span>$mid three parts, two packages</span></div>" + (ConvertTo-ReadmeFlow @(
                 'directory | AD server | Roll back a conversion'
                 'arrow | Recover package |'
                 'cloud | Cloud server | Continue a rollback'
@@ -454,7 +454,7 @@ body { display: block; margin: 0; padding: 0; }
             'cloud | Exchange Online | The mail system in the cloud.'
             'refresh | Sync | One trip that tells the cloud what changed.'
             'shield | Backup | The copy of every value before a change.'
-            'folder | Transfer package | One zip file between two servers. The tool names it.'
+            'folder | Transfer package | One zip file and its .sha256 file between two servers. The tool names them.'
             'chart | Report | The web page that says what was done.'
             'search | Preview | A trial that changes nothing.'
             'batch | Batch | One move of many people, with its short ID.'

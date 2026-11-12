@@ -680,6 +680,7 @@
                   <RadioButton x:Name="S_Source_Single" GroupName="G_Source" Style="{StaticResource Seg}" Content="Single identity (test)"/>
                   <RadioButton x:Name="S_Source_Scope" GroupName="G_Source" Style="{StaticResource Seg}" Content="Configured scope"/>
                   <RadioButton x:Name="S_Source_Ou" GroupName="G_Source" Style="{StaticResource Seg}" Content="OU"/>
+                  <RadioButton x:Name="S_Source_Group" GroupName="G_Source" Style="{StaticResource Seg}" Content="AD group"/>
                   <RadioButton x:Name="S_Source_Csv" GroupName="G_Source" Style="{StaticResource Seg}" Content="CSV"/>
                 </WrapPanel>
                 <WrapPanel>
@@ -710,6 +711,15 @@
   </Grid>
   <StackPanel Grid.Row="1"><DockPanel><Button x:Name="BtnPickOu" DockPanel.Dock="Right" Content="Pick an OU..." Margin="8,0,0,0"/><TextBox x:Name="F_Ou"/></DockPanel></StackPanel>
   <TextBlock Grid.Row="2" Text="Distinguished name; sub-OUs are included." Style="{StaticResource Hint}" Margin="0,4,0,0"/>
+</Grid>
+                <Grid x:Name="Row_Group" Width="560" Margin="0,0,20,12">
+  <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+  <Grid Margin="0,0,0,5" MinHeight="22">
+    <TextBlock Text="AD group" Style="{StaticResource RowLabel}" VerticalAlignment="Center"/>
+  </Grid>
+  <StackPanel Grid.Row="1"><DockPanel><Button x:Name="BtnCheckGroup" DockPanel.Dock="Right" Content="Check" Margin="8,0,0,0"/><TextBox x:Name="F_Group"/></DockPanel></StackPanel>
+  <TextBlock Grid.Row="2" Text="Name (sAMAccountName or CN) or distinguished name; members of nested groups are included." Style="{StaticResource Hint}" Margin="0,4,0,0"/>
+  <TextBlock x:Name="GroupInfo" Grid.Row="3" FontSize="13" TextWrapping="Wrap" Margin="0,4,0,0" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
 </Grid>
                 <Grid x:Name="Row_Csv" Width="560" Margin="0,0,20,12">
   <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>

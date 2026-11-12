@@ -14,7 +14,7 @@
     claimed to be equivalent.
 .NOTES
     Author : Nicolas Fabert
-    Version: 3.1.2
+    Version: 3.1.3
 #>
 #Requires -Version 7.5
 
@@ -32,7 +32,7 @@ function global:Get-PraExpectedInventory {
         'console-run-rollback-cloud-light', 'console-run-rollback-light', 'console-run-syncfailed-light', 'console-run-waiting-light', 'console-settings-light', 'console-setup-dark',
         'console-setup-light', 'console-setup-lights-light', 'console-setup-next-light', 'console-setup-red-light',
         'console-setup-red-lights-light', 'console-task-ad-light', 'console-task-check-light', 'console-task-continue-light',
-        'console-task-finalize-light', 'console-task-finish-light', 'console-task-identity-light', 'console-task-light',
+        'console-task-finalize-light', 'console-task-finish-light', 'console-task-group-light', 'console-task-identity-light', 'console-task-light',
         'console-task-package-selected-light', 'console-task-rollback-ad-light', 'console-task-rollback-continue-light', 'console-task-rollback-light', 'console-task-rollback-package-light', 'console-task-rollback-selected-light', 'console-task-scope-light',
         'console-verify-before-light', 'console-verify-check-light', 'console-verify-cloud-light', 'console-verify-finalize-light',
         'console-verify-light', 'console-verify-rollback-cloud-light', 'console-verify-rollback-light', 'console-verify-scope-light', 'guide-dictionary-light',

@@ -32,11 +32,11 @@
 
 .EXAMPLE
     .\tools\New-PraPackage.ps1
-    Creates ..\package\PraRemoteMailbox-3.1.2.
+    Creates ..\package\PraRemoteMailbox-3.1.3.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.2
+    Version : 3.1.3
 #>
 [CmdletBinding()]
 param(
@@ -139,7 +139,7 @@ $problems = New-Object 'Collections.Generic.List[string]'
 foreach ($name in 'Backups', 'reports', 'logs', 'tests', 'tools') {
     if (Test-Path -LiteralPath (Join-Path $Destination $name)) { $problems.Add("Folder $name\ must not be in the package.") }
 }
-# Filter on the extension (-Include is ignored with -LiteralPath in Windows PowerShell 5.1, the former host of this script).
+# Filter on the extension (-Include is ignored with -LiteralPath in Windows PowerShell 5.1).
 Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { Test-OrdinalIn $_.Extension @('.clixml', '.jsonl', '.sha256') -IgnoreCase } | ForEach-Object { $problems.Add("Backup file in the package: $($_.Name)") }
 $textFiles = Get-ChildItem -LiteralPath $Destination -Recurse -File | Where-Object { Test-OrdinalIn $_.Extension @('.ps1', '.psm1', '.psd1', '.csv', '.xaml') -IgnoreCase }
 foreach ($value in (New-OrdinalSet $emptied.ToArray())) {
