@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.3
+    Version : 3.1.4
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5

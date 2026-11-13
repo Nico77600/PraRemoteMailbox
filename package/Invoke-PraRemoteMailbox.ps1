@@ -149,7 +149,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 3.1.3
+    Version    : 3.1.4
     Requires   : PowerShell 7.5 or later (pwsh.exe; Windows PowerShell 5.1 is refused), RSAT ActiveDirectory,
                  ExchangeOnlineManagement 3.10.1+, Microsoft.Graph.Authentication and Microsoft.Graph.Users 2.41.1+ in one same
                  version (cloud part), ADSync (sync; through the Windows PowerShell compatibility layer when local).
@@ -1382,8 +1382,9 @@ try {
 }
 catch {
     $failure = $_; $failureOperation = $context.CurrentOperation
-    if (-not $context.TranscriptStarted -and -not $context.LogFile -and $context.LogFolder) {
-        try { Initialize-PraAudit $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Audit unavailable: $($_.Exception.Message)"; Source = 'Audit' }) }
+    # The audit starts here when the run stopped before reaching it (a configuration that cannot be read); an audit that failed is already reported.
+    if (-not $context.TranscriptStarted -and -not $context.LogFile -and $context.LogFolder -and -not [bool](Get-PraValue $context 'AuditAttempted' $false)) {
+        try { Initialize-PraAudit $context } catch { $retryMessage = $_.Exception.Message; if (-not @($context.Issues.ToArray() | Where-Object { ([string](Get-PraValue $_ 'Message' '')).Contains($retryMessage) }).Count) { $context.Issues.Add([pscustomobject]@{ Message = "Audit unavailable: $retryMessage"; Source = 'Audit' }) } }
     }
     $context.CurrentOperation = $failureOperation
     try {

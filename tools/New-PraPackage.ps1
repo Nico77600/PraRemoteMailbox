@@ -32,11 +32,11 @@
 
 .EXAMPLE
     .\tools\New-PraPackage.ps1
-    Creates ..\package\PraRemoteMailbox-3.1.3.
+    Creates ..\package\PraRemoteMailbox-3.1.4.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.3
+    Version : 3.1.4
 #>
 [CmdletBinding()]
 param(

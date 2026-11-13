@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.3
+    Version : 3.1.4
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # window, run context, report, audit). The literal comments "Version : x.y.z" of the file headers cannot be
 # computed (the signature and the manifest hash the exact bytes): they are listed in the guide, annex D, and
 # checked against this value by the tests. tools\New-PraPackage.ps1 reads the version from this line.
-$script:ToolVersion = '3.1.3'
+$script:ToolVersion = '3.1.4'
 $script:TranscriptOwner = $null
 $script:PraNativePath = $null
 $script:PraNativeProcess = $null
@@ -652,7 +652,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v3.1.3 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v3.1.4 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)
@@ -1045,10 +1045,14 @@ function Initialize-PraPrivateFolder {
     if (Test-Path -LiteralPath $Path) { throw "A file exists where the folder is expected: $Path" }
     # Missing parent folders are created with NORMAL inheritance (the administrator's choice); only the leaf gets the private ACL,
     # in one step (no moment where files inherit broader rights).
-    $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
-    if ($parent) { [void][IO.Directory]::CreateDirectory($parent) }
-    $info = New-Object IO.DirectoryInfo $Path
-    [IO.FileSystemAclExtensions]::Create($info, (New-PraPrivateDirectorySecurity))
+    $info = $null
+    try {
+        $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
+        if ($parent) { [void][IO.Directory]::CreateDirectory($parent) }
+        $info = New-Object IO.DirectoryInfo $Path
+        [IO.FileSystemAclExtensions]::Create($info, (New-PraPrivateDirectorySecurity))
+    }
+    catch { throw ('The folder {0} cannot be created: {1}' -f $Path, $(if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message })) }
     if (-not ([IO.FileSystemAclExtensions]::GetAccessControl($info)).AreAccessRulesProtected) { throw "Folder ACL is not protected: $Path" }
 }
 
@@ -1301,6 +1305,7 @@ function Initialize-PraAudit {
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context)
     $Context.LogFile = ''
+    $Context['AuditAttempted'] = $true
     try {
         if ($null -ne $script:TranscriptOwner) { throw 'A transcript of this module is already running.' }
         $stem = Get-PraArtifactStem $Context
@@ -1719,6 +1724,8 @@ function Complete-PraRun {
         if ((Test-PraOrdinalIn $key @('LogFile','TranscriptPath') -IgnoreCase)) { $candidates = [string]$candidates }
         if ((Test-PraOrdinalIgnoreCaseEqual $key 'TranscriptPath') -and -not (Get-PraValue $Context '_PraTranscriptCreated' $false)) { $candidates = '' }
         foreach ($path in $candidates) {
+            # An empty log or transcript path means the audit never started: that cause is already an issue of the run.
+            if (-not $path -and (Test-PraOrdinalIn $key @('LogFile','TranscriptPath') -IgnoreCase) -and @($Context.Issues.ToArray() | Where-Object { (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $_ 'Source' '')) 'Audit') -or ([string](Get-PraValue $_ 'Message' '')).StartsWith('Audit ', [StringComparison]::OrdinalIgnoreCase) }).Count) { continue }
             try {
                 if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'file not found' }
                 $file = Get-Item -LiteralPath $path -ErrorAction Stop

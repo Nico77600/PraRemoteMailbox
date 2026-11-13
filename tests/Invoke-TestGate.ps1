@@ -12,7 +12,7 @@
     pwsh.exe -NoLogo -NoProfile -NonInteractive -File .\tests\Invoke-TestGate.ps1
 .NOTES
     Author : Nicolas Fabert
-    Version: 3.1.3
+    Version: 3.1.4
 #>
 #Requires -Version 7.5
 [CmdletBinding()]

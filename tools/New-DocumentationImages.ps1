@@ -30,7 +30,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.3
+    Version : 3.1.4
     Part of : PRA Remote Mailbox (repository tool, not in the package). Needs PowerShell 7.5+, Microsoft Edge, Windows (WPF).
 #>
 #Requires -Version 7.5
