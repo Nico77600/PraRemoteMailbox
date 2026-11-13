@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    High-volume HTML report tests for PRA Remote Mailbox 3.1.3 (offline; synthetic data only: no AD, Exchange, Graph or network).
+    High-volume HTML report tests for PRA Remote Mailbox 3.1.4 (offline; synthetic data only: no AD, Exchange, Graph or network).
 .DESCRIPTION
     Report-only evidence: the real Write-PraReport / Write-PraReportHtml of a fixture copy of the package write the
     reports of synthetic runs (up to 100,000 rows), and the compressed data is decoded exactly like the page does and
@@ -9,7 +9,7 @@
     measured generation times (they are measurements, not gates).
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.3
+    Version : 3.1.4
 #>
 #Requires -Version 7.5
 

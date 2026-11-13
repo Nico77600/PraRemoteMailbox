@@ -9,7 +9,7 @@
     No legacy Assert-MockCalled: counters are mutable objects.
 .NOTES
     Author : Nicolas Fabert
-    Version: 3.1.3
+    Version: 3.1.4
     Run it through tests\Invoke-TestGate.ps1 (evidence, PSScriptAnalyzer, mandatory tests).
 #>
 #Requires -Version 7.5
@@ -4575,7 +4575,7 @@ Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single 
         $version | Should -Match '^\d+\.\d+\.\d+$'
         # External anchors: the version is not only compared with the files that quote it. It must be the release that this tree is
         # (update this literal with the release) and the newest heading of the change log.
-        $version | Should -BeExactly '3.1.3'
+        $version | Should -BeExactly '3.1.4'
         $heading=[regex]::Match([IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'CHANGELOG.md')),'(?m)^## (\d+\.\d+\.\d+)\b')
         $heading.Success | Should -BeTrue
         $heading.Groups[1].Value | Should -BeExactly $version -Because 'the first "## x.y.z" heading of CHANGELOG.md is the version of the tree'
@@ -8565,7 +8565,7 @@ Describe 'Release 3.1.3 - every stop ends with a next step, and the Error block 
         Assert-Next313e $run 'Fix the problem named above, then run the same command again:' '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -ConfigPath '
     }
     It 'a failed run whose own next steps are hidden still ends with the fallback, and one that set its own keeps them' {
-        $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.3'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
+        $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.4'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
             CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
             Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $true; ReportFolder = (Join-Path $global:PraGate.Root 'reports-313e'); NoReport = $true; BatchId = 'abcd1234'; LogFile = ''; TranscriptStarted = $false
             NextSteps = @('Copy these two files to the cloud server.'); ExitCode = 1; CloudConnectFailed = $false; ResultStatus = ''; FallbackNext = @('Fix the problem named above, then run the same command again:', '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply') }
@@ -9106,7 +9106,7 @@ Describe 'Release 3.1.3 - the stop names the object that failed, a cancel is not
     It 'a run cancelled by the operator is reported as cancelled: no error, RESULT: CANCELLED, exit code 1, and the command to run it again' {
         $log = Join-Path $global:PraGate.Root 'cancel-313i.log'
         [IO.File]::WriteAllText($log, 'log' + [Environment]::NewLine)
-        $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.3'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
+        $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.4'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
             CurrentPhase = 'Start'; CurrentOperation = 'Confirm-Apply'; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
             Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $false; ReportFolder = (Join-Path $global:PraGate.Root 'reports-313i'); NoReport = $true; BatchId = ''; LogFile = $log; TranscriptPath = $log; _PraTranscriptCreated = $true; TranscriptStarted = $false
             NextSteps = @(); ExitCode = 1; CloudConnectFailed = $false; ResultStatus = ''; Cancelled = $true
@@ -9310,6 +9310,54 @@ Describe 'Release 3.1.3 - letter case never matters: configuration, CSV, batch i
         $found = Compare-PraX500Address -Expected @('X500:/o=A/cn=Bob', 'X500:/o=A/cn=Carl') -Actual @('x500:/O=A/CN=BOB', 'SMTP:x@y.com')
         @($found.Present) | Should -Be @('X500:/o=A/cn=Bob')
         @($found.Missing) | Should -Be @('X500:/o=A/cn=Carl')
+    }
+}
+Describe 'Release 3.1.4 - one error for one cause when the log folder cannot be created (real main, synthetic)' -Tag 'Release314' {
+    It 'a log folder under a file is one error: the cause, no Audit file line, no Audit unavailable line, RESULT: FAIL and a next step' {
+        $runtime = New-GateRuntime -Name 'logfolder-314'
+        $blocker = Join-Path $runtime.Root 'blocker'
+        [IO.File]::WriteAllText($blocker, 'a file where a folder is needed')
+        $folder = Join-Path $blocker 'logs'
+        Set-GateConfigText $runtime { param($t) ([regex]::Replace($t, "(?m)^\s*Logging=@\{Folder='[^']+'\}", (" Logging=@{Folder='" + $folder.Replace("'", "''") + "'}"))) }
+        $run = Invoke-GateProcess $runtime @{Action='Check';Identity='user1';Once=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'RESULT: FAIL'
+        @($run.MainResult.Issues).Count | Should -Be 1 -Because (@($run.MainResult.Issues | ForEach-Object { $_.Message }) -join ' / ')
+        $run.MainResult.Issues[0].Message | Should -Match '^Audit could not start: The folder .* cannot be created: '
+        $run.MainResult.Issues[0].Message | Should -Not -Match 'Exception'
+        $run.MainResult.ErrorCount | Should -Be 1
+        $run.Output | Should -Not -Match 'Audit file'
+        $run.Output | Should -Not -Match 'Audit unavailable'
+        @($run.MainResult.NextSteps).Count | Should -BeGreaterThan 0
+    }
+    It 'a configuration that cannot be read is one error and the log file is still created: <Name>' -ForEach @(
+        @{Name='unknown setting';Mutate={ param($t) $t.Replace("Execution=@{Phase='Both'}", "Execution=@{Phase='Both'}`r`n Typo=1") }}
+        @{Name='not a data file';Mutate={ param($t) 'this is not a configuration' }}
+    ) {
+        $runtime = New-GateRuntime -Name 'badconfig-314'
+        Set-GateConfigText $runtime $Mutate
+        $run = Invoke-GateProcess $runtime @{Action='Check';Identity='user1';Once=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'RESULT: FAIL'
+        @($run.MainResult.Issues).Count | Should -Be 1 -Because (@($run.MainResult.Issues | ForEach-Object { $_.Message }) -join ' / ')
+        $run.Output | Should -Not -Match 'Audit unavailable'
+        $run.Output | Should -Not -Match 'Audit could not start'
+        $logs = @(Get-ChildItem -LiteralPath (Join-Path $runtime.Package 'logs') -Filter '*.log' -File -ErrorAction SilentlyContinue)
+        $logs.Count | Should -BeGreaterThan 0
+        [IO.File]::ReadAllText($logs[0].FullName) | Should -Match 'RESULT: FAIL'
+    }
+    It 'Complete-PraRun adds no Audit file issue for an empty log and transcript path when the audit failure is already an issue, and exactly one when it is not' {
+        foreach ($case in @(@{Existing = $true; Expected = 1}, @{Existing = $false; Expected = 1})) {
+            $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.4'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Check'; Mode = 'Preview'; Phase = 'Cloud'
+                CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
+                Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $false; ReportFolder = (Join-Path $global:PraGate.Root 'reports-314'); NoReport = $true; BatchId = ''; LogFile = ''; TranscriptPath = ''; TranscriptStarted = $false
+                NextSteps = @(); ExitCode = 0; CloudConnectFailed = $false; ResultStatus = ''; FallbackNext = @('Fix the problem named above, then run the same command again:', '.\Invoke-PraRemoteMailbox.ps1 -Action Check') }
+            if ($case.Existing) { $ctx.Issues.Add([pscustomobject]@{ Timestamp = 't'; Phase = 'p'; Operation = 'Create-Log'; Identity = ''; Source = 'Execution'; Message = 'Audit could not start: the log folder cannot be created' }); $ctx.ExitCode = 1 }
+            $result = Complete-PraRun -Context $ctx
+            @($result.Issues).Count | Should -Be $case.Expected -Because (@($result.Issues | ForEach-Object { $_.Message }) -join ' / ')
+            if ($case.Existing) { @($result.Issues | Where-Object { $_.Message -match '^Audit file' }).Count | Should -Be 0 }
+            else { @($result.Issues | Where-Object { $_.Message -match '^Audit file LogFile unavailable' }).Count | Should -Be 1 }
+        }
     }
 }
 AfterAll {

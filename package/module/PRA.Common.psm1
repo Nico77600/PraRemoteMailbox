@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.3
+    Version : 3.1.4
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # window, run context, report, audit). The literal comments "Version : x.y.z" of the file headers cannot be
 # computed (the signature and the manifest hash the exact bytes): they are listed in the guide, annex D, and
 # checked against this value by the tests. tools\New-PraPackage.ps1 reads the version from this line.
-$script:ToolVersion = '3.1.3'
+$script:ToolVersion = '3.1.4'
 $script:TranscriptOwner = $null
 $script:PraNativePath = $null
 $script:PraNativeProcess = $null
@@ -652,7 +652,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v3.1.3 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v3.1.4 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)
@@ -1045,10 +1045,14 @@ function Initialize-PraPrivateFolder {
     if (Test-Path -LiteralPath $Path) { throw "A file exists where the folder is expected: $Path" }
     # Missing parent folders are created with NORMAL inheritance (the administrator's choice); only the leaf gets the private ACL,
     # in one step (no moment where files inherit broader rights).
-    $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
-    if ($parent) { [void][IO.Directory]::CreateDirectory($parent) }
-    $info = New-Object IO.DirectoryInfo $Path
-    [IO.FileSystemAclExtensions]::Create($info, (New-PraPrivateDirectorySecurity))
+    $info = $null
+    try {
+        $parent = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))
+        if ($parent) { [void][IO.Directory]::CreateDirectory($parent) }
+        $info = New-Object IO.DirectoryInfo $Path
+        [IO.FileSystemAclExtensions]::Create($info, (New-PraPrivateDirectorySecurity))
+    }
+    catch { throw ('The folder {0} cannot be created: {1}' -f $Path, $(if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message })) }
     if (-not ([IO.FileSystemAclExtensions]::GetAccessControl($info)).AreAccessRulesProtected) { throw "Folder ACL is not protected: $Path" }
 }
 
@@ -1301,6 +1305,7 @@ function Initialize-PraAudit {
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context)
     $Context.LogFile = ''
+    $Context['AuditAttempted'] = $true
     try {
         if ($null -ne $script:TranscriptOwner) { throw 'A transcript of this module is already running.' }
         $stem = Get-PraArtifactStem $Context
@@ -1719,6 +1724,8 @@ function Complete-PraRun {
         if ((Test-PraOrdinalIn $key @('LogFile','TranscriptPath') -IgnoreCase)) { $candidates = [string]$candidates }
         if ((Test-PraOrdinalIgnoreCaseEqual $key 'TranscriptPath') -and -not (Get-PraValue $Context '_PraTranscriptCreated' $false)) { $candidates = '' }
         foreach ($path in $candidates) {
+            # An empty log or transcript path means the audit never started: that cause is already an issue of the run.
+            if (-not $path -and (Test-PraOrdinalIn $key @('LogFile','TranscriptPath') -IgnoreCase) -and @($Context.Issues.ToArray() | Where-Object { (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $_ 'Source' '')) 'Audit') -or ([string](Get-PraValue $_ 'Message' '')).StartsWith('Audit ', [StringComparison]::OrdinalIgnoreCase) }).Count) { continue }
             try {
                 if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw 'file not found' }
                 $file = Get-Item -LiteralPath $path -ErrorAction Stop
@@ -3035,10 +3042,10 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
-# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDUJ81KrbFuuCVa
-# 0jDxSLRJDI3uksyr+86L5yUbT08XXaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCvJhRiprdR7SOO
+# E9idbgfgQurBt8gsCGFyqHUyFghEhaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -3110,28 +3117,28 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCAPfK1Iij5o
-# AJi6iIg00QBULRLwAY8femVxp2m91D6yJDANBgkqhkiG9w0BAQEFAASCAgBNs+vE
-# 02BTGQuqR7BHt4TLektflHPoDP2q/1gaShmRgfw/6HonLu0fVJXehjswbI9mO1sf
-# taPrp2H3fTWla5Mp4VX3cQs01+znzyBd/Cdwo/tvtdaswt7RxGfGlamDZ2qRlnUT
-# XVWs/RSTci3DXZ8F4Nq3HS39++qDqIRkAM6dY0apky7bnM+xkdau5Y2apfEJwAXc
-# xHaoGxVtssqvMxQAqfe31L3Scw3xAb9hijp94dNqrWvnua1dtsFzEu6DffH2le2Z
-# nt+dXDjXvV8uTP8QBAj5I9dEXplXGI9ewn9Sx/M6azaWX3fi2Ex0MX48Bjn+L/G4
-# t/czA9q7T0ANDNO0QsawJCbR4F2f7FRJftZHaH1a8gx/bcBvpIXxm5rAelDm427C
-# 3ebSr59nutHnR0DMyWwVmDBg78VIzea79bRUhVHlh4Uuof2fVGyeb7mz18wskuqZ
-# l9j60OIF5RnbLBGKA1Bo3np9Ezfj1hpcjBMJyEv29IO9Au1xN1jLRTfN+8kQ8cGB
-# dO0ZjWMNw9BlI9AbewfZ9blkX0cSH5aI7lCkkGlr5EIlDv20bx60LLxnmpzyMgd9
-# aIEa+ivfZfFkNWca5/JycKounEOe8zaC3UkaObkD4ed3Svk7P6fbImOaTb2vR/pg
-# qA1hfLyhaVpwtjLylSSFB0jJ46oooJArkgK4RaGCFM0wghTJBgorBgEEAYI3AwMB
-# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDMMohAfHeF
+# 6KMJM6TTbAtok+eL/RYsLC5xiyCdfdhfEzANBgkqhkiG9w0BAQEFAASCAgBn3t21
+# EGU0FZaE228TXzUrItna/eH5FrPm0KF9tbsDOqOmxajQzvJ23mYli2elTFH1WJts
+# oYcF7dvFCpMA8SRl1kfX5CnSo6vo7err3y1G+ugv4KLdS5cYv/wEKMGDRMz9ROw1
+# 6C6pwN8qMn2nU0R58DAJU1bjouUnay5FjyZZ0hbhXy2RY2+i1Bd44QthPJxbFVdm
+# RZ45yzF9AJLPNGYByEJ69fPr+OLrZ1xjS6dz08lTaqpSWImABxJHRhXSL2K3NzzQ
+# Q6AvYAmkyl61aJzFEjFhjWsvSEXwj9sVZfpYYnKG9oRafVq1bFgNesmuv4agq4eH
+# fl0z4Byjy74LdSjz5aC6Cb1mQEg/fqIxV9gDzE9cDY03BSDut4mQEUtn2ARbqMm9
+# nNlIs1DDrLJDZ7Zn8peRMDibds72PNOQW21vKv/PlzQ1nKedO4Qcq+icRqI0Pp/4
+# 5S1MjrPdcPqVa1g16oM+oBUdZ1LaFs2hVQZq9hgJIQXZq3NNyFTUFzAMdb3I4A0N
+# HhnR7wHiXfjzST9LpNC+hvmt0+6yzX8SxTkPBXGukakxc6YoAi66GF5Hl8S2rGsq
+# 5zMsGBmT5px+L6KT8oyFmu4VcrnaRgHtKcCmBjYgdQl4GpaHfEA2kGMgfSGON9Mz
+# sdRd4vbdQzN+Bq1MRmTSoIJMkZ0wDkub5E8LAKGCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEINUcauGKJYYc7IWSO1jrQscGL58fIEJ5joyUzOIGnBORAggAwbeBc8J6
-# MRgPMjAyNjExMTIxODAxNThaMAMCAQECEGP5XzWcYBjHcBoLGCD7m/CgghGnMIIE
+# BAIBBQAEIIEgEAwZls2KUHQWERm+Zpavqe14pq44sPBPMDsjq2+jAggnDvZ/iHhQ
+# qhgPMjAyNjExMTMxMjEyMzNaMAMCAQECEDm9zLsfd/GtxWBhQlsQK+SgghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3226,17 +3233,17 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMjE4MDE1OFowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIF+4
-# g0T9mTws1PvloM7vcrlD0IXPErQ76kFIJ7PvaPZxMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMzEyMTIzM1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIL1x
+# 1k1q1+QY69wjVGpdtTDZIr77zMVvcUbHKsf4IkJHMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERjBEAiBKDRq78fdacuXyWyacuLdMjlGa2mqlEUpLEhG9fJcgFQIgZGWR
-# zi3S6ws8wAGuMtye2e0fqiYl5ZJSjcI9FX3gH+o=
+# zj0EAwIERzBFAiAygtmRn4BpBCn+ikiRvGYOhWnMIfk16MHTpVpOkNhF6gIhAPGf
+# XFy7YyDNoHNu+baUU9wILQqZecQ12eZXW3WRAJN0
 # SIG # End signature block
