@@ -2094,4 +2094,55 @@ Describe 'Release 3.2.0 - the console continues a partial batch, or a batch whos
         $reasons['plain-False'] | Should -Not -Match 'finish it here' -Because 'the configuration leaves the synchronisation to the operator'
         $reasons['synced-True'] | Should -Not -Match 'finish it here' -Because 'its journal has an Entra Connect entry that ended well'
     }
+    It 'finishes a batch here only when it was converted on this server and this server can run the AD part: an imported batch, or a cloud-only server, goes on with the cloud part (partial, plain and sync-failed batches, Sync on and off)' {
+        $runtime = New-GuiTestRoot
+        $backups = Join-Path $runtime.Root 'Backups'
+        $makeBatch = {
+            param([string]$Kind, [bool]$Imported)
+            $batch = New-GuiTestBatch -Runtime $runtime
+            if ($Kind -eq 'partial') { Write-GuiTestJson $batch.Proof @{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'GuiSynthetic'; Partial = $true; PlannedCount = 10; Records = @(@{ ObjectGuid = [guid]::NewGuid().ToString(); Operation = 'Convert'; ADVerified = $true }) } }
+            if ($Kind -eq 'failed') { Write-GuiTestFile (Join-Path $batch.Folder ('Journal-' + $batch.Id + '.jsonl')) ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Failed`"}`r`n") }
+            if ($Imported) { Write-GuiTestFile (Join-Path $backups ('Imported\' + $batch.Id + '.txt')) 'Convert-package 2026-11-17' }
+            [pscustomobject]@{ Folder = $batch.Folder; BatchId = $batch.Id; Environment = 'GuiSynthetic' }
+        }
+        $items = @{}
+        foreach ($kind in 'plain', 'partial', 'failed') { foreach ($imported in $false, $true) { $items[$kind + '-' + $imported] = & $makeBatch $kind $imported } }
+        $inbox = & $makeBatch 'plain' $false
+        $package = & (Get-Module PRA.Gui) { param($Item) Get-PraTransferPackageName -Kind Convert -Environment $Item.Environment -BatchId $Item.BatchId } $inbox
+        Write-GuiTestFile (Join-Path $backups ('Inbox\' + $package)) 'synthetic package'
+        $items['inbox'] = $inbox
+        $reasons = & (Get-Module PRA.Gui) {
+            param($Items, $Folder)
+            $saved = $script:Gui
+            try {
+                $result = @{}
+                foreach ($role in 'Cloud', 'AD', 'Both') {
+                    foreach ($sync in $false, $true) {
+                        $script:Gui = [pscustomobject]@{ State = [pscustomobject]@{ Config = @{ EntraConnect = @{ Sync = $sync }; Storage = @{ BackupFolder = $Folder } } }; Detect = [pscustomobject]@{ Role = $role; AD = ($role -ne 'Cloud'); Cloud = ($role -ne 'AD') } }
+                        foreach ($name in $Items.Keys) { $result[$role + '-' + $sync + '-' + $name] = [string](Get-PraGuiFinishReason $Items[$name]) }
+                    }
+                }
+                $result
+            }
+            finally { $script:Gui = $saved }
+        } $items $backups
+        foreach ($sync in $false, $true) {
+            foreach ($kind in 'plain', 'partial', 'failed', 'inbox') {
+                foreach ($role in 'Cloud', 'AD', 'Both') {
+                    $name = if ($kind -eq 'inbox') { 'inbox' } else { $kind + '-True' }
+                    $reasons[$role + '-' + $sync + '-' + $name] | Should -Not -Match 'finish it here' -Because ('imported batch, role ' + $role + ', sync ' + $sync + ', ' + $kind)
+                }
+            }
+            foreach ($kind in 'partial', 'failed') {
+                $reasons['Cloud-' + $sync + '-' + $kind + '-False'] | Should -Not -Match 'finish it here' -Because 'a cloud-only server has no AD part to finish'
+                $reasons['AD-' + $sync + '-' + $kind + '-False'] | Should -Match 'finish it here' -Because 'a local batch of a server that has AD'
+                $reasons['Both-' + $sync + '-' + $kind + '-False'] | Should -Match 'finish it here'
+            }
+            $reasons['Cloud-' + $sync + '-plain-False'] | Should -Not -Match 'finish it here'
+            $reasons['AD-' + $sync + '-plain-False'] | Should -Match 'finish it here' -Because 'a server that only has AD and no package yet finishes its own batch'
+        }
+        $reasons['AD-True-plain-False'] | Should -BeExactly 'AD part done, sync not confirmed: finish it here'
+        $reasons['Both-False-plain-False'] | Should -Not -Match 'finish it here' -Because 'a plain local batch with Sync off is left to the operator when the cloud part can run here'
+        $reasons['Both-True-plain-False'] | Should -BeExactly 'AD part done, sync not confirmed: finish it here'
+    }
 }

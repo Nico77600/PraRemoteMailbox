@@ -28,6 +28,15 @@
     bounded re-reads (Exo.GrantVerifyAttempts x Exo.GrantVerifyDelaySeconds) and a line "Verified".
     A grant is never retried.
 
+    Identity: unless Cloud.IdentityCheck = Off, the Microsoft Entra ID account of every object (and of every trustee of a permission to grant) must carry the Active
+    Directory source anchor of the object (onPremisesImmutableId = base64 of the objectGUID or of ms-DS-ConsistencyGuid). Another account, a cloud-only account or an
+    ambiguous answer is an error for that object and nothing is changed on it. The Exchange Online object found by UPN must carry the ExternalDirectoryObjectId of
+    that account.
+
+    Retries: a read of Microsoft Graph or Exchange Online is sent again on 408, 429, 502, 503, 504, a timeout or no answer (Retry-After honoured), within
+    Cloud.RetryBudgetObjectSeconds for an object and Cloud.RetryBudgetRunMinutes for the run; a throttled answer slows the calls of the whole run, and a run that used
+    up its budget stops with one error. Any other failure is not sent again.
+
     Sessions: Microsoft Graph is connected before Exchange Online; an Exchange Online
     or Graph session that already exists in the console is refused;
     tenant, token, connection ID and module path are checked before each call. Exo.UseSubprocess (or
@@ -187,6 +196,8 @@ $script:PraExoWorker = {
         if (-not [guid]::TryParse($oid,[ref]$parsed) -or $parsed -eq [guid]::Empty -or [string]::IsNullOrWhiteSpace($smtp)) { throw "Recipient identity incomplete: $Upn" }
         $expected=V (V $P 'ExpectedIdentities' @{}) $Upn
         if ($null -ne $expected -and (-not (SameIgnoreCase $oid (V $expected 'ObjectId')) -or -not (SameIgnoreCase $smtp (V $expected 'PrimarySmtpAddress')))) { throw "Recipient identity changed since the pre-check: $Upn" }
+        $confirmed=V (V $P 'VerifiedObjectIds' @{}) $Upn
+        if ($null -ne $confirmed -and $confirmed -and -not (SameIgnoreCase $oid $confirmed)) { throw "The Exchange Online recipient is not the Microsoft Entra ID account confirmed for this object: $Upn" }
         $keys = @($Upn) + @(foreach ($key in @('UserPrincipalName','PrimarySmtpAddress','ExternalDirectoryObjectId','Guid','DistinguishedName','Identity','Alias','Name','DisplayName','Sid','SamAccountName')) {
             $val = [string](V $items[0] $key); if (-not [string]::IsNullOrWhiteSpace($val)) { $val }
         })
@@ -195,7 +206,7 @@ $script:PraExoWorker = {
     }
     function Mailbox {
         param([string]$Upn,[switch]$Hold)
-        $grantParameters = @{ Filter=(ExactFilter $Upn); Properties=@('RecipientTypeDetails','EmailAddresses','LegacyExchangeDN'); ResultSize='Unlimited' }
+        $grantParameters = @{ Filter=(ExactFilter $Upn); Properties=@('RecipientTypeDetails','EmailAddresses','LegacyExchangeDN','ExternalDirectoryObjectId'); ResultSize='Unlimited' }
         if ($Hold) { $grantParameters.Properties += @('IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled') }
         $items = @(Get-EXOMailbox @grantParameters -ErrorAction Stop)
         if ($Hold -and $items.Count -eq 0) { $items = @(Get-EXOMailbox @grantParameters -InactiveMailboxOnly -ErrorAction Stop) }
@@ -203,6 +214,8 @@ $script:PraExoWorker = {
         if ($items.Count -eq 0) { return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@() } }
         $m = $items[0]; $type = [string](V $m 'RecipientTypeDetails')
         if (-not $type) { throw "Mailbox type not returned: $Upn" }
+        $mailboxOid=[string](V $m 'ExternalDirectoryObjectId' ''); $confirmed=V (V $P 'VerifiedObjectIds' @{}) $Upn
+        if ($mailboxOid -and $null -ne $confirmed -and $confirmed -and -not (SameIgnoreCase $mailboxOid $confirmed)) { throw "The Exchange Online mailbox is not the Microsoft Entra ID account confirmed for this object: $Upn" }
         $holds = V -Object $m -Name 'InPlaceHolds' -Default @()
         # EmailAddresses (every proxy address of the mailbox, X500 included): whether Exchange Online returned the property at all is kept apart from "empty".
         $hasAddresses = if ($m -is [System.Collections.IDictionary]) { $m.Contains('EmailAddresses') } else { $null -ne $m.PSObject.Properties['EmailAddresses'] }
@@ -305,6 +318,8 @@ $script:PraExoWorker = {
         }
         $mb = @(Get-Mailbox -Filter (ExactFilter $Upn) -ResultSize Unlimited -ErrorAction Stop)
         if ($mb.Count -ne 1) { throw "Mailbox not unique for the SendOnBehalf read: $Upn" }
+        $behalfOid=[string](V $mb[0] 'ExternalDirectoryObjectId' '')
+        if ($behalfOid -and -not (SameIgnoreCase $behalfOid $Target.ObjectId)) { throw "The mailbox of the SendOnBehalf read is not the confirmed Exchange Online recipient: $Upn" }
         $delegates=V -Object $mb[0] -Name 'GrantSendOnBehalfTo' -Default @()
         foreach ($delegate in $delegates) {
             if ($null -eq $delegate) { continue }
@@ -409,7 +424,9 @@ function Get-PraCloudSession {
         $Context['_PraCloudSession'] = @{ GraphAttempted=$false; ExoAttempted=$false; Graph=$false; Exo=$false; Subprocess=$false
             Binding=$null; OwnedExoIds=@(); GraphContext=$null; Identities=@{}; Preflight=$false }
     }
-    return $Context['_PraCloudSession']
+    $session = $Context['_PraCloudSession']
+    foreach ($name in @('Verified', 'IdentityCache')) { if (-not $session.ContainsKey($name)) { $session[$name] = @{} } }
+    return $session
 }
 
 function Get-PraNetworkFailure {
@@ -462,8 +479,263 @@ function Write-PraCloudFailure {
         Write-PraCloudError -Context $Context -Row $Row -Message $plain -Technical $raw -RunError
         return
     }
+    $info=Get-PraCloudFailureInfo $ErrorRecord
+    if ($info.Throttled) {
+        $plain='{0}Microsoft 365 kept limiting the requests or was unavailable (HTTP {1}) and the retry time of this object is used up. Run again in a few minutes.' -f $(if ($Upn) { $Upn + ': ' } else { '' }), $info.Status
+        Write-PraCloudError -Context $Context -Row $Row -Message $plain -Technical $raw -RunError
+        return
+    }
     $message=$(if ($Extra) { $raw + ' | ' + $Extra } else { $raw })
     if ($Expectation) { Write-PraCloudError -Context $Context -Row $Row -Message $message } else { Write-PraCloudError -Context $Context -Row $Row -Message $message -RunError }
+}
+
+function Get-PraCloudFailureInfo {
+    <# What a failed cloud call says about itself: Status (the HTTP status, 0 when there is none), RetryAfter (seconds, 0 when none, never more than two minutes), Transient (the same read can be sent again: 408, 429, 502, 503, 504, a timeout or a connection that did not answer), Throttled (429 or 503) and NotFound (404). Looks at the inner exceptions, then at the text (the Exchange Online child process only returns text). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $status = 0; $retryAfter = 0
+    $texts = New-Object 'System.Collections.Generic.List[string]'
+    $queue = New-Object 'System.Collections.Generic.Queue[object]'; $queue.Enqueue($ErrorRecord.Exception)
+    $detail = [string](Get-PraValue (Get-PraValue $ErrorRecord 'ErrorDetails' $null) 'Message' '')
+    if ($detail) { $texts.Add($detail) }
+    $visited = 0
+    while ($queue.Count -gt 0 -and $visited -lt 20) {
+        $visited++
+        $e = $queue.Dequeue(); if ($null -eq $e) { continue }
+        $texts.Add([string]$e.Message)
+        $response = Get-PraValue $e 'Response' $null
+        foreach ($holder in @($e, $response)) {
+            if ($null -eq $holder -or $status -ne 0) { continue }
+            $code = Get-PraValue $holder 'StatusCode' $null
+            if ($null -ne $code) { try { $status = [int]$code } catch { $status = 0 } }
+        }
+        $headers = Get-PraValue $response 'Headers' $null
+        if ($null -ne $headers -and $retryAfter -eq 0) {
+            $parsed = 0
+            $retry = Get-PraValue $headers 'RetryAfter' $null
+            if ($null -ne $retry) {
+                $delta = Get-PraValue $retry 'Delta' $null; $when = Get-PraValue $retry 'Date' $null
+                if ($null -ne $delta) { try { $retryAfter = [int][Math]::Ceiling(([TimeSpan]$delta).TotalSeconds) } catch { $retryAfter = 0 } }
+                elseif ($null -ne $when) { try { $retryAfter = [int][Math]::Ceiling(([DateTimeOffset]$when - [DateTimeOffset]::UtcNow).TotalSeconds) } catch { $retryAfter = 0 } }
+            }
+            elseif ([int]::TryParse([string](Get-PraValue $headers 'Retry-After' ''), [ref]$parsed)) { $retryAfter = $parsed }
+        }
+        if ($e -is [AggregateException]) { foreach ($inner in $e.InnerExceptions) { $queue.Enqueue($inner) } }
+        elseif ($null -ne $e.InnerException) { $queue.Enqueue($e.InnerException) }
+    }
+    $all = $texts -join ' '
+    if ($status -eq 0) {
+        foreach ($match in [regex]::Matches($all, '(?i)(?:HttpStatusCode|status ?code|status)\D{0,40}?(\d{3})(?!\d)')) {
+            $candidate = [int]$match.Groups[1].Value
+            if ($candidate -ge 400 -and $candidate -le 599) { $status = $candidate; break }
+        }
+    }
+    if ($status -eq 0) {
+        if ($all -match '(?i)TooManyRequests|Too Many Requests|throttl') { $status = 429 }
+        elseif ($all -match '(?i)ServiceUnavailable|Service Unavailable') { $status = 503 }
+        elseif ($all -match '(?i)GatewayTimeout|Gateway Timeout') { $status = 504 }
+        elseif ($all -match '(?i)BadGateway|Bad Gateway') { $status = 502 }
+        elseif ($all -match '(?i)RequestTimeout|Request Timeout') { $status = 408 }
+        elseif ($all -match '(?i)Request_ResourceNotFound') { $status = 404 }
+    }
+    if ($retryAfter -le 0 -and $all -match '(?i)retry[- ]after\D{0,20}(\d{1,5})') { $retryAfter = [int]$Matches[1] }
+    $retryAfter = [Math]::Min([Math]::Max($retryAfter, 0), 120)
+    $transient = $false
+    if ($status -ne 0) { $transient = (Test-PraOrdinalIn $status @(408, 429, 502, 503, 504)) }
+    else { $transient = ($null -ne (Get-PraNetworkFailure $ErrorRecord)) -or ($all -match '(?i)\btimeout\b|timed out|task was canceled|operation was canceled') }
+    return [pscustomobject]@{ Status = $status; RetryAfter = $retryAfter; Transient = [bool]$transient; Throttled = (Test-PraOrdinalIn $status @(429, 503)); NotFound = ($status -eq 404) }
+}
+
+function Get-PraRetryState {
+    <# The retry budgets of this run (Cloud.RetryBudgetObjectSeconds per object, Cloud.RetryBudgetRunMinutes for the run) and what has been spent. Created on first use. #>
+    [CmdletBinding()]
+    param([hashtable]$Context)
+    if (-not $Context.ContainsKey('_PraRetry')) {
+        $cloud = Get-PraValue $Context.Config 'Cloud' @{}
+        $Context['_PraRetry'] = @{ ObjectBudget = [int](Get-PraValue $cloud 'RetryBudgetObjectSeconds' 180); RunBudget = ([int](Get-PraValue $cloud 'RetryBudgetRunMinutes' 30) * 60)
+            RunSpent = 0; Objects = @{}; Retries = 0; Throttled = 0; Pace = 0; RunExhausted = $false }
+    }
+    return $Context['_PraRetry']
+}
+
+function Stop-PraCloudRun {
+    <# The retry time of the run is used up: ONE plain error ends the cloud part (nothing is asked of Microsoft 365 any more), never one failure per object. #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [Exception]$Inner = $null)
+    $state = Get-PraRetryState $Context
+    $state.RunExhausted = $true; $Context.CloudThrottled = $true
+    $minutes = [Math]::Round($state.RunBudget / 60.0, 1)
+    $message = 'Microsoft 365 is limiting or not answering this run: the {0} minute(s) allowed for retries are used up ({1} retries, {2} throttled answers). Nothing more is asked of Microsoft 365. What this run already did is kept: run the same command again in a few minutes.' -f $minutes, $state.Retries, $state.Throttled
+    $failure = [System.InvalidOperationException]::new($message, $Inner)
+    $failure.Data['PraRunBudget'] = $true
+    throw $failure
+}
+
+function Invoke-PraCloudCall {
+    <#
+    .SYNOPSIS
+        One read of Microsoft Graph or Exchange Online that can be sent again. A transient failure (408, 429, 502, 503, 504, a timeout, no answer) is retried after the
+        Retry-After of the answer, or 5, 10, 20, 40 seconds, at most five tries, within the budget of the object and the budget of the run; each retry is in the log (Detail).
+        A throttled answer also slows the next calls of the whole run (a pause that doubles up to 30 seconds and halves after each success). Any other failure (a 4xx
+        other than 408 and 429, a refusal, a bad answer) is thrown as it is at once. -NoRetry: one try (a write is never sent again).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Call, [Parameter(Mandatory)][scriptblock]$Script, [object[]]$ArgumentList = @(), [switch]$NoRetry)
+    $state = Get-PraRetryState $Context
+    $key = [string](Get-PraValue $Context 'CurrentIdentity' '')
+    if ($NoRetry -or $state.ObjectBudget -le 0 -or $state.RunBudget -le 0) { return (& $Script @ArgumentList) }
+    if ($state.RunExhausted) { Stop-PraCloudRun -Context $Context }
+    if ($state.Pace -gt 0) {
+        if (($state.RunSpent + $state.Pace) -gt $state.RunBudget) { Stop-PraCloudRun -Context $Context }
+        $null = Write-PraLog -Context $Context -Message ('Cloud calls slowed down after throttling: pausing {0} s before {1}' -f $state.Pace, $Call) -Level Detail
+        Start-Sleep -Seconds $state.Pace
+        $state.RunSpent += $state.Pace
+    }
+    for ($try = 1; $true; $try++) {
+        try {
+            $answer = & $Script @ArgumentList
+            if ($state.Pace -gt 0) { $state.Pace = [int][Math]::Floor($state.Pace / 2) }
+            return $answer
+        }
+        catch {
+            $failure = $_
+            $info = Get-PraCloudFailureInfo $failure
+            if (-not $info.Transient) { throw }
+            if ($info.Throttled) { $state.Throttled++; $state.Pace = [int][Math]::Min(30, [Math]::Max(2, $state.Pace * 2)) }
+            $spent = if ($state.Objects.ContainsKey($key)) { [int]$state.Objects[$key] } else { 0 }
+            $wait = if ($info.RetryAfter -gt 0) { [int]$info.RetryAfter } else { [int][Math]::Min(60, 5 * [Math]::Pow(2, $try - 1)) }
+            $runOut = (($state.RunSpent + $wait) -gt $state.RunBudget)
+            if ($try -ge 5 -or ($spent + $wait) -gt $state.ObjectBudget -or $runOut) {
+                $null = Write-PraLog -Context $Context -Message ('Retry budget used up | {0} | {1} | status {2} | {3} tries | object {4} of {5} s, run {6} of {7} s' -f $Call, $key, $info.Status, $try, $spent, $state.ObjectBudget, $state.RunSpent, $state.RunBudget) -Level Detail
+                if ($runOut) { Stop-PraCloudRun -Context $Context -Inner $failure.Exception }
+                throw $failure
+            }
+            $null = Write-PraLog -Context $Context -Message ('Retry {0} | {1} | {2} | status {3}{4} | waiting {5} s | object {6} of {7} s, run {8} of {9} s' -f $try, $Call, $key, $(if ($info.Status) { $info.Status } else { 'no answer' }), $(if ($info.RetryAfter -gt 0) { ' (Retry-After ' + $info.RetryAfter + ' s)' } else { '' }), $wait, ($spent + $wait), $state.ObjectBudget, ($state.RunSpent + $wait), $state.RunBudget) -Level Detail
+            Start-Sleep -Seconds $wait
+            $state.Objects[$key] = $spent + $wait; $state.RunSpent += $wait; $state.Retries++
+        }
+    }
+}
+
+function Test-PraIdentityCheck {
+    <# Cloud.IdentityCheck: Anchor (the default, also when the setting is missing) confirms every cloud account against the Active Directory source anchor; Off finds accounts by UPN only. #>
+    [CmdletBinding()]
+    param([hashtable]$Context)
+    return (-not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue (Get-PraValue $Context.Config 'Cloud' @{}) 'IdentityCheck' 'Anchor')) 'Off'))
+}
+
+function Get-PraEntraAccount {
+    <# The Entra ID accounts found by UPN (-Upn) or by source anchor (-Anchor), read only. An account that does not exist is an empty answer, never an error. #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [string]$Upn, [string]$Anchor)
+    Assert-PraGraphSession $Context
+    $select = @('id', 'userPrincipalName', 'onPremisesImmutableId', 'onPremisesSyncEnabled')
+    if ($Anchor) {
+        $filter = "onPremisesImmutableId eq '{0}'" -f $Anchor.Replace("'", "''")
+        $byAnchor = { param($Filter, $Property) Get-MgUser -Filter $Filter -Property $Property -ErrorAction Stop }
+        return @(Invoke-PraCloudCall -Context $Context -Call 'Microsoft Graph user by source anchor' -Script $byAnchor -ArgumentList @($filter, $select))
+    }
+    $byUpn = { param($UserId, $Property) Get-MgUser -UserId $UserId -Property $Property -ErrorAction Stop }
+    try { return @(Invoke-PraCloudCall -Context $Context -Call 'Microsoft Graph user' -Script $byUpn -ArgumentList @($Upn, $select)) }
+    catch { if ((Get-PraCloudFailureInfo $_).NotFound) { return @() }; throw }
+}
+
+function Resolve-PraCloudIdentity {
+    <#
+    .SYNOPSIS
+        Confirms that the Entra ID account found by UPN is the account synchronised from the Active Directory object (read only).
+    .DESCRIPTION
+        Status Match       the account carries one of the source anchors (onPremisesImmutableId, compared exactly).
+        Status Mismatch    the account with this UPN carries another anchor, is not synchronised (cloud only), or the synchronised account has another UPN.
+        Status Ambiguous   Microsoft Entra ID returns several accounts.
+        Status NotFound    no account by UPN and none by anchor (not synchronised yet).
+        Status NoAnchor    the record has no usable anchor: the account is only found by UPN (-SyncedOnly: a cloud-only account is still a Mismatch).
+        -Recorded $false: the anchors were derived from the objectGUID of a record written by an older version.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [Parameter(Mandatory)][string]$Upn, [AllowNull()][string[]]$Anchors, [bool]$Recorded = $true, [switch]$SyncedOnly)
+    $anchorList = @($Anchors | Where-Object { $_ })
+    $result = { param($Status, $ObjectId, $Message, $Technical) [pscustomobject]@{ Status = $Status; ObjectId = $ObjectId; Message = $Message; Technical = $Technical } }
+    $older = if ($Recorded) { '' } else { ' The record was written by an older version and holds only the objectGUID: if your tenant uses ms-DS-ConsistencyGuid as source anchor with another value, check the account by hand and set Cloud.IdentityCheck = Off in the configuration file.' }
+    $accounts = @(Get-PraEntraAccount -Context $Context -Upn $Upn)
+    if ($accounts.Count -gt 1) {
+        return (& $result 'Ambiguous' '' ('{0}: Microsoft Entra ID returned {1} accounts for this UPN, so the right one cannot be chosen. Nothing was changed on it. Remove the duplicate account in Microsoft Entra ID, then run the same command again.' -f $Upn, $accounts.Count) ('accounts=' + (@($accounts | ForEach-Object { [string](Get-PraValue $_ 'Id' '') }) -join ',')))
+    }
+    if ($accounts.Count -eq 1) {
+        $id = [string](Get-PraValue $accounts[0] 'Id' ''); $found = [string](Get-PraValue $accounts[0] 'OnPremisesImmutableId' '')
+        if (-not $anchorList.Count) {
+            if ($SyncedOnly -and -not $found) { return (& $result 'Mismatch' $id ('{0}: the Microsoft Entra ID account with this UPN is a cloud-only account, not an account synchronised from Active Directory. Nothing was changed on it. Give one of the two accounts another UPN, then run the same command again.' -f $Upn) ('id=' + $id)) }
+            return (& $result 'NoAnchor' $id '' ('id=' + $id))
+        }
+        if (Test-PraOrdinalIn $found $anchorList) { return (& $result 'Match' $id '' ('id=' + $id + '; onPremisesImmutableId=' + $found)) }
+        $why = if ($found) { 'it is synchronised from another Active Directory object' } else { 'it is a cloud-only account' }
+        return (& $result 'Mismatch' $id ('{0}: the Microsoft Entra ID account with this UPN is not the account synchronised from this Active Directory object ({1}). Nothing was changed on it. Give one of the two accounts another UPN so that Entra Connect can synchronise this object under its own UPN, or leave this object out, then run the same command again.{2}' -f $Upn, $why, $older) ('id=' + $id + '; onPremisesImmutableId=' + $found + '; expected=' + ($anchorList -join ' or ')))
+    }
+    if (-not $anchorList.Count) { return (& $result 'NotFound' '' '' '') }
+    $byAnchor = @{}
+    foreach ($anchor in $anchorList) {
+        foreach ($account in @(Get-PraEntraAccount -Context $Context -Anchor $anchor)) {
+            $accountId = [string](Get-PraValue $account 'Id' '')
+            if ($accountId -and -not $byAnchor.ContainsKey($accountId)) { $byAnchor[$accountId] = $account }
+        }
+    }
+    if ($byAnchor.Count -gt 1) { return (& $result 'Ambiguous' '' ('{0}: Microsoft Entra ID has {1} accounts that carry the source anchor of this Active Directory object, so the right one cannot be chosen. Nothing was changed on it. Remove the duplicate account in Microsoft Entra ID, then run the same command again.' -f $Upn, $byAnchor.Count) ('accounts=' + (@($byAnchor.Keys) -join ','))) }
+    if ($byAnchor.Count -eq 1) {
+        $other = @($byAnchor.Values)[0]
+        return (& $result 'Mismatch' ([string](Get-PraValue $other 'Id' '')) ('{0}: the account synchronised from this Active Directory object is {1} in Microsoft Entra ID, not {0}. Nothing was changed on it. Make the UPN in Active Directory and in Microsoft Entra ID the same (then let Entra Connect synchronise), then run the same command again.' -f $Upn, [string](Get-PraValue $other 'UserPrincipalName' '')) ('id=' + [string](Get-PraValue $other 'Id' '')))
+    }
+    return (& $result 'NotFound' '' '' '')
+}
+
+function Confirm-PraCloudIdentity {
+    <# The Entra ID account (and the account of each trustee) of one object is the one synchronised from Active Directory. Returns Ok, Wait (not in Microsoft Entra ID yet: read again at the next check) or Failed (an error is recorded; the object is never acted on). #>
+    [CmdletBinding()]
+    param([hashtable]$Context, $State, [switch]$Throw)
+    $row = $State.Row; $upn = [string]$State.Upn
+    $fail = { param($Message, $Technical) if ($Throw) { throw $Message }; Write-PraCloudError -Context $Context -Row $row -Message $Message -Technical $Technical -RunError; return 'Failed' }
+    if (-not (Test-PraIdentityCheck $Context)) {
+        if (-not [bool](Get-PraValue $Context 'IdentityCheckOffSaid' $false)) {
+            $Context.IdentityCheckOffSaid = $true
+            Write-PraItem -Context $Context -Status Info -Text 'Cloud.IdentityCheck = Off: the Microsoft Entra ID accounts are found by UPN only, they are not confirmed against Active Directory.'
+        }
+        return 'Ok'
+    }
+    $session = Get-PraCloudSession $Context
+    $source = Get-PraValue $row 'BackupRec' $null; if ($null -eq $source) { $source = $row }
+    $anchor = Get-PraSourceAnchor -Record $source
+    if ($session.IdentityCache.ContainsKey($upn)) { $verdict = $session.IdentityCache[$upn] }
+    else {
+        $verdict = Resolve-PraCloudIdentity -Context $Context -Upn $upn -Anchors $anchor.Candidates -Recorded $anchor.Recorded
+        if (Test-PraOrdinalIn $verdict.Status @('Match', 'Mismatch', 'Ambiguous')) { $session.IdentityCache[$upn] = $verdict }
+    }
+    if (Test-PraOrdinalIn $verdict.Status @('Mismatch', 'Ambiguous')) { return (& $fail $verdict.Message $verdict.Technical) }
+    if (Test-PraOrdinalEqual $verdict.Status 'NotFound') {
+        if ($Throw) { throw ('{0}: the account is not in Microsoft Entra ID (neither by UPN nor by source anchor). It must be synchronised from Active Directory before this run: run the Entra Connect sync, then run the command again.' -f $upn) }
+        $State.PlainText = 'the account is not in Microsoft Entra ID yet (the Entra Connect sync has not run)'
+        $row.CloudStatus = 'Pending'
+        return 'Wait'
+    }
+    if (Test-PraOrdinalEqual $verdict.Status 'NoAnchor') {
+        if ($Context.AllowMutation -is [bool] -and $Context.AllowMutation -and @($State.Requests).Count) {
+            return (& $fail ('{0}: the Active Directory identity of this object is not in the record, so the Microsoft Entra ID account cannot be confirmed and no permission is granted. Give the object by its sAMAccountName or run its batch, then run the command again.' -f $upn) '')
+        }
+        $note = '{0}: the Microsoft Entra ID account is found by its UPN only: this object has no Active Directory identity in the record (the identity was given as a UPN). Give its sAMAccountName or -Batch to have it confirmed.' -f $upn
+        Write-PraItem -Context $Context -Status Warn -Text $note
+        $row.Warnings = ([string](Get-PraValue $row 'Warnings' '') + '; ' + $note).Trim(' ', ';')
+    }
+    $session.Verified[$upn] = [string]$verdict.ObjectId
+    $trustees = @(@($State.Requests) | ForEach-Object { [string]$_.Trustee } | Get-PraOrdinalUnique -IgnoreCase)
+    foreach ($trustee in $trustees) {
+        $stored = Get-PraValue (Get-PraValue $source 'SharedTrusteeAnchors' $null) $trustee $null
+        if ($session.IdentityCache.ContainsKey($trustee)) { $answer = $session.IdentityCache[$trustee] }
+        else {
+            $answer = Resolve-PraCloudIdentity -Context $Context -Upn $trustee -Anchors ([string[]]@(if ($null -ne $stored) { @($stored) })) -Recorded ($null -ne $stored) -SyncedOnly
+            if (Test-PraOrdinalIn $answer.Status @('Match', 'Mismatch', 'Ambiguous')) { $session.IdentityCache[$trustee] = $answer }
+        }
+        if (Test-PraOrdinalIn $answer.Status @('Mismatch', 'Ambiguous')) { return (& $fail ('Permissions on {0} are not granted. {1}' -f $upn, $answer.Message) $answer.Technical) }
+        if (-not (Test-PraOrdinalEqual $answer.Status 'NotFound')) { $session.Verified[$trustee] = [string]$answer.ObjectId }
+    }
+    return 'Ok'
 }
 
 function Read-PraExoProgress {
@@ -623,13 +895,24 @@ function Invoke-PraExo {
         -not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or -not (Test-PraOrdinalEqual $Context.Action 'Convert') -or -not (Test-PraOrdinalIn $Context.Phase @('Cloud','Both')) -or $WhatIfPreference)) { throw 'Grant without an active write authorisation.' }
     $Params=$Params.Clone()
     $Params.ExpectedIdentities=Get-PraValue $session 'Identities' @{}
+    $verified=@{}
+    foreach ($name in @(@([string](Get-PraValue $Params 'Upn' '')) + @([string](Get-PraValue $Params 'Trustee' '')) + @(Get-PraList $Params 'Requests' | ForEach-Object { [string](Get-PraValue $_ 'Trustee' '') }))) {
+        if ($name -and $session.Verified.ContainsKey($name)) { $verified[$name]=[string]$session.Verified[$name] }
+    }
+    $Params.VerifiedObjectIds=$verified
     if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Grant')) {
         $exo=Get-PraValue $Context.Config 'Exo' @{}
         $Params.GrantVerifyAttempts=Get-PraValue $exo 'GrantVerifyAttempts' 13
         $Params.GrantVerifyDelaySeconds=Get-PraValue $exo 'GrantVerifyDelaySeconds' 10
     }
-    $results = @(if ($session.Subprocess) { Invoke-PraExoSubprocess -Context $Context -Operation $Operation -Params $Params -Permit $Permit -OnApplied $OnApplied -OnProgress $OnProgress }
-        else { & $script:PraExoWorker $Operation $Params $Permit (Get-PraValue $session 'Binding' $null) $OnApplied $OnProgress })
+    $dispatch = {
+        param($Ctx, $Sess, $Op, $Prm, $Prt, $Applied, $Progress)
+        if ($Sess.Subprocess) { Invoke-PraExoSubprocess -Context $Ctx -Operation $Op -Params $Prm -Permit $Prt -OnApplied $Applied -OnProgress $Progress }
+        else { & $script:PraExoWorker $Op $Prm $Prt (Get-PraValue $Sess 'Binding' $null) $Applied $Progress }
+    }
+    $dispatchArguments = @($Context, $session, $Operation, $Params, $Permit, $OnApplied, $OnProgress)
+    $results = @(if (Test-PraOrdinalIgnoreCaseEqual $Operation 'Grant') { & $dispatch @dispatchArguments }
+        else { Invoke-PraCloudCall -Context $Context -Call ('Exchange Online ' + $Operation) -Script $dispatch -ArgumentList $dispatchArguments })
     if ($results.Count -ne 1) { throw 'Exchange Online result not unique.' }
     $result=$results[0]
     $booleans=switch ($Operation) { 'Probe' { 'Connected' }; 'Permission' { 'TrusteeFound'; 'Verified' }; 'Grant' { 'TrusteeFound'; 'Verified'; 'Mutated' }; default { 'Found' } }
@@ -815,6 +1098,7 @@ function Initialize-PraCloudPreflight {
             $mailboxCheck=($isRecover -or [bool](Get-PraValue $cloud 'CheckMailbox' $false))
             if (-not $shared -and ([bool](Get-PraValue $cloud 'CheckLicense' $false) -or ($mailboxCheck -and (Test-PraOrdinalIgnoreCaseEqual $via 'Graph')))) { $needGraph=$true }
         }
+        if (Test-PraIdentityCheck $Context) { $needGraph=$true }
         # EXO resolves each target even while it is still a MailUser; no provisioning assertion here.
         Connect-PraCloudSession -Context $Context -NeedGraph $needGraph -NeedExo ($Rows.Count -gt 0)
         $session=Get-PraCloudSession $Context
@@ -822,6 +1106,7 @@ function Initialize-PraCloudPreflight {
             $upn=[string](Get-PraValue $row 'UserPrincipalName' '')
             $Context.CurrentIdentity=$upn; $Context.CurrentOperation='ResolvePreflightIdentity'
             $requests=if ($isRecover) { @() } else { @(Get-PraPermissionRequest $Context $row) }
+            $null=Confirm-PraCloudIdentity -Context $Context -State @{ Row=$row; Upn=$upn; Requests=$requests; PlainText='' } -Throw
             $result=Invoke-PraExo -Context $Context -Operation Preflight -Params @{ Upn=$upn; Requests=$requests }
             $identities=Get-PraValue $result 'Identities' @{}
             $names=if ($identities -is [System.Collections.IDictionary]) { @($identities.Keys) } else { @($identities.PSObject.Properties.Name) }
@@ -835,7 +1120,8 @@ function Initialize-PraCloudPreflight {
             }
             if ($needGraph -and -not [bool](Get-PraValue $row 'IsShared' $false)) {
                 Assert-PraGraphSession $Context
-                $users=@(Get-MgUser -UserId $upn -Property Id,UserPrincipalName -ErrorAction Stop)
+                $readUser={ param($UserId,$Property) Get-MgUser -UserId $UserId -Property $Property -ErrorAction Stop }
+                $users=@(Invoke-PraCloudCall -Context $Context -Call 'Microsoft Graph user' -Script $readUser -ArgumentList @($upn,@('Id','UserPrincipalName')))
                 $target=Get-PraValue $identities $upn $null
                 if ($users.Count -ne 1 -or -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $users[0] 'Id' '')) ([string](Get-PraValue $target 'ObjectId' ''))) -or
                     -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $users[0] 'UserPrincipalName' '')) $upn)) { throw "Graph and Exchange Online identities differ at the pre-check: $upn" }
@@ -937,7 +1223,8 @@ function Get-PraGraphFact {
     if (-not (Get-PraCloudSession $Context).Graph) { throw 'Microsoft Graph required but not connected.' }
     Assert-PraGraphSession $Context
     $props=@('assignedPlans'); if ($Mailbox) { $props+='provisionedPlans' }; if ($License) { $props+='assignedLicenses' }; if ($Addresses) { $props+='proxyAddresses' }
-    $users=@(Get-MgUser -UserId $Upn -Property $props -ErrorAction Stop)
+    $readUser={ param($UserId,$Property) Get-MgUser -UserId $UserId -Property $Property -ErrorAction Stop }
+    $users=@(Invoke-PraCloudCall -Context $Context -Call 'Microsoft Graph user' -Script $readUser -ArgumentList @($Upn,$props))
     if ($users.Count -ne 1 -or $null -eq $users[0]) { throw "Microsoft Graph: user not found or not unique ($Upn)." }
     $values=@{}; $sentinel=New-Object object
     foreach ($prop in $props) {
@@ -958,7 +1245,8 @@ function Get-PraGraphFact {
     if ($Mailbox) { $prov=@($values.provisionedPlans | Where-Object { (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $_ 'Service' '') 'exchange') -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $_ 'ProvisioningStatus' '') 'Success') }).Count -gt 0 }
     $required=[string](Get-PraValue (Get-PraValue $Context.Config 'Cloud' @{}) 'RequiredSkuPartNumber' '')
     if ($Mailbox -or ($License -and $required)) {
-        $details=@(Get-MgUserLicenseDetail -UserId $Upn -All -ErrorAction Stop)
+        $readDetails={ param($UserId) Get-MgUserLicenseDetail -UserId $UserId -All -ErrorAction Stop }
+        $details=@(Invoke-PraCloudCall -Context $Context -Call 'Microsoft Graph licence details' -Script $readDetails -ArgumentList @($Upn))
         foreach ($d in $details) {
             $sku += [string](Get-PraValue $d 'SkuPartNumber' '')
             foreach ($p in @((Get-PraValue $d 'ServicePlans' @()) | Where-Object { ([string](Get-PraValue $_ 'ServicePlanName' '')).StartsWith('EXCHANGE_',[StringComparison]::OrdinalIgnoreCase) })) {
@@ -1111,20 +1399,31 @@ function Invoke-PraCloudPhase {
             $needGraph=$needGraph -or $lic -or $graphMailbox; $needExo=$needExo -or $exoMailbox
             [void]$states.Add(@{ Row=$row; Upn=$upn; Shared=$shared; Mailbox=$mb; License=$lic; GraphMailbox=$graphMailbox
                 ExoMailbox=$exoMailbox; Requests=$requests; PreserveMailbox=$preserveMailbox; PreserveLicense=$preserveLicense; Done=$false; PlainText=''
-                X500=$x500Expected; X500Reads=0; X500Failure=''; X500Last=$null; CoreDone=$false })
+                X500=$x500Expected; X500Reads=0; X500Failure=''; X500Last=$null; CoreDone=$false; IdentityChecked=$false; LastFailure=$null })
         }
         if ($states.Count -eq 0) { return }
+        if (Test-PraIdentityCheck $Context) { $needGraph=$true }
         try { Connect-PraCloudSession -Context $Context -NeedGraph $needGraph -NeedExo $needExo }
         catch { $Context.CloudConnectFailed=$true; throw }
         $clock=[Diagnostics.Stopwatch]::StartNew(); $timeout=[double]$Context.TimeoutMinutes*60; $attempt=0
         $x500MaxReads=3   # first read + two re-reads at the polling interval: the cloud value can lag one synchronisation, never a long new wait
+        $stopRun=$null
         do {
             $attempt++; $pending=@($states | Where-Object { -not $_.Done })
             $null=Write-PraLog -Context $Context -Message ("Check {0}: {1} object(s) in Exchange Online" -f $attempt, $pending.Count) -Level Info
             foreach ($s in $pending) {
                 $row=$s.Row; $Context.CurrentIdentity=[string](Get-PraValue $row 'ObjectGuid' $s.Upn); $Context.CurrentOperation='CloudCheck'
                 try {
+                    $s.LastFailure=$null
                     if ($s.CoreDone) { $null=Invoke-PraX500Step -Context $Context -State $s -Fresh $null -MaxReads $x500MaxReads -Final ([bool]$Context.Once); continue }
+                    if (-not $s.IdentityChecked) {
+                        $Context.CurrentOperation='ConfirmIdentity'
+                        $outcome=Confirm-PraCloudIdentity -Context $Context -State $s
+                        $Context.CurrentOperation='CloudCheck'
+                        if (Test-PraOrdinalEqual $outcome 'Failed') { $s.Done=$true; continue }
+                        if (Test-PraOrdinalEqual $outcome 'Wait') { continue }
+                        $s.IdentityChecked=$true
+                    }
                     $details=New-Object 'System.Collections.Generic.List[string]'; $plain=New-Object 'System.Collections.Generic.List[string]'; $mbok=$true; $licok=$true; $facts=$null
                     if ($s.GraphMailbox -or $s.License) { $facts=Get-PraGraphFact -Context $Context -Upn $s.Upn -Mailbox $s.GraphMailbox -License $s.License -Addresses ([bool]($null -ne $s.X500 -and $s.GraphMailbox)) }
                     if ($s.ExoMailbox) {
@@ -1194,8 +1493,19 @@ function Invoke-PraCloudPhase {
                             $null=Invoke-PraX500Step -Context $Context -State $s -Fresh $fresh -MaxReads $x500MaxReads -Final ([bool]$Context.Once)
                         } else { $s.Done=$true }
                     } else { $row.CloudStatus='Pending' }
-                } catch { Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $_ -Upn $s.Upn -Extra ([string]$row.PermDetail); $s.Done=$true }
+                } catch {
+                    $failure=$_
+                    $info=Get-PraCloudFailureInfo $failure
+                    if ((Get-PraRetryState $Context).RunExhausted) { $stopRun=$failure; break }
+                    if ($info.Transient -and -not $Context.Once -and $clock.Elapsed.TotalSeconds -lt $timeout) {
+                        $s.LastFailure=$failure; $row.CloudStatus='Pending'
+                        $s.PlainText='Microsoft 365 could not be read just now ({0}); the read is repeated at the next check' -f $(if ($info.Status) { 'HTTP ' + $info.Status } else { 'no answer' })
+                        $null=Write-PraLog -Context $Context -Message ("{0} | cloud read failed, repeated at the next check | {1}" -f $s.Upn, ([string]$failure.Exception.Message -replace '\s+',' ')) -Level Detail
+                    }
+                    else { Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $failure -Upn $s.Upn -Extra ([string]$row.PermDetail); $s.Done=$true }
+                }
             }
+            if ($null -ne $stopRun) { break }
             $pending=@($states | Where-Object { -not $_.Done })
             if (-not $pending.Count -or $Context.Once -or $clock.Elapsed.TotalSeconds -ge $timeout) { break }
             $seconds=[Math]::Min([Math]::Max(1,([double]$Context.IntervalMinutes*60)),[Math]::Max(0,($timeout-$clock.Elapsed.TotalSeconds)))
@@ -1213,7 +1523,17 @@ function Invoke-PraCloudPhase {
             if ($seconds -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(2147483647,($seconds*1000))) }
         } while ($true)
         $preview=(-not $Context.AllowMutation -and (Test-PraOrdinalIn $Context.Action @('Convert','Recover')))
-        foreach ($s in $states) {
+        if ($null -ne $stopRun) {
+            foreach ($s in @($states | Where-Object { -not $_.Done -and $_.CoreDone })) { Complete-PraX500Check -Context $Context -State $s }
+            $unfinished=@($states | Where-Object { -not $_.Done })
+            foreach ($s in $unfinished) {
+                $s.Row.CloudStatus='Pending'; $s.Row.FinalStatus='Pending'
+                $s.Row.Detail=([string]$s.Row.Detail+' | not finished: the retry time of the run is used up').Trim(' ','|')
+            }
+            $Context.CurrentIdentity=''; $Context.CurrentOperation='CloudCheck'
+            Write-PraCloudError -Context $Context -Row $null -Message ('{0} {1} object(s) were not finished.' -f $stopRun.Exception.Message, $unfinished.Count) -Technical ([string]$stopRun.Exception.InnerException.Message)
+        }
+        else { foreach ($s in $states) {
             if ($s.Done) { continue }
             if ($s.CoreDone) { Complete-PraX500Check -Context $Context -State $s; continue }
             if ($preview) {
@@ -1222,13 +1542,14 @@ function Invoke-PraCloudPhase {
                 $null=Write-PraLog -Context $Context -Message ("{0}: not yet in the expected state: {1}" -f $s.Upn, $(if ($s.PlainText) { $s.PlainText } else { 'see the log' })) -Level Info
                 $null=Write-PraLog -Context $Context -Message ("{0}: technical detail: {1}" -f $s.Upn, $s.Row.CloudDetail) -Level Detail
             }
+            elseif ($null -ne $s.LastFailure) { Write-PraCloudFailure -Context $Context -Row $s.Row -ErrorRecord $s.LastFailure -Upn $s.Upn -Extra ([string]$s.Row.PermDetail) }
             else {
                 $because=$(if ($s.PlainText) { $s.PlainText } else { 'see the log' })
                 $message=$(if ($Context.Once) { '{0}: not in the expected state: {1}.' -f $s.Upn,$because } else { '{0}: still not in the expected state after waiting {1} min: {2}.' -f $s.Upn,$Context.TimeoutMinutes,$because })
                 $Context.CloudNotReached=[int]$Context.CloudNotReached+1
                 Write-PraCloudError -Context $Context -Row $s.Row -Message $message -Technical ('Expected state not reached (timeout or -Once): '+$s.Row.CloudDetail)
             }
-        }
+        } }
     } catch {
         $failure=$_
         foreach ($row in $Rows) { Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $failure -Upn ([string](Get-PraValue $row 'UserPrincipalName' '')) }
@@ -1255,7 +1576,7 @@ function Invoke-PraRetentionCheck {
             if (-not [guid]::TryParse($raw,[ref]$parsed) -or $parsed -eq [guid]::Empty) { throw 'Retention.PolicyGuid is not a GUID.' }
             $guid=$parsed.ToString('N')
         }
-        try { Connect-PraCloudSession -Context $Context -NeedGraph $false -NeedExo $true }
+        try { Connect-PraCloudSession -Context $Context -NeedGraph (Test-PraIdentityCheck $Context) -NeedExo $true }
         catch { $Context.CloudConnectFailed=$true; throw }
         $cloud=Get-PraValue $Context.Config 'Cloud' @{}; $name=[string](Get-PraValue $cfg 'PolicyName' '')
         if (-not $guid -and $name -and [bool](Get-PraValue $cfg 'UseComplianceSession' $false) -and -not [string](Get-PraValue $cloud 'AppId' '')) {
@@ -1270,7 +1591,8 @@ function Invoke-PraRetentionCheck {
                 $session.OwnedExoIds=@($session.OwnedExoIds)+$newIds
             }
             try {
-                $policies=@(Get-RetentionCompliancePolicy -Identity $name -ErrorAction Stop)
+                $readPolicy={ param($Identity) Get-RetentionCompliancePolicy -Identity $Identity -ErrorAction Stop }
+                $policies=@(Invoke-PraCloudCall -Context $Context -Call 'Get-RetentionCompliancePolicy' -Script $readPolicy -ArgumentList @($name))
                 if ($policies.Count -ne 1) { throw 'Retention policy not found or not unique.' }
                 $raw=[string](Get-PraValue $policies[0] 'Guid' '')
                 if (-not $raw) { $raw=[string](Get-PraValue $policies[0] 'ExchangeObjectId' '') }
@@ -1285,7 +1607,10 @@ function Invoke-PraRetentionCheck {
             $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=[string](Get-PraValue $row 'ObjectGuid' '')
             $row.CloudMailbox=$null; $row.CloudLicense=$null; $row.CloudStatus='Pending'
             try {
-                $h=Invoke-PraExo -Context $Context -Operation 'Hold' -Params @{ Upn=[string](Get-PraValue $row 'UserPrincipalName' '') }
+                $holdUpn=[string](Get-PraValue $row 'UserPrincipalName' '')
+                # An inactive mailbox has no account in Microsoft Entra ID any more: it is found by UPN only. An account that exists must be the synchronised one.
+                if ((Test-PraIdentityCheck $Context) -and (Test-PraOrdinalEqual (Confirm-PraCloudIdentity -Context $Context -State @{ Row=$row; Upn=$holdUpn; Requests=@(); PlainText='' }) 'Failed')) { continue }
+                $h=Invoke-PraExo -Context $Context -Operation 'Hold' -Params @{ Upn=$holdUpn }
                 $row.CloudMailbox=[bool](Get-PraValue $h 'Found' $false)
                 $holds=Get-PraValue $h 'Holds' @(); $holds=@($holds | Where-Object { $null -ne $_ })
                 $included=$false; $excluded=$false; $deleteOnly=$false

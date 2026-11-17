@@ -147,6 +147,9 @@
         CheckLicense          = $true        # wait for a licence with Exchange enabled (users)
         MailboxCheckVia       = 'Exo'        # Exo (mailbox type in Exchange Online) or Graph (provisioning)
         RequiredSkuPartNumber = ''           # '' = any licence with Exchange; e.g. 'SPE_E3'
+        IdentityCheck         = 'Anchor'     # Anchor = the Entra ID account must carry the AD source anchor (objectGUID or ms-DS-ConsistencyGuid); Off = accounts are found by UPN only
+        RetryBudgetObjectSeconds = 180       # most seconds one object waits in retries of throttled or unreachable cloud calls (0 = no retry)
+        RetryBudgetRunMinutes    = 30        # most minutes the whole run waits in retries; used up, the run stops cleanly (0 = no retry)
     }
 
     # Exchange Online module.

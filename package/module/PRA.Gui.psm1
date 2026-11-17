@@ -1335,6 +1335,19 @@ function Test-PraGuiBatchSyncCompleted {
     return $false
 }
 
+function Test-PraGuiBatchImported {
+    <# True when the batch came from a transfer package imported on this server: the engine leaves <Storage.BackupFolder>\Imported\<batch id>.txt, and the package may still wait in the Inbox. #>
+    param($Item)
+    try {
+        $root=[string]$script:Gui.State.Config.Storage.BackupFolder
+        if (-not $root) { return $false }
+        $id=([string]$Item.BatchId).ToLowerInvariant()
+        if (Test-Path -LiteralPath (Join-Path (Join-Path $root 'Imported') ($id+'.txt')) -PathType Leaf) { return $true }
+        $package=Get-PraTransferPackageName -Kind Convert -Environment ([string]$Item.Environment) -BatchId ([string]$Item.BatchId)
+        return (Test-Path -LiteralPath (Join-Path (Join-Path $root 'Inbox') $package) -PathType Leaf)
+    } catch { return $false }
+}
+
 function Get-PraGuiFinishReason {
     <#
     .SYNOPSIS
@@ -1343,9 +1356,12 @@ function Get-PraGuiFinishReason {
     #>
     param($Item)
     $g=$script:Gui
-    if (Test-PraGuiBatchSyncFailed $Item.Folder $Item.BatchId) { return 'AD part done, sync did not run: finish it here' }
+    # The AD part is finished on the server that ran it: a batch imported from a transfer package, or a server that cannot run the AD part, goes on with the cloud part.
+    $adHere=(-not $g.Detect) -or (Test-GuiOrdinalIn ([string]$g.Detect.Role) @('AD','Both') -IgnoreCase)
+    $finishHere=$adHere -and -not (Test-PraGuiBatchImported $Item)
+    if ($finishHere -and (Test-PraGuiBatchSyncFailed $Item.Folder $Item.BatchId)) { return 'AD part done, sync did not run: finish it here' }
     # A batch with no Entra Connect entry that ended well goes through the AD part first (the synchronisation, then the package), as the command line does: a partial batch always, any other batch when the configuration asks for the synchronisation.
-    if (-not (Test-PraGuiBatchSyncCompleted $Item.Folder $Item.BatchId)) {
+    if ($finishHere -and -not (Test-PraGuiBatchSyncCompleted $Item.Folder $Item.BatchId)) {
         $partialText=Get-PraGuiPartialText (Join-Path $Item.Folder ('State-'+$Item.BatchId+'.json'))
         $syncOn=[bool](Get-PraGuiValue (Get-PraGuiValue $g.State.Config 'EntraConnect' @{}) 'Sync' $false)
         if ($partialText) { return 'AD part partly done, sync not run: finish it here' }
@@ -1355,7 +1371,7 @@ function Get-PraGuiFinishReason {
     try { $package=Get-PraTransferPackageName -Kind Convert -Environment ([string]$Item.Environment) -BatchId ([string]$Item.BatchId) } catch { return '' }
     $outbox=Join-Path $g.State.Config.Storage.BackupFolder 'Outbox'
     $cloudHere=(-not $g.Detect) -or ([bool]$g.Detect.Cloud -and -not (Test-PraGuiNetworkDown))
-    if (-not $cloudHere -and -not (Test-Path -LiteralPath (Join-Path $outbox $package) -PathType Leaf)) { return 'AD part done, no package yet: finish it here' }
+    if ($finishHere -and -not $cloudHere -and -not (Test-Path -LiteralPath (Join-Path $outbox $package) -PathType Leaf)) { return 'AD part done, no package yet: finish it here' }
     return ''
 }
 

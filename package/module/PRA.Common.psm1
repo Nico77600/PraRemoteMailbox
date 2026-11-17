@@ -417,6 +417,53 @@ function Get-PraList {
     foreach ($item in $value) { if ($null -ne $item) { $item } }
 }
 
+function ConvertTo-PraImmutableId {
+    <# The onPremisesImmutableId that a GUID gives: the base64 text of its 16 bytes in Active Directory byte order. A GUID (object, text or 16 bytes) only; $null for anything else, the empty GUID included. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -isnot [guid] -and $Value -isnot [byte[]] -and $Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = @($Value | Where-Object { $null -ne $_ })
+        if ($items.Count -eq 1) { return (ConvertTo-PraImmutableId -Value $items[0]) }
+        if ($items.Count -eq 16 -and -not @($items | Where-Object { $_ -isnot [byte] }).Count) { return (ConvertTo-PraImmutableId -Value ([byte[]]$items)) }
+        return $null
+    }
+    $guid = [guid]::Empty
+    if ($Value -is [guid]) { $guid = $Value }
+    elseif ($Value -is [byte[]]) { if ($Value.Length -ne 16) { return $null }; $guid = [guid]::new([byte[]]$Value) }
+    elseif (-not [guid]::TryParse([string]$Value, [ref]$guid)) { return $null }
+    if ($guid -eq [guid]::Empty) { return $null }
+    return [Convert]::ToBase64String($guid.ToByteArray())
+}
+
+function Get-PraSourceAnchor {
+    <#
+    .SYNOPSIS
+        The source anchors of one Active Directory record, as the onPremisesImmutableId texts the Entra ID account may carry.
+    .DESCRIPTION
+        A record written by this version holds SourceAnchor (ObjectGuid and ConsistencyGuid, both base64); the Entra ID account is the right one when it carries either.
+        A record without it (backup, transfer package or batch of an older version) has only its ObjectGuid: the anchor is derived from it (Recorded = $false).
+        A record without a usable GUID has no anchor (Usable = $false). The texts are base64 and are compared exactly.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object]$Record)
+    $candidates = New-Object 'Collections.Generic.List[string]'
+    $stored = Get-PraValue $Record 'SourceAnchor' $null
+    $recorded = $false
+    if ($null -ne $stored) {
+        foreach ($name in @('ConsistencyGuid', 'ObjectGuid')) {
+            $text = [string](Get-PraValue $stored $name '')
+            if ($text -cmatch '^[A-Za-z0-9+/]{22}==\z' -and -not $candidates.Contains($text)) { $candidates.Add($text); $recorded = $true }
+        }
+    }
+    if (-not $recorded) {
+        $derived = ConvertTo-PraImmutableId -Value (Get-PraValue $Record 'ObjectGuid' $null)
+        if ($derived) { $candidates.Add($derived) }
+    }
+    return [pscustomobject]@{ Candidates = [string[]]$candidates.ToArray(); Recorded = $recorded; Usable = ($candidates.Count -gt 0) }
+}
+
 function Format-PraDuration {
     <#
     .SYNOPSIS
@@ -1147,6 +1194,7 @@ function Get-PraDefaultConfiguration {
         Cloud = @{
             TenantId=''; Organization=''; AppId=''; CertificateThumbprint=''; UserPrincipalName=''
             CheckMailbox=$true; CheckLicense=$true; MailboxCheckVia='Exo'; RequiredSkuPartNumber=''
+            IdentityCheck='Anchor'; RetryBudgetObjectSeconds=180; RetryBudgetRunMinutes=30
         }
         Exo = @{ MinModuleVersion='3.10.1'; UseSubprocess=$false; DisableWAM=$false; GrantVerifyAttempts=13; GrantVerifyDelaySeconds=10 }
         Polling = @{ IntervalMinutes=1; TimeoutMinutes=60 }
@@ -1273,6 +1321,12 @@ function Import-PraConfiguration {
     $badValue = $cloud.MailboxCheckVia
     $cloud.MailboxCheckVia = Resolve-PraOfficialValue $cloud.MailboxCheckVia @('Graph','Exo')
     if ($null -eq $cloud.MailboxCheckVia) { throw (Get-PraConfigurationValueError $file 'Cloud.MailboxCheckVia' 'Exo or Graph' $badValue) }
+    $badValue = $cloud.IdentityCheck
+    $cloud.IdentityCheck = Resolve-PraOfficialValue $cloud.IdentityCheck @('Anchor','Off')
+    if ($null -eq $cloud.IdentityCheck) { throw (Get-PraConfigurationValueError $file 'Cloud.IdentityCheck' 'Anchor or Off' $badValue) }
+    if ($cloud.RetryBudgetObjectSeconds -lt 0 -or $cloud.RetryBudgetObjectSeconds -gt 3600 -or $cloud.RetryBudgetRunMinutes -lt 0 -or $cloud.RetryBudgetRunMinutes -gt 720) {
+        throw 'Configuration: Cloud.RetryBudgetObjectSeconds must be 0..3600 and Cloud.RetryBudgetRunMinutes 0..720 (0 = no retry).'
+    }
     if ([bool]$cloud.AppId -ne [bool]$cloud.CertificateThumbprint) { throw 'Configuration: Cloud.AppId and Cloud.CertificateThumbprint go together (both set = certificate sign-in, both empty = interactive sign-in).' }
     if ($cloud.AppId) {
         # Certificate (app-only) sign-in cannot work without the tenant: refuse it at load, not in the middle of a run.
@@ -3114,7 +3168,7 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-PraImmutableId, Get-PraSourceAnchor, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Test-PraOwnEntryProcess, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block

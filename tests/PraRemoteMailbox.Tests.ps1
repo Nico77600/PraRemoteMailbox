@@ -190,7 +190,14 @@ function Get-ADUser {
     }
     foreach ($user in $global:PraGateAd.Users) {
         $match=$false
-        if ($Identity) { $match=([string]$Identity -in @([string]$user.ObjectGUID,$user.SamAccountName,$user.DistinguishedName)) }
+        if ($Identity) {
+            $match=([string]$Identity -in @([string]$user.ObjectGUID,$user.SamAccountName,$user.DistinguishedName))
+            # A GUID with braces or without dashes, and a down-level logon name (GATE\sam), are accepted as the directory accepts them.
+            if (-not $match) {
+                $digits=([string]$Identity).Trim().Trim('{','}').Replace('-','')
+                $match=($digits -ieq ([string]$user.ObjectGUID).Replace('-','')) -or (([string]$Identity -match '^GATE\\(?<sam>.+)$') -and $Matches.sam -ieq $user.SamAccountName)
+            }
+        }
         elseif ($LDAPFilter -like '(userPrincipalName=*') {
             $encoded=$user.UserPrincipalName.Replace('\','\5c').Replace('*','\2a').Replace('(','\28').Replace(')','\29').Replace([string][char]0,'\00')
             $match=$LDAPFilter -ieq ('(userPrincipalName='+$encoded+')')
@@ -222,7 +229,7 @@ function Get-ADGroupMember {
 }
 function Get-ADObject {
     [CmdletBinding()]
-    param([object]$Identity,[string]$Filter,[string[]]$Properties,[string]$Server)
+    param([object]$Identity,[string]$Filter,[string]$LDAPFilter,[string]$SearchBase,[string[]]$Properties,[string]$Server)
     Assert-GateServer $Server
     Write-GateEvent 'Get-ADObject' $Identity $Server @{Filter=$Filter;Properties=$Properties}
     if ($global:PraGateAd.ContainsKey('PermissionGroups')) {
@@ -356,6 +363,13 @@ function Invoke-PraCloudPhase {
             [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase='Cloud'; Source='Cloud'; Operation='Connect-MgGraph'; Identity=[string]$row.ObjectGuid; Message=$text })
             Write-PraItem -Context $Context -Status Fail -Text $text
         }
+    } elseif ($state.Case -eq 'CloudThrottled') {
+        # What the real cloud phase does when the retry time of the run is used up: ONE run error, the rows not finished, never one error per row.
+        $Context.CloudThrottled=$true; $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='CloudCheck'; $Context.CurrentIdentity=''
+        foreach ($row in $Rows) { $row.CloudStatus='Pending'; $row.FinalStatus='Pending'; $row.CloudDetail='SYNTHETIC: not finished, the retry time of the run is used up.' }
+        $text='Microsoft 365 is limiting or not answering this run: the 30 minute(s) allowed for retries are used up (40 retries, 12 throttled answers). Nothing more is asked of Microsoft 365. What this run already did is kept: run the same command again in a few minutes. '+@($Rows).Count+' object(s) were not finished.'
+        [void]$Context.Issues.Add([pscustomobject]@{ Timestamp=(Get-Date).ToString('o'); Phase='Cloud'; Source='Cloud'; Operation='CloudCheck'; Identity=''; Message=$text })
+        Write-PraItem -Context $Context -Status Fail -Text $text
     } elseif ($state.Case -eq 'CloudWaitTimeout') {
         # What the real cloud phase does when the objects are still not in the expected state after the wait: a cloud error on each row (not a run error) and their number.
         $Context.CurrentPhase='Cloud'; $Context.CurrentOperation='CloudCheck'; $Context.CloudNotReached=0
@@ -2612,7 +2626,7 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgU
         $global:PraGate.CloudContext=New-GateContext $global:PraGate.Runtime -Mode Preview -Action Recover
         $global:PraGate.CloudContext.Phase='Cloud'; $global:PraGate.CloudContext.Once=$true
         $global:PraGate.CloudContext.CheckScope='Both'; $global:PraGate.CloudContext.IntervalMinutes=0; $global:PraGate.CloudContext.TimeoutMinutes=0
-        $global:PraGate.CloudContext.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';TenantId='20000000-0000-0000-0000-000000000002'}
+        $global:PraGate.CloudContext.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';IdentityCheck='Off';TenantId='20000000-0000-0000-0000-000000000002'}
         $global:PraGate.CloudContext.Config.SharedMailbox.GrantFullAccess=$false
         $global:PraGate.CloudRow=New-PraRow $global:PraGate.CloudContext ([pscustomobject]@{ObjectGuid='00000000-0000-0000-0000-000000000001';UserPrincipalName='user1@gate.invalid';IsShared=$false})
         $global:PraGate.CloudCalls=@{Writes=0;Connected=0}
@@ -3077,7 +3091,7 @@ Export-ModuleMember -Function Get-ConnectionInformation,Get-EXORecipient,Get-EXO
         BeforeEach {
             $context=New-GateContext $global:PraGate.Runtime
             $context.Phase='Both'
-            $context.Config.Cloud=@{TenantId=$global:PraGate.Native.Tenant;UserPrincipalName='operator@gate.invalid';CheckMailbox=$true;CheckLicense=$true;MailboxCheckVia='Exo';AppId='';CertificateThumbprint=''}
+            $context.Config.Cloud=@{TenantId=$global:PraGate.Native.Tenant;UserPrincipalName='operator@gate.invalid';CheckMailbox=$true;CheckLicense=$true;MailboxCheckVia='Exo';IdentityCheck='Off';AppId='';CertificateThumbprint=''}
             $context.Config.Exo=@{MinModuleVersion='3.10.0';UseSubprocess=$false;DisableWAM=$true;GrantVerifyAttempts=13;GrantVerifyDelaySeconds=10}
             $context.Config.SharedMailbox.PermissionSource='AD';$context.Config.SharedMailbox.GrantFullAccess=$true;$context.Config.SharedMailbox.GrantSendAs=$true
             $global:PraGate.NativeContext=$context
@@ -6779,7 +6793,7 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgU
         $global:PraGate.Runtime=New-GateRuntime -Name 'x500-cloud'
         $context=New-GateContext $global:PraGate.Runtime -Mode Apply -Action Convert
         $context.Phase='Cloud'; $context.Once=$false; $context.CheckScope='Both'; $context.IntervalMinutes=0; $context.TimeoutMinutes=5
-        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';TenantId='20000000-0000-0000-0000-000000000002'}
+        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';IdentityCheck='Off';TenantId='20000000-0000-0000-0000-000000000002'}
         $context.Config.SharedMailbox.GrantFullAccess=$false
         $context.LogFile=Join-Path $global:PraGate.Runtime.Root 'logs\x500-cloud.log'
         $global:PraGate.CloudContext=$context
@@ -7865,7 +7879,7 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgU
         $global:PraGate.Runtime=New-GateRuntime -Name 'check-313'
         $context=New-GateContext $global:PraGate.Runtime -Mode Preview -Action Check
         $context.Phase='Cloud'; $context.Once=$false; $context.CheckScope='Both'; $context.IntervalMinutes=1; $context.TimeoutMinutes=3
-        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';TenantId='20000000-0000-0000-0000-000000000002'}
+        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';IdentityCheck='Off';TenantId='20000000-0000-0000-0000-000000000002'}
         $context.Config.SharedMailbox.GrantFullAccess=$false
         $context.LogFile=Join-Path $global:PraGate.Runtime.Root 'logs\check-313.log'
         $global:PraGate.CloudContext=$context
@@ -8116,7 +8130,7 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-ConnectionInfo
         $global:PraGate.Runtime=New-GateRuntime -Name 'network-313c'
         $context=New-GateContext $global:PraGate.Runtime -Mode Preview -Action Check
         $context.Phase='Cloud'; $context.Once=$true; $context.CheckScope='Both'; $context.IntervalMinutes=1; $context.TimeoutMinutes=3
-        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';TenantId='20000000-0000-0000-0000-000000000002'}
+        $context.Config.Cloud=@{CheckMailbox=$true;CheckLicense=$false;MailboxCheckVia='Exo';RequiredSkuPartNumber='';IdentityCheck='Off';TenantId='20000000-0000-0000-0000-000000000002'}
         $context.Config.SharedMailbox.GrantFullAccess=$false
         $context.LogFile=Join-Path $global:PraGate.Runtime.Root 'logs\network-313c.log'
         $global:PraGate.CloudContext=$context
@@ -9484,7 +9498,7 @@ Describe 'Release 3.2.0 - an object that was not reached is not skipped: Planned
         $runtime = New-GateRuntime -Name 'pending-cloud-320a'
         $context = New-GateContext $runtime -Mode Apply -Action Convert
         $context.Phase = 'Cloud'; $context.Once = $true; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 1
-        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; TenantId = '20000000-0000-0000-0000-000000000002' }
+        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Off'; TenantId = '20000000-0000-0000-0000-000000000002' }
         $context.LogFile = Join-Path $runtime.Root 'logs\pending-cloud.log'
         $global:PraGate.Context320 = $context
         $global:PraGate.Row320 = New-PraRow $context ([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'user1@gate.invalid'; SamAccountName = 'user1'; IsShared = $false })
@@ -9863,7 +9877,7 @@ Describe 'Release 3.2.0 - the shared mailbox permissions follow the batch: store
             $runtime = New-GateRuntime -Name ('grant-none-320a-' + $source)
             $context = New-GateContext $runtime -Mode Apply -Action Convert
             $context.Phase = 'Cloud'; $context.Once = $true; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 1; $context.GrantSettingsSource = $source
-            $context.Config.Cloud = @{ CheckMailbox = $false; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; TenantId = '20000000-0000-0000-0000-000000000002' }
+            $context.Config.Cloud = @{ CheckMailbox = $false; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Off'; TenantId = '20000000-0000-0000-0000-000000000002' }
             $context.Config.SharedMailbox = @{ Enabled = $false; PermissionSource = 'AD'; GrantFullAccess = $false; GrantSendAs = $false; GrantSendOnBehalf = $false }
             $context.LogFile = Join-Path $runtime.Root 'logs\grant-none.log'
             if ($source -eq 'Batch') { $context.BatchGrantSettings = @{ Enabled = $true; PermissionSource = 'AD'; GrantFullAccess = $false; GrantSendAs = $false; GrantSendOnBehalf = $false } }
@@ -10059,5 +10073,965 @@ Describe 'Release 3.2.0 - the exit code goes to the host only when the script is
         & $make 'a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4' $true @()
         (& $find @('11111111-1111-1111-1111-111111111111')) | Should -BeNullOrEmpty -Because 'the Recover wrote nothing'
         $global:PraGate.Remove('StoppedRecover'); $global:PraGate.Remove('StoppedObjects')
+    }
+}
+
+Describe 'Release 3.2.0 - source anchors and the new cloud settings (production Common module)' -Tag 'Release320b' {
+    BeforeAll { Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global }
+    It 'ConvertTo-PraImmutableId gives the base64 of the 16 bytes of a GUID, whatever the form (object, text in any letter case, bytes, a one-item collection) and nothing for anything else' {
+        $guid = [guid]'ab12cd34-0000-4000-8000-0000000000ef'
+        $expected = [Convert]::ToBase64String($guid.ToByteArray())
+        ConvertTo-PraImmutableId -Value $guid | Should -BeExactly $expected
+        ConvertTo-PraImmutableId -Value 'AB12CD34-0000-4000-8000-0000000000EF' | Should -BeExactly $expected
+        ConvertTo-PraImmutableId -Value 'ab12cd34-0000-4000-8000-0000000000ef' | Should -BeExactly $expected
+        ConvertTo-PraImmutableId -Value ([byte[]]$guid.ToByteArray()) | Should -BeExactly $expected
+        ConvertTo-PraImmutableId -Value @(, [byte[]]$guid.ToByteArray()) | Should -BeExactly $expected
+        ConvertTo-PraImmutableId -Value $null | Should -BeNullOrEmpty
+        ConvertTo-PraImmutableId -Value '' | Should -BeNullOrEmpty
+        ConvertTo-PraImmutableId -Value 'not a guid' | Should -BeNullOrEmpty
+        ConvertTo-PraImmutableId -Value ([guid]::Empty) | Should -BeNullOrEmpty
+        ConvertTo-PraImmutableId -Value ([byte[]](1, 2, 3)) | Should -BeNullOrEmpty
+    }
+    It 'Get-PraSourceAnchor: a record with SourceAnchor gives both anchors, an older record derives the objectGUID anchor (and says so), a record without a GUID has no anchor' {
+        $guid = 'ab12cd34-0000-4000-8000-0000000000ef'; $other = 'cd34ef56-0000-4000-8000-0000000000aa'
+        $objectAnchor = [Convert]::ToBase64String(([guid]$guid).ToByteArray()); $consistencyAnchor = [Convert]::ToBase64String(([guid]$other).ToByteArray())
+        $current = Get-PraSourceAnchor -Record ([pscustomobject]@{ ObjectGuid = $guid; SourceAnchor = [pscustomobject]@{ ObjectGuid = $objectAnchor; ConsistencyGuid = $consistencyAnchor } })
+        $current.Recorded | Should -BeTrue
+        $current.Candidates | Should -BeExactly @($consistencyAnchor, $objectAnchor)
+        $objectOnly = Get-PraSourceAnchor -Record ([pscustomobject]@{ ObjectGuid = $guid; SourceAnchor = [pscustomobject]@{ ObjectGuid = $objectAnchor; ConsistencyGuid = '' } })
+        $objectOnly.Candidates | Should -BeExactly @($objectAnchor)
+        $older = Get-PraSourceAnchor -Record ([pscustomobject]@{ ObjectGuid = $guid.ToUpperInvariant() })
+        $older.Recorded | Should -BeFalse
+        $older.Usable | Should -BeTrue
+        $older.Candidates | Should -BeExactly @($objectAnchor) -Because 'a GUID written in capitals gives the same anchor'
+        $none = Get-PraSourceAnchor -Record ([pscustomobject]@{ ObjectGuid = ''; UserPrincipalName = 'user1@gate.invalid' })
+        $none.Usable | Should -BeFalse
+        @($none.Candidates).Count | Should -Be 0
+        (Get-PraSourceAnchor -Record $null).Usable | Should -BeFalse
+        $damaged = Get-PraSourceAnchor -Record ([pscustomobject]@{ ObjectGuid = $guid; SourceAnchor = [pscustomobject]@{ ObjectGuid = 'not base64'; ConsistencyGuid = '' } })
+        $damaged.Recorded | Should -BeFalse -Because 'a stored anchor that is not base64 is never trusted: the anchor is derived from the GUID'
+        $damaged.Candidates | Should -BeExactly @($objectAnchor)
+    }
+    It 'Cloud.IdentityCheck and the two retry budgets have defaults, are checked, and the value is read in any letter case; the configuration file says the same as the defaults' {
+        $defaults = InModuleScope PRA.Common { Get-PraDefaultConfiguration }
+        $defaults.Cloud.IdentityCheck | Should -BeExactly 'Anchor'
+        $defaults.Cloud.RetryBudgetObjectSeconds | Should -Be 180
+        $defaults.Cloud.RetryBudgetRunMinutes | Should -Be 30
+        $shipped = Import-PowerShellDataFile -LiteralPath (Join-Path $global:PraGate.Source 'config\PraRemoteMailbox.config.psd1')
+        $shipped.Cloud.IdentityCheck | Should -BeExactly 'Anchor'
+        $shipped.Cloud.RetryBudgetObjectSeconds | Should -Be 180
+        $shipped.Cloud.RetryBudgetRunMinutes | Should -Be 30
+        $runtime = New-GateRuntime -Name 'config-320b'
+        Set-GateConfigText $runtime { param($t) $t.Replace("Execution=@{Phase='Both'}", "Execution=@{Phase='Both'}; Cloud=@{IdentityCheck='oFF'}") }
+        (Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck).Cloud.IdentityCheck | Should -BeExactly 'Off'
+        Set-GateConfigText $runtime { param($t) $t.Replace("IdentityCheck='oFF'", "IdentityCheck='aNCHOR'") }
+        (Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck).Cloud.IdentityCheck | Should -BeExactly 'Anchor'
+        Set-GateConfigText $runtime { param($t) $t.Replace("IdentityCheck='aNCHOR'", "IdentityCheck='upn'") }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck } | Should -Throw '*Cloud.IdentityCheck must be Anchor or Off*'
+        Set-GateConfigText $runtime { param($t) $t.Replace("IdentityCheck='upn'", 'RetryBudgetObjectSeconds=-1') }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck } | Should -Throw '*Cloud.RetryBudgetObjectSeconds must be 0..3600*'
+        Set-GateConfigText $runtime { param($t) $t.Replace('RetryBudgetObjectSeconds=-1', 'RetryBudgetRunMinutes=721') }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck } | Should -Throw '*Cloud.RetryBudgetRunMinutes 0..720*'
+        Set-GateConfigText $runtime { param($t) $t.Replace('RetryBudgetRunMinutes=721', 'RetryBudgetRunMinutes=0;RetryBudgetObjectSeconds=0') }
+        $zero = Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck
+        $zero.Cloud.RetryBudgetRunMinutes | Should -Be 0 -Because '0 means no retry'
+        Set-GateConfigText $runtime { param($t) $t.Replace('RetryBudgetRunMinutes=0;RetryBudgetObjectSeconds=0', 'RetryBudgetRunMinutes=1.5') }
+        { Import-PraConfiguration -Path $runtime.ConfigPath -Root $runtime.Package -DeferScopeCheck } | Should -Throw '*must be a whole number*'
+    }
+}
+
+Describe 'Release 3.2.0 - the source anchors are recorded at Convert and read back (production Directory module, synthetic AD)' -Tag 'Release320b' {
+    BeforeAll {
+        function global:Use-Directory320b {
+            param($Runtime)
+            $env:PRA_GATE_STATE = $Runtime.StatePath
+            $env:PSModulePath = $Runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+            Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+            Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction SilentlyContinue
+            Import-Module (Join-Path $Runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global -ErrorAction Stop
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global -ErrorAction Stop
+            New-GateContext $Runtime -Mode Preview
+        }
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\Use-Directory320b' -ErrorAction SilentlyContinue }
+    It 'the record of a Convert holds the objectGUID anchor, and the ms-DS-ConsistencyGuid anchor when the object has one; the record survives its JSON file and is accepted by the reader' {
+        $runtime = New-GateRuntime -Name 'anchor-320b' -UserCount 2
+        $consistency = [byte[]](9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10)
+        Add-Member -InputObject $runtime.State.Users[1] -NotePropertyName 'mS-DS-ConsistencyGuid' -NotePropertyValue $consistency -Force
+        [IO.File]::WriteAllText($runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($runtime.State, 35))
+        $context = Use-Directory320b $runtime
+        $plain = New-PraPlan $context 'user1' 'Convert'
+        $withConsistency = New-PraPlan $context 'user2' 'Convert'
+        $plain.Record.SourceAnchor.ObjectGuid | Should -BeExactly ([Convert]::ToBase64String(([guid]$runtime.State.Users[0].ObjectGUID).ToByteArray()))
+        $plain.Record.SourceAnchor.ConsistencyGuid | Should -BeExactly ''
+        $withConsistency.Record.SourceAnchor.ObjectGuid | Should -BeExactly ([Convert]::ToBase64String(([guid]$runtime.State.Users[1].ObjectGUID).ToByteArray()))
+        $withConsistency.Record.SourceAnchor.ConsistencyGuid | Should -BeExactly ([Convert]::ToBase64String($consistency))
+        $withConsistency.Record.SharedTrusteeAnchors.Count | Should -Be 0
+        $global:PraGate.Anchor320b = ($withConsistency.Record | ConvertTo-Json -Depth 30) | ConvertFrom-PraJson
+        $global:PraGate.Anchor320bLegacy = ($withConsistency.Record | ConvertTo-Json -Depth 30) | ConvertFrom-PraJson
+        $global:PraGate.Anchor320bLegacy.PSObject.Properties.Remove('SourceAnchor'); $global:PraGate.Anchor320bLegacy.PSObject.Properties.Remove('SharedTrusteeAnchors')
+        InModuleScope PRA.Directory {
+            { Assert-PraStoredRecord $global:PraGate.Anchor320b } | Should -Not -Throw
+            { Assert-PraStoredRecord $global:PraGate.Anchor320b -Planned } | Should -Not -Throw
+            { Assert-PraStoredRecord $global:PraGate.Anchor320bLegacy } | Should -Not -Throw -Because 'a record written by an older version has no anchor'
+        }
+        (Get-PraSourceAnchor -Record $global:PraGate.Anchor320b).Candidates.Count | Should -Be 2
+        (Get-PraSourceAnchor -Record $global:PraGate.Anchor320bLegacy).Recorded | Should -BeFalse
+        Remove-Variable Anchor320b, Anchor320bLegacy -Scope Global -ErrorAction SilentlyContinue
+        $global:PraGate.Remove('Anchor320b'); $global:PraGate.Remove('Anchor320bLegacy')
+    }
+    It 'a stored anchor that is not a base64 GUID is refused by the backup reader' {
+        $runtime = New-GateRuntime -Name 'anchor-bad-320b' -UserCount 2
+        $context = Use-Directory320b $runtime
+        $plan = New-PraPlan $context 'user1' 'Convert'
+        $global:PraGate.AnchorBad320b = ($plan.Record | ConvertTo-Json -Depth 30) | ConvertFrom-PraJson
+        $global:PraGate.AnchorBad320b.SourceAnchor.ObjectGuid = 'AAAA'
+        InModuleScope PRA.Directory { { Assert-PraStoredRecord $global:PraGate.AnchorBad320b } | Should -Throw '*invalid source anchor*' }
+        $global:PraGate.AnchorBad320b.SourceAnchor.ObjectGuid = (Get-PraSourceAnchor -Record $plan.Record).Candidates[0]
+        $global:PraGate.AnchorBad320b | Add-Member -NotePropertyName SharedTrusteeAnchors -NotePropertyValue ([pscustomobject]@{ 'a@gate.invalid' = @('AAAA') }) -Force
+        InModuleScope PRA.Directory { { Assert-PraStoredRecord $global:PraGate.AnchorBad320b } | Should -Throw '*invalid trustee source anchor*' }
+        $global:PraGate.Remove('AnchorBad320b')
+    }
+    It 'the anchors of a trustee (user, member of a group) are remembered by UPN, ms-DS-ConsistencyGuid first, and go into the record of the shared mailbox' {
+        $runtime = New-GateRuntime -Name 'anchor-trustee-320b' -UserCount 2
+        $context = Use-Directory320b $runtime
+        $trusteeGuid = [guid]'50000000-0000-0000-0000-000000000001'; $consistency = [byte[]](1..16)
+        $global:PraGate.Trustee320b = [pscustomobject]@{ objectClass = 'user'; sAMAccountName = 'trustee1'; userPrincipalName = 'Trustee1@gate.invalid'; DistinguishedName = 'CN=Trustee1,OU=Tests,DC=gate,DC=invalid'; ObjectGUID = $trusteeGuid; 'mS-DS-ConsistencyGuid' = $consistency }
+        $global:PraGate.TrusteeContext320b = $context
+        $upns = InModuleScope PRA.Directory { @(Expand-PraTrustee -Context $global:PraGate.TrusteeContext320b -Object $global:PraGate.Trustee320b) }
+        $upns | Should -BeExactly @('Trustee1@gate.invalid')
+        $stored = $context['_PraTrusteeAnchors']['trustee1@GATE.invalid']
+        $stored | Should -BeExactly @(([Convert]::ToBase64String($consistency)), ([Convert]::ToBase64String($trusteeGuid.ToByteArray()))) -Because 'the lookup ignores the case of the UPN, the first anchor is the ms-DS-ConsistencyGuid'
+        $global:PraGate.Remove('Trustee320b'); $global:PraGate.Remove('TrusteeContext320b')
+    }
+    It 'ms-DS-ConsistencyGuid is asked for by name only when the schema has it, and that is read once; an unreadable schema is "no", never an error' {
+        $runtime = New-GateRuntime -Name 'anchor-schema-320b' -UserCount 2
+        $context = Use-Directory320b $runtime
+        $global:PraGate.SchemaContext320b = $context; $global:PraGate.SchemaReads320b = 0
+        $first = InModuleScope PRA.Directory {
+            Mock Get-ADRootDSE { $global:PraGate.SchemaReads320b++; [pscustomobject]@{ schemaNamingContext = 'CN=Schema,CN=Configuration,DC=gate,DC=invalid' } }
+            Mock Get-ADObject { @([pscustomobject]@{ DistinguishedName = 'CN=ms-DS-ConsistencyGuid,CN=Schema,CN=Configuration,DC=gate,DC=invalid' }) }
+            @((Test-PraConsistencyGuidSchema -Context $global:PraGate.SchemaContext320b), (Test-PraConsistencyGuidSchema -Context $global:PraGate.SchemaContext320b))
+        }
+        $first | Should -BeExactly @($true, $true)
+        $global:PraGate.SchemaReads320b | Should -Be 1
+        $second = New-GateContext $runtime -Mode Preview
+        $global:PraGate.SchemaContext320b = $second
+        $none = InModuleScope PRA.Directory {
+            Mock Get-ADRootDSE { [pscustomobject]@{ schemaNamingContext = 'CN=Schema,CN=Configuration,DC=gate,DC=invalid' } }
+            Mock Get-ADObject { throw 'SYNTHETIC: the schema is not readable.' }
+            Test-PraConsistencyGuidSchema -Context $global:PraGate.SchemaContext320b
+        }
+        $none | Should -BeFalse
+        $global:PraGate.Remove('SchemaContext320b'); $global:PraGate.Remove('SchemaReads320b')
+    }
+}
+
+Describe 'Release 3.2.0 - the cloud account is the one synchronised from Active Directory, never found by UPN alone (production Cloud module, mocked Microsoft Graph and Exchange Online, no network)' -Tag 'Release320b' {
+    BeforeAll {
+        $global:PraGate.R7NetworkPath = Join-Path $global:PraGate.Root 'PraGateR7Network.psm1'
+        $networkSource = @'
+if ($env:PRA_GATE_NONET -cne 'SYNTHETIC-NO-NETWORK') { throw 'Synthetic interlock absent.' }
+function Get-EXOMailbox { [CmdletBinding()]param($Filter,$Properties,$ResultSize,[switch]$InactiveMailboxOnly) throw 'SYNTHETIC BLOCK: EXO mailbox' }
+function Get-EXORecipient { [CmdletBinding()]param($UserPrincipalName,$Filter,$Properties,$ResultSize) throw 'SYNTHETIC BLOCK: EXO recipient' }
+function Get-MgUser { [CmdletBinding()]param($UserId,$Filter,$Property) throw 'SYNTHETIC BLOCK: Graph user' }
+function Get-MgUserLicenseDetail { [CmdletBinding()]param($UserId,[switch]$All) throw 'SYNTHETIC BLOCK: Graph licence' }
+function Get-MgContext { [CmdletBinding()]param() [pscustomobject]@{TenantId='20000000-0000-0000-0000-000000000002';ContextScope='Process'} }
+function Get-ConnectionInformation { [CmdletBinding()]param() [pscustomobject]@{TenantID='20000000-0000-0000-0000-000000000002';State='Connected';TokenStatus='Active';ConnectionId='30000000-0000-0000-0000-000000000003';ModuleName=$global:PraGate.R7NetworkPath} }
+Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgUserLicenseDetail,Get-MgContext,Get-ConnectionInformation
+'@
+        [IO.File]::WriteAllText($global:PraGate.R7NetworkPath, $networkSource, (New-Object Text.UTF8Encoding($true)))
+        Get-Module PRA.Cloud -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module $global:PraGate.R7NetworkPath -Global -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+        function global:New-R7Anchor { param([string]$Guid) [Convert]::ToBase64String(([guid]$Guid).ToByteArray()) }
+        function global:New-R7Row {
+            param([string]$Upn = 'user1@gate.invalid', [string]$Guid = 'ab12cd34-0000-4000-8000-0000000000ef', [string]$Consistency = '', [switch]$Legacy, [switch]$NoGuid)
+            $record = [ordered]@{ ObjectGuid = $(if ($NoGuid) { '' } else { $Guid }); UserPrincipalName = $Upn; SamAccountName = $Upn.Split('@')[0]; IsShared = $false }
+            if (-not $Legacy -and -not $NoGuid) { $record.SourceAnchor = [ordered]@{ ObjectGuid = (New-R7Anchor $Guid); ConsistencyGuid = $Consistency } }
+            New-PraRow $global:PraGate.CloudContext ([pscustomobject]$record)
+        }
+        function global:New-R7Account { param([string]$Id, [string]$Upn, [string]$Immutable) [pscustomobject]@{ Id = $Id; UserPrincipalName = $Upn; OnPremisesImmutableId = $Immutable; OnPremisesSyncEnabled = [bool]$Immutable } }
+    }
+    BeforeEach {
+        $global:PraGate.Runtime = New-GateRuntime -Name 'identity-320b'
+        $context = New-GateContext $global:PraGate.Runtime -Mode Apply -Action Convert
+        $context.Phase = 'Cloud'; $context.Once = $false; $context.CheckScope = 'Both'; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 5
+        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Anchor'; TenantId = '20000000-0000-0000-0000-000000000002' }
+        $context.Config.SharedMailbox.GrantFullAccess = $false
+        $context.LogFile = Join-Path $global:PraGate.Runtime.Root 'logs\identity-320b.log'
+        $global:PraGate.CloudContext = $context
+        $global:PraGate.R7Binding = @{ TenantId = '20000000-0000-0000-0000-000000000002'; ConnectionId = '30000000-0000-0000-0000-000000000003'; ModuleLocation = $global:PraGate.R7NetworkPath; ModulePath = $global:PraGate.R7NetworkPath }
+        $global:PraGate.R7Accounts = @(); $global:PraGate.R7GraphCalls = New-Object 'Collections.Generic.List[string]'; $global:PraGate.R7ExoCalls = 0; $global:PraGate.R7Mailbox = $null
+    }
+    AfterAll {
+        Remove-Item -LiteralPath 'Function:\New-R7Anchor', 'Function:\New-R7Row', 'Function:\New-R7Account' -ErrorAction SilentlyContinue
+        Remove-Module PRA.Cloud, PraGateR7Network -Force -ErrorAction SilentlyContinue
+    }
+    It 'identity case "<Name>": <Expect>' -ForEach @(
+        @{ Name = 'the account carries the objectGUID anchor'; Expect = 'Success'; Upn = 'user1@gate.invalid'; Guid = 'ab12cd34-0000-4000-8000-0000000000ef'; Consistency = ''; Imm = [Convert]::ToBase64String(([guid]'ab12cd34-0000-4000-8000-0000000000ef').ToByteArray()); Legacy = $false; Message = '' }
+        @{ Name = 'the account carries the ms-DS-ConsistencyGuid anchor, not the objectGUID one'; Expect = 'Success'; Upn = 'user1@gate.invalid'; Guid = 'ab12cd34-0000-4000-8000-0000000000ef'; Consistency = [Convert]::ToBase64String(([guid]'cd34ef56-0000-4000-8000-0000000000aa').ToByteArray()); Imm = [Convert]::ToBase64String(([guid]'cd34ef56-0000-4000-8000-0000000000aa').ToByteArray()); Legacy = $false; Message = '' }
+        @{ Name = 'the UPN is typed in other letter case than in Microsoft Entra ID'; Expect = 'Success'; Upn = 'USER1@GATE.INVALID'; Guid = 'ab12cd34-0000-4000-8000-0000000000ef'; Consistency = ''; Imm = [Convert]::ToBase64String(([guid]'ab12cd34-0000-4000-8000-0000000000ef').ToByteArray()); Legacy = $false; Message = '' }
+        @{ Name = 'a record of an older version (no anchor stored) whose objectGUID matches'; Expect = 'Success'; Upn = 'user1@gate.invalid'; Guid = 'ab12cd34-0000-4000-8000-0000000000ef'; Consistency = ''; Imm = [Convert]::ToBase64String(([guid]'ab12cd34-0000-4000-8000-0000000000ef').ToByteArray()); Legacy = $true; Message = '' }
+        @{ Name = 'the UPN is held by a cloud-only account'; Expect = 'Error'; Upn = 'user1@gate.invalid'; Guid = 'ab12cd34-0000-4000-8000-0000000000ef'; Consistency = ''; Imm = ''; Legacy = $false; Message = 'user1@gate\.invalid: the Microsoft Entra ID account with this UPN is not the account synchronised from this Active Directory object \(it is a cloud-only account\)\. Nothing was changed on it\. Give one of the two accounts another UPN' }
+        @{ Name = 'the UPN is held by an account synchronised from another object'; Expect = 'Error'; Upn = 'user1@gate.invalid'; Guid = 'ab12cd34-0000-4000-8000-0000000000ef'; Consistency = ''; Imm = [Convert]::ToBase64String(([guid]'11111111-0000-4000-8000-000000000001').ToByteArray()); Legacy = $false; Message = '\(it is synchronised from another Active Directory object\)' }
+        @{ Name = 'the anchor of the account differs only by letter case (it is a machine id, compared exactly)'; Expect = 'Error'; Upn = 'user1@gate.invalid'; Guid = 'ab12cd34-0000-4000-8000-0000000000ef'; Consistency = ''; Imm = ([Convert]::ToBase64String(([guid]'ab12cd34-0000-4000-8000-0000000000ef').ToByteArray())).ToLowerInvariant(); Legacy = $false; Message = 'synchronised from another Active Directory object' }
+        @{ Name = 'a record of an older version whose objectGUID does not match: the message says how to go on'; Expect = 'Error'; Upn = 'user1@gate.invalid'; Guid = 'ab12cd34-0000-4000-8000-0000000000ef'; Consistency = ''; Imm = [Convert]::ToBase64String(([guid]'11111111-0000-4000-8000-000000000001').ToByteArray()); Legacy = $true; Message = 'The record was written by an older version and holds only the objectGUID: .*set Cloud\.IdentityCheck = Off' }
+    ) {
+        $anchor = [Convert]::ToBase64String(([guid]$Guid).ToByteArray())
+        if ($Name -match 'letter case \(it is a machine id') { $Imm | Should -Not -BeExactly $anchor }
+        $global:PraGate.R7Accounts = @(New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000001' -Upn 'user1@gate.invalid' -Immutable $Imm)
+        $global:PraGate.R7Mailbox = [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid'); ExternalDirectoryObjectId = 'aaaaaaaa-0000-0000-0000-000000000001' }
+        $global:PraGate.CloudRow = New-R7Row -Upn $Upn -Guid $Guid -Consistency $Consistency -Legacy:$Legacy
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+            Mock Assert-PraGraphSession { }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-MgUser {
+                param($UserId, $Filter, $Property)
+                $global:PraGate.R7GraphCalls.Add($(if ($UserId) { 'upn:' + $UserId } else { 'anchor:' + $Filter }))
+                if ($UserId) {
+                    $found = @($global:PraGate.R7Accounts | Where-Object { $_.UserPrincipalName -ieq $UserId })
+                    if (-not $found.Count) { throw [System.Net.Http.HttpRequestException]::new('Request_ResourceNotFound: Resource does not exist.', $null, [System.Net.HttpStatusCode]::NotFound) }
+                    $found
+                }
+                elseif ($Filter -match "^onPremisesImmutableId eq '(.+)'$") { $wanted = $Matches[1]; @($global:PraGate.R7Accounts | Where-Object { $_.OnPremisesImmutableId -ceq $wanted }) }
+            }
+            Mock Get-EXOMailbox { $global:PraGate.R7ExoCalls++; $global:PraGate.R7Mailbox }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $row = $global:PraGate.CloudRow; $context = $global:PraGate.CloudContext
+        if ($Expect -eq 'Success') {
+            $context.Issues.Count | Should -Be 0
+            $row.CloudStatus | Should -BeExactly 'Success'
+            $global:PraGate.R7ExoCalls | Should -BeGreaterThan 0
+            $global:PraGate.R7GraphCalls.Count | Should -Be 1 -Because 'one read by UPN is enough when the account carries the anchor'
+        }
+        else {
+            $context.Issues.Count | Should -Be 1
+            [string]$context.Issues[0].Message | Should -Match $Message
+            $row.CloudStatus | Should -BeExactly 'Error'
+            $row.RunError | Should -BeTrue -Because 'the object could not be confirmed: it is not "not in the expected state"'
+            $global:PraGate.R7ExoCalls | Should -Be 0 -Because 'the object is never acted on: Exchange Online is not even read'
+        }
+    }
+    It 'the synchronised account has another UPN in Microsoft Entra ID: an error with both UPNs, and nothing read in Exchange Online' {
+        $anchor = New-R7Anchor 'ab12cd34-0000-4000-8000-0000000000ef'
+        $global:PraGate.R7Accounts = @(New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000001' -Upn 'renamed1@gate.invalid' -Immutable $anchor)
+        $global:PraGate.CloudRow = New-R7Row
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+            Mock Assert-PraGraphSession { }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-MgUser {
+                param($UserId, $Filter, $Property)
+                if ($UserId) { throw [System.Net.Http.HttpRequestException]::new('Request_ResourceNotFound: Resource does not exist.', $null, [System.Net.HttpStatusCode]::NotFound) }
+                $wanted = ([regex]::Match($Filter, "'(.+)'")).Groups[1].Value; @($global:PraGate.R7Accounts | Where-Object { $_.OnPremisesImmutableId -ceq $wanted })
+            }
+            Mock Get-EXOMailbox { $global:PraGate.R7ExoCalls++ }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        $context.Issues.Count | Should -Be 1
+        [string]$context.Issues[0].Message | Should -Match 'user1@gate\.invalid: the account synchronised from this Active Directory object is renamed1@gate\.invalid in Microsoft Entra ID, not user1@gate\.invalid\. Nothing was changed on it\. Make the UPN in Active Directory and in Microsoft Entra ID the same'
+        $global:PraGate.R7ExoCalls | Should -Be 0
+    }
+    It 'an ambiguous answer is an error: two accounts for the UPN, or two accounts that carry the anchor' {
+        $anchor = New-R7Anchor 'ab12cd34-0000-4000-8000-0000000000ef'
+        $global:PraGate.R7Accounts = @((New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000001' -Upn 'user1@gate.invalid' -Immutable $anchor), (New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000002' -Upn 'user1@gate.invalid' -Immutable ''))
+        $global:PraGate.CloudRow = New-R7Row
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+            Mock Assert-PraGraphSession { }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-MgUser { param($UserId, $Filter, $Property) @($global:PraGate.R7Accounts) }
+            Mock Get-EXOMailbox { $global:PraGate.R7ExoCalls++ }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        [string]$context.Issues[0].Message | Should -Match 'user1@gate\.invalid: Microsoft Entra ID returned 2 accounts for this UPN, so the right one cannot be chosen\. Nothing was changed on it\. Remove the duplicate account'
+        $global:PraGate.R7ExoCalls | Should -Be 0
+        $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Error'
+        $global:PraGate.R7Accounts = @((New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000001' -Upn 'old1@gate.invalid' -Immutable $anchor), (New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000002' -Upn 'old2@gate.invalid' -Immutable $anchor))
+        $global:PraGate.CloudContext.Issues.Clear()
+        $global:PraGate.CloudRow = New-R7Row
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+            Mock Assert-PraGraphSession { }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-MgUser {
+                param($UserId, $Filter, $Property)
+                if ($UserId) { throw [System.Net.Http.HttpRequestException]::new('Request_ResourceNotFound: Resource does not exist.', $null, [System.Net.HttpStatusCode]::NotFound) }
+                @($global:PraGate.R7Accounts)
+            }
+            Mock Get-EXOMailbox { $global:PraGate.R7ExoCalls++ }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        [string]$global:PraGate.CloudContext.Issues[0].Message | Should -Match 'user1@gate\.invalid: Microsoft Entra ID has 2 accounts that carry the source anchor of this Active Directory object, so the right one cannot be chosen'
+        $global:PraGate.R7ExoCalls | Should -Be 0
+    }
+    It 'an account that is not in Microsoft Entra ID yet is waited for (the sync has not run), never confirmed and never an identity error' {
+        $global:PraGate.CloudContext.Once = $true
+        $global:PraGate.CloudRow = New-R7Row
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+            Mock Assert-PraGraphSession { }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-MgUser { param($UserId, $Filter, $Property) if ($UserId) { throw [System.Net.Http.HttpRequestException]::new('Request_ResourceNotFound: Resource does not exist.', $null, [System.Net.HttpStatusCode]::NotFound) } }
+            Mock Get-EXOMailbox { $global:PraGate.R7ExoCalls++ }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        [string]$context.Issues[0].Message | Should -Match 'user1@gate\.invalid: not in the expected state: the account is not in Microsoft Entra ID yet \(the Entra Connect sync has not run\)\.'
+        Get-PraValue $global:PraGate.CloudRow 'RunError' $null | Should -BeNullOrEmpty -Because 'it is "not in the expected state", not an object that could not be read'
+        $global:PraGate.R7ExoCalls | Should -Be 0
+    }
+    It 'the Exchange Online object found by UPN must be the confirmed account: another ExternalDirectoryObjectId stops the object (mailbox read)' {
+        $anchor = New-R7Anchor 'ab12cd34-0000-4000-8000-0000000000ef'
+        $global:PraGate.R7Accounts = @(New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000001' -Upn 'user1@gate.invalid' -Immutable $anchor)
+        $global:PraGate.R7Mailbox = [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid'); ExternalDirectoryObjectId = 'bbbbbbbb-0000-0000-0000-000000000009' }
+        $global:PraGate.CloudRow = New-R7Row
+        $global:PraGate.CloudContext.Once = $true
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+            Mock Assert-PraGraphSession { }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-MgUser { param($UserId, $Filter, $Property) @($global:PraGate.R7Accounts | Where-Object { $_.UserPrincipalName -ieq $UserId }) }
+            Mock Get-EXOMailbox { param($Filter, $Properties, $ResultSize) $global:PraGate.R7ExoCalls++; $global:PraGate.R7Props = @($Properties); $global:PraGate.R7Mailbox }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $global:PraGate.R7Props | Should -Contain 'ExternalDirectoryObjectId' -Because 'the property is asked for'
+        $context = $global:PraGate.CloudContext
+        $context.Issues.Count | Should -Be 1
+        [string]$context.Issues[0].Message | Should -Match 'The Exchange Online mailbox is not the Microsoft Entra ID account confirmed for this object: user1@gate\.invalid'
+        $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Error'
+    }
+    It 'Cloud.IdentityCheck = Off finds accounts by UPN only, reads nothing in Microsoft Entra ID for the identity, and says so ONCE for the run' {
+        $global:PraGate.CloudContext.Config.Cloud.IdentityCheck = 'oFf'
+        $global:PraGate.R7Mailbox = [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:x@gate.invalid'); ExternalDirectoryObjectId = 'aaaaaaaa-0000-0000-0000-000000000001' }
+        $global:PraGate.CloudRows = @((New-R7Row -Upn 'user1@gate.invalid'), (New-R7Row -Upn 'user2@gate.invalid' -Guid 'cd34ef56-0000-4000-8000-0000000000aa'))
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context, $NeedGraph) $global:PraGate.R7NeedGraph = $NeedGraph; $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-MgUser { $global:PraGate.R7GraphCalls.Add('called') }
+            Mock Get-EXOMailbox { $global:PraGate.R7ExoCalls++; $global:PraGate.R7Mailbox }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext $global:PraGate.CloudRows 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        $global:PraGate.R7GraphCalls.Count | Should -Be 0
+        $global:PraGate.R7NeedGraph | Should -BeFalse -Because 'nothing else needs Microsoft Graph in this configuration'
+        $context.Issues.Count | Should -Be 0
+        @($global:PraGate.CloudRows | Where-Object { $_.CloudStatus -ceq 'Success' }).Count | Should -Be 2
+        $context.Warnings | Should -Be 0 -Because 'an explicit setting is a notice, not a warning'
+        @(Get-PraList $context 'Journey' | Where-Object { $_.Text -match 'Cloud\.IdentityCheck = Off: the Microsoft Entra ID accounts are found by UPN only' }).Count | Should -Be 1
+    }
+    It 'a record without any Active Directory identity (a Check given a UPN) is found by UPN with ONE warning that says how to have it confirmed; a write is refused for it' {
+        $context = New-GateContext $global:PraGate.Runtime -Mode Preview -Action Check
+        $context.Phase = 'Cloud'; $context.Once = $true; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 1
+        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Anchor'; TenantId = '20000000-0000-0000-0000-000000000002' }
+        $context.LogFile = Join-Path $global:PraGate.Runtime.Root 'logs\identity-noanchor-320b.log'
+        $global:PraGate.CloudContext = $context
+        $global:PraGate.R7Accounts = @(New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000001' -Upn 'user1@gate.invalid' -Immutable 'anything')
+        $global:PraGate.R7Mailbox = [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid'); ExternalDirectoryObjectId = 'aaaaaaaa-0000-0000-0000-000000000001' }
+        $global:PraGate.CloudRow = New-R7Row -NoGuid
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+            Mock Assert-PraGraphSession { }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-MgUser { param($UserId, $Filter, $Property) @($global:PraGate.R7Accounts | Where-Object { $_.UserPrincipalName -ieq $UserId }) }
+            Mock Get-EXOMailbox { $global:PraGate.R7ExoCalls++; $global:PraGate.R7Mailbox }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CloudRow) 'Convert'
+        }
+        $row = $global:PraGate.CloudRow
+        $context.Issues.Count | Should -Be 0
+        $row.CloudStatus | Should -BeExactly 'Success'
+        $context.Warnings | Should -Be 1
+        $row.Warnings | Should -Match 'user1@gate\.invalid: the Microsoft Entra ID account is found by its UPN only: this object has no Active Directory identity in the record \(the identity was given as a UPN\)\. Give its sAMAccountName or -Batch to have it confirmed\.'
+        $apply = New-GateContext $global:PraGate.Runtime -Mode Apply -Action Convert
+        $apply.Config.Cloud = $context.Config.Cloud; $apply.LogFile = $context.LogFile; $global:PraGate.ApplyContext = $apply; $global:PraGate.ApplyRow = New-PraRow $apply ([pscustomobject]@{ ObjectGuid = ''; UserPrincipalName = 'shared1@gate.invalid'; SamAccountName = 'shared1'; IsShared = $true })
+        $outcome = InModuleScope PRA.Cloud {
+            Mock Get-MgUser { param($UserId, $Filter, $Property) @([pscustomobject]@{ Id = 'aaaaaaaa-0000-0000-0000-000000000003'; UserPrincipalName = $UserId; OnPremisesImmutableId = 'x' }) }
+            Mock Assert-PraGraphSession { }
+            $state = @{ Row = $global:PraGate.ApplyRow; Upn = 'shared1@gate.invalid'; Requests = @([pscustomobject]@{ Right = 'FullAccess'; Trustee = 'trustee1@gate.invalid' }); PlainText = '' }
+            Confirm-PraCloudIdentity -Context $global:PraGate.ApplyContext -State $state
+        }
+        $outcome | Should -BeExactly 'Failed'
+        [string]$apply.Issues[0].Message | Should -Match 'the Active Directory identity of this object is not in the record, so the Microsoft Entra ID account cannot be confirmed and no permission is granted'
+    }
+    It 'trustees: a cloud-only account, an account that carries another anchor and an ambiguous answer stop the object before any grant; a recorded anchor (ms-DS-ConsistencyGuid first) or a synchronised account of an older record passes' {
+        $trusteeGuid = 'ab12cd34-0000-4000-8000-000000000bbb'
+        $trusteeAnchor = New-R7Anchor $trusteeGuid; $trusteeConsistency = [Convert]::ToBase64String([byte[]](1..16))
+        $global:PraGate.R7Accounts = @(
+            (New-R7Account -Id 'cccccccc-0000-0000-0000-000000000001' -Upn 'cloudonly@gate.invalid' -Immutable ''),
+            (New-R7Account -Id 'cccccccc-0000-0000-0000-000000000002' -Upn 'other@gate.invalid' -Immutable (New-R7Anchor '11111111-0000-4000-8000-000000000001')),
+            (New-R7Account -Id 'cccccccc-0000-0000-0000-000000000003' -Upn 'good@gate.invalid' -Immutable $trusteeConsistency),
+            (New-R7Account -Id 'cccccccc-0000-0000-0000-000000000004' -Upn 'older@gate.invalid' -Immutable 'any-synchronised-anchor'),
+            (New-R7Account -Id 'dddddddd-0000-0000-0000-000000000001' -Upn 'shared1@gate.invalid' -Immutable $trusteeAnchor))
+        $record = [pscustomobject]@{ ObjectGuid = $trusteeGuid; UserPrincipalName = 'shared1@gate.invalid'; IsShared = $true
+            SourceAnchor = [pscustomobject]@{ ObjectGuid = $trusteeAnchor; ConsistencyGuid = '' }
+            SharedTrusteeAnchors = [pscustomobject]@{ 'good@gate.invalid' = @($trusteeConsistency, (New-R7Anchor '22222222-0000-4000-8000-000000000002')); 'cloudonly@gate.invalid' = @($trusteeAnchor); 'other@gate.invalid' = @($trusteeAnchor) } }
+        $global:PraGate.R7Record = $record; $global:PraGate.R7Cases = @(
+            @{ Trustee = 'cloudonly@gate.invalid'; Outcome = 'Failed'; Message = 'Permissions on shared1@gate\.invalid are not granted\. cloudonly@gate\.invalid: the Microsoft Entra ID account with this UPN is not the account synchronised from this Active Directory object \(it is a cloud-only account\)' }
+            @{ Trustee = 'other@gate.invalid'; Outcome = 'Failed'; Message = 'other@gate\.invalid: .*\(it is synchronised from another Active Directory object\)' }
+            @{ Trustee = 'GOOD@gate.invalid'; Outcome = 'Ok'; Message = '' }
+            @{ Trustee = 'older@gate.invalid'; Outcome = 'Ok'; Message = '' }
+            @{ Trustee = 'unknown@gate.invalid'; Outcome = 'Ok'; Message = '' })
+        InModuleScope PRA.Cloud {
+            Mock Get-MgUser {
+                param($UserId, $Filter, $Property)
+                if ($UserId) {
+                    $found = @($global:PraGate.R7Accounts | Where-Object { $_.UserPrincipalName -ieq $UserId })
+                    if (-not $found.Count) { throw [System.Net.Http.HttpRequestException]::new('Request_ResourceNotFound', $null, [System.Net.HttpStatusCode]::NotFound) }
+                    $found
+                }
+                else { @() }
+            }
+            Mock Assert-PraGraphSession { }
+            Mock Start-Sleep { }
+            foreach ($case in $global:PraGate.R7Cases) {
+                $context = New-GateContext $global:PraGate.Runtime -Mode Apply -Action Convert
+                $context.Config.Cloud = @{ IdentityCheck = 'Anchor' }
+                $context['_PraCloudSession'] = @{ Graph = $true }
+                $row = [pscustomobject]@{ ObjectGuid = ''; UserPrincipalName = 'shared1@gate.invalid'; CloudStatus = 'Pending'; FinalStatus = 'Pending'; CloudDetail = ''; Detail = ''; BackupRec = $global:PraGate.R7Record }
+                $state = @{ Row = $row; Upn = 'shared1@gate.invalid'; Requests = @([pscustomobject]@{ Right = 'FullAccess'; Trustee = $case.Trustee }); PlainText = '' }
+                $outcome = Confirm-PraCloudIdentity -Context $context -State $state
+                $outcome | Should -BeExactly $case.Outcome -Because $case.Trustee
+                if ($case.Outcome -ceq 'Failed') { [string]$context.Issues[0].Message | Should -Match $case.Message; $row.CloudStatus | Should -BeExactly 'Error' }
+                else { $context.Issues.Count | Should -Be 0 -Because $case.Trustee }
+            }
+        }
+    }
+    It 'the retention check confirms the account of an active mailbox before it reads the holds, and an inactive mailbox (no account) is read by UPN' {
+        $anchor = New-R7Anchor 'ab12cd34-0000-4000-8000-0000000000ef'
+        $context = New-GateContext $global:PraGate.Runtime -Mode Preview -Action Check
+        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Anchor'; TenantId = '20000000-0000-0000-0000-000000000002' }
+        $context.Config.Retention = @{ Enabled = $true; PolicyGuid = '40000000-0000-0000-0000-000000000004'; PolicyName = ''; UseComplianceSession = $false }
+        $context.LogFile = Join-Path $global:PraGate.Runtime.Root 'logs\identity-retention-320b.log'
+        $global:PraGate.CloudContext = $context
+        $global:PraGate.R7Mailbox = [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid'); InPlaceHolds = @('mbx40000000000000000000000000000004'); IsInactiveMailbox = $false }
+        foreach ($case in @(@{ Imm = ''; Expect = 'Error' }, @{ Imm = $anchor; Expect = 'Success' }, @{ Imm = 'none'; Expect = 'Success' })) {
+            $global:PraGate.R7ExoCalls = 0
+            $global:PraGate.R7Accounts = @(if ($case.Imm -cne 'none') { New-R7Account -Id 'aaaaaaaa-0000-0000-0000-000000000001' -Upn 'user1@gate.invalid' -Immutable $case.Imm })
+            $global:PraGate.CloudContext.Issues.Clear()
+            $global:PraGate.CloudRow = New-R7Row
+            InModuleScope PRA.Cloud {
+                Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $true; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R7Binding } }
+                Mock Assert-PraGraphSession { }
+                Mock Close-PraCloudSession { }
+                Mock Start-Sleep { }
+                Mock Get-MgUser {
+                    param($UserId, $Filter, $Property)
+                    if (-not $UserId) { return @() }
+                    $found = @($global:PraGate.R7Accounts | Where-Object { $_.UserPrincipalName -ieq $UserId })
+                    if (-not $found.Count) { throw [System.Net.Http.HttpRequestException]::new('Request_ResourceNotFound', $null, [System.Net.HttpStatusCode]::NotFound) }
+                    $found
+                }
+                Mock Get-EXOMailbox { $global:PraGate.R7ExoCalls++; $global:PraGate.R7Mailbox }
+                Invoke-PraRetentionCheck $global:PraGate.CloudContext @($global:PraGate.CloudRow)
+            }
+            if ($case.Expect -ceq 'Error') { $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Error'; $global:PraGate.R7ExoCalls | Should -Be 0 -Because 'the holds of another account are never read' }
+            else { $global:PraGate.CloudRow.CloudStatus | Should -BeExactly 'Success' -Because ($case.Imm + ' ' + (@($global:PraGate.CloudContext.Issues | ForEach-Object Message) -join ';')); $global:PraGate.R7ExoCalls | Should -BeGreaterThan 0 }
+        }
+    }
+    It 'Exchange Online is told which account was confirmed: the recipient read (Preflight, Permission, Grant) and the SendOnBehalf mailbox read refuse another ExternalDirectoryObjectId (worker, mocked cmdlets)' {
+        $global:PraGate.R7Worker = @{ Binding = $global:PraGate.R7Binding }
+        $result = InModuleScope PRA.Cloud {
+            Mock Get-EXORecipient { [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; PrimarySmtpAddress = 'user1@gate.invalid'; ExternalDirectoryObjectId = 'bbbbbbbb-0000-0000-0000-000000000009'; Guid = [guid]::NewGuid(); DistinguishedName = 'CN=user1' } }
+            $verified = @{ 'user1@gate.invalid' = 'aaaaaaaa-0000-0000-0000-000000000001' }
+            $answers = @{}
+            foreach ($operation in 'Recipient', 'Preflight') {
+                try { $null = & $script:PraExoWorker $operation @{ Upn = 'USER1@gate.invalid'; VerifiedObjectIds = $verified; Requests = @() } $null $global:PraGate.R7Worker.Binding $null $null; $answers[$operation] = 'accepted' }
+                catch { $answers[$operation] = $_.Exception.Message }
+            }
+            $verified = @{ 'user1@gate.invalid' = 'BBBBBBBB-0000-0000-0000-000000000009' }
+            try { $null = & $script:PraExoWorker 'Recipient' @{ Upn = 'user1@gate.invalid'; VerifiedObjectIds = $verified } $null $global:PraGate.R7Worker.Binding $null $null; $answers.Same = 'accepted' } catch { $answers.Same = $_.Exception.Message }
+            $answers
+        }
+        $result.Recipient | Should -Match 'The Exchange Online recipient is not the Microsoft Entra ID account confirmed for this object: USER1@gate\.invalid'
+        $result.Preflight | Should -Match 'The Exchange Online recipient is not the Microsoft Entra ID account confirmed for this object'
+        $result.Same | Should -BeExactly 'accepted' -Because 'the object ids are GUIDs: their letter case never matters'
+    }
+}
+
+Describe 'Release 3.2.0 - transient cloud failures are retried within a budget, and throttling backs off the whole run (production Cloud module, no network)' -Tag 'Release320b' {
+    BeforeAll {
+        Get-Module PRA.Cloud -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+        function global:New-R8Failure {
+            param([int]$Status = 0, [int]$RetryAfter = 0, [string]$Text = '', [string]$Kind = 'Http')
+            $exception = switch ($Kind) {
+                'Timeout' { [TimeoutException]::new('The operation has timed out.') }
+                'Socket' { [System.Net.Http.HttpRequestException]::new('No connection could be made.', [System.Net.Sockets.SocketException]::new(10061)) }
+                'Plain' { [InvalidOperationException]::new($Text) }
+                default { if ($Status) { [System.Net.Http.HttpRequestException]::new($(if ($Text) { $Text } else { "Response status code does not indicate success: $Status." }), $null, [System.Net.HttpStatusCode]$Status) } else { [System.Net.Http.HttpRequestException]::new($Text) } }
+            }
+            if ($RetryAfter) {
+                $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]$Status)
+                $response.Headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([TimeSpan]::FromSeconds($RetryAfter))
+                Add-Member -InputObject $exception -NotePropertyName Response -NotePropertyValue $response
+            }
+            [Management.Automation.ErrorRecord]::new($exception, 'x', [Management.Automation.ErrorCategory]::NotSpecified, $null)
+        }
+        function global:New-R8Context {
+            param([int]$ObjectSeconds = 180, [int]$RunMinutes = 30, [string]$Name = 'retry')
+            $runtime = New-GateRuntime -Name ($Name + '-320b')
+            $context = New-GateContext $runtime -Mode Apply -Action Convert
+            $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Off'; TenantId = '20000000-0000-0000-0000-000000000002'; RetryBudgetObjectSeconds = $ObjectSeconds; RetryBudgetRunMinutes = $RunMinutes }
+            $context.LogFile = Join-Path $runtime.Root ('logs\' + $Name + '.log')
+            $context.CurrentIdentity = 'object1'
+            $context
+        }
+    }
+    AfterAll {
+        Remove-Item -LiteralPath 'Function:\New-R8Failure', 'Function:\New-R8Context' -ErrorAction SilentlyContinue
+        Remove-Module PRA.Cloud -Force -ErrorAction SilentlyContinue
+    }
+    It 'Get-PraCloudFailureInfo reads the status, the Retry-After and the nature of a failure (<Name>)' -ForEach @(
+        @{ Name = '429 with a Retry-After header of 7 s'; Make = { New-R8Failure -Status 429 -RetryAfter 7 }; Status = 429; RetryAfter = 7; Transient = $true; Throttled = $true }
+        @{ Name = '429 with Retry-After in the text (Exchange Online child process)'; Make = { New-R8Failure -Kind Plain -Text 'Exchange Online child process code=1, stdout=[{"Error":"HttpStatusCode=429 TooManyRequests Retry-After: 9"}]' }; Status = 429; RetryAfter = 9; Transient = $true; Throttled = $true }
+        @{ Name = 'a Retry-After of 500 s is never waited more than two minutes'; Make = { New-R8Failure -Status 429 -RetryAfter 500 }; Status = 429; RetryAfter = 120; Transient = $true; Throttled = $true }
+        @{ Name = '503'; Make = { New-R8Failure -Status 503 }; Status = 503; RetryAfter = 0; Transient = $true; Throttled = $true }
+        @{ Name = '504'; Make = { New-R8Failure -Status 504 }; Status = 504; RetryAfter = 0; Transient = $true; Throttled = $false }
+        @{ Name = '502'; Make = { New-R8Failure -Status 502 }; Status = 502; RetryAfter = 0; Transient = $true; Throttled = $false }
+        @{ Name = '408'; Make = { New-R8Failure -Status 408 }; Status = 408; RetryAfter = 0; Transient = $true; Throttled = $false }
+        @{ Name = 'the name of the error only (ServiceUnavailable)'; Make = { New-R8Failure -Kind Plain -Text 'Microsoft Graph: ServiceUnavailable, the service is busy.' }; Status = 503; RetryAfter = 0; Transient = $true; Throttled = $true }
+        @{ Name = 'a timeout'; Make = { New-R8Failure -Kind Timeout }; Status = 0; RetryAfter = 0; Transient = $true; Throttled = $false }
+        @{ Name = 'a connection that does not answer'; Make = { New-R8Failure -Kind Socket }; Status = 0; RetryAfter = 0; Transient = $true; Throttled = $false }
+        @{ Name = '404 is permanent'; Make = { New-R8Failure -Status 404 }; Status = 404; RetryAfter = 0; Transient = $false; Throttled = $false }
+        @{ Name = '403 is permanent'; Make = { New-R8Failure -Status 403 }; Status = 403; RetryAfter = 0; Transient = $false; Throttled = $false }
+        @{ Name = '401 is permanent'; Make = { New-R8Failure -Status 401 }; Status = 401; RetryAfter = 0; Transient = $false; Throttled = $false }
+        @{ Name = '400 is permanent'; Make = { New-R8Failure -Status 400 }; Status = 400; RetryAfter = 0; Transient = $false; Throttled = $false }
+        @{ Name = '500 is not retried'; Make = { New-R8Failure -Status 500 }; Status = 500; RetryAfter = 0; Transient = $false; Throttled = $false }
+        @{ Name = 'any other error'; Make = { New-R8Failure -Kind Plain -Text 'SYNTHETIC: the answer is not valid.' }; Status = 0; RetryAfter = 0; Transient = $false; Throttled = $false }
+    ) {
+        $global:PraGate.R8Record = & $Make
+        $info = InModuleScope PRA.Cloud { Get-PraCloudFailureInfo $global:PraGate.R8Record }
+        $info.Status | Should -Be $Status
+        $info.RetryAfter | Should -Be $RetryAfter
+        $info.Transient | Should -Be $Transient
+        $info.Throttled | Should -Be $Throttled
+    }
+    It 'a 429 with Retry-After is waited as told and the read then succeeds: the waits are the Retry-After values, every retry is in the log at Detail level, nothing is an error' {
+        $global:PraGate.R8Context = New-R8Context -Name 'retry-after'
+        $global:PraGate.R8Sleeps = New-Object 'Collections.Generic.List[int]'; $global:PraGate.R8Calls = 0
+        $answer = InModuleScope PRA.Cloud {
+            Mock Start-Sleep { param($Seconds) $global:PraGate.R8Sleeps.Add([int]$Seconds) }
+            $read = { $global:PraGate.R8Calls++; if ($global:PraGate.R8Calls -le 2) { throw (New-R8Failure -Status 429 -RetryAfter 7) }; 'the user' }
+            Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Microsoft Graph user' -Script $read
+        }
+        $answer | Should -BeExactly 'the user'
+        $global:PraGate.R8Calls | Should -Be 3
+        @($global:PraGate.R8Sleeps) | Should -BeExactly @(7, 7)
+        $log = [IO.File]::ReadAllText($global:PraGate.R8Context.LogFile)
+        $log | Should -Match '\[DETAIL\] Retry 1 \| Microsoft Graph user \| object1 \| status 429 \(Retry-After 7 s\) \| waiting 7 s \| object 7 of 180 s, run 7 of 1800 s'
+        $log | Should -Match '\[DETAIL\] Retry 2 \| Microsoft Graph user \| object1 \| status 429 \(Retry-After 7 s\) \| waiting 7 s \| object 14 of 180 s, run 14 of 1800 s'
+        $global:PraGate.R8Context.Issues.Count | Should -Be 0
+        $global:PraGate.R8Context.Warnings | Should -Be 0
+    }
+    It 'without Retry-After the waits are 5, 10, 20 and 40 s, and the fifth failure ends the read with the error of the service (five tries at most)' {
+        $global:PraGate.R8Context = New-R8Context -ObjectSeconds 3600 -Name 'five-tries'
+        $global:PraGate.R8Sleeps = New-Object 'Collections.Generic.List[int]'; $global:PraGate.R8Calls = 0
+        $message = InModuleScope PRA.Cloud {
+            Mock Start-Sleep { param($Seconds) $global:PraGate.R8Sleeps.Add([int]$Seconds) }
+            $read = { $global:PraGate.R8Calls++; throw (New-R8Failure -Status 504 -Text 'SYNTHETIC gateway timeout') }
+            try { Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Exchange Online Mailbox' -Script $read; 'no error' } catch { $_.Exception.Message }
+        }
+        $message | Should -BeExactly 'SYNTHETIC gateway timeout'
+        $global:PraGate.R8Calls | Should -Be 5
+        @($global:PraGate.R8Sleeps) | Should -BeExactly @(5, 10, 20, 40)
+    }
+    It 'a permanent error is thrown at once and never retried: 404, 403, 400 and an error without status (one call, no wait); a write (-NoRetry) is never sent again either' {
+        foreach ($case in @(@{ Status = 404 }, @{ Status = 403 }, @{ Status = 400 }, @{ Status = 0 })) {
+            $global:PraGate.R8Context = New-R8Context -Name 'permanent'
+            $global:PraGate.R8Sleeps = New-Object 'Collections.Generic.List[int]'; $global:PraGate.R8Calls = 0; $global:PraGate.R8Status = $case.Status
+            $message = InModuleScope PRA.Cloud {
+                Mock Start-Sleep { param($Seconds) $global:PraGate.R8Sleeps.Add([int]$Seconds) }
+                $read = { $global:PraGate.R8Calls++; if ($global:PraGate.R8Status) { throw (New-R8Failure -Status $global:PraGate.R8Status -Text "SYNTHETIC refusal $($global:PraGate.R8Status)") } else { throw (New-R8Failure -Kind Plain -Text 'SYNTHETIC refusal 0') } }
+                try { Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Microsoft Graph user' -Script $read; 'no error' } catch { $_.Exception.Message }
+            }
+            $message | Should -BeExactly ('SYNTHETIC refusal ' + $case.Status)
+            $global:PraGate.R8Calls | Should -Be 1 -Because ([string]$case.Status)
+            $global:PraGate.R8Sleeps.Count | Should -Be 0
+        }
+        $global:PraGate.R8Context = New-R8Context -Name 'nowrite'; $global:PraGate.R8Calls = 0
+        InModuleScope PRA.Cloud {
+            Mock Start-Sleep { }
+            $write = { $global:PraGate.R8Calls++; throw (New-R8Failure -Status 429 -RetryAfter 3) }
+            try { Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Add permission' -Script $write -NoRetry } catch { $null = $_ }
+        }
+        $global:PraGate.R8Calls | Should -Be 1
+    }
+    It 'the budget of an object is bounded: when the next wait would pass it, the read ends with the error of the service, and another object has its own budget' {
+        $global:PraGate.R8Context = New-R8Context -ObjectSeconds 10 -Name 'object-budget'
+        $global:PraGate.R8Sleeps = New-Object 'Collections.Generic.List[int]'; $global:PraGate.R8Calls = 0
+        $messages = InModuleScope PRA.Cloud {
+            Mock Start-Sleep { param($Seconds) $global:PraGate.R8Sleeps.Add([int]$Seconds) }
+            $read = { $global:PraGate.R8Calls++; throw (New-R8Failure -Status 429 -RetryAfter 7 -Text 'SYNTHETIC throttled') }
+            $first = try { Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Microsoft Graph user' -Script $read; 'no error' } catch { $_.Exception.Message }
+            $global:PraGate.R8Context.CurrentIdentity = 'object2'
+            $second = try { Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Microsoft Graph user' -Script $read; 'no error' } catch { $_.Exception.Message }
+            @($first, $second)
+        }
+        $messages | Should -BeExactly @('SYNTHETIC throttled', 'SYNTHETIC throttled')
+        $global:PraGate.R8Calls | Should -Be 4 -Because 'two tries for each object: the second wait (7 + 7 s) would pass the 10 s of the object'
+        $log = [IO.File]::ReadAllText($global:PraGate.R8Context.LogFile)
+        $log | Should -Match 'Retry budget used up \| Microsoft Graph user \| object1 \| status 429 \| 2 tries \| object 7 of 10 s'
+        $log | Should -Match 'Retry budget used up \| Microsoft Graph user \| object2 \| status 429 \| 2 tries \| object 7 of 10 s'
+    }
+    It 'a retry budget of 0 means no retry: one call, the error of the service' {
+        foreach ($case in @(@{ Object = 0; Run = 30 }, @{ Object = 180; Run = 0 })) {
+            $global:PraGate.R8Context = New-R8Context -ObjectSeconds $case.Object -RunMinutes $case.Run -Name 'budget-zero'; $global:PraGate.R8Calls = 0
+            $message = InModuleScope PRA.Cloud {
+                Mock Start-Sleep { throw 'no wait expected' }
+                $read = { $global:PraGate.R8Calls++; throw (New-R8Failure -Status 429 -RetryAfter 3 -Text 'SYNTHETIC throttled') }
+                try { Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Microsoft Graph user' -Script $read; 'no error' } catch { $_.Exception.Message }
+            }
+            $message | Should -BeExactly 'SYNTHETIC throttled'
+            $global:PraGate.R8Calls | Should -Be 1
+        }
+    }
+    It 'the budget of the run is bounded: used up, ONE plain error stops the run, and the next calls are not even sent' {
+        $global:PraGate.R8Context = New-R8Context -ObjectSeconds 3600 -RunMinutes 1 -Name 'run-budget'
+        $global:PraGate.R8Sleeps = New-Object 'Collections.Generic.List[int]'; $global:PraGate.R8Calls = 0
+        $result = InModuleScope PRA.Cloud {
+            Mock Start-Sleep { param($Seconds) $global:PraGate.R8Sleeps.Add([int]$Seconds) }
+            $read = { $global:PraGate.R8Calls++; throw (New-R8Failure -Status 429 -RetryAfter 30 -Text 'SYNTHETIC throttled') }
+            $first = try { Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Microsoft Graph user' -Script $read; $null } catch { $_.Exception }
+            $callsAfterFirst = $global:PraGate.R8Calls
+            $global:PraGate.R8Context.CurrentIdentity = 'object2'
+            $second = try { Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Microsoft Graph user' -Script $read; $null } catch { $_.Exception }
+            @{ First = $first; Second = $second; CallsAfterFirst = $callsAfterFirst; State = (Get-PraRetryState $global:PraGate.R8Context) }
+        }
+        $result.First.Message | Should -Match '^Microsoft 365 is limiting or not answering this run: the 1 minute\(s\) allowed for retries are used up \(2 retries, 3 throttled answers\)\. Nothing more is asked of Microsoft 365\. What this run already did is kept: run the same command again in a few minutes\.$'
+        $result.First.Data['PraRunBudget'] | Should -BeTrue
+        $result.CallsAfterFirst | Should -Be 3
+        $global:PraGate.R8Calls | Should -Be 3 -Because 'the second object is refused before any call'
+        $result.Second.Message | Should -Match '^Microsoft 365 is limiting or not answering this run'
+        $result.State.RunExhausted | Should -BeTrue
+        $global:PraGate.R8Context.CloudThrottled | Should -BeTrue
+        @($global:PraGate.R8Sleeps) | Should -BeExactly @(30, 30)
+    }
+    It 'a throttled answer slows the calls of the whole run: the next calls pause 4, 2, 1 s (halved after each success) before they are sent, then no pause' {
+        $global:PraGate.R8Context = New-R8Context -ObjectSeconds 3600 -Name 'pace'
+        $global:PraGate.R8Sleeps = New-Object 'Collections.Generic.List[int]'; $global:PraGate.R8Calls = 0
+        $log = InModuleScope PRA.Cloud {
+            Mock Start-Sleep { param($Seconds) $global:PraGate.R8Sleeps.Add([int]$Seconds) }
+            $flaky = { $global:PraGate.R8Calls++; if ($global:PraGate.R8Calls -le 3) { throw (New-R8Failure -Status 503) }; 'ok' }
+            $fine = { 'ok' }
+            $null = Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'first' -Script $flaky
+            $global:PraGate.R8Sleeps.Add(-1)
+            foreach ($name in 'b', 'c', 'd', 'e') { $global:PraGate.R8Context.CurrentIdentity = $name; $null = Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call ('call ' + $name) -Script $fine; $global:PraGate.R8Sleeps.Add(-1) }
+            [IO.File]::ReadAllText($global:PraGate.R8Context.LogFile)
+        }
+        (@($global:PraGate.R8Sleeps) -join ',') | Should -BeExactly '5,10,20,-1,4,-1,2,-1,1,-1,-1' -Because 'the retries of the first call, then one pause before each of the next calls while the pace is above 0'
+        $log | Should -Match 'Cloud calls slowed down after throttling: pausing 4 s before call b'
+        $log | Should -Match 'pausing 1 s before call d'
+        $log | Should -Not -Match 'pausing .* before call e'
+    }
+    It 'a batch of 5000 objects under permanent throttling does not become 5000 failures: the run stops after the budget, with a bounded number of calls' {
+        $global:PraGate.R8Context = New-R8Context -ObjectSeconds 180 -RunMinutes 10 -Name 'storm'
+        $global:PraGate.R8Calls = 0
+        $global:PraGate.R8Sleeps = New-Object 'Collections.Generic.List[int]'
+        $summary = InModuleScope PRA.Cloud {
+            Mock Start-Sleep { param($Seconds) $global:PraGate.R8Sleeps.Add([int]$Seconds) }
+            $read = { $global:PraGate.R8Calls++; throw (New-R8Failure -Status 429 -Text 'SYNTHETIC throttled') }
+            $reached = 0; $failures = 0
+            foreach ($index in 1..5000) {
+                $global:PraGate.R8Context.CurrentIdentity = 'object' + $index
+                try { $null = Invoke-PraCloudCall -Context $global:PraGate.R8Context -Call 'Microsoft Graph user' -Script $read }
+                catch { $failures++; if ((Get-PraRetryState $global:PraGate.R8Context).RunExhausted) { break } }
+                $reached++
+            }
+            @{ Reached = $reached; Failures = $failures; State = (Get-PraRetryState $global:PraGate.R8Context) }
+        }
+        $summary.State.RunExhausted | Should -BeTrue
+        $summary.Reached | Should -BeLessThan 25 -Because 'the run stopped; it did not go through 5000 objects'
+        $global:PraGate.R8Calls | Should -BeLessThan 150
+        $summary.State.RunSpent | Should -BeLessOrEqual 600
+        ($global:PraGate.R8Sleeps | Measure-Object -Sum).Sum | Should -BeLessOrEqual 600
+    }
+}
+
+Describe 'Release 3.2.0 - a transient failure does not end the object in the cloud phase (production Cloud module, mocked Exchange Online, no network)' -Tag 'Release320b' {
+    BeforeAll {
+        $global:PraGate.R8NetworkPath = Join-Path $global:PraGate.Root 'PraGateR8Network.psm1'
+        $networkSource = @'
+if ($env:PRA_GATE_NONET -cne 'SYNTHETIC-NO-NETWORK') { throw 'Synthetic interlock absent.' }
+function Get-EXOMailbox { [CmdletBinding()]param($Filter,$Properties,$ResultSize,[switch]$InactiveMailboxOnly) throw 'SYNTHETIC BLOCK: EXO mailbox' }
+function Get-ConnectionInformation { [CmdletBinding()]param() [pscustomobject]@{TenantID='20000000-0000-0000-0000-000000000002';State='Connected';TokenStatus='Active';ConnectionId='30000000-0000-0000-0000-000000000003';ModuleName=$global:PraGate.R8NetworkPath} }
+Export-ModuleMember -Function Get-EXOMailbox,Get-ConnectionInformation
+'@
+        [IO.File]::WriteAllText($global:PraGate.R8NetworkPath, $networkSource, (New-Object Text.UTF8Encoding($true)))
+        Get-Module PRA.Cloud -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module $global:PraGate.R8NetworkPath -Global -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+        function global:New-R8Failure2 {
+            param([int]$Status, [int]$RetryAfter = 0)
+            $exception = [System.Net.Http.HttpRequestException]::new("Response status code does not indicate success: $Status.", $null, [System.Net.HttpStatusCode]$Status)
+            if ($RetryAfter) {
+                $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]$Status)
+                $response.Headers.RetryAfter = [System.Net.Http.Headers.RetryConditionHeaderValue]::new([TimeSpan]::FromSeconds($RetryAfter))
+                Add-Member -InputObject $exception -NotePropertyName Response -NotePropertyValue $response
+            }
+            $exception
+        }
+    }
+    BeforeEach {
+        $global:PraGate.Runtime = New-GateRuntime -Name 'phase-retry-320b'
+        $context = New-GateContext $global:PraGate.Runtime -Mode Apply -Action Convert
+        $context.Phase = 'Cloud'; $context.Once = $false; $context.CheckScope = 'Both'; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 5
+        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Off'; TenantId = '20000000-0000-0000-0000-000000000002' }
+        $context.Config.SharedMailbox.GrantFullAccess = $false
+        $context.LogFile = Join-Path $global:PraGate.Runtime.Root 'logs\phase-retry-320b.log'
+        $global:PraGate.CloudContext = $context
+        $global:PraGate.R8Binding = @{ TenantId = '20000000-0000-0000-0000-000000000002'; ConnectionId = '30000000-0000-0000-0000-000000000003'; ModuleLocation = $global:PraGate.R8NetworkPath; ModulePath = $global:PraGate.R8NetworkPath }
+        $global:PraGate.R8Calls = 0; $global:PraGate.R8Sleeps = New-Object 'Collections.Generic.List[int]'; $global:PraGate.R8Failures = @{}
+        $global:PraGate.R8Mailbox = [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:x@gate.invalid') }
+        $global:PraGate.CloudRows = @(1..3 | ForEach-Object { New-PraRow $context ([pscustomobject]@{ ObjectGuid = ('00000000-0000-0000-0000-00000000000' + $_); UserPrincipalName = "user$_@gate.invalid"; SamAccountName = "user$_"; IsShared = $false }) })
+    }
+    AfterAll {
+        Remove-Item -LiteralPath 'Function:\New-R8Failure2' -ErrorAction SilentlyContinue
+        Remove-Module PRA.Cloud, PraGateR8Network -Force -ErrorAction SilentlyContinue
+    }
+    It 'a 429 and a 503 on the first read of two objects are retried inside the call: every object ends Success, no error, and the retries are in the log' {
+        $global:PraGate.R8Failures = @{ 'user1@gate.invalid' = @{ Status = 429; RetryAfter = 6; Times = 1 }; 'user3@gate.invalid' = @{ Status = 503; RetryAfter = 0; Times = 2 } }
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $false; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R8Binding } }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { param($Seconds, $Milliseconds) if ($Seconds) { $global:PraGate.R8Sleeps.Add([int]$Seconds) } }
+            Mock Get-EXOMailbox {
+                param($Filter, $Properties, $ResultSize)
+                $global:PraGate.R8Calls++
+                $upn = ([regex]::Match($Filter, "'(.+)'")).Groups[1].Value
+                $plan = $global:PraGate.R8Failures[$upn]
+                if ($null -ne $plan -and $plan.Times -gt 0) { $plan.Times--; throw (New-R8Failure2 -Status $plan.Status -RetryAfter $plan.RetryAfter) }
+                $global:PraGate.R8Mailbox
+            }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext $global:PraGate.CloudRows 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        $context.Issues.Count | Should -Be 0
+        @($global:PraGate.CloudRows | Where-Object { $_.CloudStatus -ceq 'Success' }).Count | Should -Be 3
+        $global:PraGate.R8Calls | Should -Be 6 -Because 'three reads and three retries'
+        $log = [IO.File]::ReadAllText($context.LogFile)
+        $log | Should -Match '\[DETAIL\] Retry 1 \| Exchange Online Mailbox \| 00000000-0000-0000-0000-000000000001 \| status 429 \(Retry-After 6 s\) \| waiting 6 s'
+        $log | Should -Match '\[DETAIL\] Retry 2 \| Exchange Online Mailbox \| 00000000-0000-0000-0000-000000000003 \| status 503 \| waiting 10 s'
+    }
+    It 'the budget of an object used up in a wait that goes on: the object stays pending and is read again at the next check, and ends Success when the service answers again; it is not an error' {
+        $global:PraGate.CloudContext.Config.Cloud.RetryBudgetObjectSeconds = 12
+        $global:PraGate.CloudRows = @($global:PraGate.CloudRows[0])
+        $global:PraGate.R8Failures = @{ 'user1@gate.invalid' = @{ Status = 503; RetryAfter = 0; Times = 6 } }
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $false; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R8Binding } }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { param($Seconds, $Milliseconds) if ($Seconds) { $global:PraGate.R8Sleeps.Add([int]$Seconds) } }
+            Mock Get-EXOMailbox {
+                param($Filter, $Properties, $ResultSize)
+                $global:PraGate.R8Calls++
+                $plan = $global:PraGate.R8Failures['user1@gate.invalid']
+                if ($plan.Times -gt 0) { $plan.Times--; throw (New-R8Failure2 -Status $plan.Status) }
+                $global:PraGate.R8Mailbox
+            }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext $global:PraGate.CloudRows 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        $context.Issues.Count | Should -Be 0
+        $global:PraGate.CloudRows[0].CloudStatus | Should -BeExactly 'Success'
+        $global:PraGate.CloudRows[0].FinalStatus | Should -BeExactly 'Success'
+        $global:PraGate.R8Calls | Should -Be 7
+        $log = [IO.File]::ReadAllText($context.LogFile)
+        $log | Should -Match 'Retry budget used up'
+        $log | Should -Match 'user1@gate\.invalid \| cloud read failed, repeated at the next check'
+    }
+    It 'a look that cannot wait for the next check (-Once) ends the object at once, in plain words, as an object that could not be read (a run error), never "not in the expected state"' {
+        $global:PraGate.CloudContext.Once = $true
+        $global:PraGate.CloudContext.Config.Cloud.RetryBudgetObjectSeconds = 5
+        $global:PraGate.CloudRows = @($global:PraGate.CloudRows[0])
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $false; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R8Binding } }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { }
+            Mock Get-EXOMailbox { $global:PraGate.R8Calls++; throw (New-R8Failure2 -Status 429) }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext $global:PraGate.CloudRows 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        $context.Issues.Count | Should -Be 1
+        [string]$context.Issues[0].Message | Should -BeExactly 'user1@gate.invalid: Microsoft 365 kept limiting the requests or was unavailable (HTTP 429) and the retry time of this object is used up. Run again in a few minutes.'
+        $global:PraGate.CloudRows[0].CloudStatus | Should -BeExactly 'Error'
+        $global:PraGate.CloudRows[0].RunError | Should -BeTrue
+    }
+    It 'a permanent refusal (403) is not retried and ends the object at once with its own message' {
+        $global:PraGate.CloudRows = @($global:PraGate.CloudRows[0])
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $false; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R8Binding } }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { param($Seconds, $Milliseconds) if ($Seconds) { $global:PraGate.R8Sleeps.Add([int]$Seconds) } }
+            Mock Get-EXOMailbox { $global:PraGate.R8Calls++; throw (New-R8Failure2 -Status 403) }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext $global:PraGate.CloudRows 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        $global:PraGate.R8Calls | Should -Be 1
+        $global:PraGate.R8Sleeps.Count | Should -Be 0
+        $context.Issues.Count | Should -Be 1
+        [string]$context.Issues[0].Message | Should -Be 'Response status code does not indicate success: 403.'
+        $global:PraGate.CloudRows[0].CloudStatus | Should -BeExactly 'Error'
+    }
+    It 'the retry time of the run used up in the cloud phase: ONE run error for the run (not one per object), the objects not finished stay Pending, nothing more is asked of Exchange Online' {
+        $global:PraGate.CloudContext.Config.Cloud.RetryBudgetRunMinutes = 1
+        $global:PraGate.CloudContext.Config.Cloud.RetryBudgetObjectSeconds = 3600
+        $global:PraGate.CloudRows = @(1..6 | ForEach-Object { New-PraRow $global:PraGate.CloudContext ([pscustomobject]@{ ObjectGuid = ('00000000-0000-0000-0000-00000000000' + $_); UserPrincipalName = "user$_@gate.invalid"; SamAccountName = "user$_"; IsShared = $false }) })
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $false; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R8Binding } }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { param($Seconds, $Milliseconds) if ($Seconds) { $global:PraGate.R8Sleeps.Add([int]$Seconds) } }
+            Mock Get-EXOMailbox { $global:PraGate.R8Calls++; throw (New-R8Failure2 -Status 429 -RetryAfter 30) }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext $global:PraGate.CloudRows 'Convert'
+        }
+        $context = $global:PraGate.CloudContext
+        $context.Issues.Count | Should -Be 1 -Because 'one error for the run'
+        [string]$context.Issues[0].Message | Should -Match '^Microsoft 365 is limiting or not answering this run: the 1 minute\(s\) allowed for retries are used up .* 6 object\(s\) were not finished\.$'
+        $context.CloudThrottled | Should -BeTrue
+        @($global:PraGate.CloudRows | Where-Object { $_.CloudStatus -ceq 'Error' }).Count | Should -Be 0
+        @($global:PraGate.CloudRows | Where-Object { $_.FinalStatus -ceq 'Pending' }).Count | Should -Be 6
+        $global:PraGate.R8Calls | Should -Be 3 -Because 'the first object tried three times; no other object was asked'
+    }
+}
+
+Describe 'Release 3.2.0 - the run says that Microsoft 365 limited its requests, with the command to run again (real main, synthetic)' -Tag 'Release320b' {
+    It 'a Check whose retry time is used up: ONE error for the run, "limited the requests", nothing changed, the Check proposed again later' {
+        $runtime = New-GateRuntime -Name 'check-throttled-320b' -Case 'CloudThrottled'
+        $run = Invoke-GateProcess $runtime @{Action='Check';Identity='user1';ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match ([regex]::Escape('Microsoft 365 is limiting or not answering this run: the 30 minute(s) allowed for retries are used up'))
+        $run.Output | Should -Match "Stopped at step 'Cloud' \(operation CloudCheck\): Microsoft 365 limited the requests of this run\. Nothing was changed\. Run the Check again\."
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -BeExactly 'Microsoft 365 limited the requests of this run. Nothing was changed: run the Check again in a few minutes:'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Identity ''user1'''
+        $run.Output | Should -Not -Match 'did not answer'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+}
+
+Describe 'Release 3.2.0 - a partial batch whose proof cannot be used is rolled back from its journal; a Convert says its Exchange Online part (real main, production Directory module, synthetic AD)' -Tag 'Release320a' {
+    BeforeAll {
+        $global:PraGate.R3 = New-GateRuntime -Name 'partial-unusable-320a' -Case 'FailAtSam' -UserCount 10 -Extra @{ FailSam = 'user3' }
+        $runtime = $global:PraGate.R3
+        $env:PRA_GATE_STATE = $runtime.StatePath; $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+        Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        $context = New-GateContext $runtime
+        $global:PraGate.R3Plans = @(foreach ($sam in 'user1', 'user10', 'user2', 'user3', 'user4', 'user5', 'user6', 'user7', 'user8', 'user9') { New-PraPlan $context $sam 'Convert' })
+        try { $null = Invoke-PraAdBatch $context $global:PraGate.R3Plans 'Convert' } catch { $null = $_ }
+        $global:PraGateAd.Case = 'Normal'
+        [IO.File]::WriteAllText($runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($global:PraGateAd, 35))
+        $global:PraGate.R3Folder = Split-Path @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Convert-*.json')[0].FullName -Parent
+        $global:PraGate.R3Json = @(Get-ChildItem -LiteralPath $global:PraGate.R3Folder -File -Filter 'Convert-*.json')[0].FullName
+        $global:PraGate.R3Id = ([IO.File]::ReadAllText($global:PraGate.R3Json) | ConvertFrom-Json -DateKind String).BatchId
+    }
+    AfterAll { foreach ($key in 'R3', 'R3Plans', 'R3Folder', 'R3Json', 'R3Id') { $global:PraGate.Remove($key) } }
+    It 'Recover of a partial batch whose State file has no .sha256 or was changed: a warning says the proof cannot be used, and the objects the journal shows as written (three verified, one stopped on) are taken, the six others are not' {
+        $short = $global:PraGate.R3Id.Substring(0, 8)
+        $state = Join-Path $global:PraGate.R3Folder ('State-' + $global:PraGate.R3Id + '.json')
+        foreach ($case in 'missing-sha256', 'tampered-state') {
+            if ($case -eq 'missing-sha256') { Move-Item -LiteralPath ($state + '.sha256') -Destination ($state + '.sha256.away') }
+            else { [IO.File]::WriteAllText($state, ([IO.File]::ReadAllText($state).Replace('"PlannedCount": 10', '"PlannedCount": 11')), (New-Object Text.UTF8Encoding($true))) }
+            try {
+                $run = Invoke-GateProcess $global:PraGate.R3 @{Action='Recover';Phase='AD';Mode='Preview';ConfigPath=$global:PraGate.R3.ConfigPath;Batch=$short} -TimeoutSeconds 120
+                $run.ExitCode | Should -Be 0 -Because ($case + ': ' + $run.Output + $run.Error)
+                $run.Output | Should -Match ('The AD proof of batch ' + $short + ' is marked partial but cannot be used \(') -Because $case
+                $run.Output | Should -Match 'the journal of the batch decides which objects are rolled back' -Because $case
+                $run.MainResult.PlannedCount | Should -Be 4 -Because $case
+                $run.MainResult.SkippedCount | Should -Be 6 -Because $case
+            }
+            finally {
+                if ($case -eq 'missing-sha256') { Move-Item -LiteralPath ($state + '.sha256.away') -Destination ($state + '.sha256') }
+                else { [IO.File]::WriteAllText($state, ([IO.File]::ReadAllText($state).Replace('"PlannedCount": 11', '"PlannedCount": 10')), (New-Object Text.UTF8Encoding($true))) }
+            }
+        }
+    }
+    It 'no journal either: Recover refuses with the backup path, the Recover of a named object and the manual restore as next steps, writes nothing, and the named object is rolled back on its own' {
+        $short = $global:PraGate.R3Id.Substring(0, 8)
+        $state = Join-Path $global:PraGate.R3Folder ('State-' + $global:PraGate.R3Id + '.json')
+        $journal = Join-Path $global:PraGate.R3Folder ('Journal-' + $global:PraGate.R3Id + '.jsonl')
+        Move-Item -LiteralPath ($state + '.sha256') -Destination ($state + '.sha256.away'); Move-Item -LiteralPath $journal -Destination ($journal + '.away')
+        try {
+            $before = @(Get-GateWrites $global:PraGate.R3).Count
+            $run = Invoke-GateProcess $global:PraGate.R3 @{Action='Recover';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$global:PraGate.R3.ConfigPath;Batch=$short} -TimeoutSeconds 120
+            $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+            $run.Output | Should -Match ('Recover of batch ' + $short + ' cannot go on: its AD proof is partial but unusable \(.*\) and its journal lists no object that was written\. Nothing was changed\.')
+            @(Get-GateWrites $global:PraGate.R3).Count | Should -Be $before
+            $steps = @($run.MainResult.NextSteps); $joined = $steps -join "`n"
+            $joined | Should -Match ([regex]::Escape($global:PraGate.R3Json))
+            $joined | Should -Match ('-Action Recover .*-Batch ' + $short + '.*-Identity ''user1''')
+            $joined | Should -Match 'restore the attributes of the objects from that backup file by hand'
+            $one = Invoke-GateProcess $global:PraGate.R3 @{Action='Recover';Phase='AD';Mode='Preview';ConfigPath=$global:PraGate.R3.ConfigPath;Batch=$short;Identity='USER1'} -TimeoutSeconds 120
+            $one.ExitCode | Should -Be 0 -Because ($one.Output + $one.Error)
+            $one.MainResult.PlannedCount | Should -Be 1
+            $one.Output | Should -Match 'is marked partial but cannot be used'
+        }
+        finally { Move-Item -LiteralPath ($state + '.sha256.away') -Destination ($state + '.sha256'); Move-Item -LiteralPath ($journal + '.away') -Destination $journal }
+    }
+    It 'with the proof unusable and the journal present, the Apply rolls back the objects the journal names and leaves the others alone' {
+        $short = $global:PraGate.R3Id.Substring(0, 8)
+        $state = Join-Path $global:PraGate.R3Folder ('State-' + $global:PraGate.R3Id + '.json')
+        Move-Item -LiteralPath ($state + '.sha256') -Destination ($state + '.sha256.away')
+        try {
+            $before = @(Get-GateWrites $global:PraGate.R3 | Where-Object Operation -eq 'Set-ADUser').Count
+            $run = Invoke-GateProcess $global:PraGate.R3 @{Action='Recover';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$global:PraGate.R3.ConfigPath;Batch=$short} -TimeoutSeconds 120
+            $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+            $run.MainResult.ErrorCount | Should -Be 0
+            (@(Get-GateWrites $global:PraGate.R3 | Where-Object Operation -eq 'Set-ADUser').Count - $before) | Should -Be 3
+            $run.MainResult.SkippedCount | Should -Be 6
+        }
+        finally { Move-Item -LiteralPath ($state + '.sha256.away') -Destination ($state + '.sha256') }
+    }
+    It 'the line of a verified object says the Exchange Online part (mailbox, licence, permissions) for a Convert, and keeps the deprovisioning check for a Recover or a Deprovision' {
+        $context = New-GateContext $global:PraGate.R3 -Mode Apply -Action Convert
+        $context.Journey = New-Object 'Collections.Generic.List[object]'
+        $plan = New-PraPlan $context 'user5' 'Convert'
+        $plan.Row.ADVerified = $true; $plan.Row.FinalStatus = 'Pending'
+        $texts = @{}
+        foreach ($operation in 'Convert', 'Recover', 'Deprovision') {
+            $plan.Operation = $operation
+            $context.Journey.Clear()
+            & (Get-Module PRA.Directory) { param($c, $p) Write-PraAdDelta -Context $c -Plan $p -Stage Verified } $context $plan 6>$null
+            $texts[$operation] = (@(Get-PraList $context 'Journey' | ForEach-Object { [string]$_.Text }) -join ' | ')
+        }
+        $texts['Convert'] | Should -Match 'AD verified, .* next: Exchange Online part \(mailbox, licence, permissions\)$'
+        $texts['Convert'] | Should -Not -Match 'deprovisioning'
+        $texts['Recover'] | Should -Match 'next: Exchange Online deprovisioning check$'
+        $texts['Deprovision'] | Should -Match 'next: Exchange Online deprovisioning check$'
+    }
+}
+
+Describe 'Release 3.2.0 - the CSV of the objects left matches GUIDs in any form, and never drops a line without saying so (real main, synthetic AD)' -Tag 'Release320a' {
+    It 'GUIDs with braces, without dashes and in capitals match; a line that names no object of the batch (GATE\user8) is kept with a warning; the lines of converted objects are left out and counted' {
+        $runtime = New-GateRuntime -Name 'csv-guid-320a' -Case 'FailAtSam' -UserCount 10 -Extra @{ FailSam = 'user3' }
+        $guid = { param($n) '00000000-0000-0000-0000-{0:000000000000}' -f $n }
+        $identity = @{ 1 = ('{' + (& $guid 1).ToUpperInvariant() + '}'); 2 = 'user2'; 3 = 'user3'; 4 = (& $guid 4).Replace('-', '').ToUpperInvariant(); 5 = ('{' + (& $guid 5) + '}'); 6 = (& $guid 6).ToUpperInvariant()
+            7 = 'USER7'; 8 = 'GATE\user8'; 9 = 'user9@gate.invalid'; 10 = 'user10' }
+        $csv = Join-Path $runtime.Root 'forms.csv'
+        [IO.File]::WriteAllText($csv, ("Identity,Note`r`n" + ((1..10 | ForEach-Object { $identity[$_] + ',note ' + $_ }) -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($true)))
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;CsvPath=$csv;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $joined = @($run.MainResult.NextSteps) -join "`n"
+        $left = [regex]::Match($joined, 'with the file (?<p>[^ ]+\.csv), which lists only them').Groups['p'].Value
+        Test-Path -LiteralPath $left | Should -BeTrue -Because $joined
+        $rows = @(Import-Csv -LiteralPath $left)
+        ($rows.Note -join ',') | Should -BeExactly 'note 4,note 5,note 6,note 7,note 8,note 9' -Because 'every object left has its line, whatever the form of its identity; the converted objects and the one stopped on have none'
+        ($rows.Identity -join '|') | Should -BeExactly ($identity[4] + '|' + $identity[5] + '|' + $identity[6] + '|USER7|GATE\user8|user9@gate.invalid')
+        $run.Output | Should -Match ([regex]::Escape('1 line(s) of the file ' + $csv + ' name no object of batch'))
+        $run.Output | Should -Match 'GATE\\user8\): they are kept in the new file, check them'
+        $run.Output | Should -Match ([regex]::Escape('4 line(s) of the file ' + $csv + ' name objects that batch'))
     }
 }

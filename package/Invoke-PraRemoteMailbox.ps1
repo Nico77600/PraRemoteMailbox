@@ -818,16 +818,18 @@ function Assert-PraBatchNotRolledBack {
 function Get-PraBatchTouchedSet {
     <# The objects that the journal of the Convert batch in $context.Source shows as written or about to be written. #>
     $journal = Join-Path (Split-Path $context.Source.Path -Parent) ('Journal-' + [string]$context.Source.Data.BatchId + '.jsonl')
-    return (Get-PraJournalTouchedObject -Path $journal)
+    return , (Get-PraJournalTouchedObject -Path $journal)
 }
 
 function Get-PraPartialSourceProof {
-    <# The AD proof of the Convert batch in $context.Source when it is marked partial (checked in full), else $null. A batch without a readable proof is not partial for this purpose. #>
+    <# The AD proof of the Convert batch in $context.Source when it is marked partial (checked in full), else $null. A batch without a State file is not partial for this purpose.
+       A State file that cannot be read, or that fails its checks (missing or wrong .sha256, damaged content), gives Unusable = $true with the Reason: the caller falls back to the journal. #>
     $path = Join-Path (Split-Path $context.Source.Path -Parent) ('State-' + [string]$context.Source.Data.BatchId + '.json')
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    try { $raw = [IO.File]::ReadAllText($path) | ConvertFrom-PraJson } catch { return $null }
+    try { $raw = [IO.File]::ReadAllText($path) | ConvertFrom-PraJson } catch { return [pscustomobject]@{ Unusable = $true; Reason = 'the State file cannot be read' } }
     if ((Get-PraValue $raw 'Partial' $false) -ne $true) { return $null }
-    return (Import-PraProof $context $path $context.Source 'Convert')
+    try { return (Import-PraProof $context $path $context.Source 'Convert') }
+    catch { return [pscustomobject]@{ Unusable = $true; Reason = (([string]$_.Exception.Message -split '\r?\n')[0]).Trim() } }
 }
 
 function Set-PraUnprovenRow {
@@ -867,6 +869,15 @@ function New-PraPartialContinuation {
         NotConverted = [string[]]@($left | ForEach-Object { [string]$_.SamAccountName }); NotConvertedIdentifiers = [string[]]$ids.ToArray(); MayBeChanged = [string[]]@($maybe | ForEach-Object { [string]$_.SamAccountName }) }
 }
 
+function ConvertTo-PraIdentityKey {
+    <# The key an identity is matched by: a GUID in any form (braces, no dashes, any case) is its 32 lower-case digits, any other text is itself (the comparison ignores the case). #>
+    param([AllowNull()][string]$Value)
+    $text = ([string]$Value).Trim()
+    $guid = [guid]::Empty
+    if ($text -and [guid]::TryParse($text, [ref]$guid)) { return $guid.ToString('N') }
+    return $text
+}
+
 function Write-PraRemainingCsv {
     <#
     .SYNOPSIS
@@ -891,8 +902,20 @@ function Write-PraRemainingCsv {
             $delimiter = if ($header -match '(?i)(^|,)\s*"?Identity"?\s*(,|$)') { ',' } else { ';' }
             $rows = @(ConvertFrom-Csv -InputObject $text -Delimiter $delimiter -ErrorAction Stop)
             $wanted = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-            foreach ($id in @($Partial.NotConvertedIdentifiers)) { [void]$wanted.Add($id) }
-            $keep = @($rows | Where-Object { $wanted.Contains(([string](Get-PraValue $_ 'Identity' '')).Trim()) })
+            foreach ($id in @($Partial.NotConvertedIdentifiers)) { [void]$wanted.Add((ConvertTo-PraIdentityKey $id)) }
+            $converted = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($row in @($context.Rows | Where-Object { -not $script:NotConverted.Contains([string]$_.ObjectGuid) })) {
+                foreach ($value in @([string]$row.SamAccountName, [string]$row.UserPrincipalName, [string]$row.ObjectGuid, [string](Get-PraValue $row.BackupRec 'DistinguishedName' ''))) { if ($value) { [void]$converted.Add((ConvertTo-PraIdentityKey $value)) } }
+            }
+            $keep = New-Object 'Collections.Generic.List[object]'; $unknown = New-Object 'Collections.Generic.List[string]'; $leftOut = 0
+            foreach ($row in $rows) {
+                $key = ConvertTo-PraIdentityKey ([string](Get-PraValue $row 'Identity' ''))
+                if ($wanted.Contains($key)) { $keep.Add($row) }
+                elseif ($converted.Contains($key)) { $leftOut++ }
+                else { $keep.Add($row); $unknown.Add([string](Get-PraValue $row 'Identity' '')) }
+            }
+            if ($unknown.Count) { Write-PraItem -Context $context -Status Warn -Text ('{0} line(s) of the file {1} name no object of batch {2} ({3}): they are kept in the new file, check them.' -f $unknown.Count, $source, $Partial.ShortId, (($unknown | Select-Object -First 5) -join ', ')) }
+            if ($leftOut) { Write-PraItem -Context $context -Status Info -Text ('{0} line(s) of the file {1} name objects that batch {2} converted or stopped on: they are left out of the new file.' -f $leftOut, $source, $Partial.ShortId) }
             if (-not $keep.Count) { return '' }
             $columns = @($rows[0].PSObject.Properties.Name)
         }
@@ -1138,6 +1161,12 @@ try {
         Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Transfer package {0} verified (checksums, Environment, names): {1} folder(s) extracted, {2} already present and identical' -f $imported.Name, $imported.Created.Count, $imported.Existing.Count)
         if ((-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply'))) { Write-PraItem -Context $context -Status Info -Text 'Preview: the package was verified and read from a private temporary folder, deleted at the end. Nothing was written to the backup folder.' }
         $script:ImportedFolders = @($imported.Created)
+        if ((Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) {
+            # The console tells an imported batch from one converted here by this file (outside the batch folder, which travels with the package).
+            $markerFolder = Join-Path $importRoot 'Imported'
+            Initialize-PraPrivateFolder -Path $markerFolder
+            [IO.File]::WriteAllText((Join-Path $markerFolder (([string]$imported.BatchId).ToLowerInvariant() + '.txt')), ('{0} {1}' -f $imported.Name, [DateTime]::UtcNow.ToString('o')), (New-Object Text.UTF8Encoding($false)))
+        }
         $Batch = [string]$imported.BatchId
         if ($PSBoundParameters.ContainsKey('Batch')) { $PSBoundParameters['Batch'] = $Batch }
     }
@@ -1314,7 +1343,23 @@ try {
         if ($null -ne $sourceProof) {
             $script:Touched = Get-PraBatchTouchedSet
             $proven = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-            foreach ($entry in @($sourceProof.Data.Records)) { [void]$proven.Add([string]$entry.ObjectGuid) }
+            if ([bool](Get-PraValue $sourceProof 'Unusable' $false)) {
+                # The proof cannot be trusted: the journal says which objects the batch may have changed, and those are rolled back. A named object (-Identity) is rolled back on its own.
+                $backupFolder = Split-Path $context.Source.Path -Parent
+                $short = Get-PraShortId ([string]$context.Source.Data.BatchId)
+                Write-PraItem -Context $context -Status Warn -Text ('The AD proof of batch {0} is marked partial but cannot be used ({1}): the journal of the batch decides which objects are rolled back.' -f $short, $sourceProof.Reason)
+                if (-not $Identity -and -not $script:Touched.Count) {
+                    $first = $records | Select-Object -First 1
+                    $context.NextSteps = @(('The backup of batch {0} is {1}: it holds the original values of every object of the batch.' -f $short, $context.Source.Path),
+                        'If you know that an object was converted by this batch, roll it back on its own (run the Preview, then the same command with -Mode Apply):',
+                        ((Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $short) + ' -Identity ' + (ConvertTo-PraLiteral ([string](Get-PraValue $first 'SamAccountName' 'user')))),
+                        'Otherwise restore the attributes of the objects from that backup file by hand (the backups are the only way back), or copy the original State file and its .sha256 file back into the batch folder and run the same Recover again.')
+                    $context.NextOnFailure = $true; $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+                    throw ('Recover of batch {0} cannot go on: its AD proof is partial but unusable ({1}) and its journal lists no object that was written. Nothing was changed.' -f $short, $sourceProof.Reason)
+                }
+                if ($Identity) { foreach ($record in $records) { [void]$script:Touched.Add([string]$record.ObjectGuid) } }
+            }
+            else { foreach ($entry in @($sourceProof.Data.Records)) { [void]$proven.Add([string]$entry.ObjectGuid) } }
             $taken = New-Object 'Collections.Generic.List[object]'; $left = New-Object 'Collections.Generic.List[object]'
             foreach ($record in $records) { if ($proven.Contains([string]$record.ObjectGuid) -or $script:Touched.Contains([string]$record.ObjectGuid)) { $taken.Add($record) } else { $left.Add($record) } }
             foreach ($record in $left) {
@@ -1393,6 +1438,7 @@ try {
                 Initialize-PraDirectory $context
                 $user = Get-PraUser $context $Identity
                 $record = [pscustomobject]@{ ObjectGuid = ([guid]$user.ObjectGUID).ToString(); SamAccountName = $user.SamAccountName; UserPrincipalName = $user.UserPrincipalName; IsShared = ((Test-PraOrdinalIn $user.msExchRecipientTypeDetails @(4, 34359738368) -IgnoreCase))
+                    SourceAnchor = [pscustomobject]@{ ObjectGuid = [string](ConvertTo-PraImmutableId -Value $user.ObjectGUID); ConsistencyGuid = [string](ConvertTo-PraImmutableId -Value (Get-PraValue $user 'mS-DS-ConsistencyGuid' $null)) }
                     ExpectedX500 = [string[]]@(Get-PraExpectedX500 -LegacyExchangeDN ([string](Get-PraValue $user 'legacyExchangeDN' '')) -ProxyAddresses @($user.proxyAddresses)) }
             }
             $context.Rows.Add((New-PraRow $context $record))
@@ -1521,7 +1567,10 @@ try {
         }
         elseif ($context.Issues.Count -or $cloudErrors.Count) {
             $isCheck = (Test-PraOrdinalIgnoreCaseEqual $Action 'Check')
-            $network = [bool](Get-PraValue $context 'NetworkFailure' $false)
+            $throttled = [bool](Get-PraValue $context 'CloudThrottled' $false)
+            $network = [bool](Get-PraValue $context 'NetworkFailure' $false) -or $throttled
+            $unanswered = if ($throttled) { 'Microsoft 365 limited the requests of this run' } else { 'Microsoft 365 did not answer from this machine' }
+            $whenAgain = if ($throttled) { 'in a few minutes' } else { 'when the connection works' }
             # The stop names the first object whose check failed.
             if (-not [int](Get-PraValue $context 'CloudNotReached' 0) -and -not (Test-PraOrdinalIn ([string]$context.CurrentOperation) @('Connect-MgGraph', 'Connect-ExchangeOnline'))) {
                 $failedIssues = @($context.Issues.ToArray() | Where-Object { Test-PraOrdinalEqual ([string](Get-PraValue $_ 'Source' '')) 'Cloud' })
@@ -1530,12 +1579,12 @@ try {
                     $context.CurrentIdentity = [string](Get-PraValue $failedIssues[0] 'Identity' '')
                 }
             }
-            $lead = if ($network) { 'Microsoft 365 did not answer' } elseif ($isCheck) { 'The Exchange Online check could not be done' } else { 'Exchange Online check failed' }
+            $lead = if ($throttled) { 'Microsoft 365 limited the requests of this run' } elseif ($network) { 'Microsoft 365 did not answer' } elseif ($isCheck) { 'The Exchange Online check could not be done' } else { 'Exchange Online check failed' }
             if (-not $context.AllowMutation) {
                 $again = if ($isCheck) { 'Check' } else { 'Preview' }
                 $stop = '{0}. Nothing was changed. Run the {1} again.' -f $lead, $again
                 $rerun = Get-PraCommandLine -ActionName $Action -PhaseName $(if ($isCheck) { '' } else { $effectivePhase }) -ModeName 'Preview' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $Batch }) -KeepFilters
-                $first = if ($network) { 'Microsoft 365 did not answer from this machine. Nothing was changed: run the {0} again when the connection works:' -f $again } else { 'Nothing was changed. Fix the problem named above, then run the {0} again:' -f $again }
+                $first = if ($network) { '{0}. Nothing was changed: run the {1} again {2}:' -f $unanswered, $again, $whenAgain } else { 'Nothing was changed. Fix the problem named above, then run the {0} again:' -f $again }
                 $context.NextSteps = @($first, $rerun)
                 $context.NextOnFailure = $true
                 throw $stop
@@ -1544,7 +1593,7 @@ try {
             # The command is given as the operator typed it: the package path or the batch ID.
             $typedBatch = if ($script:PackageArgument) { $script:PackageArgument } elseif ($Batch) { $Batch } else { $context.BatchId }
             if ($network -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) {
-                $context.NextSteps = @('Microsoft 365 did not answer from this machine. What this run already did is kept: run the same command again when the connection works:', (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $typedBatch -KeepFilters))
+                $context.NextSteps = @(('{0}. What this run already did is kept: run the same command again {1}:' -f $unanswered, $whenAgain), (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $typedBatch -KeepFilters))
                 $context.NextOnFailure = $true
             }
             elseif ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) {
@@ -1563,7 +1612,7 @@ try {
             elseif ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -and $context.BatchId -and $null -ne $context.Proof) {
                 # The Active Directory part of the batch is written and verified (Convert or Recover): only the Exchange Online part is left, and the batch is continued by its ID.
                 $bothContinues = $true
-                $bothFirst = if ($network) { 'Microsoft 365 did not answer from this machine. What this run already did is kept (Active Directory is changed and verified): run the Exchange Online part when the connection works:' } else { 'What this run already did is kept (Active Directory is changed and verified). Fix the problem named above, then run the Exchange Online part:' }
+                $bothFirst = if ($network) { '{0}. What this run already did is kept (Active Directory is changed and verified): run the Exchange Online part {1}:' -f $unanswered, $whenAgain } else { 'What this run already did is kept (Active Directory is changed and verified). Fix the problem named above, then run the Exchange Online part:' }
                 $context.NextSteps = @($bothFirst, (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $context.BatchId))
                 $context.NextOnFailure = $true
             }

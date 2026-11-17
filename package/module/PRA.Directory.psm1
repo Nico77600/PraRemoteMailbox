@@ -427,6 +427,7 @@ function Get-PraUser {
     param([hashtable]$Context, [Parameter(Mandatory)][string]$Identity, [string[]]$ExtraProperties = @(), [switch]$Capture)
     $properties = @('memberOf','uSNChanged','DisplayName','mail','mailNickname','msExchArchiveGUID','legacyExchangeDN') + @($script:AttributeKinds.Keys) + $ExtraProperties
     if ($Capture) { $properties += @('*','msExchMailboxSecurityDescriptor','nTSecurityDescriptor','publicDelegates') }
+    elseif (Test-PraConsistencyGuidSchema -Context $Context) { $properties += 'mS-DS-ConsistencyGuid' }
     $properties = @($properties | Get-PraOrdinalUnique -IgnoreCase)
     $server = $Context.Server
     if ($Identity -match '@' -and $Identity -notmatch '^(CN|OU|DC)=') {
@@ -1028,7 +1029,8 @@ function Write-PraAdDelta {
     if ((-not (Test-PraOrdinalIgnoreCaseEqual $afterType $beforeType))) { $typeText += (' {0} ' -f [char]0x2192) + $(if ($script:RecipientTypeNames.ContainsKey($afterType)) { $script:RecipientTypeNames[$afterType] } else { $afterType }) }
     if ((Test-PraOrdinalIgnoreCaseEqual $Stage 'Verified')) {
         $groupAction = [string](Get-PraValue $Plan.Row 'GroupAction' '')
-        $statusText = switch ([string]$Plan.Row.FinalStatus) { 'Pending' { 'next: Exchange Online deprovisioning check' } 'AlreadyDone' { 'already in the expected state' } default { 'done' } }
+        $pendingText = if ((Test-PraOrdinalIgnoreCaseEqual $Plan.Operation 'Convert')) { 'next: Exchange Online part (mailbox, licence, permissions)' } else { 'next: Exchange Online deprovisioning check' }
+        $statusText = switch ([string]$Plan.Row.FinalStatus) { 'Pending' { $pendingText } 'AlreadyDone' { 'already in the expected state' } default { 'done' } }
         $text = '{0}  {1}  {2} AD verified, {3} attribute(s) changed{4} {2} {5}' -f $record.SamAccountName, $typeText, [char]0x00B7, ($Plan.Kinds.Count - $unchanged), $(if ((Test-PraOrdinalIn $groupAction @('Added','Removed') -IgnoreCase)) { ', licence group ' + $groupAction.ToLowerInvariant() } else { '' }), $statusText
         Write-PraItem -Context $Context -Status Ok -Text $text
         return
@@ -1167,6 +1169,7 @@ function Initialize-PraPermissionCache {
     [CmdletBinding()]
     param([hashtable]$Context)
     [void]$script:PermissionCaches.Remove($Context)
+    [void]$Context.Remove('_PraTrusteeAnchors')
 }
 
 function Get-PraPermissionCache {
@@ -1200,6 +1203,34 @@ function Add-PraPermissionCache {
     $cache.Order.Enqueue($Key); $cache.UpnCount += $Upns.Count; $cache.CharacterCount += $characters
 }
 
+function Test-PraConsistencyGuidSchema {
+    <# True when the schema of the forest has ms-DS-ConsistencyGuid (read once per run, never an error: an answer that cannot be read is "no"). #>
+    [CmdletBinding()]
+    param([hashtable]$Context)
+    if ($Context.ContainsKey('_PraConsistencyGuidSchema')) { return [bool]$Context['_PraConsistencyGuidSchema'] }
+    $available = $false
+    try {
+        $schema = [string](Get-ADRootDSE -Server $Context.Server -ErrorAction Stop).schemaNamingContext
+        if ($schema) { $available = (@(Get-ADObject -SearchBase $schema -LDAPFilter '(&(objectClass=attributeSchema)(lDAPDisplayName=mS-DS-ConsistencyGuid))' -Server $Context.Server -ErrorAction Stop).Count -eq 1) }
+    }
+    catch { Write-PraLog -Context $Context -Message ('ms-DS-ConsistencyGuid: schema not readable, only the objectGUID is recorded for trustees ({0})' -f $_.Exception.Message) -Level Detail }
+    $Context['_PraConsistencyGuidSchema'] = $available
+    return $available
+}
+
+function Add-PraTrusteeAnchor {
+    <# Remembers the source anchors (objectGUID, and ms-DS-ConsistencyGuid when the object has it) of a trustee seen in this run, by UPN. #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [string]$Upn, $Object)
+    if (-not $Context.ContainsKey('_PraTrusteeAnchors')) { $Context['_PraTrusteeAnchors'] = New-Object 'Collections.Generic.Dictionary[string,string[]]' ([StringComparer]::OrdinalIgnoreCase) }
+    $anchors = New-Object 'Collections.Generic.List[string]'
+    foreach ($value in @((Get-PraValue $Object 'mS-DS-ConsistencyGuid' $null), (Get-PraValue $Object 'ObjectGUID' $null))) {
+        $text = ConvertTo-PraImmutableId -Value $value
+        if ($text -and -not $anchors.Contains($text)) { $anchors.Add($text) }
+    }
+    if ($anchors.Count) { $Context['_PraTrusteeAnchors'][$Upn] = [string[]]$anchors.ToArray() }
+}
+
 function Expand-PraTrustee {
     <# UPN(s) of a trustee: the user itself, or the members of a group (recursive), minus the exclusions. #>
     [CmdletBinding()]
@@ -1209,6 +1240,7 @@ function Expand-PraTrustee {
     if (Test-PraOrdinalIgnoreCaseEqual $Object.objectClass 'user') {
         $upn = [string](Get-PraValue $Object 'userPrincipalName' '')
         if (-not $upn) { throw "Trustee without UPN: $($Object.DistinguishedName)" }
+        Add-PraTrusteeAnchor -Context $Context -Upn $upn -Object $Object
         return $upn
     }
     if (-not (Test-PraOrdinalIgnoreCaseEqual $Object.objectClass 'group')) { throw "Unsupported trustee type: $($Object.objectClass)" }
@@ -1231,11 +1263,13 @@ function Expand-PraTrustee {
                 foreach ($upn in $cache.Entries[$memberKey].Upns) { [void]$upns.Add($upn) }
             }
             else {
-                $user = Get-ADUser -Identity $member.DistinguishedName -Properties userPrincipalName, sAMAccountName -Server $Context.Server -ErrorAction Stop
+                $memberProperties = @('userPrincipalName', 'sAMAccountName') + @(if (Test-PraConsistencyGuidSchema -Context $Context) { 'mS-DS-ConsistencyGuid' })
+                $user = Get-ADUser -Identity $member.DistinguishedName -Properties $memberProperties -Server $Context.Server -ErrorAction Stop
                 $memberUpns = @()
                 if (-not (Test-PraOrdinalIn -IgnoreCase $user.SamAccountName $excluded)) {
                     if (-not $user.UserPrincipalName) { throw "Trustee without UPN: $($member.DistinguishedName)" }
                     $memberUpns = @([string]$user.UserPrincipalName); [void]$upns.Add([string]$user.UserPrincipalName)
+                    Add-PraTrusteeAnchor -Context $Context -Upn ([string]$user.UserPrincipalName) -Object $user
                 }
                 Add-PraPermissionCache -Context $Context -Key $memberKey -Upns $memberUpns
             }
@@ -1270,7 +1304,8 @@ function Resolve-PraAclTrustee {
     if ($cache.Entries.ContainsKey($key)) { return $cache.Entries[$key].Upns }
     $Context.CurrentOperation = 'Resolve-PermissionTrustee'; $Context.CurrentIdentity = $sid.Value
     Write-PraLog -Context $Context -Message ("PERMISSIONS TRUSTEE | DC=$($Context.Server) | SID=$($sid.Value)") -Level Debug
-    $objects = @(Get-ADObject -Filter "objectSid -eq '$($sid.Value)'" -Properties objectClass, userPrincipalName, sAMAccountName -Server $Context.Server -ErrorAction Stop)
+    $trusteeProperties = @('objectClass', 'userPrincipalName', 'sAMAccountName') + @(if (Test-PraConsistencyGuidSchema -Context $Context) { 'mS-DS-ConsistencyGuid' })
+    $objects = @(Get-ADObject -Filter "objectSid -eq '$($sid.Value)'" -Properties $trusteeProperties -Server $Context.Server -ErrorAction Stop)
     if ($objects.Count -eq 0) {
         if ($null -eq $Unknown) { throw "Permission trustee not found in AD: $($sid.Value)" }
         Write-PraLog -Context $Context -Message ("PERMISSIONS TRUSTEE | SID=$($sid.Value) | not found in AD (deleted account or another domain): ignored") -Level Detail
@@ -1383,7 +1418,8 @@ function Get-PraSharedPermission {
             if ($cache.Entries.ContainsKey($key)) { $upns = $cache.Entries[$key].Upns }
             else {
                 $Context.CurrentOperation = 'Resolve-PublicDelegate'; $Context.CurrentIdentity = [string]$dn
-                $delegate = Get-ADObject -Identity $dn -Properties objectClass, userPrincipalName, sAMAccountName -Server $Context.Server -ErrorAction Stop
+                $delegateProperties = @('objectClass', 'userPrincipalName', 'sAMAccountName') + @(if (Test-PraConsistencyGuidSchema -Context $Context) { 'mS-DS-ConsistencyGuid' })
+                $delegate = Get-ADObject -Identity $dn -Properties $delegateProperties -Server $Context.Server -ErrorAction Stop
                 $upns = [string[]]@(Expand-PraTrustee -Context $Context -Object $delegate)
                 Add-PraPermissionCache -Context $Context -Key $key -Upns $upns
             }
@@ -1537,8 +1573,17 @@ function New-PraPlan {
     $sourceLicensing = Get-PraValue $SourceRecord 'Licensing' $null
     $preserveMailbox = $shared -and (Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover') -and [bool](Get-PraValue $Context 'KeepCloudShared' $false)
     $preserveLicense = ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover')) -and [bool](Get-PraValue $sourceLicensing 'Enabled' $false) -and [bool](Get-PraValue $sourceLicensing 'WasMember' $false)
+    $trusteeAnchors = [ordered]@{}
+    $knownAnchors = Get-PraValue $Context '_PraTrusteeAnchors' $null
+    if ($null -ne $knownAnchors) {
+        foreach ($trustee in @(@($permissions.FullAccess) + @($permissions.SendAs) + @($permissions.SendOnBehalf) | Get-PraOrdinalUnique -IgnoreCase | Get-PraOrdinalSorted -IgnoreCase)) {
+            if ($knownAnchors.ContainsKey([string]$trustee)) { $trusteeAnchors[[string]$trustee] = [string[]]@($knownAnchors[[string]$trustee]) }
+        }
+    }
     $record = [ordered]@{
         ObjectGuid=([guid]$user.ObjectGUID).ToString(); DistinguishedName=[string]$user.DistinguishedName
+        SourceAnchor=[ordered]@{ ObjectGuid=[string](ConvertTo-PraImmutableId -Value $user.ObjectGUID); ConsistencyGuid=[string](ConvertTo-PraImmutableId -Value (Get-PraValue $user 'mS-DS-ConsistencyGuid' $null)) }
+        SharedTrusteeAnchors=$trusteeAnchors
         SamAccountName=[string]$user.SamAccountName; UserPrincipalName=[string]$user.UserPrincipalName; DisplayName=[string](Get-PraValue $user 'DisplayName' $user.SamAccountName)
         CapturedUtc=[DateTime]::UtcNow.ToString('o'); CapturedUsnChanged=(Get-PraUsn $user); IsShared=$shared; RequestedOperation=$Operation
         Attributes=$before; PlannedAttributes=$desired; Licensing=$licensing
@@ -1608,6 +1653,22 @@ function Assert-PraStoredRecord {
         if ($expectedStored -isnot [string] -and $expectedStored -isnot [array]) { throw 'Backup: invalid list of expected X500 addresses.' }
         if (@($expectedStored).Count -gt $script:MaxExpectedX500) { throw 'Backup: too many expected X500 addresses.' }
         foreach ($value in @($expectedStored)) { if ($value -isnot [string] -or -not (Test-PraX500Address $value) -or $value.Length -gt $script:MaxExpectedX500Length) { throw 'Backup: invalid list of expected X500 addresses.' } }
+    }
+    # Source anchors (absent from a batch written without them: the anchor is derived from the GUID of the record).
+    $anchorStored = Get-PraValue $Record 'SourceAnchor' $null
+    if ($null -ne $anchorStored) {
+        foreach ($name in @('ObjectGuid', 'ConsistencyGuid')) {
+            $text = Get-PraValue $anchorStored $name $null
+            if ($text -isnot [string] -or ($text -and $text -cnotmatch '^[A-Za-z0-9+/]{22}==\z')) { throw 'Backup: invalid source anchor.' }
+        }
+        if (-not [string](Get-PraValue $anchorStored 'ObjectGuid' '')) { throw 'Backup: invalid source anchor.' }
+    }
+    $trusteeStored = Get-PraValue $Record 'SharedTrusteeAnchors' $null
+    if ($null -ne $trusteeStored) {
+        $trusteeNames = if ($trusteeStored -is [Collections.IDictionary]) { @($trusteeStored.Keys) } else { @($trusteeStored.PSObject.Properties | ForEach-Object { $_.Name }) }
+        foreach ($name in $trusteeNames) {
+            foreach ($text in @(Get-PraList $trusteeStored ([string]$name))) { if ($text -isnot [string] -or $text -cnotmatch '^[A-Za-z0-9+/]{22}==\z') { throw 'Backup: invalid trustee source anchor.' } }
+        }
     }
     if (-not $Legacy) {
         if ($Record.CapturedUsnChanged -isnot [string] -or $Record.CapturedUsnChanged -notmatch '^[1-9][0-9]*\z') { throw 'Backup: original uSNChanged missing or invalid.' }
