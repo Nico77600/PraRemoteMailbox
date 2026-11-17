@@ -660,17 +660,17 @@ try {
  if(-not $g.Pending){throw ('Preview not authorized: '+$c.SumText.Text+' '+$g.PreviewError)}
  if($c.VerList.Items.Count -ne 1){throw 'The grid is not populated by the Preview report'}
  if($g.Model.Steps.Count -ne 3 -or $g.Model.Steps[2].Status -ne 'Ok'){throw 'The plan and step events did not drive the steps'}
- $c.ConfirmBox.Text='CONVERTX'
+ $c.ConfirmBox.Text='CONVERTX'; Pump 350
  if($c.BtnNext.IsEnabled){throw 'A wrong confirmation word enabled Run'}
- $c.ConfirmBox.Text='convert'
+ $c.ConfirmBox.Text='convert'; Pump 350
  if(-not $c.BtnNext.IsEnabled){throw 'Lowercase confirmation did not enable Run'}
- $c.ConfirmBox.Text=' CoNvErT '
+ $c.ConfirmBox.Text=' CoNvErT '; Pump 350
  if(-not $c.BtnNext.IsEnabled){throw 'Mixed-case confirmation with spaces did not enable Run'}
  $c.F_Identity.Text='other@example.invalid'; Pump
  if($g.Pending -or $c.BtnNext.IsEnabled -or $c.ConfirmBox.Text){throw 'Changing the object source preserved the authorization'}
  $c.F_Identity.Text='synthetic@example.invalid'; Pump
  Click $g 'BtnPreview'; Wait-Run $g
- $c.ConfirmBox.Text='CONVERT'
+ $c.ConfirmBox.Text='CONVERT'; Pump 350
  if(-not $c.BtnNext.IsEnabled){throw 'A fresh Preview did not reauthorize Run'}
  [IO.File]::AppendAllText($Config,"`n# Changed input")
  Click $g 'BtnNext'
@@ -2023,6 +2023,132 @@ AfterAll {
             try { Remove-Item -LiteralPath $script:GuiEvidence -Recurse -Force -ErrorAction Stop; break }
             catch { if($attempt -eq 20) { throw }; Start-Sleep -Milliseconds 500 }
         }
+    }
+}
+
+Describe 'Release 3.2.0 - scale: the console reads a batch file again only when it changed, finds an object of an event without a scan, and reads its CSV files by their stamp (synthetic, no engine)' -Tag 'Release320c' {
+    It 'keeps what it read of a batch while the file and its .sha256 file are unchanged, and reads again only the file that changed' {
+        $runtime=New-GuiTestRoot
+        $batches=@(1..3 | ForEach-Object { New-GuiTestBatch $runtime })
+        $first=Read-PraGuiState $runtime.Root $runtime.Config
+        $first.Batches.Count | Should -Be 3
+        $second=Read-PraGuiState $runtime.Root $runtime.Config
+        foreach ($item in $second.Batches) {
+            $before=@($first.Batches | Where-Object Path -eq $item.Path)[0]
+            [object]::ReferenceEquals($item.Data,$before.Data) | Should -BeTrue -Because 'the batch was not read again'
+        }
+        $changed=$batches[1]
+        $data=$changed.Data.Clone(); $data.Records=@($data.Records[0],$data.Records[0]); $data.Environment='GuiSynthetic'
+        Write-GuiTestJson $changed.Path $data
+        $third=Read-PraGuiState $runtime.Root $runtime.Config
+        foreach ($item in $third.Batches) {
+            $before=@($second.Batches | Where-Object Path -eq $item.Path)[0]
+            [object]::ReferenceEquals($item.Data,$before.Data) | Should -Be ($item.Path -ne $changed.Path)
+        }
+        @($third.Batches | Where-Object Path -eq $changed.Path)[0].Data.RecordCount | Should -Be 2
+        [IO.File]::WriteAllText($batches[2].Path+'.sha256',('0'*64),$script:GuiEncoding)
+        $fourth=Read-PraGuiState $runtime.Root $runtime.Config
+        @($fourth.Batches | Where-Object Path -eq $batches[2].Path)[0].Status | Should -Match 'SHA-256 mismatch' -Because 'a changed .sha256 file is a change of the batch'
+    }
+    It 'keeps in the batch only what the window shows (the counts), so that a batch of thousands of objects costs little memory, and counts the shared mailboxes' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $data=$batch.Data.Clone()
+        $data.Records=@(1..2000 | ForEach-Object { @{ObjectGuid=[guid]::NewGuid().ToString();SamAccountName=('user'+$_);UserPrincipalName=('user'+$_+'@contoso.invalid');IsShared=(($_ % 4) -eq 0)} })
+        Write-GuiTestJson $batch.Path $data
+        $item=Read-PraGuiBatch $batch.Path 'GuiSynthetic'
+        $item.Valid | Should -BeTrue
+        $item.Data.RecordCount | Should -Be 2000
+        $item.Data.SharedCount | Should -Be 500
+        $item.Data.PSObject.Properties.Name | Should -Not -Contain 'Records'
+        $item.Data.BatchId | Should -BeExactly $batch.Id
+        (Read-PraGuiBatch $batch.Path 'OtherSynthetic').EnvMismatch | Should -BeTrue
+        (Read-PraGuiBatch $batch.Path 'otherSYNTHETIC' -AnyEnvironment).Valid | Should -BeTrue
+        (Read-PraGuiBatch $batch.Path 'guisynthetic').Valid | Should -BeTrue -Because 'the Environment is compared ignoring the letter case'
+    }
+    It 'finds the row of an object in a step by its name in any letter case, without scanning the rows of the step' {
+        $result=& (Get-Module PRA.Gui) {
+            $model=@{ Objects=@{}; ObjectIndex=@{} }
+            $clock=[Diagnostics.Stopwatch]::StartNew()
+            for ($i=1; $i -le 3000; $i++) { Add-PraGuiModelObject $model 's3' ('User'+$i+'@contoso.invalid') (New-PraGuiRow @{ Name=('User'+$i+'@contoso.invalid'); Result='ok' }) }
+            $hits=0
+            for ($i=1; $i -le 3000; $i++) { $row=Get-PraGuiModelObject $model 's3' ('USER'+$i+'@CONTOSO.INVALID'); if ($row -and $row.Result -ceq 'ok') { $hits++ } }
+            $plain=@{ Objects=@{ s1=(New-Object 'Collections.ObjectModel.ObservableCollection[object]') } }
+            $plain.Objects.s1.Add((New-PraGuiRow @{ Name='Only@contoso.invalid'; Result='x' }))
+            @{ Rows=$model.Objects['s3'].Count; Hits=$hits; Seconds=$clock.Elapsed.TotalSeconds; Missing=(Get-PraGuiModelObject $model 's3' 'nobody@contoso.invalid'); NoStep=(Get-PraGuiModelObject $model 's9' 'x'); Scan=(Get-PraGuiModelObject $plain 's1' 'ONLY@contoso.invalid') }
+        }
+        $result.Rows | Should -Be 3000
+        $result.Hits | Should -Be 3000
+        $result.Missing | Should -BeNullOrEmpty
+        $result.NoStep | Should -BeNullOrEmpty
+        $result.Scan.Result | Should -BeExactly 'x' -Because 'a model built without the dictionary is still searched'
+        $result.Seconds | Should -BeLessThan 60
+    }
+    It 'says how many rows its target CSV file has from the stamp of the file, and reads the file again when it changes' {
+        $runtime=New-GuiTestRoot
+        $csv=Join-Path $runtime.Root 'targets.csv'
+        Write-GuiTestFile $csv ("Identity`r`n"+((1..50 | ForEach-Object { 'user'+$_+'@contoso.invalid' }) -join "`r`n"))
+        $global:PraGuiCsv=$csv
+        $text=& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }
+        $text | Should -BeExactly ' 50 rows.'
+        & (Get-Module PRA.Gui) { $script:PraGuiCsvCache[$global:PraGuiCsv].Text=' kept from the first reading.' }
+        (& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }) | Should -BeExactly ' kept from the first reading.' -Because 'the file was not read again'
+        Write-GuiTestFile $csv ("Identity`r`n"+((1..7 | ForEach-Object { 'user'+$_+'@contoso.invalid' }) -join "`r`n"))
+        (& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }) | Should -BeExactly ' 7 rows.'
+        Write-GuiTestFile $csv "Wrong`r`nsynthetic@example.invalid"
+        (& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }) | Should -Match 'requires an Identity column'
+        Remove-Variable PraGuiCsv -Scope Global
+        $source=Get-Content -LiteralPath $script:GuiModule -Raw
+        $source | Should -Match '\$c\.ConfirmBox\.Add_TextChanged\(\{ \$script:Gui\.ConfirmTimer\.Stop\(\); \$script:Gui\.ConfirmTimer\.Start\(\) \}\)' -Because 'a refresh follows a pause in the typing, not each key'
+        $source | Should -Not -Match 'ConfirmBox\.Add_TextChanged\(\{ Update-PraGuiView \}\)'
+    }
+    It 'reads the per-run CSV of thousands of rows with the formula guard removed from the columns it shows, and the shared flag as a boolean' {
+        $runtime=New-GuiTestRoot
+        $path=Join-Path $runtime.Root 'run.csv'
+        $lines=New-Object 'Collections.Generic.List[string]'
+        $lines.Add('"ObjectGuid";"SamAccountName";"UserPrincipalName";"IsShared";"BackupPath";"Warnings";"FinalStatus";"Detail";"CloudDetail"')
+        for ($i=1; $i -le 3000; $i++) { $lines.Add(('"{0}";"''=user{1}";"user{1}@contoso.invalid";"{2}";"B{1}";"";"Planned";"''-detail {1}";"''=kept"' -f [guid]::NewGuid(),$i,$(if ($i % 2) { 'True' } else { 'False' }))) }
+        [IO.File]::WriteAllText($path,($lines -join "`r`n"),$script:GuiEncoding)
+        $global:PraGuiReport=$path
+        $clock=[Diagnostics.Stopwatch]::StartNew()
+        $rows=@(& (Get-Module PRA.Gui) { Read-PraGuiReport $global:PraGuiReport })
+        $seconds=$clock.Elapsed.TotalSeconds
+        Remove-Variable PraGuiReport -Scope Global
+        $rows.Count | Should -Be 3000
+        $rows[0].SamAccountName | Should -BeExactly '=user1'
+        $rows[0].Detail | Should -BeExactly '-detail 1'
+        $rows[0].IsShared | Should -BeTrue
+        $rows[1].IsShared | Should -BeFalse
+        $rows[0].UserPrincipalName | Should -BeExactly 'user1@contoso.invalid'
+        $rows[0].CloudDetail | Should -BeExactly "'=kept" -Because 'a column the window does not show keeps its guard'
+        $seconds | Should -BeLessThan 60
+    }
+    It 'counts the rows of a preview once for a given list (a refresh follows each key typed in the confirmation box)' {
+        $result=& (Get-Module PRA.Gui) {
+            $saved=$script:Gui
+            try {
+                $rows=New-Object 'Collections.ObjectModel.ObservableCollection[object]'
+                for ($i=1; $i -le 3000; $i++) { $rows.Add((New-PraGuiRow @{ Type=$(if ($i % 3 -eq 0) { 'Shared' } else { 'User' }); Status=$(if ($i % 10 -eq 0) { 'Warn' } elseif ($i % 50 -eq 0) { 'Fail' } else { 'Ok' }) })) }
+                $script:Gui=@{ VerRows=$rows }
+                $first=[pscustomobject]@{ }
+                $tally=Get-PraGuiVerTally
+                $first=[pscustomobject]@{ Count=$tally.Count; Shared=$tally.Shared; Warn=$tally.Warn; Failed=$tally.Failed }
+                $script:Gui.VerTally.Warn=-1
+                $second=Get-PraGuiVerTally
+                $keptWarn=$second.Warn
+                $rows.Add((New-PraGuiRow @{ Type='Shared'; Status='Fail' }))
+                $third=Get-PraGuiVerTally
+                @{ First=$first; Same=($keptWarn -eq -1); Third=$third }
+            } finally { $script:Gui=$saved }
+        }
+        $result.First.Count | Should -Be 3000
+        $result.First.Shared | Should -Be 1000
+        $result.First.Warn | Should -Be 300
+        $result.First.Failed | Should -Be 0 -Because 'a row that is a multiple of 50 is also a multiple of 10 and counts as a warning'
+        $result.Same | Should -BeTrue
+        $result.Third.Count | Should -Be 3001
+        $result.Third.Shared | Should -Be 1001
+        $result.Third.Failed | Should -Be 1
     }
 }
 

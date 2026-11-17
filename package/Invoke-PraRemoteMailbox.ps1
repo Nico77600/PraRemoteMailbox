@@ -506,16 +506,15 @@ function Initialize-PraCloudAuthority {
     <#
     .SYNOPSIS
         Callbacks given to the cloud module. Before each Exchange Online write, AssertCloudAuthorization
-        re-reads the AD proof of the object; JournalMutation records the write in the batch journal.
+        checks the AD proof of the object (read in full once, then by its stamps) and the backup; JournalMutation records the write in the batch journal.
     #>
     # GetNewClosure captures local variables, not the $context of the script: copy it first.
     $capturedContext = $context
     $context.AssertCloudAuthorization = {
         param($Row)
         if (-not $capturedContext.AllowMutation -or $capturedContext.OperationFailed -or $capturedContext.Issues.Count -gt 0 -or $null -eq $capturedContext.Proof) { throw 'Cloud write refused: no authorisation or the run already has an error.' }
-        $proof = Import-PraProof $capturedContext $capturedContext.Proof.Path $capturedContext.Source $capturedContext.Action
-        if (@($proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $Row.ObjectGuid }).Count -ne 1) { throw 'Cloud write refused: the object is not in a verified AD phase.' }
-        Assert-PraReceipt $capturedContext $capturedContext.Source $Row.ObjectGuid
+        Assert-PraCloudProofObject -Context $capturedContext -ProofPath $capturedContext.Proof.Path -Source $capturedContext.Source -Operation $capturedContext.Action -ObjectGuid ([string]$Row.ObjectGuid)
+        Assert-PraReceipt $capturedContext $capturedContext.Source ([string]$Row.ObjectGuid)
     }.GetNewClosure()
     $context.JournalMutation = { param($Target, $Operation, $Status, $Detail) Write-PraJournal $capturedContext $Target $Operation $Status ([string]$Detail) }.GetNewClosure()
 }
@@ -606,22 +605,27 @@ function Get-PraFinalizeInput {
     $records = @(Select-PraSourceRecord $context.Source); $seen = @{}
     $items = @($manifest.Items)
     if (-not $items.Count) { throw 'Finalize package is empty.' }
+    $proofIndex = Get-PraRecordIndex $context.Proof.Data.Records
+    $snapshotIndex = Get-PraRecordIndex $context.Proof.Receipt.Data.Records
+    $sourceIndex = Get-PraRecordIndex $context.Source.Data.Records
     foreach ($item in $items) {
         if ($item.CloudConfirmed -isnot [bool] -or -not $item.CloudConfirmed -or $item.DeprovisionConfirmed -isnot [bool] -or -not $item.DeprovisionConfirmed -or $item.RestoreShared -isnot [bool] -or $item.RestoreTag -isnot [bool] -or
-            -not (Test-PraOrdinalIn $item.ObjectGuid @($context.Proof.Data.Records.ObjectGuid) -IgnoreCase) -or $seen.ContainsKey($item.ObjectGuid)) { throw 'Finalize package: invalid object confirmation.' }
-        $proofEntry = @($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
-        $snapshotEntry = @($context.Proof.Receipt.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
-        $sourceEntry = @($context.Source.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
+            $null -eq (Find-PraRecord $proofIndex ([string]$item.ObjectGuid)) -or $seen.ContainsKey($item.ObjectGuid)) { throw 'Finalize package: invalid object confirmation.' }
+        $proofEntry = Find-PraRecord $proofIndex ([string]$item.ObjectGuid)
+        $snapshotEntry = Find-PraRecord $snapshotIndex ([string]$item.ObjectGuid)
+        $sourceEntry = Find-PraRecord $sourceIndex ([string]$item.ObjectGuid)
         if ($snapshotEntry.PreserveCloudMailbox -or ($item.RestoreShared -and (-not (Test-PraOrdinalEqual $proofEntry.Operation 'Deprovision') -or -not $sourceEntry.IsShared)) -or
             ($item.RestoreTag -and -not [bool](Get-PraValue (Get-PraValue $sourceEntry 'Retention' $null) 'Enabled' $false)) -or
             (-not $item.RestoreShared -and -not $item.RestoreTag)) { throw 'Finalize package does not match the AD operations it proves.' }
         $seen[$item.ObjectGuid] = $true
     }
-    if ($Identity -and @($records | Where-Object { Test-PraOrdinalIn $_.ObjectGuid @($items.ObjectGuid) -IgnoreCase }).Count -ne 1) { throw "Identity '$Identity' is not authorised by this Finalize package." }
+    $itemByGuid = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in $items) { $itemByGuid[[string]$item.ObjectGuid] = $item }
+    $authorised = New-Object 'Collections.Generic.List[object]'
+    foreach ($record in $records) { if ($itemByGuid.ContainsKey([string]$record.ObjectGuid)) { $authorised.Add($record) } }
+    if ($Identity -and $authorised.Count -ne 1) { throw "Identity '$Identity' is not authorised by this Finalize package." }
     $context.BatchId = Get-PraShortId ((Split-Path (Split-Path $path -Parent) -Leaf) -replace '^Finalize-', '')
-    return @($records | Where-Object { Test-PraOrdinalIn $_.ObjectGuid @($items.ObjectGuid) -IgnoreCase } | ForEach-Object {
-            $recordGuid = $_.ObjectGuid
-            [pscustomobject]@{ Record = $_; Item = ($items | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $recordGuid }) } })
+    return @($authorised | ForEach-Object { [pscustomobject]@{ Record = $_; Item = $itemByGuid[[string]$_.ObjectGuid] } })
 }
 
 function Format-PraByteSize {
@@ -818,7 +822,7 @@ function Assert-PraBatchNotRolledBack {
 function Get-PraBatchTouchedSet {
     <# The objects that the journal of the Convert batch in $context.Source shows as written or about to be written. #>
     $journal = Join-Path (Split-Path $context.Source.Path -Parent) ('Journal-' + [string]$context.Source.Data.BatchId + '.jsonl')
-    return , (Get-PraJournalTouchedObject -Path $journal)
+    return , (Get-PraJournalTouchedObject -Path $journal -Context $context)
 }
 
 function Get-PraPartialSourceProof {
@@ -827,6 +831,7 @@ function Get-PraPartialSourceProof {
     $path = Join-Path (Split-Path $context.Source.Path -Parent) ('State-' + [string]$context.Source.Data.BatchId + '.json')
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     try { $raw = [IO.File]::ReadAllText($path) | ConvertFrom-PraJson } catch { return [pscustomobject]@{ Unusable = $true; Reason = 'the State file cannot be read' } }
+    if ($null -eq $raw -or $null -eq (Get-PraValue $raw 'Kind' $null)) { return [pscustomobject]@{ Unusable = $true; Reason = 'the State file is not an AD proof' } }
     if ((Get-PraValue $raw 'Partial' $false) -ne $true) { return $null }
     try { return (Import-PraProof $context $path $context.Source 'Convert') }
     catch { return [pscustomobject]@{ Unusable = $true; Reason = (([string]$_.Exception.Message -split '\r?\n')[0]).Trim() } }
@@ -921,8 +926,9 @@ function Write-PraRemainingCsv {
         }
         else { $keep = @($names | ForEach-Object { [pscustomobject]@{ Identity = $_ } }); $columns = @('Identity') }
         $quote = { param($value) '"' + ([string]$value).Replace('"', '""') + '"' }
-        $lines = @(($columns | ForEach-Object { & $quote $_ }) -join $delimiter)
-        foreach ($row in $keep) { $lines += (($columns | ForEach-Object { & $quote (Get-PraValue $row $_ '') }) -join $delimiter) }
+        $lines = New-Object 'Collections.Generic.List[string]'
+        $lines.Add((($columns | ForEach-Object { & $quote $_ }) -join $delimiter))
+        foreach ($row in $keep) { $lines.Add((($columns | ForEach-Object { & $quote (Get-PraValue $row $_ '') }) -join $delimiter)) }
         $path = Join-Path $folder ('ToConvert-{0}-{1}.csv' -f $Partial.ShortId, $context.RunId.Substring(0, 15))
         Write-PraImmutableFile $path (($lines -join "`r`n") + "`r`n")
         return $path
@@ -1230,12 +1236,13 @@ try {
         # The preflight runs before any object is marked: a refused run has touched nothing and must not show objects as done.
         Test-PraSyncAvailable
         if ($context.Proof.Partial) { $script:Touched = Get-PraBatchTouchedSet }
+        $provenIndex = Get-PraRecordIndex $context.Proof.Data.Records
         foreach ($record in @($context.Source.Data.Records)) {
-            $proven = @($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid })
-            if ($proven.Count -ne 1 -and -not ($context.Proof.Partial -and $proven.Count -eq 0)) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName). The batch cannot be finished from here. Nothing was changed." }
+            $provenCount = if ($null -eq (Find-PraRecord $provenIndex ([string]$record.ObjectGuid))) { 0 } elseif ($provenIndex.Duplicates.Contains([string]$record.ObjectGuid)) { 2 } else { 1 }
+            if ($provenCount -ne 1 -and -not ($context.Proof.Partial -and $provenCount -eq 0)) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName). The batch cannot be finished from here. Nothing was changed." }
             $row = New-PraRow $context $record
             $row.BackupPath = $context.Proof.Receipt.Path
-            if ($proven.Count -eq 0) { Set-PraUnprovenRow -Row $row -Record $record -Reason 'not converted by this batch (it stopped at its first error before this object)'; continue }
+            if ($provenCount -eq 0) { Set-PraUnprovenRow -Row $row -Record $record -Reason 'not converted by this batch (it stopped at its first error before this object)'; continue }
             $row.ADVerified = $true; $row.ADApplied = $true
             $row.FinalStatus = if ($context.AllowMutation) { 'Success' } else { 'Planned' }
             $row.Detail = 'AD changes made and verified by an earlier run of this batch; they are not changed again.'
@@ -1494,6 +1501,8 @@ try {
             }
             $script:SourcePartial = ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover') -and $null -ne $context.Proof -and $null -ne (Get-PraPartialSourceProof))
             if (($null -ne $context.Proof -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and $context.Proof.Partial) -or $script:SourcePartial) { $script:Touched = Get-PraBatchTouchedSet }
+            $verifiedIndex = if ($null -ne $context.Proof) { Get-PraRecordIndex $context.Proof.Data.Records } else { $null }
+            $plannedIndex = if ($null -ne $context.Proof) { Get-PraRecordIndex $context.Proof.Receipt.Data.Records } else { $null }
             foreach ($record in $records) {
                 $row = New-PraRow $context $record
                 $originalLicensing = Get-PraValue $record 'Licensing' $null
@@ -1502,17 +1511,18 @@ try {
                 $holders = Get-PraValue $record 'SharedPermissions' $null
                 $row.SharedFullAccess = Get-PraValue $holders 'FullAccess' @(); $row.SharedSendAs = Get-PraValue $holders 'SendAs' @(); $row.SharedSendOnBehalf = Get-PraValue $holders 'SendOnBehalf' @()
                 if ($null -ne $context.Proof) {
-                    $verified = @($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid })
-                    if ($verified.Count -eq 0 -and ($context.Proof.Partial -or $script:SourcePartial)) {
+                    $verifiedRecord = Find-PraRecord $verifiedIndex ([string]$record.ObjectGuid)
+                    $verifiedCount = if ($null -eq $verifiedRecord) { 0 } elseif ($verifiedIndex.Duplicates.Contains([string]$record.ObjectGuid)) { 2 } else { 1 }
+                    if ($verifiedCount -eq 0 -and ($context.Proof.Partial -or $script:SourcePartial)) {
                         # Partial batch: this object was not converted by it (or may be partly changed); the cloud part leaves it out.
                         $row.BackupPath = $context.Proof.Receipt.Path
                         Set-PraUnprovenRow -Row $row -Record $record -Reason 'not converted by this batch (it stopped at its first error before this object)'
                         $row.CloudStatus = 'Skipped'
                         continue
                     }
-                    if ($verified.Count -ne 1) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName)" }
-                    $row.ADVerified = $true; $row.DeproPending = (Test-PraOrdinalEqual $verified[0].Operation 'Deprovision'); $row.BackupPath = $context.Proof.Receipt.Path
-                    $provenPlan = @($context.Proof.Receipt.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid })[0]
+                    if ($verifiedCount -ne 1) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName)" }
+                    $row.ADVerified = $true; $row.DeproPending = (Test-PraOrdinalEqual $verifiedRecord.Operation 'Deprovision'); $row.BackupPath = $context.Proof.Receipt.Path
+                    $provenPlan = Find-PraRecord $plannedIndex ([string]$record.ObjectGuid)
                     $row.PreserveCloudMailbox = [bool]$provenPlan.PreserveCloudMailbox; $row.PreserveLicense = [bool]$provenPlan.PreserveLicense
                 }
                 $context.Rows.Add($row)
@@ -1627,7 +1637,9 @@ try {
                 foreach ($row in $tagged | Where-Object PreserveCloudMailbox) {
                     $row.FinalStatus = 'Pending'; $row.Detail += ' | Cloud mailbox kept on purpose: the retention tag stays.'
                 }
-                $followup = @($cloudRows | Where-Object { -not $_.PreserveCloudMailbox -and ($_.DeproPending -or $tagged.Contains($_)) })
+                $taggedSet = New-Object 'Collections.Generic.HashSet[object]' ([Collections.Generic.ReferenceEqualityComparer]::Instance)
+                foreach ($taggedRow in $tagged) { [void]$taggedSet.Add($taggedRow) }
+                $followup = @($cloudRows | Where-Object { -not $_.PreserveCloudMailbox -and ($_.DeproPending -or $taggedSet.Contains($_)) })
                 foreach ($row in $followup) { if (-not (Test-PraOrdinalEqual $row.CloudStatus 'Success') -or $row.DeprovisionConfirmed -ne $true -or $row.ADVerified -ne $true) { throw 'Cloud deprovisioning or AD proof not confirmed: restore and tag clean-up blocked.' } }
                 if (-not $followup.Count) { Write-PraItem -Context $context -Status Skip -Text 'Nothing left to restore.' }
                 elseif ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -or $defer -or -not @(Get-Module -ListAvailable ActiveDirectory).Count) {

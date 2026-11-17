@@ -182,6 +182,48 @@ function Get-PraOrdinalUnique {
     process { if ($null -ne $InputObject -and $seen.Add([string]$InputObject)) { [string]$InputObject } }
 }
 
+$script:PraRecordIndexCache = New-Object 'Runtime.CompilerServices.ConditionalWeakTable[object,object]'
+
+function New-PraRecordIndex {
+    <# The records of a list by ObjectGuid (ordinal, ignoring the case): ByGuid finds one record without scanning the list, Duplicates holds the GUIDs that more than one record carries (the first record is kept). #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][object]$Record)
+    $map = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    $duplicates = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $count = 0
+    foreach ($item in @($Record)) {
+        if ($null -eq $item) { continue }
+        $count++
+        $key = [string]$item.ObjectGuid
+        if ($map.ContainsKey($key)) { [void]$duplicates.Add($key); continue }
+        $map.Add($key, $item)
+    }
+    return [pscustomobject]@{ ByGuid = $map; Duplicates = $duplicates; Count = $count }
+}
+
+function Get-PraRecordIndex {
+    <# New-PraRecordIndex of a records array, built once: the same array (and the same number of records) gives the same index. A value that is not an array is indexed each time. #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][object]$Record)
+    if ($Record -is [object[]]) {
+        $cached = $null
+        if ($script:PraRecordIndexCache.TryGetValue($Record, [ref]$cached) -and $cached.Count -eq $Record.Length) { return $cached }
+        $index = New-PraRecordIndex -Record $Record
+        $script:PraRecordIndexCache.AddOrUpdate($Record, $index)
+        return $index
+    }
+    return (New-PraRecordIndex -Record $Record)
+}
+
+function Find-PraRecord {
+    <# The record of an index (New-PraRecordIndex, Get-PraRecordIndex) for a GUID in any letter case; $null when there is none. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Index, [AllowNull()][AllowEmptyString()][string]$Guid)
+    $found = $null
+    if ($Guid -and $Index.ByGuid.TryGetValue($Guid, [ref]$found)) { return $found }
+    return $null
+}
+
 function Compare-PraX500Address {
     <#
     .SYNOPSIS
@@ -2012,7 +2054,7 @@ $script:PraTransferKinds = @{
     Recover  = @{ Direction = 'ToCloud'; Target = 'Cloud'; Prefix = 'Batch-' }
     Finalize = @{ Direction = 'ToAD'; Target = 'AD'; Prefix = 'Finalize-' }
 }
-$script:PraTransferLimits = @{ MaxEntries = [int]2000; MaxEntryBytes = [long]268435456; MaxTotalBytes = [long]536870912; MaxManifestBytes = [long]1048576 }
+$script:PraTransferLimits = @{ MaxEntries = [int]2000; MaxEntryBytes = [long]2147483648; MaxTotalBytes = [long]4294967296; MaxManifestBytes = [long]1048576 }
 
 function Remove-PraStaleStaging {
     <# Sweeps the staging folders ('.importing-*') that a killed import left in the backup folder (older than 15 minutes: never an import in progress). #>
@@ -2551,7 +2593,7 @@ function New-PraEffectiveConfiguration {
 # small machine-readable file (PhaseData-*.json + .sha256) in the batch folder it creates; the file travels in the transfer package with the batch
 # (listed in transfer.json with its SHA-256 like every entry, so a changed file is refused at import). It is DATA FOR A REPORT: nothing in the engine
 # decides anything from it. It is read as untrusted input (size, schema, checksum, Environment) and every value is HTML-encoded when it is shown.
-$script:PraPhaseLimits = @{ MaxBytes = [long]67108864; MaxText = 2000; MaxStepText = 300; MaxStepsPerObject = 40; MaxJourney = 200000; MaxObjects = 200000; MaxFiles = 24; MaxIssues = 500; DetailedObjects = 2000 }
+$script:PraPhaseLimits = @{ MaxBytes = [long]268435456; MaxText = 2000; MaxStepText = 300; MaxStepsPerObject = 40; MaxJourney = 1000000; MaxObjects = 200000; MaxFiles = 24; MaxIssues = 10000; DetailedObjects = 10000 }
 $script:PraPhaseFilter = 'PhaseData-*.json'
 $script:PraNotAvailable = 'not available (folder from an older version or copied manually)'
 # Display only: a Pending phase (or stage) that a later phase of the same report took over is shown as handed over; the verdict logic reads the raw status.
@@ -3099,8 +3141,8 @@ function Write-PraGlobalReportHtml {
         $issues = @(Get-PraList $phase.Record 'Issues'); $warnings = @(Get-PraList $phase.Record 'Warnings')
         if (-not $issues.Count -and -not $warnings.Count) { continue }
         [void]$sb.Append('<section class="card ').Append($(if ($issues.Count) { 'fail' } else { 'warn' })).Append('"><h2>').Append((& $h ('Errors and warnings ' + [char]0x00B7 + ' ' + $phase.Label))).Append('</h2><table><thead><tr><th>Kind</th><th>Time</th><th>Step</th><th>Object</th><th>Message</th></tr></thead><tbody>')
-        foreach ($issue in ($issues | Select-Object -First 200)) { [void]$sb.Append('<tr><td><span class="pill fail">error</span></td><td>').Append((& $h (Get-PraValue $issue 'Timestamp' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Phase' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Identity' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Message' ''))).Append('</td></tr>') }
-        foreach ($warning in ($warnings | Select-Object -First 200)) { [void]$sb.Append('<tr><td><span class="pill warn">warning</span></td><td>').Append((& $h (Get-PraValue $warning 'Timestamp' ''))).Append('</td><td>').Append((& $h (Get-PraValue $warning 'Phase' ''))).Append('</td><td></td><td>').Append((& $h (Get-PraValue $warning 'Message' ''))).Append('</td></tr>') }
+        foreach ($issue in ($issues | Select-Object -First $script:PraPhaseLimits.MaxIssues)) { [void]$sb.Append('<tr><td><span class="pill fail">error</span></td><td>').Append((& $h (Get-PraValue $issue 'Timestamp' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Phase' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Identity' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Message' ''))).Append('</td></tr>') }
+        foreach ($warning in ($warnings | Select-Object -First $script:PraPhaseLimits.MaxIssues)) { [void]$sb.Append('<tr><td><span class="pill warn">warning</span></td><td>').Append((& $h (Get-PraValue $warning 'Timestamp' ''))).Append('</td><td>').Append((& $h (Get-PraValue $warning 'Phase' ''))).Append('</td><td></td><td>').Append((& $h (Get-PraValue $warning 'Message' ''))).Append('</td></tr>') }
         [void]$sb.Append('</tbody></table></section>')
     }
     [void]$sb.Append('<p class="muted">Generated by PRA Remote Mailbox v').Append((& $h $Model.Version)).Append('. This report holds names and statuses only: no secret, no token.</p></body></html>')
@@ -3168,7 +3210,7 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-PraImmutableId, Get-PraSourceAnchor, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-PraImmutableId, Get-PraSourceAnchor, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, New-PraRecordIndex, Get-PraRecordIndex, Find-PraRecord, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Test-PraOwnEntryProcess, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
