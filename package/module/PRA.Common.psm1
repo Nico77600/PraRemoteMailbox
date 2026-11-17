@@ -53,6 +53,7 @@ $script:ToolVersion = '3.1.4'
 $script:TranscriptOwner = $null
 $script:PraNativePath = $null
 $script:PraNativeProcess = $null
+$script:PraEventWriteWarned = $false
 # Columns of the CSV report, in this order (also the fields copied from each result row).
 $script:RowFields = @('ObjectGuid','SamAccountName','UserPrincipalName','Action','IsShared','ADApplied','ADVerified',
     'GroupAction','BackupPath','LastOperation','CloudMailbox','CloudLicense','CloudStatus','CloudDetail','PreserveCloudMailbox',
@@ -226,6 +227,8 @@ function Get-PraCloudModuleReport {
         $Available = @(Get-Module -ListAvailable -Name 'Microsoft.Graph.Authentication', 'Microsoft.Graph.Users', 'ExchangeOnlineManagement' -SkipEditionCheck -ErrorAction SilentlyContinue)
     }
     if (-not $PSBoundParameters.ContainsKey('Loaded')) { $Loaded = @(Get-Module -Name 'Microsoft.Graph.*' -ErrorAction SilentlyContinue) }
+    # The built-in minimum is the floor: a lower value in the configuration does not lower it.
+    if ([version]$MinExo -lt [version]$script:PraMinExoVersion) { $MinExo = $script:PraMinExoVersion }
     $minGraphVersion = [version]$MinGraph; $minExoVersion = [version]$MinExo
     $versionsOf = {
         param([object[]]$Modules, [string]$Name)
@@ -457,23 +460,68 @@ function Add-PraWarning {
     })
 }
 
+function ConvertTo-PraPlainMessage {
+    <#
+    .SYNOPSIS
+        The text of an error without its stack: the lines "at Namespace.Type.Method(...)", "at <ScriptBlock>, file: line N" and "--- End of ... stack trace ---" are removed.
+        The card, the console and the report show this text; the log keeps the whole detail. The empty parts that Exchange Online puts between its separators ("||You can't use...")
+        are removed too, so that no stray pipe is shown.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $frame = '^\s*(at\s+(<[^>\r\n]+>|[^\s(,]+\([^\r\n]*|[^\s,]+,\s+[^\r\n]*?\bline\s+\d+[^\r\n]*)|---\s*End of [^\r\n]*---)\s*$'
+    $kept = @([regex]::Split($Text, '\r?\n') | Where-Object { $_ -notmatch $frame })
+    $plain = ($kept -join [Environment]::NewLine).TrimEnd()
+    $plain = [regex]::Replace($plain, '\|(?:[ \t]*\|)+', '|')
+    $plain = [regex]::Replace($plain, '(?m)^[ \t]*\|[ \t]*|(?<=:[ \t]+)\|[ \t]*', '')
+    return ([regex]::Replace($plain, '(?m)[ \t]*\|[ \t]*(?=\r?$)', ''))
+}
+
+function Test-PraOwnEntryProcess {
+    <#
+    .SYNOPSIS
+        True when this PowerShell process was started for one script or one command (pwsh -File, -Command or -EncodedCommand, without -NoExit): the console's child
+        process, a scheduled task, a batch file. False for an interactive session where the operator typed the command: its window must never be closed by the run.
+    .PARAMETER Arguments
+        The command line of the process (the first item is the program); the process's own when not given.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([string[]]$Arguments = [Environment]::GetCommandLineArgs())
+    $own = $false
+    for ($i = 1; $i -lt $Arguments.Count; $i++) {
+        $argument = [string]$Arguments[$i]
+        if ($argument.Length -lt 2 -or -not ($argument.StartsWith('-', [StringComparison]::Ordinal) -or $argument.StartsWith('/', [StringComparison]::Ordinal))) { continue }
+        $name = $argument.TrimStart('-', '/')
+        if (Test-PraOrdinalIn $name @('noexit', 'noe') -IgnoreCase) { return $false }
+        if (Test-PraOrdinalIn $name @('file', 'f', 'command', 'c', 'commandwithargs', 'cwa', 'encodedcommand', 'e', 'ec') -IgnoreCase) { $own = $true }
+    }
+    return $own
+}
+
 function Write-PraEvent {
-    <# Optional JSONL channel to the window; CLI runs without PRA_EVENT_FILE are unchanged. #>
+    <# Optional JSONL channel to the window; CLI runs without PRA_EVENT_FILE are unchanged. A line that cannot be written (another program holds the file) never stops the run: it is tried three times, the first failure of the run is said once on the console. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][ValidateSet('start','step','item','summary','result','plan','progress','count')][string]$Kind, [hashtable]$Data = @{})
     if (-not $env:PRA_EVENT_FILE) { return }
     $record = [ordered]@{ time = [datetime]::UtcNow.ToString('o'); kind = $Kind }
     foreach ($key in $Data.Keys) { $record[$key] = $Data[$key] }
     $line = ($record | ConvertTo-Json -Compress -Depth 8) + "`n"
+    $reason = ''
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
             [IO.File]::AppendAllText($env:PRA_EVENT_FILE, $line, (New-Object Text.UTF8Encoding($false)))
             return
         }
-        catch [IO.IOException] {
-            if ($attempt -eq 3) { throw }
-            Start-Sleep -Milliseconds 50
+        catch {
+            $reason = [string]$_.Exception.Message
+            if ($attempt -lt 3) { Start-Sleep -Milliseconds 50 }
         }
+    }
+    if (-not $script:PraEventWriteWarned) {
+        $script:PraEventWriteWarned = $true
+        try { Write-PraHost @('      ', (Get-PraIcon 'Warn'), ('The progress file of the window cannot be written ({0}): the run goes on, the window may miss some events.' -f $reason)) -Color $script:Theme.Warn } catch { $null = $_ }
     }
 }
 
@@ -557,7 +605,7 @@ function Write-PraLog {
     if ((Test-PraOrdinalIgnoreCaseEqual $Level 'Warning')) { $Context.Warnings = [int](Get-PraValue $Context 'Warnings' 0) + 1; Add-PraWarning $Context $Message }
     if ((Test-PraOrdinalIgnoreCaseEqual $Level 'Error')) { Add-PraIssue $Context $Message }
     Write-PraLogFile -Context $Context -Level $logLevel -Message $Message
-    $text = $Message -replace '[\r\n]+', ' | '
+    $text = (ConvertTo-PraPlainMessage $Message) -replace '[\r\n]+', ' | '
     switch ($Level) {
         'Debug' {
             $verbose = [bool](Get-PraValue $Context 'VerboseEnabled' ((Test-PraOrdinalIgnoreCaseEqual $VerbosePreference 'Continue')))
@@ -909,7 +957,7 @@ function Get-PraPhysicalPath {
         if (@($full.Split('\') | Select-Object -Skip 3 | Where-Object { [string]::Equals($_, '.', [StringComparison]::Ordinal) -or [string]::Equals($_, '..', [StringComparison]::Ordinal) }).Count) { throw "Path $Path uses a device namespace with relative segments; it cannot be resolved safely." }
     }
     $existing = $full.TrimEnd('\')
-    if ($existing -match '^[A-Za-z]:$' -or $existing -match '^\\\\[?.]\\[A-Za-z]:$') { $existing += '\' }
+    if ($existing -match '^[A-Za-z]:\z' -or $existing -match '^\\\\[?.]\\[A-Za-z]:\z') { $existing += '\' }
     $missing = New-Object Collections.Generic.List[string]
     while (-not ([IO.Directory]::Exists($existing) -or [IO.File]::Exists($existing))) {
         $parent = [IO.Path]::GetDirectoryName($existing)
@@ -1362,6 +1410,9 @@ function Get-PraOutcome {
     $runErrors = 0
     # A run refused before any change (Entra Connect check, cloud modules, domain controller refusing the account) touched no object: only its error is a result row.
     $untouched = [bool](Get-PraValue $Context 'NoChangeMade' $false)
+    # In an Apply whose batch exists (its backup is written), an object still Planned when the run ends is not done: it is Pending, never counted as a success or as skipped.
+    $appliesChanges = (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $Context 'Mode' '')) 'Apply') -and (Test-PraOrdinalIn ([string](Get-PraValue $Context 'Action' '')) @('Convert', 'Recover', 'Finalize') -IgnoreCase) -and
+        ([bool](Get-PraValue $Context 'ChangesStarted' $false) -or -not [string]::IsNullOrEmpty([string](Get-PraValue $Context 'BatchId' '')))
     foreach ($row in $(if ($untouched) { @() } else { $Context.Rows.ToArray() })) {
         $copy = [ordered]@{}
         # Same lookup as Get-PraValue (missing and $null both give $null), inlined: this loop runs 22 times per row on very large runs.
@@ -1374,6 +1425,10 @@ function Get-PraOutcome {
         $copy.PermMissing = $copy.PermMissing -join '; '
         if (-not (Test-PraOrdinalIn $copy.FinalStatus $script:FinalStatuses)) {
             $copy.Detail = 'Final status missing or invalid: {0}. {1}' -f $copy.FinalStatus, $copy.Detail; $copy.FinalStatus = 'Error'
+        }
+        elseif ($appliesChanges -and (Test-PraOrdinalEqual $copy.FinalStatus 'Planned')) {
+            $copy.FinalStatus = 'Pending'
+            if (-not $copy.Detail) { $copy.Detail = 'not finished: the run ended before this object was done; the next steps say how to go on' }
         }
         if (Test-PraOrdinalEqual $copy.FinalStatus 'Error') {
             foreach ($field in @('ObjectGuid','SamAccountName','UserPrincipalName')) { if ($copy[$field]) { $errorIdentities[[string]$copy[$field]] = $true } }
@@ -1718,6 +1773,13 @@ function Complete-PraRun {
     $ownsTranscript = [object]::ReferenceEquals($script:TranscriptOwner, $Context)
     if (([int]$Context.ExitCode -ne 0 -or $Context.CloudConnectFailed -or (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $Context 'ResultStatus' '') 'Failed')) -and $Context.Issues.Count -eq 0 -and -not [bool](Get-PraValue $Context 'Cancelled' $false)) {
         Add-PraIssue $Context 'Failure reported by the run (exit code / cloud connection).' 'Run'
+    }
+    # No stack line reaches the card, the console or the report: the log holds the whole detail.
+    foreach ($entry in @($Context.Issues.ToArray()) + @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ })) {
+        if ($entry -is [pscustomobject] -and $entry.PSObject.Properties['Message']) {
+            $plain = ConvertTo-PraPlainMessage ([string]$entry.Message)
+            if (-not [string]::Equals($plain, [string]$entry.Message, [StringComparison]::Ordinal)) { $entry.Message = $plain }
+        }
     }
     foreach ($key in @('LogFile','TranscriptPath','BackupFiles','StateFiles')) {
         $candidates = Get-PraValue $Context $key
@@ -2347,14 +2409,14 @@ function Get-PraConfigurationFlat {
 }
 
 function Get-PraConfigurationDifference {
-    <# What the run changes compared with the configuration file: one object (Key, Base, Effective, Text = 'Key: base -> effective') per setting whose value differs. #>
+    <# What the run changes compared with the configuration file: one object (Key, Base, Effective, Text = 'Key: base -> effective') per setting whose value differs (the letter case is not a difference). #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][Collections.IDictionary]$Base, [Parameter(Mandatory)][Collections.IDictionary]$Effective)
     $baseFlat = @{}
     foreach ($row in @(Get-PraConfigurationFlat -Configuration $Base)) { $baseFlat[$row.Key] = $row.Value }
     foreach ($row in @(Get-PraConfigurationFlat -Configuration $Effective)) {
         $before = if ($baseFlat.ContainsKey($row.Key)) { [string]$baseFlat[$row.Key] } else { '' }
-        if (-not (Test-PraOrdinalEqual $before $row.Value)) {
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $before $row.Value)) {
             $beforeText = if ($before) { $before } else { '(empty)' }; $afterText = if ($row.Value) { $row.Value } else { '(empty)' }
             [pscustomobject][ordered]@{ Key = $row.Key; Base = $before; Effective = $row.Value; Text = ('{0}: {1} -> {2}' -f $row.Key, $beforeText, $afterText) }
         }
@@ -2693,7 +2755,7 @@ function Get-PraGlobalModel {
         The data of the global report: the phases of the batch (earlier phases read from the PhaseData files of $Context.PhaseFolders, then this run),
         and one entry per object with its stage in each phase, its journey across the servers and its verdict.
     .DESCRIPTION
-        Verdict: failed when any phase failed it; otherwise pending when its last stage is Pending (it is expected on a later side, or it was
+        Verdict: failed when any phase failed it (the cloud error of a stage that did both sides is replaced by a later stage that covers the cloud side); otherwise pending when its last stage is Pending (it is expected on a later side, or it was
         filtered out there); skipped; done with warnings when a warning was raised; otherwise done. A side that was not carried is listed as not available.
     #>
     [CmdletBinding()]
@@ -2782,12 +2844,12 @@ function Get-PraGlobalModel {
                 $stage = $same[0]
                 $earlierResult = [ordered]@{ Time = ''; Step = 'Earlier run'; Status = 'Info'; Text = (Limit-PraText (('{0} - {1}' -f $stage.Status, $stage.Detail).Trim(' ', '-')) 300) }
                 $warnings = (@($stage.Warnings, [string](Get-PraValue $item 'Warnings' '')) | Where-Object { $_ } | Get-PraOrdinalUnique) -join ' | '
-                $stage.Status = [string](Get-PraValue $item 'FinalStatus' ''); $stage.Detail = [string](Get-PraValue $item 'Detail' ''); $stage.Warnings = $warnings
+                $stage.Status = [string](Get-PraValue $item 'FinalStatus' ''); $stage.Detail = [string](Get-PraValue $item 'Detail' ''); $stage.Warnings = $warnings; $stage.ADVerified = ((Get-PraValue $item 'ADVerified' $null) -eq $true)
                 $stage.Steps = @(@($stage.Steps) + @($earlierResult) + @(Get-PraList $item 'Steps'))
                 continue
             }
             [void]$entry.Stages.Add([pscustomobject]@{ Phase = $stagePhase; Present = $true; HandedOverTo = ''; StatusDisplay = ''; Status = [string](Get-PraValue $item 'FinalStatus' ''); Detail = [string](Get-PraValue $item 'Detail' ''); Warnings = [string](Get-PraValue $item 'Warnings' '')
-                    Steps = @(Get-PraList $item 'Steps') })
+                    ADVerified = ((Get-PraValue $item 'ADVerified' $null) -eq $true); Superseded = $false; Steps = @(Get-PraList $item 'Steps') })
         }
     }
     $verdicts = @{ Done = 0; Warn = 0; Failed = 0; Pending = 0; Skipped = 0 }
@@ -2796,9 +2858,23 @@ function Get-PraGlobalModel {
         $staged = New-Object 'Collections.Generic.List[object]'
         foreach ($phase in $stagePhases) {
             $stage = @($entry.Stages | Where-Object { [object]::ReferenceEquals($_.Phase, $phase) })
-            if ($stage.Count) { $staged.Add($stage[0]) } else { $staged.Add([pscustomobject]@{ Phase = $phase; Present = $false; HandedOverTo = ''; StatusDisplay = ''; Status = ''; Detail = ''; Warnings = ''; Steps = @() }) }
+            if ($stage.Count) { $staged.Add($stage[0]) } else { $staged.Add([pscustomobject]@{ Phase = $phase; Present = $false; HandedOverTo = ''; StatusDisplay = ''; Status = ''; Detail = ''; Warnings = ''; ADVerified = $false; Superseded = $false; Steps = @() }) }
         }
         $entry.Stages = $staged
+        # An error of the cloud part of a stage that did both sides (its AD part was verified) is not final when a later stage of the same operation covers the cloud side for this object:
+        # that stage replaces the cloud result, and the earlier error stays in its journey as an "Earlier run" line.
+        for ($i = 0; $i -lt $staged.Count; $i++) {
+            $stage = $staged[$i]
+            if (-not $stage.Present -or -not (Test-PraOrdinalEqual $stage.Status 'Error') -or -not $stage.ADVerified -or -not (Test-PraOrdinalEqual ([string](Get-PraValue $stage.Phase.Header 'Phase' '')) 'Both')) { continue }
+            for ($j = $i + 1; $j -lt $staged.Count; $j++) {
+                $later = $staged[$j]
+                if (-not $later.Present -or -not (Test-PraOrdinalEqual ([string](Get-PraValue $later.Phase.Header 'Action' '')) ([string](Get-PraValue $stage.Phase.Header 'Action' ''))) -or
+                    -not (Test-PraOrdinalIn ([string](Get-PraValue $later.Phase.Header 'Phase' '')) @('Cloud', 'Both'))) { continue }
+                $stage.Superseded = $true
+                $later.Steps = @([ordered]@{ Time = ''; Step = 'Earlier run'; Status = 'Info'; Text = (Limit-PraText (('{0} - {1}' -f $stage.Status, $stage.Detail).Trim(' ', '-')) 300) }) + @($later.Steps)
+                break
+            }
+        }
         # Display only: a Pending stage that a later phase lists for this object reads "Handed over" (it is Pending when no later phase lists it).
         for ($i = 0; $i -lt $staged.Count; $i++) {
             $stage = $staged[$i]
@@ -2811,7 +2887,7 @@ function Get-PraGlobalModel {
         }
         $present = @($staged | Where-Object { $_.Present })
         $last = $present[$present.Count - 1]
-        $failedAnywhere = @($present | Where-Object { Test-PraOrdinalEqual $_.Status 'Error' }).Count -gt 0
+        $failedAnywhere = @($present | Where-Object { (Test-PraOrdinalEqual $_.Status 'Error') -and -not $_.Superseded }).Count -gt 0
         $warned = @($present | Where-Object { $_.Warnings.Trim() -or @($_.Steps | Where-Object { Test-PraOrdinalEqual (Get-PraValue $_ 'Status' '') 'Warn' }).Count }).Count -gt 0
         $lastStage = $staged[$staged.Count - 1]
         if ($failedAnywhere) { $entry.Verdict = 'failed' }
@@ -3039,7 +3115,7 @@ function Write-PraGlobalReport {
 #endregion
 
 Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
-    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
+    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Test-PraOwnEntryProcess, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor

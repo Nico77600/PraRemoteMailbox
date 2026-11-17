@@ -42,6 +42,13 @@ function Write-GateEvent {
     $event = [ordered]@{ Operation=$Operation; Identity=[string]$Identity; Server=$Server; Detail=$Detail; Synthetic=$true; Utc=[datetime]::UtcNow.ToString('o') }
     [IO.File]::AppendAllText($global:PraGateAd.EventPath, (($event | ConvertTo-Json -Depth 10 -Compress) + "`r`n"))
 }
+function Stop-GatePipeline {
+    # What Ctrl+C does to a run: the pipeline that runs the script is stopped, the finally blocks run, the next statements do not.
+    $runspace=[Management.Automation.Runspaces.Runspace]::DefaultRunspace
+    $method=$runspace.GetType().GetMethod('GetCurrentlyRunningPipeline',[Reflection.BindingFlags]'Instance,Public,NonPublic',$null,[Type]::EmptyTypes,$null)
+    $null=$method.Invoke($runspace,@()).StopAsync()
+    Microsoft.PowerShell.Utility\Start-Sleep -Seconds 60
+}
 function Assert-GateServer {
     param([string]$Server)
     if ($Server -cne $global:PraGateAd.Server) { throw "Synthetic DC mismatch: '$Server'" }
@@ -170,6 +177,7 @@ function Get-ADUser {
     param([object]$Identity,[string]$LDAPFilter,[string[]]$Properties,[string]$Server,[string]$SearchBase)
     Assert-GateServer $Server
     Write-GateEvent 'Get-ADUser' $Identity $Server @{LDAPFilter=$LDAPFilter; Properties=$Properties; SearchBase=$SearchBase}
+    if ($global:PraGateAd.Case -eq 'InterruptRead') { Stop-GatePipeline }
     if ($global:PraGateAd.Case -eq 'MissingUser') { return }
     if ($global:PraGateAd.Case -eq 'AmbiguousUser') { foreach ($user in $global:PraGateAd.Users) { Copy-GateUser $user -Capture:('*' -in $Properties) }; return }
     if ($global:PraGateAd.ContainsKey('TrusteeUsers') -and $Identity) {
@@ -239,6 +247,9 @@ function Set-ADUser {
     param([object]$Identity,[hashtable]$Replace,[string[]]$Clear,[string]$Server)
     Assert-GateServer $Server
     Assert-GateBackupBarrier
+    $writeTarget=@($global:PraGateAd.Users | Where-Object ObjectGUID -eq ([string]$Identity))[0]
+    if ($global:PraGateAd.Case -eq 'FailAtSam' -and $null -ne $writeTarget -and $writeTarget.SamAccountName -eq $global:PraGateAd.FailSam) { throw 'SYNTHETIC: this object changed since it was planned (uSNChanged).' }
+    if ($global:PraGateAd.Case -eq 'InterruptAtSam' -and $null -ne $writeTarget -and $writeTarget.SamAccountName -eq $global:PraGateAd.FailSam) { Stop-GatePipeline }
     # A refusal of the domain controller, in another language than English: the engine must still tell it from any other error.
     if ($global:PraGateAd.Case -eq 'AccessDenied') { throw [UnauthorizedAccessException]::new('Droits d''acces insuffisants pour executer l''operation.') }
     Write-GateEvent 'Set-ADUser' $Identity $Server @{Replace=$Replace;Clear=$Clear}
@@ -303,7 +314,13 @@ function Invoke-PraCloudPhase {
     [IO.File]::AppendAllText($state.EventPath,('{"Operation":"CloudPhase-SyntheticBarrier","Synthetic":true}'+"`r`n"))
     $seen=@(foreach ($row in $Rows) { [ordered]@{ Upn=[string]$row.UserPrincipalName; ExpectedX500=@(Get-PraList $row.BackupRec 'ExpectedX500'); Note=[string](Get-PraValue $row.BackupRec 'ExpectedX500Note' '') } })
     [IO.File]::AppendAllText($state.EventPath,((@{Operation='CloudRows-SyntheticBarrier';Synthetic=$true;Rows=$seen} | ConvertTo-Json -Depth 8 -Compress)+"`r`n"))
-    if ($state.Case -eq 'CloudX500Missing') {
+    if ($state.Case -eq 'CloudInterrupt') {
+        # Ctrl+C during the wait for the mailboxes: the pipeline is stopped, nothing is confirmed.
+        $runspace=[Management.Automation.Runspaces.Runspace]::DefaultRunspace
+        $method=$runspace.GetType().GetMethod('GetCurrentlyRunningPipeline',[Reflection.BindingFlags]'Instance,Public,NonPublic',$null,[Type]::EmptyTypes,$null)
+        $null=$method.Invoke($runspace,@()).StopAsync()
+        Microsoft.PowerShell.Utility\Start-Sleep -Seconds 60
+    } elseif ($state.Case -eq 'CloudX500Missing') {
         # What the real cloud phase does for an object whose X500 address is not in Exchange Online: a warning item, the object listed for the Next steps, the conversion done.
         foreach ($row in $Rows) { $row.CloudStatus='Success'; $row.CloudMailbox=$true; $row.CloudLicense=$true; $row.FinalStatus='Success'; $row.CloudDetail='SYNTHETIC: mailbox ready.' }
         $Context.CurrentIdentity=[string]$Rows[0].ObjectGuid
@@ -428,7 +445,7 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         }
     }
     function global:New-GateRuntime {
-        param([string]$Name='case',[string]$Case='Normal',[switch]$Preexisting,[switch]$Shared13,[ValidateRange(3,500)][int]$TrusteeCount=8,[ValidateRange(100,120)][int]$AclCount=100)
+        param([string]$Name='case',[string]$Case='Normal',[switch]$Preexisting,[switch]$Shared13,[ValidateRange(3,500)][int]$TrusteeCount=8,[ValidateRange(100,120)][int]$AclCount=100,[ValidateRange(2,13)][int]$UserCount=2,[hashtable]$Extra=@{})
         $caseName=$Name
         $root=Join-Path $global:PraGate.Root ([guid]::NewGuid().ToString('N').Substring(0,6))
         $modules=Join-Path $root 'modules'; $package=Join-Path $root 'package'
@@ -443,7 +460,7 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         Copy-Item -Path (Join-Path $global:PraGate.Package '*') -Destination $package -Recurse -Force
         [IO.File]::WriteAllText((Join-Path $package 'module\PRA.Cloud.psm1'),$global:PraGate.CloudSource,(New-Object Text.UTF8Encoding($true)))
         Set-PraFixtureHash -Root $package -Relative 'module\PRA.Cloud.psm1'
-        $users=@((New-GateUser 1),(New-GateUser 2))
+        $users=@(1..$UserCount | ForEach-Object { New-GateUser $_ })
         if ($Shared13) {
             $users=@(1..13 | ForEach-Object { New-GateUser $_ })
             foreach ($user in $users) {
@@ -456,6 +473,7 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         $group=[pscustomobject]@{ ObjectGUID=[guid]'10000000-0000-0000-0000-000000000001'; DistinguishedName='CN=License,OU=Tests,DC=gate,DC=invalid'; objectClass='group'; member=@() }
         if ($Preexisting) { $group.member=@($users | ForEach-Object DistinguishedName) }
         $state=@{ Case=$Case; Users=$users; Originals=([Management.Automation.PSSerializer]::Deserialize([Management.Automation.PSSerializer]::Serialize($users,30))); Group=$group; Server='dc01.gate.invalid'; BackupFolder=(Join-Path $root 'backups'); ExpectedGuids=@($users | ForEach-Object { [string]$_.ObjectGUID }); EventPath=(Join-Path $root 'events.jsonl') }
+        foreach ($key in $Extra.Keys) { $state[$key]=$Extra[$key] }
         if ($Shared13) {
             $state.NativeShared=$true; $state.AclCount=$AclCount
             $state.PermissionGroups=@(1..3 | ForEach-Object { [pscustomobject]@{ObjectGUID=[guid]('20000000-0000-0000-0000-{0:000000000000}' -f $_);DistinguishedName="CN=Permission$_,OU=Tests,DC=gate,DC=invalid";SamAccountName="permission$_";objectClass='group';objectSid=('S-1-5-21-100-200-300-'+(2000+$_))} })
@@ -4227,9 +4245,12 @@ Describe 'GUI events mirror the existing engine without extra mutations' -Tag 'G
         $event.text | Should -BeExactly $text
         $event.identity | Should -BeExactly 'user@gate.invalid'
     }
-    It 'surfaces an unavailable event channel rather than pretending the window received the event' {
+    It 'says that the event channel is unavailable, once, and never stops the run for it' {
         $env:PRA_EVENT_FILE=Join-Path $runtime.Root 'missing\events.jsonl'
-        { Write-PraEvent -Kind item -Data @{text='not delivered'} } | Should -Throw
+        InModuleScope PRA.Common { $script:PraEventWriteWarned=$false }
+        $said=& { Write-PraEvent -Kind item -Data @{text='not delivered'} } 6>&1 | Out-String
+        $said | Should -Match 'The progress file of the window cannot be written'
+        (& { Write-PraEvent -Kind item -Data @{text='not delivered either'} } 6>&1 | Out-String) | Should -Not -Match 'cannot be written'
     }
     It 'reports the actual Preview result and phase, preserving the native result and write-free behavior' {
         $run=Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath}
@@ -8524,16 +8545,17 @@ Describe 'Release 3.1.3 - every stop ends with a next step, and the Error block 
         $steps[1] | Should -Match "^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Identity 'user1' -ConfigPath "
         $run.Output | Should -Match 'then run the Check again:'
     }
-    It 'a partial AD batch says which objects may be changed and proposes the Preview, never the Apply again' {
+    It 'a batch stopped after a write that no object verified says which objects may be changed and proposes the rollback Preview and the Check, never the Apply again' {
         $runtime = New-GateRuntime -Name 'partial-ad-313e' -Case 'SecondMutationFailure'
         $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
         $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
         @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0
         $steps = @($run.MainResult.NextSteps)
-        $steps[0] | Should -Match '^Active Directory was changed for [0-9]+ object\(s\) before the stop \(see the journal and the backup named above\)\. Do not run the Apply again before reading what is left: run the Preview of the same command:$'
-        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -ConfigPath '
+        $steps[0] | Should -Match '^Active Directory was changed for [0-9]+ object\(s\) before the stop \(see the journal and the backup named above\) and none of them is verified\. Do not run the Apply again before reading what is left\. To put them back as they were, roll the batch back \(run the Preview first, then the same command with -Mode Apply\):$'
+        $steps[1] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Recover -Batch [0-9a-f]{8} -ConfigPath '
         $steps[1] | Should -Not -Match '-Mode Apply'
-        $run.Output | Should -Match 'run the Preview of the same command'
+        $steps[3] | Should -Match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Batch [0-9a-f]{8} -ConfigPath '
+        $run.Output | Should -Match 'roll the batch back'
     }
     It 'a stop before anything was written ends with the same command, as typed (usage, batch not found, cloud pre-check)' {
         $usage = New-GateRuntime -Name 'usage-313e'
@@ -9371,4 +9393,671 @@ AfterAll {
     if ([IO.Directory]::Exists($global:PraGate.Root)) { [IO.Directory]::Delete($global:PraGate.Root,$true) }
     foreach ($name in @('New-GateUser','New-GateRuntime','New-GateContext','Get-GateEvents','Set-GateConfigText','Get-GateWrites','Save-GateDeltaEvidence','Invoke-GateProcess','New-GateSourceBundles','Get-GateCodec','Get-GateExpectedNodes','Assert-GateWireSnapshot','Save-GateOomEvidence')) { Remove-Item -LiteralPath ('Function:\'+$name) -ErrorAction SilentlyContinue }
     Remove-Variable PraGateAd,PraGate -Scope Global -ErrorAction SilentlyContinue
+}
+
+Describe 'Release 3.2.0 - a run stopped from outside ends FAIL with exit code 1 and the command that continues the batch, never PASS (real main, synthetic)' -Tag 'Release320a' {
+    It 'a Convert Apply stopped during the AD writes: FAIL, exit code 1, the stop named, the objects done and not done told apart, the proof of the verified object written' {
+        $runtime = New-GateRuntime -Name 'interrupt-ad-320a' -Case 'InterruptAtSam' -Extra @{ FailSam = 'user2' }
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match '(?m)^\s*RESULT: FAIL\s*$'
+        $run.Output | Should -Not -Match '(?m)^\s*RESULT: PASS\s*$'
+        $run.Output | Should -Not -Match 'Convert finished'
+        $run.Output | Should -Match 'the run was interrupted before it finished'
+        $run.Output | Should -Match '1 done . 1 pending . 1 error\(s\) . 0 skipped'
+        $batch = [regex]::Match($run.Output, '(?m)^\s*\S+\s+Batch\s+(?<id>[0-9a-f]{8})\s*$').Groups['id'].Value
+        $batch | Should -Match '^[0-9a-f]{8}$' -Because $run.Output
+        $run.Output | Should -Match ('-Action Convert -Phase AD -Mode Apply -Batch ' + $batch + ' -ConfigPath')
+        $state = @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'State-*.json')
+        $state.Count | Should -Be 1
+        $proof = [IO.File]::ReadAllText($state[0].FullName) | ConvertFrom-Json -DateKind String
+        $proof.Partial | Should -BeTrue
+        $proof.PlannedCount | Should -Be 2
+        @($proof.Records).Count | Should -Be 1
+        (Get-Content -LiteralPath @(Get-ChildItem -LiteralPath (Join-Path $runtime.Root 'logs') -Filter '*.log')[0].FullName -Tail 2) -join "`n" | Should -Match 'RESULT: FAIL'
+    }
+    It 'a Phase Both Apply stopped in the cloud wait: no object is a success, the phase data says Failed, the Exchange Online part is the next step' {
+        $runtime = New-GateRuntime -Name 'interrupt-cloud-320a' -Case 'CloudInterrupt'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match '(?m)^\s*RESULT: FAIL\s*$'
+        $run.Output | Should -Not -Match '(?m)^\s*RESULT: PASS\s*$'
+        $run.Output | Should -Match '0 done . 2 pending . 1 error\(s\) . 0 skipped'
+        $run.Output | Should -Match 'the run was interrupted before it finished'
+        $run.Output | Should -Match '-Action Convert -Phase Cloud -Mode Apply -Batch [0-9a-f]{8} -ConfigPath'
+        $data = @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'PhaseData-*.json')
+        $data.Count | Should -Be 1
+        $phase = [IO.File]::ReadAllText($data[0].FullName) | ConvertFrom-Json -DateKind String
+        $phase.Phase.Status | Should -BeExactly 'Failed'
+        $phase.Phase.ExitCode | Should -Be 1
+        @($phase.Objects | Where-Object FinalStatus -eq 'Success').Count | Should -Be 0
+    }
+    It 'a Preview and a Check stopped the same way end FAIL too' {
+        $preview = New-GateRuntime -Name 'interrupt-preview-320a' -Case 'InterruptRead'
+        $run = Invoke-GateProcess $preview @{Action='Convert';Phase='AD';Mode='Preview';ConfigPath=$preview.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match '(?m)^\s*RESULT: FAIL\s*$'
+        $run.Output | Should -Not -Match '(?m)^\s*RESULT: PASS\s*$'
+        $run.Output | Should -Match 'the run was interrupted before it finished'
+        $check = New-GateRuntime -Name 'interrupt-check-320a' -Case 'InterruptRead'
+        $run = Invoke-GateProcess $check @{Action='Check';Identity='user1';Once=$true;ConfigPath=$check.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match '(?m)^\s*RESULT: FAIL\s*$'
+        $run.Output | Should -Not -Match '(?m)^\s*RESULT: PASS\s*$'
+    }
+}
+
+Describe 'Release 3.2.0 - an object that was not reached is not skipped: Planned becomes Pending in an Apply whose batch exists, Pending in phase Both until the cloud part confirms it (production Common module)' -Tag 'Release320a' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+        function global:New-OutcomeContext320 {
+            param([string]$Mode = 'Apply', [string]$Action = 'Convert', [string]$BatchId = '', [string[]]$Statuses)
+            $context = @{ Mode = $Mode; Action = $Action; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]'); ExitCode = 0; CloudConnectFailed = $false; ResultStatus = ''; BatchId = $BatchId }
+            foreach ($status in $Statuses) { $context.Rows.Add([pscustomobject]@{ ObjectGuid = [guid]::NewGuid().ToString(); SamAccountName = 'u'; UserPrincipalName = 'u@gate.invalid'; Action = $Action; FinalStatus = $status; Detail = ''; CloudStatus = 'N/A' }) }
+            $context
+        }
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\New-OutcomeContext320' -ErrorAction SilentlyContinue }
+    It 'counts a Planned object of an Apply that has its batch as Pending (exit code 2), and keeps it Planned in a Preview and in an Apply without a batch' {
+        $applied = Get-PraOutcome (New-OutcomeContext320 -BatchId 'abcd1234' -Statuses @('Success', 'Planned', 'Planned'))
+        $applied.Counts.Pending | Should -Be 2
+        $applied.Counts.Skipped | Should -Be 0
+        $applied.Counts.Planned | Should -Be 0
+        $applied.ExitCode | Should -Be 2
+        @($applied.Rows | Where-Object FinalStatus -eq 'Pending')[0].Detail | Should -Match 'not finished'
+        $started = New-OutcomeContext320 -Statuses @('Planned'); $started.ChangesStarted = $true
+        (Get-PraOutcome $started).Counts.Pending | Should -Be 1
+        $preview = Get-PraOutcome (New-OutcomeContext320 -Mode Preview -BatchId 'abcd1234' -Statuses @('Planned', 'Planned'))
+        $preview.Counts.Planned | Should -Be 2
+        $preview.Counts.Pending | Should -Be 0
+        $noBatch = Get-PraOutcome (New-OutcomeContext320 -Statuses @('Planned'))
+        $noBatch.Counts.Planned | Should -Be 1
+        $noBatch.Counts.Pending | Should -Be 0
+    }
+    It 'creates every row Planned, so that an object that no step reached never reads Skipped' {
+        $row = New-PraRow @{ ObjectNames = @{}; Action = 'Convert' } ([pscustomobject]@{ ObjectGuid = [guid]::NewGuid().ToString(); SamAccountName = 'u'; UserPrincipalName = 'u@gate.invalid'; IsShared = $false })
+        $row.FinalStatus | Should -BeExactly 'Planned'
+    }
+    It 'the cloud phase sets the row of an object it waits for to Pending before its first call, so that a run that ends there never reports it as done' {
+        Get-Module PRA.Cloud -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+        $runtime = New-GateRuntime -Name 'pending-cloud-320a'
+        $context = New-GateContext $runtime -Mode Apply -Action Convert
+        $context.Phase = 'Cloud'; $context.Once = $true; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 1
+        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; TenantId = '20000000-0000-0000-0000-000000000002' }
+        $context.LogFile = Join-Path $runtime.Root 'logs\pending-cloud.log'
+        $global:PraGate.Context320 = $context
+        $global:PraGate.Row320 = New-PraRow $context ([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'user1@gate.invalid'; SamAccountName = 'user1'; IsShared = $false })
+        $global:PraGate.Row320.FinalStatus = 'Success'
+        $global:PraGate.Seen320 = ''
+        InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { $global:PraGate.Seen320 = [string]$global:PraGate.Row320.FinalStatus; throw 'SYNTHETIC: the process is stopped here' }
+            Mock Close-PraCloudSession { }
+            Invoke-PraCloudPhase $global:PraGate.Context320 @($global:PraGate.Row320) 'Convert'
+        }
+        $global:PraGate.Seen320 | Should -BeExactly 'Pending'
+        $global:PraGate.Row320.FinalStatus | Should -Not -BeExactly 'Success'
+        Remove-Module PRA.Cloud -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Describe 'Release 3.2.0 - a Convert batch stopped at its first error is continued, checked and rolled back (real main, production Directory module, synthetic AD)' -Tag 'Release320a' {
+    BeforeAll {
+        $global:PraGate.R2 = New-GateRuntime -Name 'partial-320a' -Case 'FailAtSam' -UserCount 10 -Extra @{ FailSam = 'user3' }
+        $runtime = $global:PraGate.R2
+        $env:PRA_GATE_STATE = $runtime.StatePath; $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+        Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        $context = New-GateContext $runtime
+        # The order of the engine: account name in capitals, then the GUID: user1, user10, user2, user3 (fails: the fourth object), user4 ...
+        $global:PraGate.R2Plans = @(foreach ($sam in 'user1', 'user10', 'user2', 'user3', 'user4', 'user5', 'user6', 'user7', 'user8', 'user9') { New-PraPlan $context $sam 'Convert' })
+        $global:PraGate.R2Error = ''
+        try { $null = Invoke-PraAdBatch $context $global:PraGate.R2Plans 'Convert' } catch { $global:PraGate.R2Error = [string]$_.Exception.Message }
+        $global:PraGate.R2Context = $context
+        $global:PraGate.R2Partial = $context.PartialBatch
+        # What the domain controller holds after the run (the objects converted before the error), for the processes that follow.
+        $global:PraGateAd.Case = 'Normal'
+        [IO.File]::WriteAllText($runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($global:PraGateAd, 35))
+        $global:PraGate.R2Folder = Split-Path @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Convert-*.json')[0].FullName -Parent
+        $global:PraGate.R2Json = @(Get-ChildItem -LiteralPath $global:PraGate.R2Folder -File -Filter 'Convert-*.json')[0].FullName
+        $global:PraGate.R2Id = ([IO.File]::ReadAllText($global:PraGate.R2Json) | ConvertFrom-Json -DateKind String).BatchId
+        $global:PraGate.R2Csv = Join-Path $runtime.Root 'all-ten.csv'
+        [IO.File]::WriteAllText($global:PraGate.R2Csv, ("Identity`r`n" + ((1..10 | ForEach-Object { 'user' + $_ }) -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($true)))
+        $global:PraGate.R2Rest = Join-Path $runtime.Root 'seven-left.csv'
+        [IO.File]::WriteAllText($global:PraGate.R2Rest, ("Identity`r`n" + ((3..9 | ForEach-Object { 'user' + $_ }) -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($true)))
+    }
+    AfterAll { foreach ($key in 'R2', 'R2Plans', 'R2Error', 'R2Context', 'R2Partial', 'R2Folder', 'R2Json', 'R2Id', 'R2Csv', 'R2Rest', 'R2Lookup') { $global:PraGate.Remove($key) } }
+    It 'keeps the first error as the stop of the batch and writes the AD proof of the three verified objects, marked partial with the number planned' {
+        $global:PraGate.R2Error | Should -Match 'SYNTHETIC: this object changed since it was planned'
+        $partial = $global:PraGate.R2Partial
+        $partial.Verified | Should -Be 3
+        $partial.Planned | Should -Be 10
+        $partial.NotConverted.Count | Should -Be 6
+        @($partial.MayBeChanged) -join ',' | Should -BeExactly 'user3' -Because 'the batch stopped on user3 after its write was started: it may be partly changed, it is not an object to convert again'
+        $partial.NotConverted | Should -Not -Contain 'user3'
+        $proof = [IO.File]::ReadAllText($partial.StatePath) | ConvertFrom-Json -DateKind String
+        $proof.Partial | Should -BeTrue
+        $proof.PlannedCount | Should -Be 10
+        @($proof.Records).Count | Should -Be 3
+        (Get-FileHash -LiteralPath $partial.StatePath -Algorithm SHA256).Hash.ToLowerInvariant() | Should -BeExactly ([IO.File]::ReadAllText($partial.StatePath + '.sha256').Trim().ToLowerInvariant())
+        $rows = $global:PraGate.R2Context.Rows.ToArray()
+        @($rows | Where-Object { $_.FinalStatus -eq 'Success' }).Count | Should -Be 3
+        @($rows | Where-Object { $_.FinalStatus -eq 'Error' }).Count | Should -Be 1
+        @($rows | Where-Object { $_.FinalStatus -eq 'Planned' }).Count | Should -Be 6 -Because 'the objects that were not reached stay Planned: Pending in the result, never Skipped'
+        (Get-PraOutcome $global:PraGate.R2Context).Counts.Skipped | Should -Be 0
+    }
+    It 'Import-PraProof accepts the partial proof and refuses a proof that lists fewer objects without saying so, or that lies about the number planned' {
+        $context = $global:PraGate.R2Context
+        $source = Import-PraBackup $context $global:PraGate.R2Json
+        $proof = Import-PraProof $context $global:PraGate.R2Partial.StatePath $source 'Convert'
+        $proof.Partial | Should -BeTrue
+        $proof.PlannedCount | Should -Be 10
+        $copyRoot = Join-Path $global:PraGate.R2.Root 'copies'
+        foreach ($case in @(@{ Name = 'unmarked'; Edit = { param($p) $p.PSObject.Properties.Remove('Partial'); $p.PSObject.Properties.Remove('PlannedCount') }; Message = '*incomplete*' },
+                @{ Name = 'wrong-count'; Edit = { param($p) $p.PlannedCount = 9 }; Message = '*invalid partial proof*' },
+                @{ Name = 'text-marker'; Edit = { param($p) $p.Partial = 'yes' }; Message = '*Partial marker*' })) {
+            $folder = Join-Path $copyRoot $case.Name
+            Copy-Item -LiteralPath $global:PraGate.R2Folder -Destination $folder -Recurse
+            $path = Join-Path $folder ([IO.Path]::GetFileName($global:PraGate.R2Partial.StatePath))
+            $edited = [IO.File]::ReadAllText($path) | ConvertFrom-Json -DateKind String
+            & $case.Edit $edited
+            Remove-Item -LiteralPath $path, ($path + '.sha256') -Force
+            [IO.File]::WriteAllText($path, ($edited | ConvertTo-Json -Depth 12), (New-Object Text.UTF8Encoding($true)))
+            [IO.File]::WriteAllText($path + '.sha256', (Get-PraHash $path), (New-Object Text.UTF8Encoding($true)))
+            { Import-PraProof $context $path $source 'Convert' } | Should -Throw $case.Message -Because $case.Name
+        }
+    }
+    It 'Find-PraConvertedBatch names the partial batch for an object that it converted, and not for the others' {
+        $global:PraGate.R2Lookup = @{ Root = $global:PraGate.R2.State.BackupFolder; Converted = ([string]$global:PraGate.R2Plans[0].Record.ObjectGuid); Other = ([string]$global:PraGate.R2Plans[4].Record.ObjectGuid) }
+        $found = InModuleScope PRA.Directory {
+            $context = @{ Config = @{ Environment = 'SYNTHETIC_GATE'; Storage = @{ BackupFolder = $global:PraGate.R2Lookup.Root } } }
+            @{ Converted = (Find-PraConvertedBatch $context $global:PraGate.R2Lookup.Converted); Other = (Find-PraConvertedBatch $context $global:PraGate.R2Lookup.Other) }
+        }
+        $found.Converted.ShortId | Should -BeExactly $global:PraGate.R2Id.Substring(0, 8)
+        $found.Other | Should -BeNullOrEmpty
+    }
+    It 'the same CSV is refused for its first converted object with the command that continues the batch; the objects left are eligible' {
+        $refused = Invoke-GateProcess $global:PraGate.R2 @{Action='Convert';Phase='AD';Mode='Preview';CsvPath=$global:PraGate.R2Csv;ConfigPath=$global:PraGate.R2.ConfigPath} -TimeoutSeconds 120
+        $refused.ExitCode | Should -Be 1 -Because ($refused.Output + $refused.Error)
+        $refused.Output | Should -Match ('is already converted by batch ' + $global:PraGate.R2Id.Substring(0, 8))
+        $refused.Output | Should -Match ('-Action Convert -Phase AD -Mode Apply -Batch ' + $global:PraGate.R2Id.Substring(0, 8))
+        $rest = Invoke-GateProcess $global:PraGate.R2 @{Action='Convert';Phase='AD';Mode='Preview';CsvPath=$global:PraGate.R2Rest;ConfigPath=$global:PraGate.R2.ConfigPath} -TimeoutSeconds 120
+        $rest.ExitCode | Should -Be 0 -Because ($rest.Output + $rest.Error)
+        $rest.MainResult.PlannedCount | Should -Be 7
+    }
+    It 'continues the converted objects with -Phase AD -Batch: AD is not written, the three are handed over, the object the batch stopped on is told as maybe changed, the six others as not converted, with a CSV to convert them or the rollback' {
+        $before = @(Get-GateWrites $global:PraGate.R2).Count
+        $run = Invoke-GateProcess $global:PraGate.R2 @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$global:PraGate.R2.ConfigPath;Batch=$global:PraGate.R2Id.Substring(0, 8)} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 2 -Because ($run.Output + $run.Error)
+        @(Get-GateWrites $global:PraGate.R2).Count | Should -Be $before
+        $run.MainResult.PendingCount | Should -Be 4 -Because 'three handed over, one that may be partly changed'
+        $run.MainResult.SkippedCount | Should -Be 6
+        $run.MainResult.ErrorCount | Should -Be 0
+        $run.Output | Should -Match '6 object\(s\) of this batch were not converted by it'
+        $run.Output | Should -Match '1 object\(s\) may be partly changed \(the batch stopped on them after a write was started\): user3'
+        $short = $global:PraGate.R2Id.Substring(0, 8)
+        $steps = @($run.MainResult.NextSteps)
+        ($steps -join "`n") | Should -Match 'Copy these two files'
+        $at = @($steps | Where-Object { $_ -match ('^6 object\(s\) were not converted by batch ' + $short + ' \(it stopped at its first error, nothing was written to them\): user4, user5, user6, user7, user8, user9\. .*the file .*ToConvert-' + $short) })
+        $at.Count | Should -Be 1 -Because ($steps -join "`n")
+        ($steps -join "`n") | Should -Match '-Action Convert -Phase AD -CsvPath ''[^'']*ToConvert-'
+        ($steps -join "`n") | Should -Match '1 object\(s\) may be partly changed: user3\.'
+        ($steps -join "`n") | Should -Match ('-Action Recover -Batch ' + $short + ' -ConfigPath')
+        $csv = [regex]::Match(($steps -join "`n"), 'with the file (?<p>[^ ]+\.csv), which lists only them').Groups['p'].Value
+        Test-Path -LiteralPath $csv | Should -BeTrue -Because ($steps -join "`n")
+        @(Import-Csv -LiteralPath $csv).Identity -join ',' | Should -BeExactly 'user4,user5,user6,user7,user8,user9'
+        Test-Path -LiteralPath $run.MainResult.TransferPackage | Should -BeTrue
+    }
+    It 'the cloud part of the partial batch takes the three converted objects only; Check reads every object of the backup' {
+        $short = $global:PraGate.R2Id.Substring(0, 8)
+        $cloud = Invoke-GateProcess $global:PraGate.R2 @{Action='Convert';Phase='Cloud';Mode='Apply';Force=$true;ConfigPath=$global:PraGate.R2.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $cloud.ExitCode | Should -Be 2 -Because ($cloud.Output + $cloud.Error)
+        $seen = @(Get-GateEvents $global:PraGate.R2 | Where-Object Operation -eq 'CloudRows-SyntheticBarrier')
+        $seen[$seen.Count - 1].Rows.Count | Should -Be 3
+        $cloud.MainResult.SkippedCount | Should -Be 6
+        $cloud.Output | Should -Match '6 object\(s\) of this batch were not converted by it'
+        $cloudSteps = @($cloud.MainResult.NextSteps | Where-Object { $_ -match 'Action (Recover|Convert) ' -and $_ -match 'Invoke-PraRemoteMailbox' })
+        @($cloudSteps | Where-Object { $_ -match 'Action Recover -Batch|Action Convert -Phase AD( |$)' }).Count | Should -Be 2
+        @($cloudSteps | Where-Object { ($_ -match 'Action Recover -Batch|Action Convert -Phase AD( |$)') -and $_ -match '-ConfigPath' }).Count | Should -Be 0 -Because 'the AD-side commands are for the AD server: no configuration path of this server'
+        @($cloud.MainResult.NextSteps | Where-Object { $_ -match '^On the AD server: ' }).Count | Should -BeGreaterThan 0
+        $check = Invoke-GateProcess $global:PraGate.R2 @{Action='Check';Batch=$short;ConfigPath=$global:PraGate.R2.ConfigPath} -TimeoutSeconds 120
+        $check.ExitCode | Should -Be 0 -Because ($check.Output + $check.Error)
+        $seen = @(Get-GateEvents $global:PraGate.R2 | Where-Object Operation -eq 'CloudRows-SyntheticBarrier')
+        $seen[$seen.Count - 1].Rows.Count | Should -Be 10
+    }
+    It 'Recover of the partial batch restores the converted objects; Check -Batch given the Recover batch finds its Convert source' {
+        $short = $global:PraGate.R2Id.Substring(0, 8)
+        # Another batch converted user5 since: this batch never touched it, so its rollback must leave it alone.
+        $state = [Management.Automation.PSSerializer]::Deserialize([IO.File]::ReadAllText($global:PraGate.R2.StatePath))
+        $other = @($state.Users | Where-Object SamAccountName -eq 'user5')[0]
+        $other.homeMDB = $null; $other.msExchRecipientTypeDetails = [long]2147483648; $other.targetAddress = 'SMTP:user5@other.invalid'
+        [IO.File]::WriteAllText($global:PraGate.R2.StatePath, [Management.Automation.PSSerializer]::Serialize($state, 35))
+        $before = @(Get-GateWrites $global:PraGate.R2 | Where-Object Operation -eq 'Set-ADUser').Count
+        $recover = Invoke-GateProcess $global:PraGate.R2 @{Action='Recover';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$global:PraGate.R2.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $recover.ExitCode | Should -Be 2 -Because ($recover.Output + $recover.Error)
+        $recover.MainResult.ErrorCount | Should -Be 0
+        $recover.MainResult.TotalCount | Should -Be 10
+        $recover.MainResult.SkippedCount | Should -Be 6 -Because 'the objects the batch never touched are not rolled back (one of them was converted by another batch since)'
+        (@(Get-GateWrites $global:PraGate.R2 | Where-Object Operation -eq 'Set-ADUser').Count - $before) | Should -Be 3
+        $converted = @(Get-GateEvents $global:PraGate.R2 | Where-Object { $_.Operation -eq 'Set-ADUser' } | ForEach-Object { [string]$_.Identity })
+        @($converted | Where-Object { $_ -match '^00000000-0000-0000-0000-0*(5)$' }).Count | Should -Be 0
+        $recoverId = [string]$recover.MainResult.BatchId
+        $recoverId | Should -Match '^[0-9a-f]{8}$'
+        $check = Invoke-GateProcess $global:PraGate.R2 @{Action='Check';Batch=$recoverId;Expect='Deprovisioned';Once=$true;ConfigPath=$global:PraGate.R2.ConfigPath} -TimeoutSeconds 120
+        $check.ExitCode | Should -Be 0 -Because ($check.Output + $check.Error)
+        $check.Output | Should -Match ('Batch ' + $recoverId + ' is a Recover batch: the Convert batch ' + $short + ' that it rolled back is checked')
+        $wrongDefault = Invoke-GateProcess $global:PraGate.R2 @{Action='Check';Batch=$recoverId.ToUpperInvariant();Once=$true;ConfigPath=$global:PraGate.R2.ConfigPath} -TimeoutSeconds 120
+        $wrongDefault.Output | Should -Match 'give -Expect Deprovisioned' -Because 'the batch ID is accepted in any letter case'
+    }
+    It 'a Convert batch that a Recover already rolled back cannot be resumed: -Phase AD -Batch and the cloud part refuse it with a next step, nothing is changed' {
+        $short = $global:PraGate.R2Id.Substring(0, 8)
+        $before = @(Get-GateWrites $global:PraGate.R2).Count
+        foreach ($phase in 'AD', 'Cloud') {
+            $run = Invoke-GateProcess $global:PraGate.R2 @{Action='Convert';Phase=$phase;Mode='Apply';Force=$true;ConfigPath=$global:PraGate.R2.ConfigPath;Batch=$short} -TimeoutSeconds 120
+            $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+            $run.Output | Should -Match ('Convert batch ' + $short + ' cannot be resumed: Recover batch [0-9a-f]{8} already rolled back objects of it') -Because $phase
+            ($run.MainResult.NextSteps -join "`n") | Should -Match '-Action Check -Batch [0-9a-f]{8} -Expect Deprovisioned' -Because $phase
+            ($run.MainResult.NextSteps -join "`n") | Should -Match '-Action Convert -Phase AD -ConfigPath' -Because $phase
+            $run.Output | Should -Not -Match 'Copy these two files'
+        }
+        @(Get-GateWrites $global:PraGate.R2).Count | Should -Be $before
+    }
+    It 'a Recover that stopped before its proof counts too: its journal tells the objects it started on, and a missing journal counts for every object' {
+        $short = $global:PraGate.R2Id.Substring(0, 8)
+        $convertName = Split-Path $global:PraGate.R2Folder -Leaf
+        $recoverFolder = @(Get-ChildItem -LiteralPath $global:PraGate.R2.State.BackupFolder -Directory -Filter 'Batch-*' | Where-Object { $_.Name -ne $convertName })[0].FullName
+        foreach ($file in @(Get-ChildItem -LiteralPath $recoverFolder -File -Filter 'State-*')) { Remove-Item -LiteralPath $file.FullName -Force }
+        foreach ($phase in 'AD', 'Cloud') {
+            $run = Invoke-GateProcess $global:PraGate.R2 @{Action='Convert';Phase=$phase;Mode='Apply';Force=$true;ConfigPath=$global:PraGate.R2.ConfigPath;Batch=$short} -TimeoutSeconds 120
+            $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+            $run.Output | Should -Match ('Convert batch ' + $short + ' cannot be resumed: Recover batch [0-9a-f]{8} started to roll back objects of it \(it stopped before its proof\)') -Because $phase
+            ($run.MainResult.NextSteps -join "`n") | Should -Match '-Action Recover -Batch ' -Because $phase
+        }
+        $journal = @(Get-ChildItem -LiteralPath $recoverFolder -File -Filter 'Journal-*.jsonl')[0]
+        Rename-Item -LiteralPath $journal.FullName -NewName ($journal.Name + '.away')
+        $run = Invoke-GateProcess $global:PraGate.R2 @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$global:PraGate.R2.ConfigPath;Batch=$short} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'its journal is not here: every object counts as rolled back'
+    }
+}
+
+Describe 'Release 3.2.0 - the object a batch stopped on, the CSV of the objects left, the AD proof of a batch whose objects were all verified (real main and production Directory module, synthetic AD)' -Tag 'Release320a' {
+    It 'a CSV of the objects still to convert (same columns as the input) is written and named in the Next steps; the object the batch stopped on is not in it and gets the rollback' {
+        $runtime = New-GateRuntime -Name 'csv-left-320a' -Case 'FailAtSam' -UserCount 10 -Extra @{ FailSam = 'user3' }
+        $csv = Join-Path $runtime.Root 'input.csv'
+        [IO.File]::WriteAllText($csv, ("Identity,Note`r`n" + ((1..10 | ForEach-Object { 'user' + $_ + ',note ' + $_ }) -join "`r`n") + "`r`n"), (New-Object Text.UTF8Encoding($true)))
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;CsvPath=$csv;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $steps = @($run.MainResult.NextSteps)
+        $joined = $steps -join "`n"
+        $joined | Should -Match '6 object\(s\) were not converted by batch [0-9a-f]{8} \(it stopped at its first error, nothing was written to them\): user4, user5, user6, user7, user8, user9\.'
+        $joined | Should -Match '1 object\(s\) may be partly changed: user3\.'
+        $left = [regex]::Match($joined, 'with the file (?<p>[^ ]+\.csv), which lists only them').Groups['p'].Value
+        Test-Path -LiteralPath $left | Should -BeTrue -Because $joined
+        $rows = @(Import-Csv -LiteralPath $left)
+        ($rows.Identity -join ',') | Should -BeExactly 'user4,user5,user6,user7,user8,user9'
+        ($rows.Note -join ',') | Should -BeExactly 'note 4,note 5,note 6,note 7,note 8,note 9'
+        $command = @($steps | Where-Object { $_ -match '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD .*-CsvPath' })
+        $command.Count | Should -Be 1
+        $command[0] | Should -Match ([regex]::Escape("-CsvPath '" + $left + "'"))
+        $command[0] | Should -Not -Match ([regex]::Escape($csv))
+        $run.Output | Should -Match '(?m)^\s*RESULT: FAIL\s*$'
+    }
+    It 'an object that failed before any write is not partly changed: it is listed as not converted, and no journal line names it' {
+        $runtime = New-GateRuntime -Name 'untouched-320a' -UserCount 3
+        $env:PRA_GATE_STATE = $runtime.StatePath; $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+        Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        $context = New-GateContext $runtime
+        $plans = @(foreach ($sam in 'user1', 'user2', 'user3') { New-PraPlan $context $sam 'Convert' })
+        $plans[1].ExpectedUsnChanged = '1'
+        $failure = ''
+        try { $null = Invoke-PraAdBatch $context $plans 'Convert' } catch { $failure = [string]$_.Exception.Message }
+        $failure | Should -Match 'uSNChanged changed'
+        $partial = $context.PartialBatch
+        $partial.Verified | Should -Be 1
+        @($partial.MayBeChanged).Count | Should -Be 0
+        @($partial.NotConverted) -join ',' | Should -BeExactly 'user2,user3'
+        $touched = Get-PraJournalTouchedObject -Path $context.JournalPath
+        $touched.Count | Should -Be 1
+        $touched.Contains([string]$plans[1].Record.ObjectGuid) | Should -BeFalse
+    }
+    It 'every object verified and the State write fails: the proof written is the normal one, and Import-PraProof accepts it' {
+        $runtime = New-GateRuntime -Name 'allverified-320a' -UserCount 3
+        $env:PRA_GATE_STATE = $runtime.StatePath; $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+        Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        $context = New-GateContext $runtime
+        $plans = @(foreach ($sam in 'user1', 'user2', 'user3') { New-PraPlan $context $sam 'Convert' })
+        $global:PraGate.StateFail320 = 1
+        $failure = ''
+        InModuleScope PRA.Directory -Parameters @{ Context = $context; Plans = $plans } {
+            $script:OriginalWrite320 = (Get-Command Write-PraImmutableFile -CommandType Function).ScriptBlock
+            Mock Write-PraImmutableFile { & $script:OriginalWrite320 -Path $Path -Text $Text }
+            Mock Write-PraImmutableFile { throw 'SYNTHETIC: disk full' } -ParameterFilter { ([string]$Path -like '*\State-*.json') -and ($global:PraGate.StateFail320-- -gt 0) }
+            try { $null = Invoke-PraAdBatch $Context $Plans 'Convert' } catch { $global:PraGate.StateFailure320 = [string]$_.Exception.Message }
+        }
+        $global:PraGate.StateFailure320 | Should -Match 'disk full'
+        $partial = $context.PartialBatch
+        $partial.Complete | Should -BeTrue
+        $proof = [IO.File]::ReadAllText($partial.StatePath) | ConvertFrom-Json -DateKind String
+        $proof.PSObject.Properties.Name | Should -Not -Contain 'Partial'
+        @($proof.Records).Count | Should -Be 3
+        $source = Import-PraBackup $context @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Convert-*.json')[0].FullName
+        $accepted = Import-PraProof $context $partial.StatePath $source 'Convert'
+        $accepted.Partial | Should -BeFalse
+        @($accepted.Data.Records).Count | Should -Be 3
+        $global:PraGate.Remove('StateFail320'); $global:PraGate.Remove('StateFailure320')
+    }
+    It 'in phase Both an object is Pending as soon as it is verified, so that a stop or an interruption never leaves it done' {
+        foreach ($phase in 'Both', 'AD') {
+            $runtime = New-GateRuntime -Name ('both-pending-320a-' + $phase) -Case 'FailAtSam' -UserCount 2 -Extra @{ FailSam = 'user2' }
+            $env:PRA_GATE_STATE = $runtime.StatePath; $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+            Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+            Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+            Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+            $context = New-GateContext $runtime
+            $context.Phase = $phase
+            $plans = @(foreach ($sam in 'user1', 'user2') { New-PraPlan $context $sam 'Convert' })
+            try { $null = Invoke-PraAdBatch $context $plans 'Convert' } catch { $null = $_ }
+            $plans[0].Row.ADVerified | Should -BeTrue
+            $plans[0].Row.FinalStatus | Should -BeExactly $(if ($phase -eq 'Both') { 'Pending' } else { 'Success' })
+        }
+    }
+    It 'a run refused by the domain controller before any write names no batch: not on the card, not in the result' {
+        $runtime = New-GateRuntime -Name 'notapplied-320a' -Case 'AccessDenied'
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'NOT-APPLIED'
+        $run.Output | Should -Not -Match '(?m)^\s*\S+\s+Batch\s+[0-9a-f]{8}\s*$'
+        [string]$run.MainResult.BatchId | Should -BeExactly ''
+        $run.Output | Should -Not -Match '\(batch [0-9a-f]{8}\)'
+    }
+}
+
+Describe 'Release 3.2.0 - the global report: a later stage that covers the cloud side replaces the cloud error of an earlier phase Both stage (production Common module)' -Tag 'Release320a' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+        $script:R5Root = Join-Path $global:PraGate.Root ('r5-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $null = New-Item -ItemType Directory -Path $script:R5Root -Force
+        $script:R5Dot = [string][char]0x00B7
+        function global:New-R5Row {
+            param([string]$Sam, [string]$Status, [string]$Cloud, [string]$Guid, [bool]$AdVerified = $true)
+            [pscustomobject]@{ ObjectGuid = $Guid; SamAccountName = $Sam; UserPrincipalName = "$Sam@contoso.com"; Action = 'Convert'; IsShared = $false; ADApplied = $true; ADVerified = $AdVerified
+                BackupPath = 'D:\PRA\Backups\Batch-x\Convert.json'; CloudStatus = $Cloud; CloudDetail = ''; FinalStatus = $Status; Detail = $(if ($Status -eq 'Error') { 'cloud: not ready in time' } else { 'detail' }); Warnings = ''; LastOperation = ''; GroupAction = ''
+                CloudMailbox = $null; CloudLicense = $null; PreserveCloudMailbox = $false; PreserveLicense = $false; DeprovisionConfirmed = $false; PermDetail = ''; PermMissing = @() }
+        }
+        function global:New-R5Context {
+            param([string]$Phase, [object[]]$Rows, [string[]]$PhaseFolders = @(), [int]$Minutes = 0, [string]$Name = 'run')
+            $context = @{ Root = $global:PraGate.Package; Version = '3.2.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = (Get-Date).AddMinutes($Minutes); Action = 'Convert'; Mode = 'Apply'; Phase = $Phase
+                CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
+                Server = 'dc01.contoso.com'; Config = @{ Environment = 'GATE'; Cloud = @{ Organization = 'contoso.onmicrosoft.com' } }; AllowMutation = $true; ReportFolder = (Join-Path $script:R5Root ('reports-' + $Name)); NoReport = $false; BatchId = 'abcd1234'
+                LogFile = ''; NextSteps = @(); ExitCode = 0; CloudConnectFailed = $false; ResultStatus = ''; PhaseFolders = $PhaseFolders; ConfigOverrides = @() }
+            foreach ($row in $Rows) { $context.Rows.Add($row) }
+            $context
+        }
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\New-R5Row', 'Function:\New-R5Context' -ErrorAction SilentlyContinue }
+    It 'user2 failed in the cloud part of the Both run and was completed by -Phase Cloud: done, not failed; the earlier error stays in the journey as an Earlier run line' {
+        $folder = Join-Path $script:R5Root 'Batch-1111111111'; $null = New-Item -ItemType Directory -Path $folder -Force
+        $g1 = [guid]::NewGuid().ToString(); $g2 = [guid]::NewGuid().ToString()
+        $both = New-R5Context -Phase Both -Rows @((New-R5Row 'user1' 'Success' 'Success' $g1), (New-R5Row 'user2' 'Error' 'Error' $g2)) -Minutes -10 -Name 'both'
+        $null = Save-PraPhaseData -Context $both -Folder $folder -HandOff ''
+        $cloud = New-R5Context -Phase Cloud -Rows @((New-R5Row 'user2' 'Success' 'Success' $g2)) -PhaseFolders @($folder) -Minutes 0 -Name 'cloud'
+        $report = Write-PraGlobalReport -Context $cloud
+        $model = $cloud.GlobalModel
+        @($model.Phases | ForEach-Object Label) -join '|' | Should -BeExactly "Convert $script:R5Dot AD + Cloud|Convert $script:R5Dot Cloud"
+        $user2 = $model.Objects | Where-Object Name -eq 'user2@contoso.com'
+        $user2.Verdict | Should -BeExactly 'done'
+        $model.Counts.Failed | Should -Be 0
+        @($user2.Stages | ForEach-Object Status) -join ',' | Should -BeExactly 'Error,Success'
+        @($user2.Stages[1].Steps | Where-Object Step -eq 'Earlier run').Count | Should -Be 1
+        (@($user2.Stages[1].Steps | Where-Object Step -eq 'Earlier run')[0].Text) | Should -Match 'cloud: not ready in time'
+        $html = [IO.File]::ReadAllText($report.Html)
+        $html | Should -Match 'Earlier run'
+        $html | Should -Not -Match '<div class="tile-label">Result</div><div class="tile-value">Failed</div>'
+    }
+    It 'an error that is not on the cloud side stays final, and so does a cloud error that no later stage covers' {
+        $folder = Join-Path $script:R5Root 'Batch-2222222222'; $null = New-Item -ItemType Directory -Path $folder -Force
+        $g1 = [guid]::NewGuid().ToString(); $g2 = [guid]::NewGuid().ToString()
+        $both = New-R5Context -Phase Both -Rows @((New-R5Row 'user1' 'Error' 'N/A' $g1 -AdVerified $false), (New-R5Row 'user2' 'Error' 'Error' $g2)) -Minutes -10 -Name 'both2'
+        $null = Save-PraPhaseData -Context $both -Folder $folder -HandOff ''
+        $cloud = New-R5Context -Phase Cloud -Rows @((New-R5Row 'user1' 'Success' 'Success' $g1)) -PhaseFolders @($folder) -Minutes 0 -Name 'cloud2'
+        $null = Write-PraGlobalReport -Context $cloud
+        ($cloud.GlobalModel.Objects | Where-Object Name -eq 'user1@contoso.com').Verdict | Should -BeExactly 'failed' -Because 'its AD part failed: a cloud run does not repair it'
+        ($cloud.GlobalModel.Objects | Where-Object Name -eq 'user2@contoso.com').Verdict | Should -BeExactly 'failed' -Because 'the cloud run did not list this object'
+        $cloud.GlobalModel.Counts.Failed | Should -Be 2
+    }
+}
+
+Describe 'Release 3.2.0 - the shared mailbox permissions follow the batch: stored at Convert, used by the cloud phase, a record that carries permissions while nothing is granted is an error (production Cloud and Directory modules, synthetic)' -Tag 'Release320a' {
+    BeforeAll {
+        $global:PraGate.R6NetworkPath = Join-Path $global:PraGate.Root 'PraGateR6Network.psm1'
+        [IO.File]::WriteAllText($global:PraGate.R6NetworkPath, "if (`$env:PRA_GATE_NONET -cne 'SYNTHETIC-NO-NETWORK') { throw 'Synthetic interlock absent.' }`nExport-ModuleMember -Function @()`n", (New-Object Text.UTF8Encoding($true)))
+        Get-Module PRA.Cloud -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+    }
+    AfterAll { Remove-Module PRA.Cloud -Force -ErrorAction SilentlyContinue }
+    It 'Get-PraPermissionRequest takes the settings of the batch when the context has them, the configuration of the server otherwise' {
+        $global:PraGate.R6Row = [pscustomobject]@{ IsShared = $true; SharedFullAccess = @('a@gate.invalid'); SharedSendAs = @('b@gate.invalid'); SharedSendOnBehalf = @('c@gate.invalid') }
+        $global:PraGate.R6Config = @{ SharedMailbox = @{ Enabled = $true; PermissionSource = 'AD'; GrantFullAccess = $true; GrantSendAs = $true; GrantSendOnBehalf = $true } }
+        $rights = InModuleScope PRA.Cloud {
+            $server = @{ Config = $global:PraGate.R6Config }
+            $batch = @{ Config = $global:PraGate.R6Config; BatchGrantSettings = @{ Enabled = $true; PermissionSource = 'AD'; GrantFullAccess = $true; GrantSendAs = $false; GrantSendOnBehalf = $false } }
+            $off = @{ Config = @{ SharedMailbox = @{ Enabled = $false; PermissionSource = 'AD'; GrantFullAccess = $true; GrantSendAs = $true; GrantSendOnBehalf = $true } }; BatchGrantSettings = @{ Enabled = $true; PermissionSource = 'None'; GrantFullAccess = $true; GrantSendAs = $true; GrantSendOnBehalf = $true } }
+            @{ Server = @(Get-PraPermissionRequest $server $global:PraGate.R6Row | ForEach-Object Right) -join ','; Batch = @(Get-PraPermissionRequest $batch $global:PraGate.R6Row | ForEach-Object Right) -join ','; Off = @(Get-PraPermissionRequest $off $global:PraGate.R6Row | ForEach-Object Right) -join ',' }
+        }
+        $rights.Server | Should -BeExactly 'FullAccess,SendAs,SendOnBehalf'
+        $rights.Batch | Should -BeExactly 'FullAccess' -Because 'the batch grants FullAccess only, whatever this server says'
+        $rights.Off | Should -BeExactly 'SendOnBehalf' -Because 'the batch says PermissionSource None: only SendOnBehalf, although this server has the setting off'
+    }
+    It 'a permission that the settings in force do not grant is never silent, for an old batch and for a batch whose own settings grant none: a warning that names each permission, the row says to grant it by hand, no error' {
+        foreach ($source in 'Configuration', 'Batch') {
+            $runtime = New-GateRuntime -Name ('grant-none-320a-' + $source)
+            $context = New-GateContext $runtime -Mode Apply -Action Convert
+            $context.Phase = 'Cloud'; $context.Once = $true; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 1; $context.GrantSettingsSource = $source
+            $context.Config.Cloud = @{ CheckMailbox = $false; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; TenantId = '20000000-0000-0000-0000-000000000002' }
+            $context.Config.SharedMailbox = @{ Enabled = $false; PermissionSource = 'AD'; GrantFullAccess = $false; GrantSendAs = $false; GrantSendOnBehalf = $false }
+            $context.LogFile = Join-Path $runtime.Root 'logs\grant-none.log'
+            if ($source -eq 'Batch') { $context.BatchGrantSettings = @{ Enabled = $true; PermissionSource = 'AD'; GrantFullAccess = $false; GrantSendAs = $false; GrantSendOnBehalf = $false } }
+            $global:PraGate.R6Context = $context
+            $global:PraGate.R6Row = New-PraRow $context ([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'shared1@gate.invalid'; SamAccountName = 'shared1'; IsShared = $true })
+            $global:PraGate.R6Row.SharedFullAccess = @('a@gate.invalid'); $global:PraGate.R6Row.SharedSendAs = @('b@gate.invalid')
+            InModuleScope PRA.Cloud {
+                Mock Close-PraCloudSession { }
+                Invoke-PraCloudPhase $global:PraGate.R6Context @($global:PraGate.R6Row) 'Convert'
+            }
+            $row = $global:PraGate.R6Row; $context = $global:PraGate.R6Context
+            $context.Issues.Count | Should -Be 0 -Because $source
+            $row.FinalStatus | Should -Not -BeExactly 'Error'
+            $context.Warnings | Should -Be 1 -Because $source
+            $warning = @(Get-PraList $context 'WarningList')[0].Message
+            $warning | Should -Match 'shared1@gate\.invalid: 2 shared mailbox permission\(s\) not granted by '
+            $warning | Should -Match 'to grant by hand: FullAccess a@gate\.invalid; SendAs b@gate\.invalid\.'
+            $warning | Should -Match $(if ($source -eq 'Batch') { 'the settings the batch was converted with' } else { 'the settings of this server \(this batch does not record its own\)' })
+            $row.Warnings | Should -Match 'to grant by hand: FullAccess a@gate\.invalid; SendAs b@gate\.invalid' -Because 'the report and the CSV carry it'
+        }
+    }
+}
+
+Describe 'Release 3.2.0 - the grant settings are stored in the batch at Convert and the cloud phase says which settings it uses (real main, 13 synthetic shared mailboxes)' -Tag 'Release320a' {
+    It 'stores SharedMailbox.Enabled, PermissionSource and the three Grant settings in the batch, and a cloud server with other settings warns and uses the batch values' {
+        $runtime = New-GateRuntime -Name 'grant-batch-320a' -Shared13 -Case CloudConfirmed13
+        $ad = Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 180
+        $ad.ExitCode | Should -Be 2 -Because ($ad.Output + $ad.Error)
+        $json = @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File -Filter 'Convert-*.json')[0]
+        $batch = [IO.File]::ReadAllText($json.FullName) | ConvertFrom-Json -DateKind String
+        $batch.GrantSettings.Enabled | Should -BeTrue
+        $batch.GrantSettings.PermissionSource | Should -BeExactly 'AD'
+        $batch.GrantSettings.GrantFullAccess | Should -BeTrue
+        $batch.GrantSettings.GrantSendAs | Should -BeTrue
+        $batch.GrantSettings.GrantSendOnBehalf | Should -BeTrue
+        Set-GateConfigText $runtime { param($text) $text.Replace("PermissionSource='AD'", "PermissionSource='AD';GrantSendAs=`$false;GrantSendOnBehalf=`$false") }
+        $cloud = Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 180
+        $cloud.Output | Should -Match ([regex]::Escape('The shared mailbox permission settings of this server differ from the ones of the batch (GrantSendAs: batch True, this server False; GrantSendOnBehalf: batch True, this server False). The batch values are used: Enabled = True, PermissionSource = AD, GrantFullAccess = True, GrantSendAs = True, GrantSendOnBehalf = True.'))
+    }
+    It 'a batch of an older version has no stored settings: the configuration of this server is used, with a warning that says so' {
+        $runtime = New-GateRuntime -Name 'grant-legacy-320a' -Shared13 -Case CloudConfirmed13
+        $env:PRA_GATE_STATE = $runtime.StatePath; $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+        Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        $context = New-GateContext $runtime
+        $plans = @(1..13 | ForEach-Object { New-PraPlan $context ('user' + $_) 'Convert' })
+        $source = InModuleScope PRA.Directory -Parameters @{ Context = $context; Plans = $plans } {
+            Mock Get-PraGrantSettingSnapshot { $null }
+            Invoke-PraAdBatch $Context $Plans 'Convert'
+        }
+        [IO.File]::WriteAllText($runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($global:PraGateAd, 35))
+        ([IO.File]::ReadAllText($source.Path) | ConvertFrom-Json -DateKind String).GrantSettings | Should -BeNullOrEmpty
+        $cloud = Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$source.Path} -TimeoutSeconds 180
+        $cloud.Output | Should -Match ([regex]::Escape('This batch was written by an older version: it does not record the shared mailbox permission settings, so the configuration of this server decides ('))
+    }
+}
+
+Describe 'Release 3.2.0 - small items of the common module: module minimum, event file, configuration differences, plain messages (production Common module)' -Tag 'Release320a' {
+    BeforeAll { Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global }
+    It 'Exo.MinModuleVersion cannot lower the built-in minimum' {
+        $modules = @(
+            [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.9.5' }
+            [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Version = [version]'2.41.1' }
+            [pscustomobject]@{ Name = 'Microsoft.Graph.Users'; Version = [version]'2.41.1' })
+        $report = Get-PraCloudModuleReport -MinExo '3.9.0' -Available $modules -Loaded @()
+        $report.Exo.Ok | Should -BeFalse
+        $report.Exo.Message | Should -Match 'the tool needs 3\.10\.1 or later|needs 3\.10\.1'
+        (Get-PraCloudModuleReport -MinExo '3.11.0' -Available @($modules + [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.2' }) -Loaded @()).Exo.Message | Should -Match '3\.11\.0'
+        (Get-PraCloudModuleReport -MinExo '3.9.0' -Available @($modules[1], $modules[2], [pscustomobject]@{ Name = 'ExchangeOnlineManagement'; Version = [version]'3.10.1' }) -Loaded @()).Exo.Ok | Should -BeTrue
+    }
+    It 'a write of the event file that fails never stops the run, and it is said once' {
+        $file = Join-Path $global:PraGate.Root ('events-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.jsonl')
+        $old = $env:PRA_EVENT_FILE; $env:PRA_EVENT_FILE = $file
+        $hold = New-Object IO.FileStream($file, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        InModuleScope PRA.Common { $script:PraEventWriteWarned = $false }
+        try {
+            $first = & { Write-PraEvent -Kind count -Data @{ count = 1 } } 6>&1 | Out-String
+            $second = & { Write-PraEvent -Kind count -Data @{ count = 2 } } 6>&1 | Out-String
+        }
+        finally { $hold.Dispose(); $env:PRA_EVENT_FILE = $old }
+        $first | Should -Match 'The progress file of the window cannot be written'
+        $second | Should -Not -Match 'The progress file of the window cannot be written'
+    }
+    It 'a setting that differs by letter case only is not a change' {
+        $base = @{ Scope = @{ Mode = 'Auto'; SearchBase = 'OU=Tests,DC=gate,DC=invalid' }; Environment = 'Gate' }
+        @(Get-PraConfigurationDifference -Base $base -Effective @{ Scope = @{ Mode = 'AUTO'; SearchBase = 'ou=tests,dc=gate,dc=invalid' }; Environment = 'GATE' }).Count | Should -Be 0
+        $changed = @(Get-PraConfigurationDifference -Base $base -Effective @{ Scope = @{ Mode = 'Csv'; SearchBase = 'OU=Tests,DC=gate,DC=invalid' }; Environment = 'Gate' })
+        $changed.Count | Should -Be 1
+        $changed[0].Key | Should -BeExactly 'Scope.Mode'
+    }
+    It 'the card, the console and the report show no stack line and no stray Exchange Online pipe; the log keeps the detail' {
+        $text = "The call failed.`r`n   at Microsoft.Exchange.Foo.Bar(String x)`r`n   at <ScriptBlock>, C:\x\y.ps1: line 12`r`n--- End of inner exception stack trace ---`r`nOperation: ||You can't use this: the object is busy.|"
+        $plain = InModuleScope PRA.Common -Parameters @{ Text = $text } { ConvertTo-PraPlainMessage $Text }
+        $plain | Should -Not -Match 'Microsoft\.Exchange\.Foo|ScriptBlock|End of inner'
+        $plain | Should -Not -Match '\|\|'
+        $plain | Should -Match 'The call failed\.'
+        $plain | Should -Match "You can't use this: the object is busy\."
+        $ctx = @{ Root = $global:PraGate.Package; Version = '3.2.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
+            CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
+            Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $true; ReportFolder = (Join-Path $global:PraGate.Root 'reports-320a'); NoReport = $true; BatchId = ''; LogFile = ''; TranscriptStarted = $false
+            NextSteps = @(); ExitCode = 1; CloudConnectFailed = $false; ResultStatus = '' }
+        $ctx.Issues.Add([pscustomobject]@{ Timestamp = 't'; Phase = 'p'; Operation = 'Cloud'; Identity = ''; Source = 'Cloud'; Message = $text })
+        $result = Complete-PraRun -Context $ctx
+        $result.Issues[0].Message | Should -Not -Match 'Microsoft\.Exchange\.Foo|ScriptBlock'
+        $result.Issues[0].Message | Should -Match 'The call failed\.'
+    }
+    It 'a batch ID that ends with a line feed is not a batch ID' {
+        $runtime = New-GateRuntime -Name 'batch-id-lf-320a'
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Phase='AD';Mode='Preview';ConfigPath=$runtime.ConfigPath;Batch=("deadbeef" + [char]10)} -ExplicitArguments -TimeoutSeconds 60
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        ($run.MainResult.Issues.Message -join ' ') | Should -Match 'Invalid batch ID'
+    }
+}
+
+Describe 'Release 3.2.0 - a Recover batch rolled back objects of a Convert batch: Find-PraRecoverOfBatch (production Directory module, synthetic folders)' -Tag 'Release320a' {
+    It 'finds the Recover batch by the hash of its Convert source and the objects it lists, and ignores another Environment and other objects' {
+        $root = Join-Path $global:PraGate.Root ('recover-of-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $id = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
+        $folder = Join-Path $root ('Batch-' + $id); $null = New-Item -ItemType Directory -Path $folder -Force
+        $hash = 'ab' * 32
+        $state = [ordered]@{ SchemaVersion = 2; Operation = 'Recover'; Kind = 'ADVerified'; Environment = 'SYNTHETIC_GATE'; SourceBackupHash = $hash; Records = @([ordered]@{ ObjectGuid = '11111111-1111-1111-1111-111111111111'; Operation = 'Recover'; ADVerified = $true }) }
+        [IO.File]::WriteAllText((Join-Path $folder ('State-' + $id + '.json')), ($state | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($true)))
+        $global:PraGate.RecoverOf = @{ Root = $root; Hash = $hash }
+        $found = InModuleScope PRA.Directory {
+            $context = @{ Config = @{ Environment = 'synthetic_gate'; Storage = @{ BackupFolder = $global:PraGate.RecoverOf.Root } } }
+            $other = @{ Config = @{ Environment = 'ANOTHER'; Storage = @{ BackupFolder = $global:PraGate.RecoverOf.Root } } }
+            @{ Same = (Find-PraRecoverOfBatch $context $global:PraGate.RecoverOf.Hash.ToUpperInvariant() @('11111111-1111-1111-1111-111111111111'))
+               Listed = (Find-PraRecoverOfBatch $context $global:PraGate.RecoverOf.Hash @())
+               OtherObject = (Find-PraRecoverOfBatch $context $global:PraGate.RecoverOf.Hash @('22222222-2222-2222-2222-222222222222'))
+               OtherHash = (Find-PraRecoverOfBatch $context ('cd' * 32) @())
+               OtherEnvironment = (Find-PraRecoverOfBatch $other $global:PraGate.RecoverOf.Hash @()) }
+        }
+        $found.Same.ShortId | Should -BeExactly 'a1b2c3d4'
+        $found.Listed.BatchId | Should -BeExactly $id
+        $found.OtherObject | Should -BeNullOrEmpty
+        $found.OtherHash | Should -BeNullOrEmpty
+        $found.OtherEnvironment | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Release 3.2.0 - the exit code goes to the host only when the script is the entry of its own process; a Recover that stopped is found by its backup and its journal (production Common and Directory modules)' -Tag 'Release320a' {
+    BeforeAll { Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global }
+    It 'decides from the command line of the process: -File, -Command and -EncodedCommand are an own process, an interactive session is not, -NoExit is not' {
+        $pwsh = 'C:\Program Files\PowerShell\7\pwsh.exe'
+        Test-PraOwnEntryProcess -Arguments @($pwsh, '-NoProfile', '-File', 'C:\x\Invoke-PraRemoteMailbox.ps1', '-Action', 'Check') | Should -BeTrue
+        Test-PraOwnEntryProcess -Arguments @($pwsh, '-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', 'AAAA') | Should -BeTrue
+        Test-PraOwnEntryProcess -Arguments @($pwsh, '-Command', '& .\Invoke-PraRemoteMailbox.ps1') | Should -BeTrue
+        Test-PraOwnEntryProcess -Arguments @($pwsh, '-FILE', 'x.ps1') | Should -BeTrue -Because 'the option name is not case sensitive'
+        Test-PraOwnEntryProcess -Arguments @($pwsh) | Should -BeFalse -Because 'a window the operator opened and typed in'
+        Test-PraOwnEntryProcess -Arguments @($pwsh, '-NoProfile') | Should -BeFalse
+        Test-PraOwnEntryProcess -Arguments @($pwsh, '-NoExit', '-Command', 'Get-Date') | Should -BeFalse
+        Test-PraOwnEntryProcess -Arguments @($pwsh, '-Command', 'Get-Date', '-NoExit') | Should -BeFalse
+        Test-PraOwnEntryProcess -Arguments @() | Should -BeFalse
+    }
+    It 'the engine gives its exit code to the host only through that decision' {
+        $engine = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'))
+        $engine | Should -Match 'if \(\$interrupted -and \(Test-PraOwnEntryProcess\)\) \{ try \{ \$Host\.SetShouldExit'
+        ([regex]::Matches($engine, 'SetShouldExit')).Count | Should -Be 1
+    }
+    It 'finds a Recover that stopped before its proof by its backup, and tells the objects from its journal; a journal that is missing counts for every object; a Recover with no write counts for none' {
+        $root = Join-Path $global:PraGate.Root ('recover-stopped-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
+        $hash = 'ef' * 32
+        $make = {
+            param($Id, [bool]$Journal, [string[]]$Started)
+            $folder = Join-Path $root ('Batch-' + $Id); $null = New-Item -ItemType Directory -Path $folder -Force
+            $head = [ordered]@{ SchemaVersion = 3; RawFormat = 'PraDataOnlyClixml-v1'; Operation = 'Recover'; RunId = 'r'; BatchId = $Id; Environment = 'SYNTHETIC_GATE'; Server = 's'; NamingContext = 'n'; CreatedUtc = 'u'; RawFile = 'x.clixml'; RawHash = 'h'; SourceBackupHash = $hash; Records = @(@{ ObjectGuid = '11111111-1111-1111-1111-111111111111' }) }
+            [IO.File]::WriteAllText((Join-Path $folder ('Recover-SYNTHETIC_GATE-20261116_120000-' + $Id.Substring(0, 8) + '.json')), ($head | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($true)))
+            if ($Journal) {
+                $lines = @(foreach ($guid in $Started) { (@{ RunId = 'r'; Utc = 'u'; Target = $guid; Operation = 'Set-ADUser'; Status = 'Started'; Detail = '' } | ConvertTo-Json -Compress) })
+                [IO.File]::WriteAllText((Join-Path $folder ('Journal-' + $Id + '.jsonl')), (($lines + '{"RunId":"r","Utc":"u","Target":"*","Operation":"Backup","Status":"Verified","Detail":""}') -join "`r`n"), (New-Object Text.UTF8Encoding($true)))
+            }
+        }
+        $global:PraGate.StoppedRecover = @{ Root = $root; Hash = $hash }
+        $find = {
+            param($Objects)
+            $global:PraGate.StoppedObjects = $Objects
+            InModuleScope PRA.Directory {
+                $context = @{ Config = @{ Environment = 'SYNTHETIC_GATE'; Storage = @{ BackupFolder = $global:PraGate.StoppedRecover.Root } } }
+                Find-PraRecoverOfBatch $context $global:PraGate.StoppedRecover.Hash ([string[]]$global:PraGate.StoppedObjects)
+            }
+        }
+        & $make 'a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4' $true @('11111111-1111-1111-1111-111111111111')
+        $hit = & $find @('11111111-1111-1111-1111-111111111111')
+        $hit.Basis | Should -BeExactly 'Journal'
+        $hit.ShortId | Should -BeExactly 'a1a1a1a1'
+        (& $find @('22222222-2222-2222-2222-222222222222')) | Should -BeNullOrEmpty -Because 'its journal never names that object'
+        Remove-Item -LiteralPath $root -Recurse -Force
+        & $make 'a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4' $false @()
+        (& $find @('22222222-2222-2222-2222-222222222222')).Basis | Should -BeExactly 'Unknown'
+        Remove-Item -LiteralPath $root -Recurse -Force
+        & $make 'a1a1a1a1b2b2b2b2c3c3c3c3d4d4d4d4' $true @()
+        (& $find @('11111111-1111-1111-1111-111111111111')) | Should -BeNullOrEmpty -Because 'the Recover wrote nothing'
+        $global:PraGate.Remove('StoppedRecover'); $global:PraGate.Remove('StoppedObjects')
+    }
 }

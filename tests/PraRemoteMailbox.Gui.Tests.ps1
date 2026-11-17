@@ -2025,3 +2025,73 @@ AfterAll {
         }
     }
 }
+
+Describe 'Release 3.2.0 - the console: the data files of the global report are not batches, an Apply with planned objects is not Done, a partial batch is labelled (synthetic, no engine)' -Tag 'Release320a' {
+    It 'does not list PhaseData and PhaseEvents files as unreadable batches, and resolves a batch folder that holds them' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestJson (Join-Path $batch.Folder 'PhaseData-20261116101010-AD-1a2b3c4d.json') @{ SchemaVersion = 1; Kind = 'PhaseData'; Environment = 'GuiSynthetic'; Objects = @() }
+        Write-GuiTestFile (Join-Path $batch.Folder 'phasedata-20261116101011-cloud-1a2b3c4d.json') '{"Kind":"PhaseData"}'
+        Write-GuiTestFile (Join-Path $batch.Folder 'PhaseEvents-20261116101010-AD-1a2b3c4d.json') '{"Step":"x"}'
+        Write-GuiTestFile (Join-Path $batch.Folder 'PhaseEvents-20261116101010-AD-1a2b3c4d.jsonl') '{"Step":"x"}'
+        $state = Read-PraGuiState $runtime.Root $runtime.Config
+        @($state.Batches).Count | Should -Be 1 -Because (($state.Batches | ForEach-Object Label) -join "`n")
+        @($state.Batches | Where-Object { -not $_.Valid }).Count | Should -Be 0
+        $found = Resolve-PraGuiBatch $batch.Folder 'Convert' $state
+        $found.Path | Should -BeExactly $batch.Path
+        (Resolve-PraGuiBatch $batch.Id 'Convert' $state).Path | Should -BeExactly $batch.Path
+    }
+    It 'an Apply whose result is Planned, or has planned objects, is not a success; a Preview that plans is still valid' {
+        $apply = New-PraGuiRequest -Phase AD -Mode Apply
+        Test-PraGuiResult (New-GuiTestResult $apply) $apply 0 | Should -BeFalse -Because 'Planned is the status of a Preview'
+        $mixed = New-GuiTestResult $apply -Planned 1 -Success 2; $mixed.status = 'Success'
+        Test-PraGuiResult $mixed $apply 0 | Should -BeFalse -Because 'an object is still planned'
+        Test-PraGuiResult (New-GuiTestResult $apply -Planned 0 -Success 2) $apply 0 | Should -BeTrue
+        Test-PraGuiResult (New-GuiTestResult $apply -ExitCode 2 -Planned 0 -Pending 2) $apply 2 | Should -BeTrue
+        $preview = New-PraGuiRequest -Phase AD -Mode Preview
+        Test-PraGuiResult (New-GuiTestResult $preview) $preview 0 | Should -BeTrue
+        $apply = New-PraGuiRequest -Phase AD -Mode 'APPLY'
+        Test-PraGuiResult (New-GuiTestResult $apply) $apply 0 | Should -BeFalse -Because 'the mode is not case sensitive'
+    }
+    It 'labels a batch whose AD proof is partial with the number of objects converted, and nothing for a complete proof' {
+        $runtime = New-GuiTestRoot
+        $partial = New-GuiTestBatch -Runtime $runtime
+        $records = @(1..3 | ForEach-Object { @{ ObjectGuid = [guid]::NewGuid().ToString(); Operation = 'Convert'; ADVerified = $true } })
+        Write-GuiTestJson $partial.Proof @{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'GuiSynthetic'; Partial = $true; PlannedCount = 10; Records = $records }
+        (& (Get-Module PRA.Gui) { param($path) Get-PraGuiPartialText $path } $partial.Proof) | Should -BeExactly 'Partial: 3 of 10 converted'
+        $complete = New-GuiTestBatch -Runtime $runtime
+        (& (Get-Module PRA.Gui) { param($path) Get-PraGuiPartialText $path } $complete.Proof) | Should -BeExactly ''
+        (& (Get-Module PRA.Gui) { param($path) Get-PraGuiPartialText $path } (Join-Path $runtime.Root 'missing.json')) | Should -BeExactly ''
+    }
+}
+
+Describe 'Release 3.2.0 - the console continues a partial batch, or a batch whose synchronisation is not confirmed, with the AD part first (synthetic, no engine)' -Tag 'Release320a' {
+    It 'offers the AD part first for a partial batch, and for a batch without a good Entra Connect entry when the configuration asks for the synchronisation' {
+        $runtime = New-GuiTestRoot
+        $partial = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestJson $partial.Proof @{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'GuiSynthetic'; Partial = $true; PlannedCount = 10; Records = @(@{ ObjectGuid = [guid]::NewGuid().ToString(); Operation = 'Convert'; ADVerified = $true }) }
+        $plain = New-GuiTestBatch -Runtime $runtime
+        $synced = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $synced.Folder ('Journal-' + $synced.Id + '.jsonl')) ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Completed`"}`r`n")
+        $items = @{}
+        foreach ($name in 'partial', 'plain', 'synced') { $batch = Get-Variable $name -ValueOnly; $items[$name] = [pscustomobject]@{ Folder = $batch.Folder; BatchId = $batch.Id; Environment = 'GuiSynthetic' } }
+        $reasons = & (Get-Module PRA.Gui) {
+            param($Items, $Folder)
+            $saved = $script:Gui
+            try {
+                $result = @{}
+                foreach ($sync in $false, $true) {
+                    $script:Gui = [pscustomobject]@{ State = [pscustomobject]@{ Config = @{ EntraConnect = @{ Sync = $sync }; Storage = @{ BackupFolder = $Folder } } }; Detect = $null }
+                    foreach ($name in 'partial', 'plain', 'synced') { $result[$name + '-' + $sync] = [string](Get-PraGuiFinishReason $Items[$name]) }
+                }
+                $result
+            }
+            finally { $script:Gui = $saved }
+        } $items (Join-Path $runtime.Root 'Backups')
+        $reasons['partial-False'] | Should -BeExactly 'AD part partly done, sync not run: finish it here'
+        $reasons['partial-True'] | Should -BeExactly 'AD part partly done, sync not run: finish it here'
+        $reasons['plain-True'] | Should -BeExactly 'AD part done, sync not confirmed: finish it here'
+        $reasons['plain-False'] | Should -Not -Match 'finish it here' -Because 'the configuration leaves the synchronisation to the operator'
+        $reasons['synced-True'] | Should -Not -Match 'finish it here' -Because 'its journal has an Entra Connect entry that ended well'
+    }
+}

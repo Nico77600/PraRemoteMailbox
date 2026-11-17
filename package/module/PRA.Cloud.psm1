@@ -422,7 +422,7 @@ function Get-PraNetworkFailure {
         $texts.Add([string]$e.Message)
         if ($e -is [System.Net.Sockets.SocketException] -or $e -is [TimeoutException] -or $e -is [System.Threading.Tasks.TaskCanceledException]) { $network=$true }
         elseif ($e -is [System.Net.Http.HttpRequestException] -and $null -eq $e.StatusCode) { $network=$true }
-        elseif ($e -is [System.Net.WebException] -and ([string]$e.Status) -match '^(ConnectFailure|NameResolutionFailure|Timeout|ConnectionClosed|ReceiveFailure|SendFailure|ProxyNameResolutionFailure|KeepAliveFailure)$') { $network=$true }
+        elseif ($e -is [System.Net.WebException] -and ([string]$e.Status) -match '^(ConnectFailure|NameResolutionFailure|Timeout|ConnectionClosed|ReceiveFailure|SendFailure|ProxyNameResolutionFailure|KeepAliveFailure)\z') { $network=$true }
         if ($e -is [AggregateException]) { foreach ($inner in $e.InnerExceptions) { $queue.Enqueue($inner) } }
         elseif ($null -ne $e.InnerException) { $queue.Enqueue($e.InnerException) }
     }
@@ -771,7 +771,9 @@ function Close-PraCloudSession {
 function Get-PraPermissionRequest {
     param([hashtable]$Context,$Row)
     if (-not [bool](Get-PraValue $Row 'IsShared' $false)) { return }
-    $cfg = Get-PraValue $Context.Config 'SharedMailbox' @{}
+    # The settings stored in the batch by the Convert run decide; a batch that has none follows the configuration of this server.
+    $cfg = Get-PraValue $Context 'BatchGrantSettings' $null
+    if ($null -eq $cfg) { $cfg = Get-PraValue $Context.Config 'SharedMailbox' @{} }
     if (-not [bool](Get-PraValue $cfg 'Enabled' $false)) { return }
     foreach ($right in @('FullAccess','SendAs','SendOnBehalf')) {
         if ((-not (Test-PraOrdinalIgnoreCaseEqual $right 'SendOnBehalf')) -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $cfg 'PermissionSource' 'None') 'None')) { continue }
@@ -1064,6 +1066,22 @@ function Invoke-PraCloudPhase {
                 Write-PraCloudError -Context $Context -Row $row -Message 'Invalid keep flags (PreserveCloudMailbox is for shared mailboxes only).' -RunError; continue
             }
             $requests=@(); if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { $requests=@(Get-PraPermissionRequest $Context $row) }
+            # A permission that the record carries and the settings in effect do not grant is never silent: a warning names it (the result is "done with warnings"),
+            # and the row says it is to grant by hand (report and CSV).
+            if ($shared -and (Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) {
+                $notGranted=New-Object 'System.Collections.Generic.List[string]'
+                foreach ($right in @('FullAccess','SendAs','SendOnBehalf')) {
+                    foreach ($trustee in @((Get-PraValue $row ('Shared'+$right) @()) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Get-PraOrdinalUnique -IgnoreCase)) {
+                        if (-not @($requests | Where-Object { (Test-PraOrdinalEqual $_.Right $right) -and (Test-PraOrdinalIgnoreCaseEqual $_.Trustee ([string]$trustee)) }).Count) { $notGranted.Add(('{0} {1}' -f $right,[string]$trustee)) }
+                    }
+                }
+                if ($notGranted.Count) {
+                    $whose=if (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $Context 'GrantSettingsSource' 'Configuration')) 'Batch') { 'the settings the batch was converted with' } else { 'the settings of this server (this batch does not record its own)' }
+                    $note=('{0}: {1} shared mailbox permission(s) not granted by {2} - to grant by hand: {3}.' -f $upn,$notGranted.Count,$whose,($notGranted -join '; '))
+                    $row.Warnings=([string](Get-PraValue $row 'Warnings' '') + '; ' + $note).Trim(' ',';')
+                    $null=Write-PraLog -Context $Context -Message ($note + ' They are in the backup file and in the report.') -Level Warning
+                }
+            }
             $mb=([bool](Get-PraValue $cloud 'CheckMailbox' $false) -or (Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -or $requests.Count -gt 0)
             $lic=-not $shared -and [bool](Get-PraValue $cloud 'CheckLicense' $false)
             if (-not $mb -and -not $lic) {
@@ -1087,6 +1105,8 @@ function Invoke-PraCloudPhase {
                 }
             }
             $graphMailbox=$mb -and -not $shared -and (Test-PraOrdinalIgnoreCaseEqual $via 'Graph')
+            # The object is waited for from here on: it is not done until the checks below say so.
+            $row.FinalStatus='Pending'
             $exoMailbox=$mb -and ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -or $shared -or (Test-PraOrdinalIgnoreCaseEqual $via 'Exo'))
             $needGraph=$needGraph -or $lic -or $graphMailbox; $needExo=$needExo -or $exoMailbox
             [void]$states.Add(@{ Row=$row; Upn=$upn; Shared=$shared; Mailbox=$mb; License=$lic; GraphMailbox=$graphMailbox

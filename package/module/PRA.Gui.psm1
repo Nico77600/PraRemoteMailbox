@@ -216,6 +216,13 @@ function Read-PraGuiBatch {
     return $item
 }
 
+function Test-PraGuiBatchSideFile {
+    <# True for the files that share a batch folder with the batch file and are not batches: the proof (State-), the journal, the data of the global report (PhaseData-, PhaseEvents-). #>
+    param([string]$Name)
+    foreach ($prefix in @('State-', 'Journal-', 'PhaseData-', 'PhaseEvents-')) { if ($Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}
+
 function Read-PraGuiState {
     param([string]$Root, [string]$ConfigPath, [hashtable]$ScopeOverride=@{})
     $state = [pscustomobject]@{ Root=$Root; ConfigPath=$ConfigPath; Config=$null; ConfigError=''; Batches=@(); OtherEnvironment=@(); BatchError='' }
@@ -225,7 +232,7 @@ function Read-PraGuiState {
     if (-not (Test-Path -LiteralPath $folder)) { $state.BatchError='Backup folder not present yet: '+$folder; return $state }
     try {
         $state.Batches = @(Get-ChildItem -LiteralPath $folder -Recurse -File -Filter '*.json' -ErrorAction Stop |
-            Where-Object { -not $_.Name.StartsWith('State-', [StringComparison]::OrdinalIgnoreCase) -and -not $_.Name.StartsWith('Journal-', [StringComparison]::OrdinalIgnoreCase) -and (Split-Path $_.DirectoryName -Leaf) -match '^(Batch|Finalize)-' } |
+            Where-Object { -not (Test-PraGuiBatchSideFile $_.Name) -and (Split-Path $_.DirectoryName -Leaf) -match '^(Batch|Finalize)-' } |
             ForEach-Object { Read-PraGuiBatch -Path $_.FullName -Environment $state.Config.Environment })
         # A batch of another environment is not an error of the folder: it is listed apart (a run can switch to its environment).
         $state.OtherEnvironment = @($state.Batches | Where-Object { $_.EnvMismatch } | ForEach-Object { Read-PraGuiBatch -Path $_.Path -Environment $state.Config.Environment -AnyEnvironment } | Where-Object { $_.Valid })
@@ -236,7 +243,7 @@ function Read-PraGuiState {
 function Resolve-PraGuiBatch {
     param([string]$Value, [string]$Operation, $State)
     if (-not $Value) { return $null }
-    if ($Value -match '^[a-fA-F0-9]{8,32}$') {
+    if ($Value -match '^[a-fA-F0-9]{8,32}\z') {
         $found = @($State.Batches | Where-Object { $_.BatchId.StartsWith($Value,[StringComparison]::OrdinalIgnoreCase) -and (Test-GuiOrdinal $_.Operation $Operation) })
         if ($found.Count -gt 1) {
             $hashes=@(Get-GuiOrdinalUnique @($found | ForEach-Object { Get-PraGuiFileHash $_.Path }) -IgnoreCase)
@@ -259,7 +266,7 @@ function Resolve-PraGuiBatch {
         if (-not [IO.Path]::IsPathRooted($path)) { $path=Join-Path $State.Root $path }
         $entry = Get-Item -LiteralPath $path -ErrorAction Stop
         $found = @(if ($entry.PSIsContainer) {
-            @(Get-ChildItem -LiteralPath $entry.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not $_.Name.StartsWith('State-', [StringComparison]::OrdinalIgnoreCase) } |
+            @(Get-ChildItem -LiteralPath $entry.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not (Test-PraGuiBatchSideFile $_.Name) } |
                 ForEach-Object { Read-PraGuiBatch $_.FullName $State.Config.Environment } | Where-Object { Test-GuiOrdinal $_.Operation $Operation })
         } else { Read-PraGuiBatch $entry.FullName $State.Config.Environment })
     }
@@ -339,11 +346,13 @@ function Test-PraGuiResult {
         if ($null -eq (Get-PraGuiValue $Result $field)) { return $false }
     }
     if (-not (Test-GuiOrdinal $Result.kind 'result') -or -not (Test-GuiOrdinal $Result.action $Request.Action) -or -not (Test-GuiOrdinal $Result.mode $Request.Mode) -or -not (Test-GuiOrdinal $Result.phase $Request.Phase)) { return $false }
-    if ([string]$Result.exitCode -notmatch '^[012]$' -or [int]$Result.exitCode -ne $NativeExitCode -or $NativeExitCode -eq 1) { return $false }
-    foreach ($field in @('success','error','pending','skipped','planned','total')) { if ([string]$Result.$field -notmatch '^\d+$') { return $false } }
+    if ([string]$Result.exitCode -notmatch '^[012]\z' -or [int]$Result.exitCode -ne $NativeExitCode -or $NativeExitCode -eq 1) { return $false }
+    foreach ($field in @('success','error','pending','skipped','planned','total')) { if ([string]$Result.$field -notmatch '^\d+\z') { return $false } }
     if ([int]$Result.error -ne 0 -or @((Get-PraGuiValue $Result 'issues' @())).Count) { return $false }
     if ([int64]$Result.total -ne ([int64]$Result.success+[int64]$Result.error+[int64]$Result.pending+[int64]$Result.skipped+[int64]$Result.planned)) { return $false }
     if ($NativeExitCode -eq 2) { return (Test-GuiOrdinal $Result.status 'Pending') -and [int]$Result.pending -gt 0 }
+    # An Apply that leaves planned objects did not do them: only a Preview ends Planned.
+    if ((Test-GuiOrdinal $Request.Mode 'Apply' -IgnoreCase) -and ((Test-GuiOrdinal $Result.status 'Planned') -or [int]$Result.planned -gt 0)) { return $false }
     return (Test-GuiOrdinalIn $Result.status @('Success','Planned')) -and [int]$Result.pending -eq 0
 }
 
@@ -1317,6 +1326,15 @@ function Test-PraGuiBatchSyncFailed {
     return $last.Contains('"Status":"Failed"')
 }
 
+function Test-PraGuiBatchSyncCompleted {
+    <# True when the journal of the batch has an Entra Connect entry that ended well. #>
+    param([string]$Folder, [string]$BatchId)
+    $journal=Join-Path $Folder ('Journal-'+$BatchId+'.jsonl')
+    if (-not (Test-Path -LiteralPath $journal -PathType Leaf)) { return $false }
+    try { foreach ($line in [IO.File]::ReadLines($journal)) { if ($line.Contains('"Operation":"ADSync"') -and $line.Contains('"Status":"Completed"')) { return $true } } } catch { return $false }
+    return $false
+}
+
 function Get-PraGuiFinishReason {
     <#
     .SYNOPSIS
@@ -1326,12 +1344,30 @@ function Get-PraGuiFinishReason {
     param($Item)
     $g=$script:Gui
     if (Test-PraGuiBatchSyncFailed $Item.Folder $Item.BatchId) { return 'AD part done, sync did not run: finish it here' }
+    # A batch with no Entra Connect entry that ended well goes through the AD part first (the synchronisation, then the package), as the command line does: a partial batch always, any other batch when the configuration asks for the synchronisation.
+    if (-not (Test-PraGuiBatchSyncCompleted $Item.Folder $Item.BatchId)) {
+        $partialText=Get-PraGuiPartialText (Join-Path $Item.Folder ('State-'+$Item.BatchId+'.json'))
+        $syncOn=[bool](Get-PraGuiValue (Get-PraGuiValue $g.State.Config 'EntraConnect' @{}) 'Sync' $false)
+        if ($partialText) { return 'AD part partly done, sync not run: finish it here' }
+        if ($syncOn) { return 'AD part done, sync not confirmed: finish it here' }
+    }
     $package=''
     try { $package=Get-PraTransferPackageName -Kind Convert -Environment ([string]$Item.Environment) -BatchId ([string]$Item.BatchId) } catch { return '' }
     $outbox=Join-Path $g.State.Config.Storage.BackupFolder 'Outbox'
     $cloudHere=(-not $g.Detect) -or ([bool]$g.Detect.Cloud -and -not (Test-PraGuiNetworkDown))
     if (-not $cloudHere -and -not (Test-Path -LiteralPath (Join-Path $outbox $package) -PathType Leaf)) { return 'AD part done, no package yet: finish it here' }
     return ''
+}
+
+function Get-PraGuiPartialText {
+    <# 'Partial: k of n converted' for a Convert batch whose AD proof is marked partial (it stopped at its first error), else ''. #>
+    param([string]$ProofPath)
+    try {
+        if (-not (Test-Path -LiteralPath $ProofPath -PathType Leaf)) { return '' }
+        $proof=[IO.File]::ReadAllText($ProofPath) | ConvertFrom-PraJson
+        if ((Get-PraGuiValue $proof 'Partial' $false) -ne $true) { return '' }
+        return 'Partial: {0} of {1} converted' -f @(Get-PraGuiValue $proof 'Records' @()).Count,(Get-PraGuiValue $proof 'PlannedCount' '?')
+    } catch { return '' }
 }
 
 function Get-PraGuiBatchEntry {
@@ -1379,7 +1415,8 @@ function Get-PraGuiBatchEntry {
                         $state_='AD part done, cloud part to do'
                         $why=Get-PraGuiFinishReason $item
                         if ($why) { $state_=$why; $level='Warn'; $finish=$true }
-                    } else { $state_='No AD proof'; $level='Warn'; $selectable=$false } } else { $state_='Can be rolled back' } }
+                    } else { $state_='No AD proof'; $level='Warn'; $selectable=$false } } else { $state_='Can be rolled back' }
+                if ($hasProof -and $selectable) { $partialText=Get-PraGuiPartialText $proofPath; if ($partialText) { $state_=$partialText+' · '+$state_; $level='Warn' } } }
             'Recover' { if ($hasProof) { $state_='AD rollback done, cloud part to do' } else { $state_='No AD proof'; $level='Warn'; $selectable=$false } }
             'RecoverFinalize' { $state_='Ready to finalize' }
         }

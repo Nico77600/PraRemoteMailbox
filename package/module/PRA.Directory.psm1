@@ -449,7 +449,7 @@ function Get-PraUsn {
     [CmdletBinding()]
     param($User)
     $value = Get-PraValue $User 'uSNChanged' $null
-    if ($null -eq $value -or [string]$value -notmatch '^[0-9]+$' -or [int64]$value -le 0) { throw 'uSNChanged missing or invalid: the AD version of the object cannot be proven.' }
+    if ($null -eq $value -or [string]$value -notmatch '^[0-9]+\z' -or [int64]$value -le 0) { throw 'uSNChanged missing or invalid: the AD version of the object cannot be proven.' }
     return ([int64]$value).ToString([Globalization.CultureInfo]::InvariantCulture)
 }
 
@@ -515,7 +515,7 @@ function Find-PraConvertedBatch {
         $environment = [string]$Context.Config.Environment
         $candidates = New-Object 'Collections.Generic.List[object]'
         $rolledBack = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        foreach ($folder in @(Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction Stop | Where-Object { $_.Name -match '^(Batch|Finalize)-[0-9a-f]{32}$' })) {
+        foreach ($folder in @(Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction Stop | Where-Object { $_.Name -match '^(Batch|Finalize)-[0-9a-f]{32}\z' })) {
             foreach ($stateFile in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter 'State-*.json' -ErrorAction Stop)) {
                 try { $state = Get-Content -LiteralPath $stateFile.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson } catch { continue }
                 $stateEnvironment = [string](Get-PraValue $state 'Environment' '')
@@ -550,6 +550,89 @@ function Find-PraConvertedBatch {
         }
     }
     catch { Write-PraLog -Context $Context -Message ('The backup folder could not be searched for a batch of this object: {0}' -f $_.Exception.Message) -Level Detail }
+    return $null
+}
+
+function Get-PraJournalTouchedObject {
+    <#
+    .SYNOPSIS
+        The objects (GUIDs, ignoring the case) that the journal of a batch shows as written or about to be written: a Started or Applied line of an AD write.
+        An object that has such a line may be changed, whatever the batch proved. A missing or unreadable journal gives an empty set.
+    #>
+    [CmdletBinding()]
+    param([string]$Path)
+    $set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if (-not $Path -or -not [IO.File]::Exists($Path)) { return , $set }
+    try {
+        foreach ($line in [IO.File]::ReadLines($Path)) {
+            if (-not ($line.Contains('"Status":"Started"') -or $line.Contains('"Status":"Applied"'))) { continue }
+            $entry = $line | ConvertFrom-PraJson
+            if (Test-PraOrdinalIn ([string](Get-PraValue $entry 'Operation' '')) @('Set-ADUser', 'Add-ADGroupMember', 'Remove-ADGroupMember')) {
+                $target = [string](Get-PraValue $entry 'Target' '')
+                if ($target -and -not (Test-PraOrdinalEqual $target '*')) { [void]$set.Add($target) }
+            }
+        }
+    }
+    catch { $null = $_ }
+    return , $set
+}
+
+function Find-PraRecoverOfBatch {
+    <#
+    .SYNOPSIS
+        The Recover batch that rolled back, or started to roll back, objects of a Convert batch. $null when there is none.
+    .DESCRIPTION
+        First the State files (the AD proof of a Recover): the one that names the Convert backup (SourceBackupHash) and lists at least one of the objects given
+        (any object when none is given). Then the Recover backups that have no State file (a Recover that stopped before its proof): the objects that its journal
+        shows as written or about to be written count as rolled back; a journal that is missing counts for every object. Basis says which: State, Journal or Unknown.
+        A batch of another Environment is ignored.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [Parameter(Mandatory)][string]$SourceHash, [string[]]$ObjectGuid = @())
+    try {
+        $root = [string]$Context.Config.Storage.BackupFolder
+        if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { return $null }
+        $environment = [string]$Context.Config.Environment
+        foreach ($folder in @(Get-ChildItem -LiteralPath $root -Directory -Recurse -ErrorAction Stop | Where-Object { $_.Name -match '^(Batch|Finalize)-[0-9a-f]{32}\z' })) {
+            $withState = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($stateFile in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter 'State-*.json' -ErrorAction Stop)) {
+                $id = [regex]::Match($stateFile.Name, '^State-(?<id>[0-9a-fA-F]{32})\.json\z').Groups['id'].Value
+                if ($id) { [void]$withState.Add($id) }
+                try { $state = Get-Content -LiteralPath $stateFile.FullName -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-PraJson } catch { continue }
+                if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $state 'Operation' '')) 'Recover')) { continue }
+                $stateEnvironment = [string](Get-PraValue $state 'Environment' '')
+                if ($stateEnvironment -and -not (Test-PraOrdinalIgnoreCaseEqual $stateEnvironment $environment)) { continue }
+                if (-not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $state 'SourceBackupHash' '')) $SourceHash)) { continue }
+                $stateRecords = Get-PraValue $state 'Records' @()
+                $listed = @($stateRecords | ForEach-Object { [string]$_.ObjectGuid })
+                if ($ObjectGuid.Count -and -not @($ObjectGuid | Where-Object { Test-PraOrdinalIn $_ $listed -IgnoreCase }).Count) { continue }
+                if (-not $id) { continue }
+                return [pscustomobject]@{ BatchId = $id.ToLowerInvariant(); ShortId = $id.Substring(0, 8).ToLowerInvariant(); Folder = $folder.FullName; Basis = 'State' }
+            }
+            foreach ($backupFile in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter 'Recover-*.json' -ErrorAction Stop)) {
+                # The head of the file holds the fields that tell the batch (they come before the records).
+                $stream = [IO.File]::Open($backupFile.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                try { $buffer = New-Object byte[] 8192; $count = $stream.Read($buffer, 0, $buffer.Length); $head = [Text.Encoding]::UTF8.GetString($buffer, 0, $count) } finally { $stream.Dispose() }
+                if ($head -notmatch '"Operation":\s*"Recover"') { continue }
+                $headHash = [regex]::Match($head, '"SourceBackupHash":\s*"(?<h>[0-9a-fA-F]+)"').Groups['h'].Value
+                if (-not (Test-PraOrdinalIgnoreCaseEqual $headHash $SourceHash)) { continue }
+                $headEnvironment = [regex]::Match($head, '"Environment":\s*"(?<e>[^"]*)"').Groups['e'].Value
+                if ($headEnvironment -and -not (Test-PraOrdinalIgnoreCaseEqual $headEnvironment $environment)) { continue }
+                $id = [regex]::Match($head, '"BatchId":\s*"(?<i>[0-9a-fA-F]{32})"').Groups['i'].Value
+                if (-not $id -or $withState.Contains($id)) { continue }
+                $journal = Join-Path $folder.FullName ('Journal-' + $id + '.jsonl')
+                $basis = 'Journal'
+                if (-not [IO.File]::Exists($journal)) { $basis = 'Unknown' }
+                else {
+                    $touched = Get-PraJournalTouchedObject -Path $journal
+                    if ($ObjectGuid.Count) { if (-not @($ObjectGuid | Where-Object { $touched.Contains($_) }).Count) { continue } }
+                    elseif (-not $touched.Count) { continue }
+                }
+                return [pscustomobject]@{ BatchId = $id.ToLowerInvariant(); ShortId = $id.Substring(0, 8).ToLowerInvariant(); Folder = $folder.FullName; Basis = $basis }
+            }
+        }
+    }
+    catch { Write-PraLog -Context $Context -Message ('The backup folder could not be searched for a Recover batch: {0}' -f $_.Exception.Message) -Level Detail }
     return $null
 }
 
@@ -1002,13 +1085,13 @@ function Get-PraRoutingAddress {
     $address = if ($primary.Count) { $primary[0].Substring(5) } else { [string](Get-PraValue $User 'mail' '') }
     $local = if ($address) { ($address -split '@', 2)[0] } else { [string](Get-PraValue $User 'mailNickname' '') }
     if ($Context.Config.Routing.AutoDetect) {
-        $existing = @($proxies | Where-Object { $_ -imatch '^smtp:.+@.+\.mail\.onmicrosoft\.com$' } | ForEach-Object { $_.Substring(5) })
+        $existing = @($proxies | Where-Object { $_ -imatch '^smtp:.+@.+\.mail\.onmicrosoft\.com\z' } | ForEach-Object { $_.Substring(5) })
         $match = @($existing | Where-Object { (Test-PraOrdinalIgnoreCaseEqual (($_ -split '@', 2)[0]) $local) -and $_ -imatch "@$([regex]::Escape($domain))\z" })
         if (-not $match.Count) { $match = @($existing | Where-Object { $_ -imatch "@$([regex]::Escape($domain))\z" }) }
         if ($match.Count -eq 1) { return [string]$match[0] }
         if ($match.Count -gt 1) { throw "Several routing addresses possible for $($User.SamAccountName): keep one proxy address in $domain." }
     }
-    if (-not $local -or $local -match '[\s@]' -or $domain -notmatch '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$') { throw "No valid routing address for $($User.SamAccountName) (check Routing.RoutingDomain and the mail alias)." }
+    if (-not $local -or $local -match '[\s@]' -or $domain -notmatch '^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\z') { throw "No valid routing address for $($User.SamAccountName) (check Routing.RoutingDomain and the mail alias)." }
     return "$local@$domain"
 }
 
@@ -1178,8 +1261,8 @@ function Resolve-PraAclTrustee {
     param([hashtable]$Context, $Reference, [Collections.Generic.List[string]]$Unknown)
     $sid = if ($Reference -is [Security.Principal.SecurityIdentifier]) { $Reference } else { $Reference.Translate([Security.Principal.SecurityIdentifier]) }
     # BUILTIN, NT AUTHORITY and Domain/Enterprise/Schema Admins are never reproduced.
-    if ($sid.Value -match '^S-1-5-32-' -or $sid.Value -match '^S-1-5-[0-9]+$' -or
-        $sid.Value -match '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-(512|518|519)$') { return }
+    if ($sid.Value -match '^S-1-5-32-' -or $sid.Value -match '^S-1-5-[0-9]+\z' -or
+        $sid.Value -match '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-(512|518|519)\z') { return }
     # Named accounts and groups (Organization Management, Exchange Trusted Subsystem, ...) are filtered by name once the SID is
     # resolved to its AD object (see $excludedGroups below); the ACE reference is a SID here, so a name pattern could never match.
     $cache = Get-PraPermissionCache -Context $Context
@@ -1281,7 +1364,7 @@ function Get-PraSharedPermission {
         }
         CustomAttribute {
             $attr = [string]$settings.CustomAttribute
-            if ($attr -notmatch '^extensionAttribute([1-9]|1[0-5])$') { throw 'SharedMailbox.CustomAttribute is invalid.' }
+            if ($attr -notmatch '^extensionAttribute([1-9]|1[0-5])\z') { throw 'SharedMailbox.CustomAttribute is invalid.' }
             $filters = @(@((Get-PraValue $User 'mailNickname' ''), $User.SamAccountName, (Get-PraValue $User 'DisplayName' '')) | Where-Object { $_ } | Get-PraOrdinalUnique | ForEach-Object { "($attr=$(ConvertTo-PraLdapValue $_))" })
             $groups = @(Get-ADGroup -LDAPFilter ('(|' + ($filters -join '') + ')') -Server $Context.Server -ErrorAction Stop)
             if ($groups.Count -ne 1) { throw "Permission group not found or not unique for $($User.SamAccountName) ($attr)." }
@@ -1331,7 +1414,7 @@ function New-PraRow {
         UserPrincipalName=[string](Get-PraValue $Record 'UserPrincipalName' ''); Action=$Context.Action
         IsShared=[bool](Get-PraValue $Record 'IsShared' $false); ADApplied=$null; ADVerified=$null; GroupAction=''
         BackupPath=''; LastOperation=''; CloudMailbox=$null; CloudLicense=$null; CloudStatus='N/A'; CloudDetail=''
-        FinalStatus='Skipped'; Detail=''; SharedFullAccess=@(); SharedSendAs=@(); SharedSendOnBehalf=@(); PermMissing=@(); PermDetail=''; Warnings=''
+        FinalStatus='Planned'; Detail=''; SharedFullAccess=@(); SharedSendAs=@(); SharedSendOnBehalf=@(); PermMissing=@(); PermDetail=''; Warnings=''
         BackupRec=$Record; DeproPending=$false; RestoreDeferred=$false
         PreserveCloudMailbox=$false; PreserveLicense=$false; DeprovisionConfirmed=$false
     }
@@ -1364,7 +1447,7 @@ function New-PraPlan {
     $tag = if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert')) { $config.Retention.Tag } else { Get-PraValue $SourceRecord 'Retention' $null }
     $tagEnabled = if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert')) { $config.Retention.Enabled -and $tag.Enabled } else { [bool](Get-PraValue $tag 'Enabled' $false) }
     $tagAttr = if ($tagEnabled) { [string]$tag.Attribute } else { '' }
-    if ($tagAttr -and $tagAttr -notmatch '^extensionAttribute([1-9]|1[0-5])$') { throw "Retention tag attribute not allowed: $tagAttr" }
+    if ($tagAttr -and $tagAttr -notmatch '^extensionAttribute([1-9]|1[0-5])\z') { throw "Retention tag attribute not allowed: $tagAttr" }
     if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'RestoreTag') -and -not $tagEnabled) { throw 'The original value of the retention tag is not in the backup: tag clean-up refused.' }
     $kinds = [ordered]@{}; foreach ($name in $script:AttributeKinds.Keys) { $kinds[$name] = $script:AttributeKinds[$name] }
     if ($tagAttr) { $kinds[$tagAttr] = 'String' }
@@ -1496,7 +1579,7 @@ function Assert-PraStoredRecord {
     $kinds = [ordered]@{}; foreach ($name in $script:AttributeKinds.Keys) { $kinds[$name] = $script:AttributeKinds[$name] }
     $retention = Get-PraValue $Record 'Retention' $null
     if ($null -ne $retention -and $retention.Enabled) {
-        if ($retention.Attribute -notmatch '^extensionAttribute([1-9]|1[0-5])$' -or $retention.Value -isnot [string]) { throw 'Backup: invalid retention tag metadata.' }
+        if ($retention.Attribute -notmatch '^extensionAttribute([1-9]|1[0-5])\z' -or $retention.Value -isnot [string]) { throw 'Backup: invalid retention tag metadata.' }
         $kinds[$retention.Attribute] = 'String'
     }
     foreach ($name in $kinds.Keys) {
@@ -1527,7 +1610,7 @@ function Assert-PraStoredRecord {
         foreach ($value in @($expectedStored)) { if ($value -isnot [string] -or -not (Test-PraX500Address $value) -or $value.Length -gt $script:MaxExpectedX500Length) { throw 'Backup: invalid list of expected X500 addresses.' } }
     }
     if (-not $Legacy) {
-        if ($Record.CapturedUsnChanged -isnot [string] -or $Record.CapturedUsnChanged -notmatch '^[1-9][0-9]*$') { throw 'Backup: original uSNChanged missing or invalid.' }
+        if ($Record.CapturedUsnChanged -isnot [string] -or $Record.CapturedUsnChanged -notmatch '^[1-9][0-9]*\z') { throw 'Backup: original uSNChanged missing or invalid.' }
         $null = [int64]::Parse($Record.CapturedUsnChanged, [Globalization.CultureInfo]::InvariantCulture)
         if (-not (Test-PraOrdinalIn $Record.RequestedOperation @('Convert','Recover','Deprovision','RestoreTag','AlreadyRecovered'))) { throw 'Backup: invalid planned operation.' }
         if ($Record.PreserveCloudMailbox -isnot [bool] -or $Record.PreserveLicense -isnot [bool]) { throw 'Backup: invalid cloud post-conditions.' }
@@ -1574,6 +1657,11 @@ function Import-PraBackup {
         if ($version -ge 2) { Assert-PraStoredRecord $record -Planned }
         $key = ([guid]$record.ObjectGuid).ToString()
         if ($seen.ContainsKey($key)) { throw "Same GUID twice in the backup: $key" }; $seen[$key] = $true
+    }
+    $grant = Get-PraValue $data 'GrantSettings' $null
+    if ($null -ne $grant) {
+        if (-not (Test-PraOrdinalEqual $data.Operation 'Convert') -or (Get-PraValue $grant 'Enabled' $null) -isnot [bool] -or (Get-PraValue $grant 'GrantFullAccess' $null) -isnot [bool] -or (Get-PraValue $grant 'GrantSendAs' $null) -isnot [bool] -or
+            (Get-PraValue $grant 'GrantSendOnBehalf' $null) -isnot [bool] -or (Get-PraValue $grant 'PermissionSource' $null) -isnot [string] -or -not (Test-PraOrdinalIn ([string]$grant.PermissionSource) @('AD', 'Csv', 'CustomAttribute', 'None') -IgnoreCase)) { throw 'Backup: invalid shared mailbox grant settings.' }
     }
     $hash = Get-PraHash $pathResolved
     if (-not (Test-PraOrdinalEqual $hash $hashBeforeRead)) { throw 'Backup JSON changed while it was read.' }
@@ -1640,6 +1728,17 @@ function Assert-PraRecordMatchesPlan {
     }
 }
 
+function Get-PraGrantSettingSnapshot {
+    <# The settings that decide which shared mailbox permissions the cloud phase grants, as the Convert run had them: stored in the batch, so that the cloud phase of any server follows the batch. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context)
+    $shared = Get-PraValue $Context.Config 'SharedMailbox' @{}
+    return [ordered]@{
+        Enabled = [bool](Get-PraValue $shared 'Enabled' $false); PermissionSource = [string](Get-PraValue $shared 'PermissionSource' 'None')
+        GrantFullAccess = [bool](Get-PraValue $shared 'GrantFullAccess' $false); GrantSendAs = [bool](Get-PraValue $shared 'GrantSendAs' $false); GrantSendOnBehalf = [bool](Get-PraValue $shared 'GrantSendOnBehalf' $false)
+    }
+}
+
 function Save-PraBatch {
     <#
     .SYNOPSIS
@@ -1670,6 +1769,7 @@ function Save-PraBatch {
         RawFile=[IO.Path]::GetFileName($rawPath); RawHash=(Get-PraHash $rawPath)
         SourceBackupHash=$Context.SourceBackupHash; Records=@($Plans | ForEach-Object { $_.Record })
     }
+    if ((Test-PraOrdinalEqual $Operation 'Convert')) { $data['GrantSettings'] = Get-PraGrantSettingSnapshot -Context $Context }
     $Context.CurrentOperation = 'Write-BackupJson'
     $json = $data | ConvertTo-Json -Depth 30
     Write-PraImmutableFile $path $json
@@ -1685,6 +1785,8 @@ function Save-PraBatch {
         Assert-PraRecordMatchesPlan -Stored $record -Expected $Plans[$i].Record
     }
     $Context.BackupFiles.Add($path)
+    $Context.ChangesStarted = $true
+    if ((Test-PraOrdinalIn $Operation @('Convert', 'Recover'))) { $Context.BatchId = $id.Substring(0, 8) }
     $Context.JournalPath = Join-Path $directory ('Journal-' + $id + '.jsonl')
     Write-PraImmutableFile $Context.JournalPath ''
     $Context.StateFiles.Add($Context.JournalPath)
@@ -1807,7 +1909,7 @@ function Invoke-PraAdBatch {
     if ([bool](Get-PraValue $Context 'OperationFailed' $false) -or $Context.Issues.Count -gt 0 -or @($Context.Rows | Where-Object FinalStatus -eq 'Error').Count -gt 0) { throw 'No new batch after an error in this run.' }
     if (-not $Plans.Count) { Write-PraItem -Context $Context -Status Skip -Text 'Nothing to do.'; return $null }
     foreach ($plan in $Plans) { if (-not $Context.Rows.Contains($plan.Row)) { $Context.Rows.Add($plan.Row) } }
-    $receipt = $null
+    $receipt = $null; $stateWritten = $false
     try {
         foreach ($plan in $Plans) { if (-not [bool](Get-PraValue $plan 'Previewed' $false)) { Write-PraAdDelta -Context $Context -Plan $plan -Stage Planned } }
         if (-not $Context.AllowMutation -or (-not (Test-PraOrdinalIgnoreCaseEqual $Context.Mode 'Apply')) -or (Test-PraOrdinalIgnoreCaseEqual $Context.Action 'Check') -or $WhatIfPreference) {
@@ -1848,7 +1950,9 @@ function Invoke-PraAdBatch {
                 else { $plan.Row.GroupAction = if ($groupState.Enabled) { 'Preserved' } else { 'N/A' } }
                 Assert-PraCurrentState $Context $plan $plan.Desired $groupState.DesiredMember
                 $plan.Row.ADVerified = $true; $plan.Row.ADApplied = $changed; $plan.Row.LastOperation = 'ADVerified'
-                $plan.Row.FinalStatus = if ($plan.Row.DeproPending) { 'Pending' } elseif ($changed) { 'Success' } else { 'AlreadyDone' }
+                # Phase Both: the object is Pending from its verification on, until the cloud part confirms it.
+                $awaitsCloud = (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $Context 'Phase' '')) 'Both') -and (Test-PraOrdinalIn $Operation @('Convert', 'Recover'))
+                $plan.Row.FinalStatus = if ($plan.Row.DeproPending -or $awaitsCloud) { 'Pending' } elseif ($changed) { 'Success' } else { 'AlreadyDone' }
                 Write-PraJournal $Context $plan.Record.ObjectGuid $plan.Operation 'Verified'
                 Write-PraLog -Context $Context -Message "AD VERIFIED | $($plan.Record.SamAccountName) | $($plan.Row.FinalStatus)" -Level Detail
                 Write-PraAdDelta -Context $Context -Plan $plan -Stage Verified
@@ -1872,6 +1976,7 @@ function Invoke-PraAdBatch {
         Write-PraImmutableFile ($statePath + '.sha256') (Get-PraHash $statePath)
         $Context.StateFiles.Add($statePath)
         $receipt | Add-Member -NotePropertyName StatePath -NotePropertyValue $statePath
+        $stateWritten = $true
         $Context.LastVerifiedReceipt = $receipt
         return $receipt
     }
@@ -1892,7 +1997,7 @@ function Invoke-PraAdBatch {
             }
             catch { Write-PraLog -Context $Context -Message ('The folder of the backup could not be marked as not applied: {0}' -f $_.Exception.Message) -Level Detail }
             # Nothing was written: no object is reported as done, skipped or failed, and the error does not name the last object looked at.
-            $Context.NoChangeMade = $true; $Context.CurrentIdentity = ''
+            $Context.NoChangeMade = $true; $Context.NotApplied = $true; $Context.CurrentIdentity = ''
             try { Write-PraLog -Context $Context -Message $plain -Level Error }
             catch { $Context.Issues.Add([pscustomobject]@{ Message = $plain; Source = 'ADBatch' }) }
             throw $plain
@@ -1901,7 +2006,70 @@ function Invoke-PraAdBatch {
         catch { $Context.Issues.Add([pscustomobject]@{ Message=$failure.Exception.Message; Source='ADBatch' }) }
         throw $failure
     }
-    finally { Initialize-PraPermissionCache -Context $Context }
+    finally {
+        # A batch that stops (the first error, or a run that is stopped from outside) keeps what it did: the objects verified so far get their AD proof, marked partial.
+        if (-not $stateWritten -and $null -ne $receipt) {
+            try { Save-PraPartialProof -Context $Context -Receipt $receipt -Plans $Plans -Operation $Operation }
+            catch { try { Write-PraLog -Context $Context -Message ('The AD proof of the objects verified so far could not be written: {0}' -f $_.Exception.Message) -Level Detail } catch { $null = $_ } }
+        }
+        Initialize-PraPermissionCache -Context $Context
+    }
+}
+
+function Save-PraPartialProof {
+    <#
+    .SYNOPSIS
+        A batch that stopped (the first error, or a run stopped from outside): says what each object that was not verified is, and for a Convert batch writes the
+        State file (AD proof) of the objects that were written AND verified. The proof is marked Partial with the number planned, except when every object is
+        verified: then it is the normal proof. What is left is recorded in the context (PartialBatch).
+    .DESCRIPTION
+        An object that is not verified but has a Started or Applied line in the journal may be partly changed: it is named so, and kept apart from the objects that
+        were never touched. The batch id stays in the context only when something was written (or may have been) or a proof exists.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][object[]]$Plans, [string]$Operation)
+    $touched = Get-PraJournalTouchedObject -Path ([string](Get-PraValue $Context 'JournalPath' ''))
+    $notApplied = [bool](Get-PraValue $Context 'NotApplied' $false)
+    $verified = @($Plans | Where-Object { (Get-PraValue $_.Row 'ADVerified' $false) -eq $true })
+    $maybe = New-Object 'Collections.Generic.List[object]'; $untouched = New-Object 'Collections.Generic.List[object]'
+    foreach ($plan in $Plans) {
+        if ((Get-PraValue $plan.Row 'ADVerified' $false) -eq $true) { continue }
+        $guid = [string]$plan.Record.ObjectGuid
+        if (-not $notApplied -and ((Get-PraValue $plan.Row 'ADApplied' $null) -eq $true -or $touched.Contains($guid))) {
+            $maybe.Add($plan)
+            $plan.Row.Detail = ([string]$plan.Row.Detail + ' | may be partly changed: a write was started and the batch stopped before it was verified; roll the batch back to restore it').Trim(' ', '|')
+        }
+        else {
+            $untouched.Add($plan)
+            if ((Test-PraOrdinalEqual ([string]$plan.Row.FinalStatus) 'Planned')) { $plan.Row.Detail = ([string]$plan.Row.Detail + ' | not done: the batch stopped before this object, nothing was written to it').Trim(' ', '|') }
+        }
+    }
+    if (-not $verified.Count -and -not $maybe.Count -and (Test-PraOrdinalIn $Operation @('Convert', 'Recover'))) { $Context.BatchId = '' }
+    $Context.MayBeChanged = [string[]]@($maybe | ForEach-Object { [string]$_.Record.SamAccountName })
+    if (-not (Test-PraOrdinalEqual $Operation 'Convert')) { return }
+    if (-not $verified.Count) { return }
+    $complete = ($verified.Count -eq $Plans.Count)
+    $state = [ordered]@{
+        SchemaVersion=2; Operation=$Operation; Kind='ADVerified'; Environment=$Context.Config.Environment; RunId=$Context.RunId
+        BackupFile=[IO.Path]::GetFileName($Receipt.Path); BackupHash=$Receipt.Hash; SourceBackupHash=$Context.SourceBackupHash
+        CreatedUtc=[DateTime]::UtcNow.ToString('o')
+    }
+    if (-not $complete) { $state['Partial'] = $true; $state['PlannedCount'] = $Plans.Count }
+    $state['Records'] = @($verified | ForEach-Object { [ordered]@{ ObjectGuid=$_.Record.ObjectGuid; Operation=$_.Operation; ADVerified=$true; VerifiedUsnChanged=$_.ExpectedUsnChanged } })
+    $statePath = Join-Path (Split-Path $Receipt.Path -Parent) ('State-' + $Receipt.Data.BatchId + '.json')
+    Write-PraImmutableFile $statePath ($state | ConvertTo-Json -Depth 12)
+    Write-PraImmutableFile ($statePath + '.sha256') (Get-PraHash $statePath)
+    $Context.StateFiles.Add($statePath)
+    $Receipt | Add-Member -NotePropertyName StatePath -NotePropertyValue $statePath -Force
+    $identifiers = New-Object 'Collections.Generic.List[string]'
+    foreach ($plan in $untouched) { foreach ($name in 'SamAccountName', 'UserPrincipalName', 'DistinguishedName', 'ObjectGuid') { $value = [string](Get-PraValue $plan.Record $name ''); if ($value) { $identifiers.Add($value) } } }
+    $Context.PartialBatch = [pscustomobject]@{
+        BatchId=[string]$Receipt.Data.BatchId; ShortId=([string]$Receipt.Data.BatchId).Substring(0, 8); Verified=$verified.Count; Planned=$Plans.Count; StatePath=$statePath; Complete=$complete
+        NotConverted=[string[]]@($untouched | ForEach-Object { [string]$_.Record.SamAccountName }); NotConvertedIdentifiers=[string[]]$identifiers.ToArray()
+        MayBeChanged=[string[]]@($maybe | ForEach-Object { [string]$_.Record.SamAccountName }); Side='Run'
+    }
+    Write-PraJournal $Context '*' 'ADBatch' $(if ($complete) { 'Verified' } else { 'Partial' }) ('{0} of {1} object(s) verified; the AD proof lists only those' -f $verified.Count, $Plans.Count)
+    Write-PraLog -Context $Context -Message ('{0} AD PROOF | {1} of {2} object(s) | {3}' -f $(if ($complete) { 'STOPPED BATCH' } else { 'PARTIAL' }), $verified.Count, $Plans.Count, $statePath) -Level Detail
 }
 
 function Import-PraProof {
@@ -1922,7 +2090,15 @@ function Import-PraProof {
     if (-not (Test-PraOrdinalEqual ([IO.Path]::GetFileName($data.BackupFile)) $data.BackupFile)) { throw 'AD proof: invalid backup path.' }
     $receipt = Import-PraBackup $Context (Join-Path (Split-Path $Path -Parent) $data.BackupFile)
     if (-not (Test-PraOrdinalIgnoreCaseEqual $receipt.Hash $data.BackupHash) -or -not (Test-PraOrdinalEqual $receipt.Data.Operation $Operation) -or -not (Test-PraOrdinalEqual $receipt.Data.RunId $data.RunId) -or -not (Test-PraOrdinalIgnoreCaseEqual $receipt.Data.SourceBackupHash $data.SourceBackupHash)) { throw 'AD proof does not match its backup, operation or source.' }
-    if (@($data.Records).Count -ne @($receipt.Data.Records).Count) { throw 'AD proof incomplete compared with its backup.' }
+    $partialField = Get-PraValue $data 'Partial' $false
+    if ($partialField -isnot [bool]) { throw 'AD proof: invalid Partial marker.' }
+    $planned = @($receipt.Data.Records).Count
+    if ($partialField) {
+        # Only a Convert batch that stopped at its first error has a partial proof: it lists the verified objects and says how many were planned.
+        $plannedField = Get-PraValue $data 'PlannedCount' $null
+        if (-not (Test-PraOrdinalEqual $Operation 'Convert') -or ($plannedField -isnot [int] -and $plannedField -isnot [long]) -or [long]$plannedField -ne $planned -or @($data.Records).Count -lt 1 -or @($data.Records).Count -ge $planned) { throw 'AD proof: invalid partial proof.' }
+    }
+    elseif (@($data.Records).Count -ne $planned) { throw 'AD proof incomplete compared with its backup.' }
     $expectedSource = if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert')) { $data.BackupHash } else { $data.SourceBackupHash }
     if (-not (Test-PraOrdinalIgnoreCaseEqual $expectedSource $Source.Hash)) { throw 'AD proof built from another Convert batch.' }
     $seen = @{}
@@ -1931,12 +2107,12 @@ function Import-PraProof {
         $captured = @($receipt.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid })
         $allowed = switch ($Operation) { Convert { @('Convert') } Recover { @('Recover','Deprovision','AlreadyRecovered') } Finalize { @('Recover','RestoreTag','AlreadyRecovered') } Retention { @('RestoreTag') } default { @() } }
         if ($captured.Count -ne 1 -or -not (Test-PraOrdinalIn $record.Operation $allowed) -or -not (Test-PraOrdinalEqual $record.Operation $captured[0].RequestedOperation) -or
-            $record.VerifiedUsnChanged -isnot [string] -or $record.VerifiedUsnChanged -notmatch '^[1-9][0-9]*$') { throw 'AD proof: operation or version does not match the backup.' }
+            $record.VerifiedUsnChanged -isnot [string] -or $record.VerifiedUsnChanged -notmatch '^[1-9][0-9]*\z') { throw 'AD proof: operation or version does not match the backup.' }
         $null = [int64]::Parse($record.VerifiedUsnChanged, [Globalization.CultureInfo]::InvariantCulture)
         $seen[$record.ObjectGuid] = $true
     }
     if (-not $seen.Count) { throw 'AD proof is empty.' }
-    return [pscustomobject]@{ Data=$data; Path=$Path; Hash=$hash; Receipt=$receipt }
+    return [pscustomobject]@{ Data=$data; Path=$Path; Hash=$hash; Receipt=$receipt; Partial=$partialField; PlannedCount=$planned }
 }
 
 function Assert-PraFollowupState {
@@ -2376,7 +2552,7 @@ function Invoke-PraSync {
         try { Write-PraJournal $Context '*' 'ADSync' 'Failed' $failure.Technical } catch { Write-PraLog -Context $Context -Message ('The journal cannot be written: {0}' -f $_.Exception.Message) -Level Detail }
         $Context['SyncFailure'] = [pscustomobject]@{ Server = $target; Kind = $failure.Kind; Reason = $failure.Reason; Technical = $failure.Technical }
         foreach ($row in $Context.Rows) {
-            if ((Get-PraValue $row 'ADApplied' $null) -eq $true -and (Test-PraOrdinalEqual ([string]$row.FinalStatus) 'Success')) {
+            if ((Get-PraValue $row 'ADApplied' $null) -eq $true -and (Test-PraOrdinalIn ([string]$row.FinalStatus) @('Success', 'Pending'))) {
                 $row.FinalStatus = 'Pending'; $row.Detail = ([string]$row.Detail + ' | AD changed and verified; the Entra Connect sync has to be run').Trim(' ', '|')
             }
         }
@@ -2390,7 +2566,7 @@ function Invoke-PraSync {
 #endregion
 
 Export-ModuleMember -Function ConvertTo-PraLdapValue, Get-PraHash, Write-PraImmutableFile, New-PraPrivateDirectory, Write-PraJournal,
-    Initialize-PraDirectory, Get-PraUser, Resolve-PraGroup, Get-PraGroupMember, Get-PraExpectedX500, Get-PraTarget, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
+    Initialize-PraDirectory, Get-PraUser, Resolve-PraGroup, Get-PraGroupMember, Get-PraExpectedX500, Get-PraTarget, Find-PraRecoverOfBatch, Get-PraJournalTouchedObject, New-PraRow, New-PraPlan, Import-PraBackup, Invoke-PraAdPreview, Invoke-PraAdBatch,
     Import-PraProof, Invoke-PraSync, Test-PraSyncServer, Start-PraSyncProbe, Invoke-PraAdReplication, Assert-PraReceipt, Test-PraStateEqual, Assert-PraFollowupState, Initialize-PraPermissionCache
 
 # SIG # Begin signature block
