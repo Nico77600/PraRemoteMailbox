@@ -656,12 +656,17 @@ function Write-PraProgress {
 }
 
 function Write-PraLogFile {
-    <# Appends one line to the log file. A log that cannot be written stops the run (audit). #>
+    <# Appends one line (or, with -Lines, a block of lines in one write) to the log file. A log that cannot be written stops the run (audit). #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost','',Justification='Last-resort console message when the log is broken.')]
-    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Level, [AllowEmptyString()][string]$Message)
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Level, [AllowEmptyString()][string]$Message, [string[]]$Lines)
     if (-not $Context.LogFile) { return }
-    $line = '{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Level, ($Message -replace '[\r\n]+', ' | ')
-    try { [IO.File]::AppendAllText($Context.LogFile, $line + "`r`n", (New-Object Text.UTF8Encoding($false))) }
+    if ($PSBoundParameters.ContainsKey('Lines')) {
+        $block = New-Object Text.StringBuilder
+        foreach ($entry in $Lines) { [void]$block.Append(('{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Level, ($entry -replace '[\r\n]+', ' | '))).Append("`r`n") }
+        $text = $block.ToString()
+    }
+    else { $text = ('{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Level, ($Message -replace '[\r\n]+', ' | ')) + "`r`n" }
+    try { [IO.File]::AppendAllText($Context.LogFile, $text, (New-Object Text.UTF8Encoding($false))) }
     catch {
         $failure = 'The log file cannot be written: {0}' -f $_.Exception.Message
         Add-PraIssue $Context $failure 'Log'
@@ -683,18 +688,27 @@ function Write-PraLog {
         Detail    log only (full values, technical traces)
         Debug     log only; also on the console with -Verbose
         Step      log only (step headers are drawn by Write-PraStep)
+    .PARAMETER Lines
+        Several Detail lines written to the log in one write (the lines of one object, for example). Detail only.
     .PARAMETER ForegroundColor
         Console colour of the text (presentation only: it never changes the level or the counters).
     #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
-        [ValidateSet('Info','Sub','Success','Warning','Error','Debug','Step','Detail')][string]$Level = 'Info',
+    [CmdletBinding(DefaultParameterSetName = 'One')]
+    param([Parameter(Mandatory, Position = 0)][hashtable]$Context, [Parameter(Mandatory, Position = 1, ParameterSetName = 'One')][AllowEmptyString()][string]$Message,
+        [Parameter(Mandatory, ParameterSetName = 'Block')][AllowEmptyString()][string[]]$Lines,
+        [Parameter(Position = 2)][ValidateSet('Info','Sub','Success','Warning','Error','Debug','Step','Detail')][string]$Level = 'Info',
         [ConsoleColor]$ForegroundColor)
+    if ([string]::Equals($PSCmdlet.ParameterSetName, 'Block', [StringComparison]::Ordinal)) {
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $Level 'Detail')) { throw 'Write-PraLog -Lines is for the Detail level only.' }
+        Write-PraLogFile -Context $Context -Level 'DETAIL' -Lines $Lines
+        return
+    }
     $logLevel = @{ Info='INFO'; Sub='INFO'; Success='OK'; Warning='WARN'; Error='ERROR'; Debug='DEBUG'; Step='STEP'; Detail='DETAIL' }[$Level]
     if ((Test-PraOrdinalIgnoreCaseEqual $Level 'Warning')) { $Context.Warnings = [int](Get-PraValue $Context 'Warnings' 0) + 1; Add-PraWarning $Context $Message }
     if ((Test-PraOrdinalIgnoreCaseEqual $Level 'Error')) { Add-PraIssue $Context $Message }
     Write-PraLogFile -Context $Context -Level $logLevel -Message $Message
-    $text = (ConvertTo-PraPlainMessage $Message) -replace '[\r\n]+', ' | '
+    # The Detail and Step levels go to the log only: their plain text is not needed.
+    $text = if ((Test-PraOrdinalIgnoreCaseEqual $Level 'Detail') -or (Test-PraOrdinalIgnoreCaseEqual $Level 'Step')) { '' } else { (ConvertTo-PraPlainMessage $Message) -replace '[\r\n]+', ' | ' }
     switch ($Level) {
         'Debug' {
             $verbose = [bool](Get-PraValue $Context 'VerboseEnabled' ((Test-PraOrdinalIgnoreCaseEqual $VerbosePreference 'Continue')))
@@ -2593,7 +2607,8 @@ function New-PraEffectiveConfiguration {
 # small machine-readable file (PhaseData-*.json + .sha256) in the batch folder it creates; the file travels in the transfer package with the batch
 # (listed in transfer.json with its SHA-256 like every entry, so a changed file is refused at import). It is DATA FOR A REPORT: nothing in the engine
 # decides anything from it. It is read as untrusted input (size, schema, checksum, Environment) and every value is HTML-encoded when it is shown.
-$script:PraPhaseLimits = @{ MaxBytes = [long]268435456; MaxText = 2000; MaxStepText = 300; MaxStepsPerObject = 40; MaxJourney = 1000000; MaxObjects = 200000; MaxFiles = 24; MaxIssues = 10000; DetailedObjects = 10000 }
+# MaxFileBytes: the largest PhaseData file (the writer drops the steps above it, the reader refuses a larger file); MaxBytes: all the files read for one report together.
+$script:PraPhaseLimits = @{ MaxBytes = [long]268435456; MaxFileBytes = [long]67108864; MaxText = 2000; MaxStepText = 300; MaxStepsPerObject = 40; MaxJourney = 1000000; MaxObjects = 200000; MaxFiles = 24; MaxIssues = 10000; DetailedObjects = 10000 }
 $script:PraPhaseFilter = 'PhaseData-*.json'
 $script:PraNotAvailable = 'not available (folder from an older version or copied manually)'
 # Display only: a Pending phase (or stage) that a later phase of the same report took over is shown as handed over; the verdict logic reads the raw status.
@@ -2731,9 +2746,12 @@ function Save-PraPhaseData {
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Folder, [string]$HandOff = '')
     if (-not [IO.Directory]::Exists($Folder)) { throw "Phase data: folder not found: $Folder" }
     $json = (New-PraPhaseRecord -Context $Context -HandOff $HandOff) | ConvertTo-Json -Depth 8 -Compress
-    if ($json.Length -gt $script:PraPhaseLimits.MaxBytes / 4) { $json = (New-PraPhaseRecord -Context $Context -HandOff $HandOff -NoSteps) | ConvertTo-Json -Depth 8 -Compress }
     $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($json)
-    if ($bytes.LongLength -gt $script:PraPhaseLimits.MaxBytes) { throw 'Phase data: the file would be larger than the limit.' }
+    if ($bytes.LongLength -gt $script:PraPhaseLimits.MaxFileBytes) {
+        $json = (New-PraPhaseRecord -Context $Context -HandOff $HandOff -NoSteps) | ConvertTo-Json -Depth 8 -Compress
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($json)
+    }
+    if ($bytes.LongLength -gt $script:PraPhaseLimits.MaxFileBytes) { throw 'Phase data: the file would be larger than the limit.' }
     $runId = [string](Get-PraValue $Context 'RunId' '')
     $short = ($runId -replace '\A[^-]*-', '' -replace '[^0-9A-Za-z]', '')
     if ($short.Length -gt 8) { $short = $short.Substring(0, 8) }
@@ -2784,7 +2802,7 @@ function Read-PraPhaseData {
     $phases = New-Object 'Collections.Generic.List[object]'
     $problems = New-Object 'Collections.Generic.List[string]'
     $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::Ordinal)
-    $total = 0
+    $total = 0; $budget = [long]0
     foreach ($directory in @($Folder | Where-Object { $_ } | Get-PraOrdinalUnique -IgnoreCase)) {
         if (-not [IO.Directory]::Exists($directory)) { continue }
         $files = [string[]][IO.Directory]::GetFiles($directory, $script:PraPhaseFilter)
@@ -2795,7 +2813,11 @@ function Read-PraPhaseData {
             if ($total -gt $limits.MaxFiles) { $problems.Add('Phase data: too many files, the rest is ignored.'); break }
             try {
                 $length = ([IO.FileInfo]$file).Length
-                if ($length -lt 2 -or $length -gt $limits.MaxBytes) { throw 'the size is not acceptable' }
+                if ($length -lt 2 -or $length -gt $limits.MaxFileBytes) { throw ('the size is not acceptable (at most {0} MB for one file)' -f [long]($limits.MaxFileBytes / 1MB)) }
+                if (($budget + $length) -gt $limits.MaxBytes) {
+                    throw ('not read: the files read before it already use {0} MB of the {1} MB allowed for one report. Move the PhaseData files of other batches out of the batch folder (a batch folder holds only the files of its own batch), then run again' -f [long]($budget / 1MB), [long]($limits.MaxBytes / 1MB))
+                }
+                $budget += $length
                 $sidecar = $file + '.sha256'
                 if (-not [IO.File]::Exists($sidecar)) { throw 'the .sha256 file is missing' }
                 $stream = New-Object IO.FileStream($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)

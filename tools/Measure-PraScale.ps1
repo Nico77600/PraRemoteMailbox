@@ -26,8 +26,8 @@
 .EXAMPLE
     pwsh -NoProfile -File .\tools\Measure-PraScale.ps1 -Count 5000
 .NOTES
-    Author : Nicolas Fabert
-    Version: 3.1.4
+    Author  : Nicolas Fabert
+    Version : 3.1.4
 #>
 #Requires -Version 7.5
 [CmdletBinding()]
@@ -95,7 +95,11 @@ function global:Set-ADUser {
 function global:Add-ADGroupMember {
     [CmdletBinding(SupportsShouldProcess)]
     param([object]$Identity, [object[]]$Members, [string]$Server)
-    foreach ($id in $Members) { $global:PraScaleAd.Members.Add([string]$global:PraScaleAd.ByKey[[string]$id].DistinguishedName) }
+    foreach ($id in $Members) {
+        $member = $global:PraScaleAd.ByKey[[string]$id]
+        $global:PraScaleAd.Members.Add([string]$member.DistinguishedName)
+        $member.memberOf = @([string]$global:PraScaleAd.Group.DistinguishedName)
+    }
     $global:PraScaleAd.Group.member = $global:PraScaleAd.Members.ToArray()
 }
 

@@ -240,8 +240,10 @@ function Get-PraGuiBatchCore {
     $cached = $null
     if ($script:PraGuiBatchCache.TryGetValue($Path, [ref]$cached) -and (Test-GuiOrdinal $cached.Stamp $stamp)) { return $cached }
     $core = [pscustomobject]@{ Stamp=$stamp; Operation='?'; BatchId=''; Error=''; Data=$null; Schema=0; Problem=$null }
+    # An answer about the content is kept; a failure to read the file (a lock, a sharing violation, a missing right) is not: the next refresh reads it again.
     try {
-        $data = [IO.File]::ReadAllText($Path) | ConvertFrom-PraJson
+        try { $text = [IO.File]::ReadAllText($Path) } catch { $core.Error = $_.Exception.Message; return $core }
+        $data = $text | ConvertFrom-PraJson
         $core.Operation = [string](Get-PraGuiValue $data 'Operation' '?')
         $core.BatchId = [string](Get-PraGuiValue $data 'BatchId' ((Split-Path (Split-Path $Path -Parent) -Leaf) -replace '^(Batch|Finalize)-',''))
         if (-not (Test-GuiOrdinalIn $core.Operation @('Convert','Recover','RecoverFinalize'))) { throw 'Not a Convert, Recover or RecoverFinalize package.' }
@@ -1336,9 +1338,15 @@ function Get-PraGuiCsvRowText {
     $stamp=Get-PraGuiFileStamp $Path
     $cached=$null
     if ($script:PraGuiCsvCache.TryGetValue($Path,[ref]$cached) -and [string]::Equals($cached.Stamp,$stamp,[StringComparison]::Ordinal)) { return [string]$cached.Text }
-    try { $text=' ' + (ConvertTo-PraGuiPlural @(Read-PraTargetCsv -Path $Path).Count 'row' 'rows') + '.' } catch { $text=' ' + $_.Exception.Message }
+    # The sentence about a file that can be read is kept; a failure is told but never kept, so that a lock that ends is not shown again.
+    try { $text=' ' + (ConvertTo-PraGuiPlural @(Read-PraTargetCsv -Path $Path).Count 'row' 'rows') + '.' } catch { return (' ' + $_.Exception.Message) }
     $script:PraGuiCsvCache[$Path]=[pscustomobject]@{ Stamp=$stamp; Text=$text }
     return $text
+}
+
+function Clear-PraGuiFileCache {
+    <# Forgets what the window kept about batch files, target CSV files and their hashes: the next refresh reads them again (the Reload link). #>
+    $script:PraGuiBatchCache.Clear(); $script:PraGuiCsvCache.Clear(); $script:PraGuiHashCache.Clear()
 }
 
 function Get-PraGuiSourceText {
@@ -3205,7 +3213,7 @@ function Invoke-PraGuiClick {
                 Invoke-PraGuiChange
             }
             'BtnOpenConfig' { Open-PraGuiPath $g.ConfigPath }
-            'BtnReload' { if (-not $g.Run) { Update-PraGuiState } }
+            'BtnReload' { if (-not $g.Run) { Clear-PraGuiFileCache; Update-PraGuiState } }
             'BtnCopyCmd' { [Windows.Clipboard]::SetText($c.CmdLine.Text) }
             'BtnPickOu' { Start-PraGuiOuLookup }
             'BtnCheckIdentity' { Start-PraGuiIdentityLookup }

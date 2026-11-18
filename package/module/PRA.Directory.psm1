@@ -77,8 +77,13 @@ function Write-PraMemoryStage {
     <# Log only: stage of a backup and private memory of the process (large batches). #>
     [CmdletBinding()]
     param([hashtable]$Context, [string]$Stage, [string]$Identity = '', [string]$Detail = '')
-    $process = [Diagnostics.Process]::GetCurrentProcess()
-    try { $privateMiB = [math]::Round(($process.PrivateMemorySize64 / 1MB), 1) } finally { $process.Dispose() }
+    # The memory of the process is read once a second at most (the read takes milliseconds and the trace is called for every object).
+    if ($null -eq $script:MemoryClock -or $script:MemoryClock.ElapsedMilliseconds -ge 1000) {
+        $process = [Diagnostics.Process]::GetCurrentProcess()
+        try { $script:MemoryText = [math]::Round(($process.PrivateMemorySize64 / 1MB), 1).ToString([Globalization.CultureInfo]::InvariantCulture) } finally { $process.Dispose() }
+        $script:MemoryClock = [Diagnostics.Stopwatch]::StartNew()
+    }
+    $privateMiB = $script:MemoryText
     Write-PraLog -Context $Context -Message ("BACKUP/AD | $Stage | GUID=$Identity | $Detail | PrivateMiB=$privateMiB | Process64Bit=$([Environment]::Is64BitProcess)") -Level Debug
 }
 
@@ -188,6 +193,12 @@ function Write-PraDataFingerprint {
                     $writer.Write($State.Bytes, 0, ($count * 2))
                 }
             }
+            elseif ($child -is [bool]) {
+                if ($Depth -ge 64) { throw 'Receipt data too deep or cyclic.' }
+                $State.Nodes++
+                if ($State.Nodes -gt 10000000) { throw 'Receipt data too large.' }
+                $writer.Write([byte]2); $writer.Write([bool]$child)
+            }
             else { Write-PraDataFingerprint -State $State -Value $child -Depth ($Depth + 1) }
         }
         return
@@ -214,6 +225,12 @@ function Get-PraDataFingerprint {
 # written, and the length and the last write time of the three files. Complete, at the boundaries of a batch and after this many cheap checks: the fingerprint of
 # every record and the SHA-256 of the files.
 $script:ReceiptFileHashEvery = 200
+
+# The members of the licence group are read once and shared by the objects of a run for this many seconds (Get-PraGroupMemberSet).
+$script:GroupMemberSeconds = 30
+$script:LogEscape = [regex]::new('[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\"]')
+$script:MemoryClock = $null
+$script:MemoryText = ''
 
 function Get-PraFileStamp {
     <# Length and last write time (UTC ticks) of a file, as text; 'missing' when it is not there. #>
@@ -283,9 +300,11 @@ function Assert-PraReceiptIntegrity {
     .DESCRIPTION
         -Full: the fingerprint of every record and the SHA-256 of the three files. Without it: the fields of the receipt, the record of -ObjectGuid, and the length and
         last write time of the three files; the SHA-256 of the files is computed again after every ReceiptFileHashEvery checks of that kind.
+        -WithoutRecord (with an object): the same, but the record of the object is only looked for, not fingerprinted: for a check that is followed by another one, made
+        after the operator approved the write, which does fingerprint it.
     #>
     [CmdletBinding()]
-    param([hashtable]$Context, $Entry, [string]$ObjectGuid = '', [switch]$Full)
+    param([hashtable]$Context, $Entry, [string]$ObjectGuid = '', [switch]$Full, [switch]$WithoutRecord)
     $receipt = $Entry.Receipt
     if (-not (Test-PraOrdinalIgnoreCaseEqual $Entry.Environment $Context.Config.Environment) -or -not (Test-PraOrdinalIgnoreCaseEqual $receipt.Path $Entry.Path) -or
         -not (Test-PraOrdinalIgnoreCaseEqual $receipt.Data.Environment $Entry.Environment) -or -not (Test-PraOrdinalEqual $receipt.Data.Operation $Entry.Operation) -or
@@ -311,7 +330,7 @@ function Assert-PraReceiptIntegrity {
         if (-not $Entry.Positions.TryGetValue($ObjectGuid, [ref]$position)) { throw "Object not covered by the validated backup: $ObjectGuid" }
         $record = $Entry.RecordsArray[$position]
         if (-not [object]::ReferenceEquals($record, $Entry.RecordRefs[$position]) -or
-            -not (Test-PraOrdinalEqual (Get-PraDataFingerprint -Data $record) $Entry.Fingerprints[$ObjectGuid])) { throw $memoryChanged }
+            (-not $WithoutRecord -and -not (Test-PraOrdinalEqual (Get-PraDataFingerprint -Data $record) $Entry.Fingerprints[$ObjectGuid]))) { throw $memoryChanged }
     }
     $hashFiles = $Full -or -not $ObjectGuid -or (++$Entry.ChecksSinceFileHash -ge $script:ReceiptFileHashEvery)
     if ($hashFiles) {
@@ -573,6 +592,32 @@ function Get-PraGroup {
     return $groups[0]
 }
 
+function Get-PraGroupMemberSet {
+    <#
+    .SYNOPSIS
+        The licence group and the set of its members, read once and kept for a short time instead of being read again for every object.
+    .DESCRIPTION
+        A group of thousands of members is a read of hundreds of kilobytes. The plan of an object and the check before the final restore only need to know whether the object
+        was in the group a moment ago, so the read is shared by the objects of a run: it is read again when it is older than the keeping time or after any write to a group
+        by this run. The check that comes with every write is not served from here: it reads the memberOf attribute of the object itself (Assert-PraCurrentState).
+    .OUTPUTS
+        An object with Group (the group, as Get-PraGroup returns it) and Members (a case-insensitive set of distinguished names).
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, [Parameter(Mandatory)][string]$Identity)
+    $generation = [int](Get-PraValue $Context 'PraGroupGeneration' 0)
+    if (-not $Context.ContainsKey('PraGroupMembers')) { $Context['PraGroupMembers'] = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase) }
+    $cache = $Context['PraGroupMembers']
+    $entry = $null
+    if ($cache.TryGetValue($Identity, [ref]$entry) -and [int]$entry.Generation -eq [int]$generation -and $entry.Clock.Elapsed.TotalSeconds -lt $script:GroupMemberSeconds) { return $entry }
+    $group = Get-PraGroup $Context $Identity
+    $members = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($member in @($group.member)) { [void]$members.Add([string]$member) }
+    $entry = [pscustomobject]@{ Group = $group; Members = $members; Generation = $generation; Clock = [Diagnostics.Stopwatch]::StartNew() }
+    $cache[$Identity] = $entry
+    return $entry
+}
+
 function Resolve-PraGroup {
     <#
     .SYNOPSIS
@@ -706,22 +751,32 @@ function Get-PraJournalTouchedObject {
     <#
     .SYNOPSIS
         The objects (GUIDs, ignoring the case) that the journal of a batch shows as written or about to be written: a Started or Applied line of an AD write.
-        An object that has such a line may be changed, whatever the batch proved. A missing or unreadable journal gives an empty set. A line that cannot be parsed is skipped,
-        the others are still read; with -Context ONE warning says how many were skipped.
+        An object that has such a line may be changed, whatever the batch proved. A missing or unreadable journal gives an empty set. A line that cannot be read (not JSON,
+        cut short, or without its Operation, Status and Target) is skipped, the others are still read; with -Context ONE warning says how many were skipped, and -SkippedCount
+        receives that number.
     #>
     [CmdletBinding()]
-    param([string]$Path, [hashtable]$Context)
+    param([string]$Path, [hashtable]$Context, [ref]$SkippedCount)
     $set = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if ($null -ne $SkippedCount) { $SkippedCount.Value = 0 }
     if (-not $Path -or -not [IO.File]::Exists($Path)) { return , $set }
     $skipped = 0
     try {
         foreach ($line in [IO.File]::ReadLines($Path)) {
-            if ($line.Trim().Length -and -not $line.TrimStart().StartsWith('{', [StringComparison]::Ordinal)) { $skipped++; continue }
-            if (-not ($line.Contains('"Status":"Started"') -or $line.Contains('"Status":"Applied"'))) { continue }
+            $text = $line.Trim()
+            if (-not $text.Length) { continue }
+            if (-not $text.StartsWith('{', [StringComparison]::Ordinal)) { $skipped++; continue }
+            if (-not ($line.Contains('"Status":"Started"') -or $line.Contains('"Status":"Applied"'))) {
+                # A line that is not a write is not parsed (the journal can be large): only its shape is checked.
+                if (-not $text.EndsWith('}', [StringComparison]::Ordinal) -or -not $text.Contains('"Operation":') -or -not $text.Contains('"Status":') -or -not $text.Contains('"Target":')) { $skipped++ }
+                continue
+            }
             try {
                 $entry = $line | ConvertFrom-PraJson
-                if (Test-PraOrdinalIn ([string](Get-PraValue $entry 'Operation' '')) @('Set-ADUser', 'Add-ADGroupMember', 'Remove-ADGroupMember')) {
-                    $target = [string](Get-PraValue $entry 'Target' '')
+                $operation = Get-PraValue $entry 'Operation' $null; $target = Get-PraValue $entry 'Target' $null
+                if ($null -eq $operation -or $null -eq $target -or $null -eq (Get-PraValue $entry 'Status' $null)) { $skipped++; continue }
+                if (Test-PraOrdinalIn ([string]$operation) @('Set-ADUser', 'Add-ADGroupMember', 'Remove-ADGroupMember')) {
+                    $target = [string]$target
                     if ($target -and -not (Test-PraOrdinalEqual $target '*')) { [void]$set.Add($target) }
                 }
             }
@@ -729,7 +784,13 @@ function Get-PraJournalTouchedObject {
         }
     }
     catch { $null = $_ }
-    if ($skipped -and $null -ne $Context) { Write-PraItem -Context $Context -Status Warn -Text ('{0} line(s) of the journal {1} cannot be read and were skipped: an object that only they name is not listed as written.' -f $skipped, (Split-Path $Path -Leaf)) }
+    if ($null -ne $SkippedCount) { $SkippedCount.Value = $skipped }
+    if ($skipped -and $null -ne $Context) {
+        $batchId = [regex]::Match((Split-Path $Path -Leaf), '^Journal-(?<id>[0-9a-fA-F]{8})[0-9a-fA-F]{24}\.jsonl\z').Groups['id'].Value
+        $hook = Get-PraValue $Context 'CommandLineFor' $null
+        $command = if ($hook -is [scriptblock] -and $batchId) { ([string](& $hook 'Recover' '' $batchId)) -replace ' -Mode Apply', '' } else { '.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch ' + $(if ($batchId) { $batchId } else { '<batch>' }) }
+        Write-PraItem -Context $Context -Status Warn -Text ('{0} line(s) of the journal {1} cannot be read and were skipped: an object that only they name is not listed as written. If an object may have been converted by this batch, roll it back on its own with its Preview first: {2} -Identity <sAMAccountName>, then the same command with -Mode Apply. Or restore it by hand from the backup file of the batch.' -f $skipped, (Split-Path $Path -Leaf), $command)
+    }
     return , $set
 }
 
@@ -740,7 +801,7 @@ function Find-PraRecoverOfBatch {
     .DESCRIPTION
         First the State files (the AD proof of a Recover): the one that names the Convert backup (SourceBackupHash) and lists at least one of the objects given
         (any object when none is given). Then the Recover backups that have no State file (a Recover that stopped before its proof): the objects that its journal
-        shows as written or about to be written count as rolled back; a journal that is missing counts for every object. Basis says which: State, Journal or Unknown.
+        shows as written or about to be written count as rolled back; a journal that is missing, or that has a line which cannot be read, counts for every object. Basis says which: State, Journal, Damaged or Unknown.
         A batch of another Environment is ignored.
     #>
     [CmdletBinding()]
@@ -783,8 +844,11 @@ function Find-PraRecoverOfBatch {
                 $basis = 'Journal'
                 if (-not [IO.File]::Exists($journal)) { $basis = 'Unknown' }
                 else {
-                    $touched = Get-PraJournalTouchedObject -Path $journal
-                    if ($ObjectGuid.Count) {
+                    $damaged = 0
+                    $touched = Get-PraJournalTouchedObject -Path $journal -SkippedCount ([ref]$damaged)
+                    # A journal with a line that cannot be read may hide a write: every object counts as rolled back (the caller refuses, never guesses).
+                    if ($damaged -gt 0) { $basis = 'Damaged' }
+                    elseif ($ObjectGuid.Count) {
                         $anyTouched = $false
                         foreach ($wantedGuid in $ObjectGuid) { if ($touched.Contains($wantedGuid)) { $anyTouched = $true; break } }
                         if (-not $anyTouched) { continue }
@@ -1059,7 +1123,9 @@ function ConvertTo-PraLogText {
     <# Escapes control characters, quotes and backslashes of an AD value (the value is never cut). #>
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Value)
-    return [regex]::Replace($Value, '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\"]', [Text.RegularExpressions.MatchEvaluator]{
+    # Most values have nothing to escape: the test is one match, and the replacement (a delegate made for each call) is only built for the others.
+    if (-not $script:LogEscape.IsMatch($Value)) { return $Value }
+    return $script:LogEscape.Replace($Value, [Text.RegularExpressions.MatchEvaluator]{
             param($match)
             # On the character CODE, never on the string (ICU string comparison ignores control characters: U+0001 -eq U+0008).
             $code = [int][char]$match.Value[0]
@@ -1147,16 +1213,18 @@ function Write-PraAdDelta {
     $afterLabel = if ((Test-PraOrdinalIgnoreCaseEqual $Stage 'Verified')) { 'VERIFIED' } else { 'PLANNED' }
     $heading = if ((Test-PraOrdinalIgnoreCaseEqual $Stage 'Verified')) { 'AD VERIFIED' } else { 'AD PLAN - planned values, not applied' }
     $record = $Plan.Record
-    Write-PraLog -Context $Context -Message ("$heading | $(ConvertTo-PraLogText -Value $record.SamAccountName) | $($Plan.Operation) | Mode=$($Context.Mode) | GUID=$($record.ObjectGuid)") -Level Detail
+    # The log lines of the object (every attribute with its values) are written in one go.
+    $logLines = New-Object 'Collections.Generic.List[string]'
+    $logLines.Add("$heading | $(ConvertTo-PraLogText -Value $record.SamAccountName) | $($Plan.Operation) | Mode=$($Context.Mode) | GUID=$($record.ObjectGuid)")
     $palette = @{ ADD='Green'; CHANGE='Yellow'; REMOVE='Red'; UNCHANGED='DarkGray' }
     $consoleLines = New-Object 'Collections.Generic.List[object]'
     $unchanged = 0
     foreach ($name in $Plan.Kinds.Keys) {
         $before = $record.Attributes[$name]; $after = $Plan.Desired[$name]
         $change = if (Test-PraStateEqual -Left $before -Right $after) { 'UNCHANGED' } elseif (-not $before.Present) { 'ADD' } elseif (-not $after.Present) { 'REMOVE' } else { 'CHANGE' }
-        Write-PraLog -Context $Context -Message "ATTRIBUTE | $name | $change | Type=$($Plan.Kinds[$name])" -Level Detail
-        foreach ($value in @(Format-PraAttributeValue -State $before)) { Write-PraLog -Context $Context -Message "  $name | BEFORE : $value" -Level Detail }
-        foreach ($value in @(Format-PraAttributeValue -State $after)) { Write-PraLog -Context $Context -Message "  $name | $afterLabel : $value" -Level Detail }
+        $logLines.Add("ATTRIBUTE | $name | $change | Type=$($Plan.Kinds[$name])")
+        foreach ($value in @(Format-PraAttributeValue -State $before)) { $logLines.Add("  $name | BEFORE : $value") }
+        foreach ($value in @(Format-PraAttributeValue -State $after)) { $logLines.Add("  $name | $afterLabel : $value") }
         if ((Test-PraOrdinalIgnoreCaseEqual $change 'UNCHANGED')) { $unchanged++; continue }
         if ((Test-PraOrdinalIgnoreCaseEqual ($Plan.Kinds[$name]) 'MultiString') -and $before.Present -and $after.Present) {
             $old = @($before.Value); $new = @($after.Value)
@@ -1170,15 +1238,16 @@ function Write-PraAdDelta {
         $change = if ((Test-PraOrdinalIgnoreCaseEqual $group.WasMember $group.DesiredMember)) { 'UNCHANGED' } elseif ($group.DesiredMember) { 'ADD' } else { 'REMOVE' }
         $beforeText = if ($group.WasMember) { 'Member' } else { 'Not member' }
         $afterText = if ($group.DesiredMember) { 'Member' } else { 'Not member' }
-        Write-PraLog -Context $Context -Message "LICENCE GROUP | $(ConvertTo-PraLogText -Value $group.GroupDN) | $change" -Level Detail
-        Write-PraLog -Context $Context -Message "  Licence group | BEFORE : $beforeText" -Level Detail
-        Write-PraLog -Context $Context -Message "  Licence group | $afterLabel : $afterText" -Level Detail
+        $logLines.Add("LICENCE GROUP | $(ConvertTo-PraLogText -Value $group.GroupDN) | $change")
+        $logLines.Add("  Licence group | BEFORE : $beforeText")
+        $logLines.Add("  Licence group | $afterLabel : $afterText")
         if ((-not (Test-PraOrdinalIgnoreCaseEqual $change 'UNCHANGED'))) {
             $groupName = (($group.GroupDN -split ',')[0] -replace '^CN=', '')
             $consoleLines.Add(@(('licence group ' + $groupName), ('{0}  {1}  {2}' -f $beforeText.ToLowerInvariant(), [char]0x2192, $afterText.ToLowerInvariant()), $palette[$change]))
         }
     }
-    else { Write-PraLog -Context $Context -Message 'LICENCE GROUP | not managed for this operation' -Level Detail }
+    else { $logLines.Add('LICENCE GROUP | not managed for this operation') }
+    Write-PraLog -Context $Context -Lines $logLines.ToArray() -Level Detail
     $shared = $record.SharedPermissions
     $permissionText = ''
     if ($record.IsShared -and (Test-PraOrdinalIgnoreCaseEqual $Plan.Operation 'Convert')) {
@@ -1683,9 +1752,11 @@ function New-PraPlan {
         if ($tagEnabled) { $desired[$tagAttr] = @{ Present=$true; Kind='String'; Value=[string]$tag.Value } }
         if ($shared) { $permissions = Get-PraSharedPermission $Context $user }
         elseif ($config.Licensing.Enabled) {
-            $group = Get-PraGroup $Context $config.Licensing.GroupDN
+            # The group is read without its members: whether the object is in it comes from the memberOf attribute of the object, read just above.
+            $group = Get-PraGroup $Context $config.Licensing.GroupDN -WithoutMembers
+            $memberOf = Get-PraValue $user 'memberOf' @()
             $licensing.Enabled = $true; $licensing.GroupGuid = ([guid]$group.ObjectGUID).ToString(); $licensing.GroupDN = [string]$group.DistinguishedName
-            $licensing.WasMember = (Test-PraOrdinalIn -IgnoreCase ([string]$user.DistinguishedName) @($group.member)); $licensing.DesiredMember = $true
+            $licensing.WasMember = (Test-PraOrdinalIn -IgnoreCase ([string]$group.DistinguishedName) @($memberOf)); $licensing.DesiredMember = $true
         }
     }
     elseif ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Deprovision')) {
@@ -1722,9 +1793,10 @@ function New-PraPlan {
         }
         $sourceGroup = Get-PraValue $SourceRecord 'Licensing' $null
         if ($null -ne $sourceGroup -and $sourceGroup.Enabled) {
-            $group = Get-PraGroup $Context $sourceGroup.GroupGuid
+            $group = Get-PraGroup $Context ([string]$sourceGroup.GroupGuid) -WithoutMembers
+            $memberOf = Get-PraValue $user 'memberOf' @()
             $licensing.Enabled = $true; $licensing.GroupGuid = ([guid]$group.ObjectGUID).ToString(); $licensing.GroupDN = [string]$group.DistinguishedName
-            $licensing.WasMember = (Test-PraOrdinalIn -IgnoreCase ([string]$user.DistinguishedName) @($group.member)); $licensing.DesiredMember = [bool]$sourceGroup.WasMember
+            $licensing.WasMember = (Test-PraOrdinalIn -IgnoreCase ([string]$group.DistinguishedName) @($memberOf)); $licensing.DesiredMember = [bool]$sourceGroup.WasMember
         }
         elseif ([bool](Get-PraValue $SourceRecord 'AddedToLicenseGroup' $false)) {
             throw 'Old backup without the GUID of the licence group: removal refused (a group with the same DN may have been re-created). Have the backup migrated before restoring this batch.'
@@ -1859,9 +1931,11 @@ function Import-PraBackup {
     .SYNOPSIS
         Reads and fully validates a backup (JSON, .sha256, CLIXML) and returns its receipt.
         Schema 3 (current), 2 and 1 (old versions, read with their restrictions) are accepted.
+    .PARAMETER ExpectedSnapshots
+        The captures in memory that the CLIXML file must hold exactly (the backup that has just been written): they are compared in the same pass that validates the file.
     #>
     [CmdletBinding()]
-    param([hashtable]$Context, [Parameter(Mandatory)][string]$Path)
+    param([hashtable]$Context, [Parameter(Mandatory)][string]$Path, [AllowEmptyCollection()][object[]]$ExpectedSnapshots)
     $pathResolved = (Get-Item -LiteralPath $Path -ErrorAction Stop).FullName
     $registry = Get-PraReceiptRegistry -Context $Context
     foreach ($entry in $registry) {
@@ -1907,7 +1981,8 @@ function Import-PraBackup {
         $format = if ($version -eq 3) { [string]$data.RawFormat } else { '' }
         $Context.CurrentOperation = 'Validate-RawCapture'
         Write-PraMemoryStage -Context $Context -Stage 'RAW VALIDATE BEGIN' -Detail ("schema=$version objects=$($records.Count) file=$rawPath")
-        $null = Test-PraRawCapture -Context $Context -LiteralPath $rawPath -Records $records -RawFormat $format
+        if ($PSBoundParameters.ContainsKey('ExpectedSnapshots')) { $null = Test-PraRawCapture -Context $Context -LiteralPath $rawPath -Records $records -RawFormat $format -ExpectedSnapshots $ExpectedSnapshots }
+        else { $null = Test-PraRawCapture -Context $Context -LiteralPath $rawPath -Records $records -RawFormat $format }
         # A change during the read never yields a receipt for different content.
         if (-not (Test-PraOrdinalEqual (Get-PraHash -Path $rawPath) $rawHash)) { throw 'Backup CLIXML changed during its validation.' }
         Write-PraMemoryStage -Context $Context -Stage 'RAW VALIDATE END' -Detail ("bytes=$((Get-Item -LiteralPath $rawPath -ErrorAction Stop).Length)")
@@ -2007,8 +2082,8 @@ function Save-PraBatch {
     $json = $null
     Write-PraImmutableFile ($path + '.sha256') (Get-PraHash $path)
     $Context.CurrentOperation = 'Validate-BackupAgainstPlan'
-    $null = Test-PraRawCapture -Context $Context -LiteralPath $rawPath -Records $data.Records -RawFormat $data.RawFormat -ExpectedSnapshots $snapshots
-    $receipt = Import-PraBackup $Context $path
+    # One pass over the CLIXML file validates it and compares it with the captures in memory.
+    $receipt = Import-PraBackup $Context $path -ExpectedSnapshots $snapshots
     # A valid JSON is not necessarily complete: compare it with the plans in memory.
     for ($i = 0; $i -lt $Plans.Count; $i++) {
         $record = $receipt.Data.Records[$i]
@@ -2040,10 +2115,10 @@ function Assert-PraReceipt {
         without an object) the complete one.
     #>
     [CmdletBinding()]
-    param([hashtable]$Context, $Receipt, [string]$ObjectGuid = '', [switch]$Full)
+    param([hashtable]$Context, $Receipt, [string]$ObjectGuid = '', [switch]$Full, [switch]$WithoutRecord)
     $entry = Get-PraReceiptEntry -Context $Context -Receipt $Receipt
     if ($ObjectGuid -and -not $entry.Positions.ContainsKey($ObjectGuid)) { throw "Object not covered by the validated backup: $ObjectGuid" }
-    Assert-PraReceiptIntegrity -Context $Context -Entry $entry -ObjectGuid $ObjectGuid -Full:$Full
+    Assert-PraReceiptIntegrity -Context $Context -Entry $entry -ObjectGuid $ObjectGuid -Full:$Full -WithoutRecord:$WithoutRecord
 }
 
 function Assert-PraCurrentState {
@@ -2059,9 +2134,11 @@ function Assert-PraCurrentState {
         if (-not (Test-PraStateEqual $Expected[$name] $actual[$name])) { throw "AD state differs from the expected state | GUID=$($Plan.Record.ObjectGuid) | attribute=$name | DC=$($Context.Server)" }
     }
     if ($Plan.Record.Licensing.Enabled) {
-        $group = Get-PraGroup $Context $Plan.Record.Licensing.GroupGuid
+        # The group itself is read again each time (its name and GUID), without its members; whether this object is in it comes from the memberOf attribute of the object just read.
+        $group = Get-PraGroup $Context $Plan.Record.Licensing.GroupGuid -WithoutMembers
+        $memberOf = Get-PraValue $user 'memberOf' @()
         if (-not (Test-PraOrdinalIgnoreCaseEqual $group.DistinguishedName $Plan.Record.Licensing.GroupDN) -or
-            (-not (Test-PraOrdinalIgnoreCaseEqual (Test-PraOrdinalIn -IgnoreCase ([string]$user.DistinguishedName) @($group.member)) $ExpectedMember))) { throw 'Licence group membership differs from the backup/plan.' }
+            (-not (Test-PraOrdinalIgnoreCaseEqual (Test-PraOrdinalIn -IgnoreCase ([string]$group.DistinguishedName) @($memberOf)) $ExpectedMember))) { throw 'Licence group membership differs from the backup/plan.' }
     }
     if ($AcceptNewVersion) { $Plan.ExpectedUsnChanged = $version }
 }
@@ -2082,7 +2159,8 @@ function Invoke-PraAdWrite {
     if ([bool](Get-PraValue $Context 'OperationFailed' $false) -or $Context.Issues.Count -gt 0 -or (Test-PraOrdinalEqual ([string]$Plan.Row.FinalStatus) 'Error')) { throw 'Safety stop: no AD write after an error in this run.' }
     if (-not $Context.AllowMutation -or (-not (Test-PraOrdinalIgnoreCaseEqual $Context.Mode 'Apply')) -or (Test-PraOrdinalIgnoreCaseEqual $Context.Action 'Check') -or $WhatIfPreference) { throw 'Safety stop: AD writes are not allowed in this mode.' }
     if (-not $PSCmdlet.ShouldProcess($Plan.Record.ObjectGuid, $Operation)) { throw 'AD write not authorised (ShouldProcess).' }
-    Assert-PraReceipt $Context $Receipt $Plan.Record.ObjectGuid
+    # Before the approval the object is only looked for in the backup, and the files are checked: the record itself is fingerprinted by the check after the approval.
+    Assert-PraReceipt $Context $Receipt $Plan.Record.ObjectGuid -WithoutRecord
     if (-not (& $Context.Approval $Plan.Record.DistinguishedName $Operation)) { throw "Operation refused: $Operation. Batch stopped." }
     # An interactive confirmation can take time: the object and the backup are re-checked after it.
     $expected = if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Set-ADUser')) { $Plan.Record.Attributes } else { $Plan.Desired }
@@ -2092,6 +2170,8 @@ function Invoke-PraAdWrite {
     $Plan.Row.LastOperation = $Operation; $Plan.Row.Detail += " | attempt=$Operation"
     Write-PraJournal $Context $Plan.Record.ObjectGuid $Operation 'Started'
     Write-PraLog -Context $Context -Message "AD WRITE BEGIN | $Operation | DC=$($Context.Server) | GUID=$($Plan.Record.ObjectGuid) | backup=$($Receipt.Path)" -Level Detail
+    # A write to a group makes the members read earlier by this run out of date.
+    if ($Operation.EndsWith('ADGroupMember', [StringComparison]::OrdinalIgnoreCase)) { $Context['PraGroupGeneration'] = [int](Get-PraValue $Context 'PraGroupGeneration' 0) + 1 }
     # Any exception goes up to Invoke-PraAdBatch: no next object, no sync.
     & $Write | Out-Null
     $Plan.Row.ADApplied = $true
@@ -2167,7 +2247,7 @@ function Invoke-PraAdBatch {
         foreach ($plan in $Plans) {
             try {
                 $before = $plan.Record.Attributes; $groupState = $plan.Record.Licensing
-                Assert-PraCurrentState $Context $plan $before $groupState.WasMember
+                # Every write re-reads the object first (Invoke-PraAdWrite), and the object is read again after the last one: no read of its own here.
                 $replace = @{}; $clear = New-Object 'Collections.Generic.List[string]'
                 foreach ($name in $plan.Kinds.Keys) {
                     if (Test-PraStateEqual $before[$name] $plan.Desired[$name]) { continue }
@@ -2182,8 +2262,6 @@ function Invoke-PraAdBatch {
                     Write-PraJournal $Context $plan.Record.ObjectGuid 'Set-ADUser' 'Verified'
                 }
                 if ($groupState.Enabled -and (-not (Test-PraOrdinalIgnoreCaseEqual $groupState.WasMember $groupState.DesiredMember))) {
-                    # Re-read before each new write: the group must not have changed.
-                    Assert-PraCurrentState $Context $plan $plan.Desired $groupState.WasMember
                     $parameters = @{ Identity=[guid]$groupState.GroupGuid; Members=[guid]$plan.Record.ObjectGuid; Server=$Context.Server; ErrorAction='Stop'; Confirm=$false }
                     if ($groupState.DesiredMember) { Invoke-PraAdWrite $Context $receipt $plan 'Add-ADGroupMember' { Add-ADGroupMember @parameters }; $plan.Row.GroupAction = 'Added' }
                     else { Invoke-PraAdWrite $Context $receipt $plan 'Remove-ADGroupMember' { Remove-ADGroupMember @parameters }; $plan.Row.GroupAction = 'Removed' }
@@ -2400,9 +2478,9 @@ function Assert-PraFollowupState {
     $previous = Find-PraRecord $capturedIndex $planGuid
     if ($null -eq $verifiedRecord -or $null -eq $previous -or $verifiedIndex.Duplicates.Contains($planGuid) -or $capturedIndex.Duplicates.Contains($planGuid)) { throw 'Finalize: object not in the AD proof.' }
     if ($previous.Licensing.Enabled) {
-        $group = Get-PraGroup $Context $previous.Licensing.GroupGuid
-        if (-not (Test-PraOrdinalIgnoreCaseEqual $group.DistinguishedName $previous.Licensing.GroupDN) -or
-            (-not (Test-PraOrdinalIgnoreCaseEqual (Test-PraOrdinalIn -IgnoreCase ([string]$Plan.User.DistinguishedName) @($group.member)) ($previous.Licensing.DesiredMember)))) { throw 'Finalize: licence group membership differs from the AD proof.' }
+        $groupRead = Get-PraGroupMemberSet $Context ([string]$previous.Licensing.GroupGuid)
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $groupRead.Group.DistinguishedName $previous.Licensing.GroupDN) -or
+            (-not (Test-PraOrdinalIgnoreCaseEqual $groupRead.Members.Contains([string]$Plan.User.DistinguishedName) ($previous.Licensing.DesiredMember)))) { throw 'Finalize: licence group membership differs from the AD proof.' }
     }
     # Already finished (replay): only the complete original state is accepted, it needs no write.
     $original = $Plan.Row.BackupRec
@@ -2531,6 +2609,8 @@ function Invoke-PraAdReplication {
         $pending = @($changed | Where-Object { -not $failed.Contains([string]$_.Record.ObjectGuid) })
         for ($attempt = 1; $attempt -le $attempts -and $pending.Count; $attempt++) {
             $stillPending = New-Object 'Collections.Generic.List[object]'
+            # The members of a licence group are read once for each attempt on the destination, not once for each object.
+            $destinationGroups = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
             foreach ($plan in $pending) {
                 $Context.CurrentOperation = 'Verify-ADReplication'; $Context.CurrentIdentity = [string]$plan.Record.ObjectGuid
                 $match = $false
@@ -2542,8 +2622,18 @@ function Invoke-PraAdReplication {
                         $match = $true
                         foreach ($name in $names) { if (-not (Test-PraStateEqual $plan.Desired[$name] $actual[$name])) { $match = $false; break } }
                         if ($match -and (Test-PraOrdinalIn ([string](Get-PraValue $plan.Row 'GroupAction' '')) @('Added', 'Removed'))) {
-                            $group = @(Get-ADGroup -Identity ([guid]$plan.Record.Licensing.GroupGuid) -Properties member -Server $destination -ErrorAction Stop)
-                            $isMember = ($group.Count -eq 1) -and (Test-PraOrdinalIn -IgnoreCase ([string]$plan.Record.DistinguishedName) @($group[0].member))
+                            $groupKey = [string]$plan.Record.Licensing.GroupGuid
+                            $destinationSet = $null
+                            if (-not $destinationGroups.TryGetValue($groupKey, [ref]$destinationSet)) {
+                                $group = @(Get-ADGroup -Identity ([guid]$groupKey) -Properties member -Server $destination -ErrorAction Stop)
+                                $destinationSet = $null
+                                if ($group.Count -eq 1) {
+                                    $destinationSet = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+                                    foreach ($member in @($group[0].member)) { [void]$destinationSet.Add([string]$member) }
+                                }
+                                $destinationGroups[$groupKey] = $destinationSet
+                            }
+                            $isMember = ($null -ne $destinationSet) -and $destinationSet.Contains([string]$plan.Record.DistinguishedName)
                             $match = ($isMember -eq [bool]$plan.Record.Licensing.DesiredMember)
                         }
                     }

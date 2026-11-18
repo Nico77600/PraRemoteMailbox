@@ -419,6 +419,31 @@ function Get-PraFallbackNext {
     return @('Fix the problem named above, then run the same command again:', $same)
 }
 
+function Get-PraJsonOperation {
+    <#
+    .SYNOPSIS
+        The Operation field of a batch JSON file, read without parsing the whole file.
+    .DESCRIPTION
+        A backup of thousands of objects is tens of megabytes; its Operation field is one of the first properties of the envelope.
+        The head of the file is read and the field is taken from it when only scalar properties come before it (a nested property of
+        the same name cannot be taken). Any other shape, or a file that cannot be read this way, is parsed in full as before.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    $head = ''
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $buffer = New-Object 'byte[]' 8192
+            $count = $stream.Read($buffer, 0, $buffer.Length)
+            $head = [Text.Encoding]::UTF8.GetString($buffer, 0, $count).TrimStart([char]0xFEFF)
+        } finally { $stream.Dispose() }
+    } catch { $head = '' }
+    $scalar = '(?:"(?:[^"\\]|\\[^u]|\\u[0-9a-fA-F]{4})*"|-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null)'
+    $match = [regex]::Match($head, '\A\s*\{(?:\s*"(?:[^"\\]|\\[^u]|\\u[0-9a-fA-F]{4})*"\s*:\s*' + $scalar + '\s*,)*\s*"Operation"\s*:\s*"([^"\\]*)"\s*[,}]')
+    if ($match.Success) { return $match.Groups[1].Value }
+    return [string](([IO.File]::ReadAllText($Path) | ConvertFrom-PraJson).Operation)
+}
+
 function Get-PraBatchFile {
     <#
     .SYNOPSIS
@@ -460,7 +485,7 @@ function Get-PraBatchFile {
     $found = New-Object 'Collections.Generic.List[string]'
     foreach ($folder in $folders) {
         foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not $_.Name.StartsWith('State-', [StringComparison]::OrdinalIgnoreCase) })) {
-            try { $operation = [string](([IO.File]::ReadAllText($file.FullName) | ConvertFrom-PraJson).Operation) } catch { continue }
+            try { $operation = Get-PraJsonOperation $file.FullName } catch { continue }
             # In a Finalize package only the manifest counts (the other JSON files are copies of the source batches).
             if ((Test-PraOrdinalIn $operation $Operations) -and ($folder.Name -match '^Batch-' -or (Test-PraOrdinalEqual $operation 'RecoverFinalize'))) { $found.Add($file.FullName) }
         }
@@ -808,6 +833,7 @@ function Assert-PraBatchNotRolledBack {
     $check = (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $recover.ShortId) -replace '^(\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Batch [0-9a-fA-F]+)', '$1 -Expect Deprovisioned'
     $what = if (Test-PraOrdinalEqual $recover.Basis 'State') { 'already rolled back objects of it' }
         elseif (Test-PraOrdinalEqual $recover.Basis 'Journal') { 'started to roll back objects of it (it stopped before its proof)' }
+        elseif (Test-PraOrdinalEqual $recover.Basis 'Damaged') { 'was started on it and its journal has lines that cannot be read: every object counts as rolled back' }
         else { 'was started on it and its journal is not here: every object counts as rolled back' }
     $steps = @(('Batch {0} was rolled back by Recover batch {1}: its objects are not converted any more. To check what the rollback left, run:' -f $short, $recover.ShortId), $check)
     if (-not (Test-PraOrdinalEqual $recover.Basis 'State')) {
@@ -822,7 +848,10 @@ function Assert-PraBatchNotRolledBack {
 function Get-PraBatchTouchedSet {
     <# The objects that the journal of the Convert batch in $context.Source shows as written or about to be written. #>
     $journal = Join-Path (Split-Path $context.Source.Path -Parent) ('Journal-' + [string]$context.Source.Data.BatchId + '.jsonl')
-    return , (Get-PraJournalTouchedObject -Path $journal -Context $context)
+    $skipped = 0
+    $set = Get-PraJournalTouchedObject -Path $journal -Context $context -SkippedCount ([ref]$skipped)
+    $script:TouchedSkipped = $skipped
+    return , $set
 }
 
 function Get-PraPartialSourceProof {
@@ -1024,6 +1053,7 @@ $script:NotConverted = New-Object 'Collections.Generic.HashSet[string]' ([String
 $script:PartialContinuation = $null
 # The objects that the journal of a partial batch shows as written or about to be written, those among them that the batch did not verify, and whether the proof of the source is partial.
 $script:Touched = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$script:TouchedSkipped = 0
 $script:MayBeChanged = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 $script:SourcePartial = $false
 # Known from the start; the run sets it from the configuration.
@@ -1355,13 +1385,16 @@ try {
                 $backupFolder = Split-Path $context.Source.Path -Parent
                 $short = Get-PraShortId ([string]$context.Source.Data.BatchId)
                 Write-PraItem -Context $context -Status Warn -Text ('The AD proof of batch {0} is marked partial but cannot be used ({1}): the journal of the batch decides which objects are rolled back.' -f $short, $sourceProof.Reason)
-                if (-not $Identity -and -not $script:Touched.Count) {
+                if (-not $Identity -and ($script:TouchedSkipped -gt 0 -or -not $script:Touched.Count)) {
                     $first = $records | Select-Object -First 1
+                    $journalDamaged = ($script:TouchedSkipped -gt 0)
                     $context.NextSteps = @(('The backup of batch {0} is {1}: it holds the original values of every object of the batch.' -f $short, $context.Source.Path),
                         'If you know that an object was converted by this batch, roll it back on its own (run the Preview, then the same command with -Mode Apply):',
                         ((Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $short) + ' -Identity ' + (ConvertTo-PraLiteral ([string](Get-PraValue $first 'SamAccountName' 'user')))),
                         'Otherwise restore the attributes of the objects from that backup file by hand (the backups are the only way back), or copy the original State file and its .sha256 file back into the batch folder and run the same Recover again.')
+                    if ($journalDamaged) { $context.NextSteps = @(('The journal of batch {0} has {1} line(s) that cannot be read: it may not name every object that the batch changed, so the rollback is not guessed.' -f $short, $script:TouchedSkipped)) + @($context.NextSteps) }
                     $context.NextOnFailure = $true; $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+                    if ($journalDamaged) { throw ('Recover of batch {0} cannot go on: its AD proof is partial but unusable ({1}) and {2} line(s) of its journal cannot be read, so the objects that the batch wrote cannot be told for certain. Nothing was changed.' -f $short, $sourceProof.Reason, $script:TouchedSkipped) }
                     throw ('Recover of batch {0} cannot go on: its AD proof is partial but unusable ({1}) and its journal lists no object that was written. Nothing was changed.' -f $short, $sourceProof.Reason)
                 }
                 if ($Identity) { foreach ($record in $records) { [void]$script:Touched.Add([string]$record.ObjectGuid) } }
@@ -1565,6 +1598,19 @@ try {
         Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { Invoke-PraRetentionCheck -Context $context -Rows $cloudRows }
         else { Invoke-PraCloudPhase -Context $context -Rows $cloudRows -Act $cloudAction }
+        # Each grant checked the backup cheaply; a cloud-only run that sent at least one ends with one complete check, so that it never ends without it.
+        if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and [int](Get-PraValue $context 'GrantsSent' 0) -gt 0) {
+            try {
+                Assert-PraReceipt -Context $context -Receipt $context.Source -Full
+                Write-PraItem -Context $context -Status Ok -Icon Backup -Text ('Backup of the batch checked in full after {0} permission grant(s)' -f [int]$context.GrantsSent)
+            }
+            catch {
+                $context.NextSteps = @('The backup of this batch changed while the shared mailbox permissions were granted. Check the Backups folder of this server (nobody should write there during a run), then run the same command again, it reads the permissions first and grants only what is missing:',
+                    (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $(if ($script:PackageArgument) { $script:PackageArgument } elseif ($Batch) { $Batch } else { $context.BatchId }) -KeepFilters))
+                $context.NextOnFailure = $true
+                throw ('The final check of the backup failed after {0} grant(s): {1}' -f [int]$context.GrantsSent, $_.Exception.Message)
+            }
+        }
         $cloudErrors = @($context.Rows | Where-Object { Test-PraOrdinalEqual $_.CloudStatus 'Error' })
         $runErrors = @($cloudErrors | Where-Object { [bool](Get-PraValue $_ 'RunError' $false) }).Count
         $notExpected = $cloudErrors.Count - $runErrors
@@ -1792,7 +1838,7 @@ finally {
         catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}).' -f $_.Exception.Message) -Level Detail }
     }
     if (Get-Command Close-PraCloudSession -ErrorAction SilentlyContinue) {
-        try { Close-PraCloudSession -Context $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Cloud sign-out: $($_.Exception.Message)"; Source = 'Cloud' }) }
+        try { Close-PraCloudSession -Context $context } catch { Write-PraItem -Context $context -Status Warn -Text ('The sign-out of Microsoft 365 failed ({0}). What this run did is not affected. If a session is still open, close it: Disconnect-ExchangeOnline -Confirm:$false; Disconnect-MgGraph' -f ([string]$_.Exception.Message -replace '\s+', ' ')) }
     }
     # What a failed run proposes when no step set a more specific next step.
     try { $context.FallbackNext = @(Get-PraFallbackNext) }

@@ -2272,3 +2272,51 @@ Describe 'Release 3.2.0 - the console continues a partial batch, or a batch whos
         $reasons['Both-True-plain-False'] | Should -BeExactly 'AD part done, sync not confirmed: finish it here'
     }
 }
+
+Describe 'Release 3.2.0 - the console does not keep a failure to read a file, and Reload forgets what it kept (synthetic, no engine)' -Tag 'Release320c' {
+    It 'a batch file that is locked is told but not kept: the next refresh reads it; an answer about the content (not a batch) is kept while the file is unchanged' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $global:PraGuiLocked=$batch.Path
+        $lock=[IO.File]::Open($batch.Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { $locked=& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked } } finally { $lock.Dispose() }
+        $locked.Error | Should -Not -BeNullOrEmpty
+        $locked.Data | Should -BeNullOrEmpty
+        (& (Get-Module PRA.Gui) { $script:PraGuiBatchCache.ContainsKey($global:PraGuiLocked) }) | Should -BeFalse -Because 'a lock that ends must not stick'
+        $after=& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked }
+        $after.Error | Should -BeExactly ''
+        $after.Data.RecordCount | Should -Be 1
+        [object]::ReferenceEquals($after,(& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked })) | Should -BeTrue
+        $other=Join-Path $runtime.Root 'Backups\Batch-notabatch\Other-fixture.json'
+        Write-GuiTestJson $other @{SchemaVersion=2;Operation='Other';Records=@()}
+        $global:PraGuiLocked=$other
+        $first=& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked }
+        $first.Error | Should -Match 'Not a Convert, Recover or RecoverFinalize package'
+        [object]::ReferenceEquals($first,(& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked })) | Should -BeTrue -Because 'the content of the unchanged file will not answer differently'
+        Remove-Variable PraGuiLocked -Scope Global
+    }
+    It 'the sentence about a target CSV file is not kept when the file cannot be read (a lock), and is read again when the lock ends' {
+        $runtime=New-GuiTestRoot
+        $csv=Join-Path $runtime.Root 'targets-locked.csv'
+        Write-GuiTestFile $csv ("Identity`r`n"+((1..3 | ForEach-Object { 'user'+$_+'@contoso.invalid' }) -join "`r`n"))
+        $global:PraGuiCsv=$csv
+        $lock=[IO.File]::Open($csv,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { $locked=& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv } } finally { $lock.Dispose() }
+        $locked | Should -Not -Match '^ 3 rows\.$'
+        $locked.Trim().Length | Should -BeGreaterThan 0
+        (& (Get-Module PRA.Gui) { $script:PraGuiCsvCache.ContainsKey($global:PraGuiCsv) }) | Should -BeFalse
+        (& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }) | Should -BeExactly ' 3 rows.'
+        Remove-Variable PraGuiCsv -Scope Global
+    }
+    It 'Reload clears the caches of batch files, CSV files and hashes, and the Reload button does it before it reads the state' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $global:PraGuiLocked=$batch.Path
+        $null=& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked; $script:PraGuiCsvCache['x']=[pscustomobject]@{Stamp='s';Text='t'}; $script:PraGuiHashCache['y']=[pscustomobject]@{Stamp='s';Hash='h'} }
+        (& (Get-Module PRA.Gui) { $script:PraGuiBatchCache.Count + $script:PraGuiCsvCache.Count + $script:PraGuiHashCache.Count }) | Should -BeGreaterThan 2
+        & (Get-Module PRA.Gui) { Clear-PraGuiFileCache }
+        (& (Get-Module PRA.Gui) { $script:PraGuiBatchCache.Count + $script:PraGuiCsvCache.Count + $script:PraGuiHashCache.Count }) | Should -Be 0
+        Remove-Variable PraGuiLocked -Scope Global
+        (Get-Content -LiteralPath $script:GuiModule -Raw) | Should -Match "'BtnReload' \{ if \(-not \`$g\.Run\) \{ Clear-PraGuiFileCache; Update-PraGuiState \} \}"
+    }
+}
