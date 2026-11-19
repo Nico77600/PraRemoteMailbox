@@ -226,8 +226,6 @@ function Get-PraDataFingerprint {
 # every record and the SHA-256 of the files.
 $script:ReceiptFileHashEvery = 200
 
-# The members of the licence group are read once and shared by the objects of a run for this many seconds (Get-PraGroupMemberSet).
-$script:GroupMemberSeconds = 30
 $script:LogEscape = [regex]::new('[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\\"]')
 $script:MemoryClock = $null
 $script:MemoryText = ''
@@ -590,32 +588,6 @@ function Get-PraGroup {
     Assert-PraDomain $Context ([string]$groups[0].DistinguishedName)
     if ([guid]$groups[0].ObjectGUID -eq [guid]::Empty) { throw "Group without GUID: $Identity" }
     return $groups[0]
-}
-
-function Get-PraGroupMemberSet {
-    <#
-    .SYNOPSIS
-        The licence group and the set of its members, read once and kept for a short time instead of being read again for every object.
-    .DESCRIPTION
-        A group of thousands of members is a read of hundreds of kilobytes. The plan of an object and the check before the final restore only need to know whether the object
-        was in the group a moment ago, so the read is shared by the objects of a run: it is read again when it is older than the keeping time or after any write to a group
-        by this run. The check that comes with every write is not served from here: it reads the memberOf attribute of the object itself (Assert-PraCurrentState).
-    .OUTPUTS
-        An object with Group (the group, as Get-PraGroup returns it) and Members (a case-insensitive set of distinguished names).
-    #>
-    [CmdletBinding()]
-    param([hashtable]$Context, [Parameter(Mandatory)][string]$Identity)
-    $generation = [int](Get-PraValue $Context 'PraGroupGeneration' 0)
-    if (-not $Context.ContainsKey('PraGroupMembers')) { $Context['PraGroupMembers'] = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase) }
-    $cache = $Context['PraGroupMembers']
-    $entry = $null
-    if ($cache.TryGetValue($Identity, [ref]$entry) -and [int]$entry.Generation -eq [int]$generation -and $entry.Clock.Elapsed.TotalSeconds -lt $script:GroupMemberSeconds) { return $entry }
-    $group = Get-PraGroup $Context $Identity
-    $members = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($member in @($group.member)) { [void]$members.Add([string]$member) }
-    $entry = [pscustomobject]@{ Group = $group; Members = $members; Generation = $generation; Clock = [Diagnostics.Stopwatch]::StartNew() }
-    $cache[$Identity] = $entry
-    return $entry
 }
 
 function Resolve-PraGroup {
@@ -2170,8 +2142,6 @@ function Invoke-PraAdWrite {
     $Plan.Row.LastOperation = $Operation; $Plan.Row.Detail += " | attempt=$Operation"
     Write-PraJournal $Context $Plan.Record.ObjectGuid $Operation 'Started'
     Write-PraLog -Context $Context -Message "AD WRITE BEGIN | $Operation | DC=$($Context.Server) | GUID=$($Plan.Record.ObjectGuid) | backup=$($Receipt.Path)" -Level Detail
-    # A write to a group makes the members read earlier by this run out of date.
-    if ($Operation.EndsWith('ADGroupMember', [StringComparison]::OrdinalIgnoreCase)) { $Context['PraGroupGeneration'] = [int](Get-PraValue $Context 'PraGroupGeneration' 0) + 1 }
     # Any exception goes up to Invoke-PraAdBatch: no next object, no sync.
     & $Write | Out-Null
     $Plan.Row.ADApplied = $true
@@ -2247,7 +2217,7 @@ function Invoke-PraAdBatch {
         foreach ($plan in $Plans) {
             try {
                 $before = $plan.Record.Attributes; $groupState = $plan.Record.Licensing
-                # Every write re-reads the object first (Invoke-PraAdWrite), and the object is read again after the last one: no read of its own here.
+                # The reads of the object are those of Invoke-PraAdWrite (before every write) and the one after the last write.
                 $replace = @{}; $clear = New-Object 'Collections.Generic.List[string]'
                 foreach ($name in $plan.Kinds.Keys) {
                     if (Test-PraStateEqual $before[$name] $plan.Desired[$name]) { continue }
@@ -2478,9 +2448,12 @@ function Assert-PraFollowupState {
     $previous = Find-PraRecord $capturedIndex $planGuid
     if ($null -eq $verifiedRecord -or $null -eq $previous -or $verifiedIndex.Duplicates.Contains($planGuid) -or $capturedIndex.Duplicates.Contains($planGuid)) { throw 'Finalize: object not in the AD proof.' }
     if ($previous.Licensing.Enabled) {
-        $groupRead = Get-PraGroupMemberSet $Context ([string]$previous.Licensing.GroupGuid)
-        if (-not (Test-PraOrdinalIgnoreCaseEqual $groupRead.Group.DistinguishedName $previous.Licensing.GroupDN) -or
-            (-not (Test-PraOrdinalIgnoreCaseEqual $groupRead.Members.Contains([string]$Plan.User.DistinguishedName) ($previous.Licensing.DesiredMember)))) { throw 'Finalize: licence group membership differs from the AD proof.' }
+        # The group is read again each time (its name and GUID), without its members; whether the object is in it comes from the memberOf attribute of the object, read
+        # now on the domain controller of the proof (the plan does not carry it).
+        $group = Get-PraGroup $Context ([string]$previous.Licensing.GroupGuid) -WithoutMembers
+        $memberOf = Get-PraValue (Get-PraUser $Context $planGuid) 'memberOf' @()
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $group.DistinguishedName $previous.Licensing.GroupDN) -or
+            (-not (Test-PraOrdinalIgnoreCaseEqual (Test-PraOrdinalIn -IgnoreCase ([string]$group.DistinguishedName) @($memberOf)) ($previous.Licensing.DesiredMember)))) { throw 'Finalize: licence group membership differs from the AD proof.' }
     }
     # Already finished (replay): only the complete original state is accepted, it needs no write.
     $original = $Plan.Row.BackupRec

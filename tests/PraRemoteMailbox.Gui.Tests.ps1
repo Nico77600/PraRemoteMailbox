@@ -2320,3 +2320,233 @@ Describe 'Release 3.2.0 - the console does not keep a failure to read a file, an
         (Get-Content -LiteralPath $script:GuiModule -Raw) | Should -Match "'BtnReload' \{ if \(-not \`$g\.Run\) \{ Clear-PraGuiFileCache; Update-PraGuiState \} \}"
     }
 }
+
+Describe 'Release 3.2.0 - the console does not keep a checksum that it could not read (synthetic, no engine)' -Tag 'Release320c' {
+    It 'a locked .sha256 file is told but not kept: the next refresh reads it again; a real mismatch is kept until the stamp changes' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $global:PraGuiLocked=$batch.Path
+        $lock=[IO.File]::Open($batch.Path+'.sha256',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { $locked=& (Get-Module PRA.Gui) { Get-PraGuiBatchCoreProblem (Get-PraGuiBatchCore $global:PraGuiLocked) $global:PraGuiLocked } } finally { $lock.Dispose() }
+        $locked | Should -Match '^The checksum cannot be read: '
+        (& (Get-Module PRA.Gui) { (Get-PraGuiBatchCore $global:PraGuiLocked).Problem }) | Should -BeNullOrEmpty -Because 'a failure to read is not kept on the cached core'
+        (& (Get-Module PRA.Gui) { Get-PraGuiBatchCoreProblem (Get-PraGuiBatchCore $global:PraGuiLocked) $global:PraGuiLocked }) | Should -BeExactly '' -Because 'the lock ended'
+        [IO.File]::WriteAllText($batch.Path+'.sha256',('0'*64),$script:GuiEncoding)
+        (& (Get-Module PRA.Gui) { Get-PraGuiBatchCoreProblem (Get-PraGuiBatchCore $global:PraGuiLocked) $global:PraGuiLocked }) | Should -BeExactly 'SHA-256 mismatch.'
+        (& (Get-Module PRA.Gui) { (Get-PraGuiBatchCore $global:PraGuiLocked).Problem }) | Should -BeExactly 'SHA-256 mismatch.' -Because 'a real mismatch stays until the stamp changes'
+        Remove-Variable PraGuiLocked -Scope Global
+    }
+}
+
+Describe 'Release 3.2.0 - the console tells a finished batch from one that is still to do, a partial or pending one stands out, and a finished one never looks continuable (synthetic, no engine)' -Tag 'Release320d' {
+    BeforeAll {
+        function Write-GuiPhaseData {
+            param([string]$Folder, [string]$Action, [string]$Side, [string]$Status, [int]$Pending = 0, [string]$HandOff = '', [string]$Stamp = '20261116101010')
+            $record = [ordered]@{ SchemaVersion = 2; Kind = 'PhaseData'; Environment = 'GuiSynthetic'; BatchId = 'abcd1234'; ToolVersion = '3.2.0'; Truncated = $false
+                Phase = [ordered]@{ RunId = ('20261116_101010-' + [guid]::NewGuid().ToString('N')); Action = $Action; Phase = $Side; Mode = 'Apply'; Computer = 'SRV1'; Account = 'CONTOSO\admin'; Server = 'dc01'
+                    StartedUtc = '2026-11-16T10:10:10.0000000Z'; EndedUtc = '2026-11-16T10:20:10.0000000Z'; Status = $Status; ExitCode = 0; HandOff = $HandOff; Overrides = @(); Settings = [ordered]@{ Environment = 'GuiSynthetic' }; Steps = @()
+                    Counts = [ordered]@{ Success = 1; Error = 0; Pending = $Pending; Skipped = 0; Planned = 0 } }
+                Omitted = [ordered]@{ Objects = 0; JourneyLines = 0; Texts = 0; EventLines = 0 }
+                Objects = @([ordered]@{ ObjectGuid = [guid]::NewGuid().ToString(); Name = 'synthetic@example.invalid' }); Issues = @(); Warnings = @() }
+            $path = Join-Path $Folder ('PhaseData-{0}-{1}-{2}.json' -f $Stamp, ($Side -replace '[^0-9A-Za-z]', ''), [guid]::NewGuid().ToString('N').Substring(0, 8))
+            Write-GuiTestFile $path ($record | ConvertTo-Json -Depth 8 -Compress)
+            Write-GuiTestFile ($path + '.sha256') ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant())
+            $path
+        }
+        function Get-GuiRowOf {
+            param($Rows, [string]$BatchId)
+            foreach ($candidate in $Rows) { if ($candidate.BatchId -ceq $BatchId) { return , $candidate } }
+        }
+        function Get-GuiBatchRows {
+            param($Runtime, [string]$Action, [string]$Mode)
+            & (Get-Module PRA.Gui) {
+                param($Root, $Config, $Action, $Mode)
+                $saved = $script:Gui
+                try {
+                    $state = Read-PraGuiState $Root $Config
+                    $script:Gui = @{ Action = $Action; Mode = $Mode; State = $state; Detect = $null }
+                    @(Get-PraGuiBatchEntry)
+                }
+                finally { $script:Gui = $saved }
+            } $Runtime.Root $Runtime.Config $Action $Mode
+        }
+    }
+
+    It 'labels the batches of Continue a batch: finished, pending, stopped, partial and still to do, with the letter case of the phase data ignored; the ones that need attention come first, the finished ones last' {
+        $runtime = New-GuiTestRoot
+        $todo = New-GuiTestBatch -Runtime $runtime
+        $finished = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $finished.Folder 'convert' 'cLoUd' 'SUCCESS'
+        $both = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $both.Folder 'CONVERT' 'both' 'success'
+        $pending = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $pending.Folder 'Convert' 'BOTH' 'pENDING' -Pending 3
+        $stopped = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $stopped.Folder 'Convert' 'CLOUD' 'Failed'
+        $adOnly = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $adOnly.Folder 'Convert' 'AD' 'Pending' -HandOff 'Convert'
+        $garbage = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $garbage.Folder 'PhaseData-20261116101010-Cloud-1a2b3c4d.json') 'not json at all'
+        $partial = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestJson $partial.Proof @{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'GuiSynthetic'; Partial = $true; PlannedCount = 10; Records = @(1..3 | ForEach-Object { @{ ObjectGuid = [guid]::NewGuid().ToString(); Operation = 'Convert'; ADVerified = $true } }) }
+        $null = Write-GuiPhaseData $partial.Folder 'Convert' 'Cloud' 'Success'
+        $rows = Get-GuiBatchRows $runtime 'Convert' 'Continue'
+        $row = { param($batch) Get-GuiRowOf $rows $batch.Id }
+        $mark = [string][char]0xE73E
+        foreach ($case in @($todo, $adOnly, $garbage)) {
+            $r = & $row $case
+            $r.State | Should -BeExactly 'AD part done, cloud part to do'
+            $r.Group | Should -BeExactly 'To do'; $r.Level | Should -BeExactly 'Todo'; $r.Selectable | Should -BeTrue; $r.Finish | Should -BeFalse
+        }
+        foreach ($case in @($finished, $both)) {
+            $r = & $row $case
+            $r.State | Should -BeExactly 'Finished: cloud part done'
+            $r.Group | Should -BeExactly 'Finished'; $r.Level | Should -BeExactly 'Ok'; $r.Selectable | Should -BeFalse -Because 'a finished batch cannot be continued'; $r.Finish | Should -BeFalse; $r.Mark | Should -BeExactly $mark
+        }
+        $r = & $row $pending
+        $r.State | Should -BeExactly 'Cloud part pending: 3 objects not ready, run it again'
+        $r.Level | Should -BeExactly 'Warn'; $r.Group | Should -BeExactly 'To do'; $r.Selectable | Should -BeTrue
+        $r = & $row $stopped
+        $r.State | Should -BeExactly 'Cloud part stopped: run it again'
+        $r.Level | Should -BeExactly 'Warn'; $r.Selectable | Should -BeTrue
+        $r = & $row $partial
+        $r.State | Should -BeLike 'Partial: 3 of 10 converted * AD part*' -Because 'the cloud part of the objects that were converted does not make a partial batch finished'
+        $r.Level | Should -BeExactly 'Warn'; $r.Group | Should -BeExactly 'To do'; $r.Selectable | Should -BeTrue
+        $order = @($rows | ForEach-Object { $_.BatchId })
+        $position = { param($batch) [array]::IndexOf($order, $batch.Id) }
+        foreach ($attention in @($pending, $stopped, $partial)) { foreach ($plain in @($todo, $adOnly, $garbage)) { (& $position $attention) | Should -BeLessThan (& $position $plain) -Because 'a pending, stopped or partial batch comes before a batch that is simply to do' } }
+        foreach ($done in @($finished, $both)) { foreach ($other in @($todo, $pending, $stopped, $partial, $adOnly, $garbage)) { (& $position $done) | Should -BeGreaterThan (& $position $other) -Because 'finished batches are last' } }
+    }
+
+    It 'labels the batches of a rollback: a finished conversion is still a batch to roll back, and says it is finished; a Recover whose cloud part is done says so and cannot be continued' {
+        $runtime = New-GuiTestRoot
+        $todo = New-GuiTestBatch -Runtime $runtime
+        $finished = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $finished.Folder 'Convert' 'Cloud' 'Success'
+        $rows = Get-GuiBatchRows $runtime 'Recover' 'New'
+        $r = Get-GuiRowOf $rows $todo.Id
+        $r.State | Should -BeExactly 'Can be rolled back'; $r.Selectable | Should -BeTrue; $r.Group | Should -BeExactly 'To do'
+        $r = Get-GuiRowOf $rows $finished.Id
+        $r.State | Should -BeExactly 'Finished · can be rolled back'; $r.Selectable | Should -BeTrue; $r.Group | Should -BeExactly 'Finished'
+        $runtime = New-GuiTestRoot
+        $plain = New-GuiTestBatch -Runtime $runtime -Operation 'Recover'
+        $handed = New-GuiTestBatch -Runtime $runtime -Operation 'Recover'
+        $null = Write-GuiPhaseData $handed.Folder 'RECOVER' 'cloud' 'Pending' -HandOff 'Finalize'
+        $waiting = New-GuiTestBatch -Runtime $runtime -Operation 'Recover'
+        $null = Write-GuiPhaseData $waiting.Folder 'Recover' 'Cloud' 'Pending' -Pending 2
+        $rows = Get-GuiBatchRows $runtime 'Recover' 'Continue'
+        $r = Get-GuiRowOf $rows $plain.Id
+        $r.State | Should -BeExactly 'AD rollback done, cloud part to do'; $r.Level | Should -BeExactly 'Todo'; $r.Selectable | Should -BeTrue
+        $r = Get-GuiRowOf $rows $handed.Id
+        $r.State | Should -BeExactly 'Cloud part done: finalize on the AD server'; $r.Group | Should -BeExactly 'Finished'; $r.Selectable | Should -BeFalse
+        $r = Get-GuiRowOf $rows $waiting.Id
+        $r.State | Should -BeExactly 'Cloud part pending: 2 objects not ready, run it again'; $r.Level | Should -BeExactly 'Warn'; $r.Selectable | Should -BeTrue
+    }
+
+    It 'reads the progress of a batch from the last cloud-side run: a later failed run reopens a finished batch, a Finalize that succeeded is finished, and the header is read from the start of a large file only' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $progress = { param($folder, $operation) & (Get-Module PRA.Gui) { param($f, $o) Get-PraGuiBatchProgress $f $o } $folder $operation }
+        (& $progress $batch.Folder 'Convert').Kind | Should -BeExactly 'None'
+        $null = Write-GuiPhaseData $batch.Folder 'Convert' 'Cloud' 'Success' -Stamp '20261116101010'
+        (& $progress $batch.Folder 'convert').Kind | Should -BeExactly 'Finished'
+        $null = Write-GuiPhaseData $batch.Folder 'Convert' 'Cloud' 'Failed' -Stamp '20261116111111'
+        (& $progress $batch.Folder 'Convert').Kind | Should -BeExactly 'Stopped' -Because 'the last run decides'
+        $final = New-GuiTestBatch -Runtime $runtime -Operation 'RecoverFinalize'
+        $null = Write-GuiPhaseData $final.Folder 'FINALIZE' 'finalize' 'SUCCESS'
+        (& $progress $final.Folder 'RecoverFinalize').Kind | Should -BeExactly 'Finished'
+        (& $progress (Join-Path $runtime.Root 'missing-folder') 'Convert').Kind | Should -BeExactly 'None'
+        $large = New-GuiTestBatch -Runtime $runtime
+        $path = Write-GuiPhaseData $large.Folder 'Convert' 'Cloud' 'Success'
+        $text = [IO.File]::ReadAllText($path)
+        $objects = ((1..30000 | ForEach-Object { '{"ObjectGuid":"' + [guid]::NewGuid().ToString() + '","Name":"synthetic' + $_ + '@example.invalid","Detail":"' + ('x' * 100) + '"}' }) -join ',')
+        [IO.File]::WriteAllText($path, $text.Replace('"Objects":[', '"Objects":[' + $objects + ','), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($path + '.sha256', (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false)))
+        ([IO.FileInfo]$path).Length | Should -BeGreaterThan 4MB
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        (& $progress $large.Folder 'Convert').Kind | Should -BeExactly 'Finished'
+        $clock.Elapsed.TotalSeconds | Should -BeLessThan 5 -Because 'only the first bytes of the file are read, and the answer is kept while the file does not change'
+    }
+
+    It 'shows the sections in the window: To do is shown first for a list that continues a batch, Finished and All are one click away, a finished batch cannot be picked, and an empty section says why' {
+        $runtime = New-GuiTestRoot
+        $todo = New-GuiTestBatch -Runtime $runtime
+        $pending = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $pending.Folder 'Convert' 'Cloud' 'Pending' -Pending 1
+        $finished = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $finished.Folder 'Convert' 'Cloud' 'Success'
+        $onlyFinished = New-GuiTestRoot
+        $done = New-GuiTestBatch -Runtime $onlyFinished
+        $null = Write-GuiPhaseData $done.Folder 'Convert' 'Cloud' 'Success'
+        $probe = Join-Path $runtime.Root 'wpf-probe-sections.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$OnlyRoot,$OnlyConfig,$TodoId,$PendingId,$FinishedId)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$true; Role='Both' } }
+function New-SectionWindow($WindowRoot,$WindowConfig){
+  $window=New-PraGuiWindow -Root $WindowRoot -ConfigPath $WindowConfig -Version 'Synthetic' -PrerequisiteProbe $detect
+  $window.Form.Show()
+  Click $window 'BtnNext'
+  $window.Controls['T_Convert'].IsChecked=$true; Pump 80
+  $window.Controls['Mode_Continue'].IsChecked=$true; Pump 80
+  Click $window 'BtnReload'; Pump 80
+  return $window
+}
+function Ids($Window){ return @($Window.BatchRows | ForEach-Object { $_.BatchId }) }
+function RowOf($Window,[string]$Id){ return ,@($Window.BatchRows | Where-Object { $_.BatchId -ceq $Id })[0] }
+$g=New-SectionWindow $Root $Config
+try {
+ $c=$g.Controls
+ if($c.Bf_ToDo.Content -cne 'To do (2)' -or $c.Bf_Finished.Content -cne 'Finished (1)' -or $c.Bf_All.Content -cne 'All (3)'){throw ('Section counts: '+$c.Bf_ToDo.Content+' / '+$c.Bf_Finished.Content+' / '+$c.Bf_All.Content)}
+ if(-not $c.Bf_ToDo.IsChecked -or $c.BatchFilterBar.Visibility -ne 'Visible'){throw 'To do is not the section in force'}
+ $ids=@(Ids $g)
+ if($ids.Count -ne 2 -or $ids -contains $FinishedId -or $ids[0] -cne $PendingId -or $ids[1] -cne $TodoId){throw ('To do section: '+($ids -join ','))}
+ $pending=RowOf $g $PendingId
+ if($pending.Level -cne 'Warn' -or $pending.State -cnotmatch '^Cloud part pending: 1 object not ready'){throw ('Pending row: '+$pending.State+' / '+$pending.Level)}
+ $c.Bf_Finished.IsChecked=$true; Pump 80
+ $ids=@(Ids $g)
+ if($ids.Count -ne 1 -or $ids[0] -cne $FinishedId -or -not $c.Bf_Finished.IsChecked){throw ('Finished section: '+($ids -join ','))}
+ $row=$g.BatchRows[0]
+ if($row.Selectable -or $row.Group -cne 'Finished' -or $row.State -cne 'Finished: cloud part done'){throw ('Finished row: '+$row.State)}
+ if($c.BtnNext.IsEnabled){throw 'A finished batch must not let the operator go on'}
+ $c.Bf_All.IsChecked=$true; Pump 80
+ $ids=@(Ids $g)
+ if($ids.Count -ne 3 -or $ids[2] -cne $FinishedId){throw ('All section: '+($ids -join ','))}
+ $c.BatchList.SelectedItem=(RowOf $g $TodoId); Pump 80
+ if($null -eq $g.SelectedBatch -or $g.SelectedBatch.BatchId -cne $TodoId -or -not $c.BtnNext.IsEnabled){throw 'A batch that is to do can be picked'}
+ $c.Mode_New.IsChecked=$true; Pump 80; $c.Mode_Continue.IsChecked=$true; Pump 80
+ if(-not $c.Bf_ToDo.IsChecked -or @(Ids $g).Count -ne 2){throw 'Changing the mode puts the list back to To do'}
+} finally { $g.Form.Close() }
+$g=New-SectionWindow $OnlyRoot $OnlyConfig
+try {
+ $c=$g.Controls
+ if($g.BatchRows.Count -ne 0 -or $c.BatchEmpty.Text -cnotmatch '^Nothing is left to do here: 1 finished and hidden\. Click Finished or All to see it\.$'){throw ('Only finished: '+$g.BatchRows.Count+' / '+$c.BatchEmpty.Text)}
+ $c.Bf_Finished.IsChecked=$true; Pump 80
+ if($g.BatchRows.Count -ne 1 -or $c.BatchEmpty.Text){throw 'The finished batch is listed in its section'}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('SECTIONS-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config, '-OnlyRoot', $onlyFinished.Root, '-OnlyConfig', $onlyFinished.Config,
+            '-TodoId', $todo.Id, '-PendingId', $pending.Id, '-FinishedId', $finished.Id)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(180000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'SECTIONS-PASS'
+        } finally { $process.Dispose() }
+    }
+}

@@ -225,6 +225,7 @@ function Read-PraGuiBatch {
 # What the window knows of a batch file, read once and kept while the file and its .sha256 file keep their length and last write time: the window reads the state
 # of the backup folder at every refresh, and a batch of thousands of objects is a large file.
 $script:PraGuiBatchCache = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+$script:PraGuiPhaseCache = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
 
 function Get-PraGuiFileStamp {
     param([string]$Path)
@@ -271,7 +272,12 @@ function Get-PraGuiBatchCoreProblem {
         if ($null -eq $schema) { throw 'Unsupported schema.' }
         if (((Test-GuiOrdinal $Core.Operation 'RecoverFinalize') -and $schema -ne 2) -or (-not (Test-GuiOrdinalIn $schema @(1,2,3) -IgnoreCase))) { throw 'Unsupported schema.' }
         if ($Core.Data.FirstRecordMissing) { throw 'Empty or missing records.' }
-        if ($schema -ge 2 -and -not (Test-GuiOrdinal (ConvertTo-PraGuiHash ([IO.File]::ReadAllText($Path+'.sha256'))) (Get-PraGuiFileHash $Path) -IgnoreCase)) { throw 'SHA-256 mismatch.' }
+        if ($schema -ge 2) {
+            # A failure to read the .sha256 file or the batch file (a lock, a sharing violation) is told but not kept: the next refresh reads again. Only a real mismatch is kept.
+            try { $expected = ConvertTo-PraGuiHash ([IO.File]::ReadAllText($Path+'.sha256')); $actual = Get-PraGuiFileHash $Path }
+            catch { return ('The checksum cannot be read: ' + $_.Exception.Message) }
+            if (-not (Test-GuiOrdinal $expected $actual -IgnoreCase)) { throw 'SHA-256 mismatch.' }
+        }
     } catch { $problem = $_.Exception.Message }
     $Core.Problem = $problem
     return $problem
@@ -1346,7 +1352,7 @@ function Get-PraGuiCsvRowText {
 
 function Clear-PraGuiFileCache {
     <# Forgets what the window kept about batch files, target CSV files and their hashes: the next refresh reads them again (the Reload link). #>
-    $script:PraGuiBatchCache.Clear(); $script:PraGuiCsvCache.Clear(); $script:PraGuiHashCache.Clear()
+    $script:PraGuiBatchCache.Clear(); $script:PraGuiCsvCache.Clear(); $script:PraGuiHashCache.Clear(); $script:PraGuiPhaseCache.Clear()
 }
 
 function Get-PraGuiSourceText {
@@ -1466,6 +1472,64 @@ function Get-PraGuiPartialText {
     } catch { return '' }
 }
 
+function Read-PraGuiPhaseHeader {
+    <# The run header of a PhaseData file (action, side, status, counts, hand-off), read from the first 64 KB of the file (the header comes before the objects) and kept while the file does not change; $null when it cannot be read. The console only labels batches with it. #>
+    param([string]$Path)
+    $stamp=Get-PraGuiFileStamp $Path
+    $cached=$null
+    if ($script:PraGuiPhaseCache.TryGetValue($Path,[ref]$cached) -and (Test-GuiOrdinal $cached.Stamp $stamp)) { return $cached.Header }
+    $header=$null
+    try {
+        $stream=New-Object IO.FileStream($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+        try { $buffer=New-Object byte[] 65536; $read=$stream.Read($buffer,0,$buffer.Length) } finally { $stream.Dispose() }
+        $text=[Text.Encoding]::UTF8.GetString($buffer,0,$read).TrimStart([char]0xFEFF)
+        $cut=$text.IndexOf(',"Omitted":',[StringComparison]::Ordinal)
+        if ($cut -lt 0) { $cut=$text.IndexOf(',"Objects":',[StringComparison]::Ordinal) }
+        $json=if ($cut -gt 0) { $text.Substring(0,$cut)+'}' } elseif ($read -lt $buffer.Length) { $text } else { '' }
+        if ($json) {
+            $phase=Get-PraGuiValue ($json | ConvertFrom-PraJson) 'Phase' $null
+            if ($null -ne $phase) {
+                $counts=Get-PraGuiValue $phase 'Counts' $null
+                $header=[pscustomobject]@{ Action=[string](Get-PraGuiValue $phase 'Action' ''); Side=[string](Get-PraGuiValue $phase 'Phase' ''); Status=[string](Get-PraGuiValue $phase 'Status' ''); HandOff=[string](Get-PraGuiValue $phase 'HandOff' '')
+                    Pending=[int](Get-PraGuiValue $counts 'Pending' 0); Error=[int](Get-PraGuiValue $counts 'Error' 0); Success=[int](Get-PraGuiValue $counts 'Success' 0) }
+            }
+        }
+    } catch { Write-Verbose $_.Exception.Message }
+    $script:PraGuiPhaseCache[$Path]=[pscustomobject]@{ Stamp=$stamp; Header=$header }
+    return $header
+}
+
+function Get-PraGuiBatchProgress {
+    <#
+    .SYNOPSIS
+        What the PhaseData files of a batch folder say about the part of the operation that follows the AD part: Kind is None (no such phase data: the part is still to do), Finished
+        (its last run succeeded), HandedOver (its last run is done and waits for the Finalize of a rollback), Pending (its last run left objects not ready, Pending counts them) or
+        Stopped (its last run failed or was cancelled). The last run is the one whose file name (a UTC time first) comes last.
+    .PARAMETER Operation
+        Convert, Recover or RecoverFinalize (the operation of the batch).
+    #>
+    param([string]$Folder,[string]$Operation)
+    $none=[pscustomobject]@{ Kind='None'; Pending=0 }
+    if (-not $Folder -or -not (Test-Path -LiteralPath $Folder -PathType Container)) { return $none }
+    $finalize=(Test-GuiOrdinal $Operation 'RecoverFinalize' -IgnoreCase)
+    $action=if ($finalize) { 'Finalize' } else { [string]$Operation }
+    $sides=if ($finalize) { @('Finalize') } else { @('Cloud','Both') }
+    $last=$null
+    try {
+        $files=[string[]][IO.Directory]::GetFiles($Folder,'PhaseData-*.json')
+        [Array]::Sort([Array]$files,[Collections.IComparer][StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in $files) {
+            $header=Read-PraGuiPhaseHeader $file
+            if ($null -ne $header -and (Test-GuiOrdinal $header.Action $action -IgnoreCase) -and (Test-GuiOrdinalIn $header.Side $sides -IgnoreCase)) { $last=$header }
+        }
+    } catch { return $none }
+    if ($null -eq $last) { return $none }
+    if ($last.HandOff) { return [pscustomobject]@{ Kind='HandedOver'; Pending=0 } }
+    if (Test-GuiOrdinal $last.Status 'Success' -IgnoreCase) { return [pscustomobject]@{ Kind='Finished'; Pending=0 } }
+    if (Test-GuiOrdinal $last.Status 'Pending' -IgnoreCase) { return [pscustomobject]@{ Kind='Pending'; Pending=$last.Pending } }
+    return [pscustomobject]@{ Kind='Stopped'; Pending=$last.Pending }
+}
+
 function Get-PraGuiBatchEntry {
     <#
     .SYNOPSIS
@@ -1493,9 +1557,11 @@ function Get-PraGuiBatchEntry {
     $keyArray=[string[]]$keys.ToArray(); $itemArray=[object[]]$entries.ToArray()
     [Array]::Sort([Array]$keyArray,[Array]$itemArray,[Collections.IComparer][StringComparer]::Ordinal)
     [Array]::Reverse($itemArray)
+    $markDone=[string][char]0xE73E; $markClock=[string][char]0xE823; $markWarn=[string][char]0xE7BA
+    $ranked=@((New-Object 'Collections.Generic.List[object]'),(New-Object 'Collections.Generic.List[object]'),(New-Object 'Collections.Generic.List[object]'),(New-Object 'Collections.Generic.List[object]'))
     foreach ($item in $itemArray) {
         if (-not $item.Valid) {
-            $rows.Add((New-PraGuiRow @{ Title=('Unreadable {0}' -f (Split-Path $item.Folder -Leaf)); Sub=$item.Status; State='Invalid'; Level='Fail'; Selectable=$false; Glyph=[string][char]0xE7BA
+            $ranked[2].Add((New-PraGuiRow @{ Title=('Unreadable {0}' -f (Split-Path $item.Folder -Leaf)); Sub=$item.Status; State='Invalid'; Level='Fail'; Selectable=$false; Glyph=[string][char]0xE7BA; Group='Other'; Mark=$markWarn
                 Package=$false; Path=$item.Path; Environment=''; BatchId=''; Operation='' }))
             continue
         }
@@ -1503,25 +1569,54 @@ function Get-PraGuiBatchEntry {
         $shared=[int]$item.Data.SharedCount
         $proofPath=Join-Path $item.Folder ('State-'+$item.BatchId+'.json')
         $hasProof=Test-Path -LiteralPath $proofPath -PathType Leaf
-        $state_='Ready'; $level='Ok'; $selectable=$true; $finish=$false
+        $state_='Ready'; $level='Ok'; $selectable=$true; $finish=$false; $group='To do'; $mark=''
         $notApplied=Test-Path -LiteralPath (Join-Path $item.Folder 'NOT-APPLIED.txt') -PathType Leaf
+        $progress=if ($hasProof -or (Test-GuiOrdinal $item.Operation 'RecoverFinalize' -IgnoreCase)) { Get-PraGuiBatchProgress $item.Folder ([string]$item.Operation) } else { [pscustomobject]@{ Kind='None'; Pending=0 } }
         switch ($item.Operation) {
-            'Convert' { if ($needsProof) { if ($hasProof) {
-                        $state_='AD part done, cloud part to do'
+            'Convert' {
+                $partialText=if ($hasProof) { Get-PraGuiPartialText $proofPath } else { '' }
+                $finished=((Test-GuiOrdinal $progress.Kind 'Finished') -and -not $partialText)
+                if ($needsProof) {
+                    if (-not $hasProof) { $state_='No AD proof'; $level='Warn'; $selectable=$false; $group='Other'; $mark=$markWarn }
+                    elseif ($finished) { $state_='Finished: cloud part done'; $level='Ok'; $selectable=$false; $group='Finished'; $mark=$markDone }
+                    elseif (Test-GuiOrdinal $progress.Kind 'Pending') { $state_=('Cloud part pending: {0} not ready, run it again' -f (ConvertTo-PraGuiPlural ([int]$progress.Pending) 'object' 'objects')); $level='Warn'; $mark=$markClock }
+                    elseif (Test-GuiOrdinal $progress.Kind 'Stopped') { $state_='Cloud part stopped: run it again'; $level='Warn'; $mark=$markWarn }
+                    else {
+                        $state_='AD part done, cloud part to do'; $level='Todo'
                         $why=Get-PraGuiFinishReason $item
-                        if ($why) { $state_=$why; $level='Warn'; $finish=$true }
-                    } else { $state_='No AD proof'; $level='Warn'; $selectable=$false } } else { $state_='Can be rolled back' }
-                if ($hasProof -and $selectable) { $partialText=Get-PraGuiPartialText $proofPath; if ($partialText) { $state_=$partialText+' · '+$state_; $level='Warn' } } }
-            'Recover' { if ($hasProof) { $state_='AD rollback done, cloud part to do' } else { $state_='No AD proof'; $level='Warn'; $selectable=$false } }
-            'RecoverFinalize' { $state_='Ready to finalize' }
+                        if ($why) { $state_=$why; $level='Warn'; $finish=$true; $mark=$markWarn }
+                    }
+                }
+                else {
+                    $state_='Can be rolled back'
+                    if ($finished) { $state_='Finished · can be rolled back'; $group='Finished'; $mark=$markDone }
+                    elseif (Test-GuiOrdinal $progress.Kind 'Pending') { $state_='Cloud part pending · can be rolled back'; $level='Warn'; $mark=$markClock }
+                }
+                if ($hasProof -and $selectable -and $partialText) { $state_=$partialText+' · '+$state_; $level='Warn'; $group='To do'; $mark=$markWarn }
+            }
+            'Recover' {
+                if (-not $hasProof) { $state_='No AD proof'; $level='Warn'; $selectable=$false; $group='Other'; $mark=$markWarn }
+                elseif (Test-GuiOrdinal $progress.Kind 'Finished') { $state_='Finished: cloud part done'; $level='Ok'; $selectable=$false; $group='Finished'; $mark=$markDone }
+                elseif (Test-GuiOrdinal $progress.Kind 'HandedOver') { $state_='Cloud part done: finalize on the AD server'; $level='Ok'; $selectable=$false; $group='Finished'; $mark=$markDone }
+                elseif (Test-GuiOrdinal $progress.Kind 'Pending') { $state_=('Cloud part pending: {0} not ready, run it again' -f (ConvertTo-PraGuiPlural ([int]$progress.Pending) 'object' 'objects')); $level='Warn'; $mark=$markClock }
+                elseif (Test-GuiOrdinal $progress.Kind 'Stopped') { $state_='Cloud part stopped: run it again'; $level='Warn'; $mark=$markWarn }
+                else { $state_='AD rollback done, cloud part to do'; $level='Todo' }
+            }
+            'RecoverFinalize' {
+                if (Test-GuiOrdinal $progress.Kind 'Finished') { $state_='Finalized: the directory is restored'; $level='Ok'; $selectable=$false; $group='Finished'; $mark=$markDone }
+                elseif (Test-GuiOrdinal $progress.Kind 'Stopped') { $state_='Finalize stopped: run it again'; $level='Warn'; $mark=$markWarn }
+                else { $state_='Ready to finalize'; $level='Todo' }
+            }
         }
-        if ($notApplied -and (Test-GuiOrdinalIn $item.Operation @('Convert','Recover'))) { $state_='Nothing was written to AD: not a batch to continue'; $level='Warn'; $selectable=$false; $finish=$false }
+        if ($notApplied -and (Test-GuiOrdinalIn $item.Operation @('Convert','Recover'))) { $state_='Nothing was written to AD: not a batch to continue'; $level='Warn'; $selectable=$false; $finish=$false; $group='Other'; $mark=$markWarn }
         $glyph=switch ($item.Operation) { 'Convert' { [string][char]0xE753 } 'Recover' { [string][char]0xE7A7 } default { [string][char]0xE930 } }
         $label=if (Test-GuiOrdinal $item.Operation 'RecoverFinalize') { 'Finalize' } else { [string]$item.Operation }
         $sub='{0}, {1} shared · environment {2} · {3}' -f (ConvertTo-PraGuiPlural $recordCount 'mailbox' 'mailboxes'),$shared,$item.Environment,(Split-Path $item.Folder -Leaf)
-        $rows.Add((New-PraGuiRow @{ Title=('{0} · {1}' -f $label,(Format-PraGuiDate (Get-PraGuiBatchCreated $item))); Sub=$sub; State=$state_; Level=$level; Selectable=$selectable; Glyph=$glyph
+        $rank=if (Test-GuiOrdinal $group 'Finished') { 3 } elseif (Test-GuiOrdinal $group 'Other') { 2 } elseif (Test-GuiOrdinalIn $level @('Warn','Fail')) { 0 } else { 1 }
+        $ranked[$rank].Add((New-PraGuiRow @{ Title=('{0} · {1}' -f $label,(Format-PraGuiDate (Get-PraGuiBatchCreated $item))); Sub=$sub; State=$state_; Level=$level; Selectable=$selectable; Glyph=$glyph; Group=$group; Mark=$mark
             Package=$false; Path=$item.Path; Environment=$item.Environment; BatchId=$item.BatchId; Operation=[string]$item.Operation; Finish=$finish }))
     }
+    foreach ($list in $ranked) { foreach ($row in $list) { $rows.Add($row) } }
     # Transfer packages waiting in the Inbox.
     if ($kind -and (Get-Command Get-PraTransferPackage -ErrorAction SilentlyContinue)) {
         $inbox=Join-Path $state.Config.Storage.BackupFolder 'Inbox'
@@ -1529,7 +1624,7 @@ function Get-PraGuiBatchEntry {
             foreach ($file in @(Get-ChildItem -LiteralPath $inbox -File -Filter '*.zip' -ErrorAction SilentlyContinue)) {
                 $package=Get-PraGuiPackageInfo $file.FullName
                 if ([bool](Get-PraGuiValue $package 'Pending' $false)) {
-                    $rows.Insert(0,(New-PraGuiRow @{ Title=('Package '+$file.Name); Sub='Checking the checksums; the window stays usable.'; State='Checking...'; Level='Info'; Selectable=$false; Glyph=[string][char]0xE8B7; Package=$true; Path=$file.FullName; Environment=''; BatchId=''; Operation='' }))
+                    $rows.Insert(0,(New-PraGuiRow @{ Title=('Package '+$file.Name); Sub='Checking the checksums; the window stays usable.'; State='Checking...'; Level='Info'; Selectable=$false; Glyph=[string][char]0xE8B7; Group='To do'; Mark=''; Package=$true; Path=$file.FullName; Environment=''; BatchId=''; Operation='' }))
                     continue
                 }
                 $fits=$package.Valid -and (Test-GuiOrdinal $package.Kind $kind)
@@ -1538,7 +1633,7 @@ function Get-PraGuiBatchEntry {
                     Title=$(if ($package.Valid) { 'Package · {0} · {1}' -f $package.Kind,(Format-PraGuiDate ([datetime]::Parse([string]$package.CreatedUtc,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind).ToLocalTime())) } else { 'Package ' + $file.Name })
                     Sub=$(if ($package.Valid) { '{0} · {1:n1} MB · environment {2}' -f $file.Name,($file.Length/1MB),$package.Environment } else { $package.Error })
                     State=$(if ($package.Valid) { 'Checksums verified' } else { 'Invalid' }); Level=$(if ($package.Valid) { 'Ok' } else { 'Fail' }); Selectable=[bool]$fits
-                    Glyph=[string][char]0xE8B7; Package=$true; Path=$file.FullName; Environment=$(if ($package.Valid) { [string]$package.Environment } else { '' }); BatchId=''; Operation='' }))
+                    Glyph=[string][char]0xE8B7; Group=$(if ($package.Valid) { 'To do' } else { 'Other' }); Mark=$(if ($package.Valid) { '' } else { [string][char]0xE7BA }); Package=$true; Path=$file.FullName; Environment=$(if ($package.Valid) { [string]$package.Environment } else { '' }); BatchId=''; Operation='' }))
             }
         }
     }
@@ -1723,24 +1818,46 @@ function Update-PraGuiEnvLock {
     else { $g.EnvLock=$null }
 }
 
+function Get-PraGuiBatchFilter {
+    <# The section of the batch list in force: the one the operator picked (ToDo, Finished or All), else To do for the lists that continue a batch or finalize a rollback (a finished batch has nothing left to do) and All for the others. #>
+    $g=$script:Gui
+    if ($g.BatchFilter) { return [string]$g.BatchFilter }
+    if (((Test-GuiOrdinal $g.Mode 'Continue' -IgnoreCase) -and (Test-GuiOrdinalIn $g.Action @('Convert','Recover') -IgnoreCase)) -or (Test-GuiOrdinal $g.Action 'Finalize' -IgnoreCase)) { return 'ToDo' }
+    return 'All'
+}
+
 function Update-PraGuiBatchList {
-    <# Rebuilds the list of batches and packages for the current task, keeping the selection when the entry is still there. #>
+    <# Rebuilds the list of batches and packages for the current task: the section in force (To do, Finished or All), the batches that need attention first and the finished ones last; keeps the selection when the entry is still there. #>
     $g=$script:Gui; $c=$g.Controls
     $keep=if ($g.SelectedBatch) { [string]$g.SelectedBatch.Path } else { '' }
+    $entries=@(Get-PraGuiBatchEntry)
+    $finishedCount=@($entries | Where-Object { Test-GuiOrdinal $_.Group 'Finished' }).Count
+    $todoCount=$entries.Count - $finishedCount
+    $filter=Get-PraGuiBatchFilter
     $g.Updating++
     try {
         $g.BatchRows.Clear()
         $selected=$null
-        foreach ($row in @(Get-PraGuiBatchEntry)) {
+        foreach ($row in $entries) {
+            $isFinished=(Test-GuiOrdinal $row.Group 'Finished')
+            if ((Test-GuiOrdinal $filter 'ToDo') -and $isFinished) { continue }
+            if ((Test-GuiOrdinal $filter 'Finished') -and -not $isFinished) { continue }
             $g.BatchRows.Add($row)
             if ($keep -and (Test-GuiOrdinal $row.Path $keep -IgnoreCase) -and $row.Selectable) { $selected=$row }
         }
         if ($selected) { $c.BatchList.SelectedItem=$selected } else { $c.BatchList.SelectedItem=$null }
         $g.SelectedBatch=$selected
+        $c.Bf_ToDo.Content=('To do ({0})' -f $todoCount); $c.Bf_Finished.Content=('Finished ({0})' -f $finishedCount); $c.Bf_All.Content=('All ({0})' -f $entries.Count)
+        $c.Bf_ToDo.IsChecked=(Test-GuiOrdinal $filter 'ToDo'); $c.Bf_Finished.IsChecked=(Test-GuiOrdinal $filter 'Finished'); $c.Bf_All.IsChecked=(Test-GuiOrdinal $filter 'All')
+        $c.BatchFilterBar.Visibility=Get-PraGuiVisibility ($entries.Count -gt 0)
         Update-PraGuiEnvLock
     } finally { $g.Updating-- }
     $folder=if ($g.State.Config) { [string]$g.State.Config.Storage.BackupFolder } else { '' }
-    $c.BatchEmpty.Text=$(if ($g.BatchRows.Count -eq 0) { 'Nothing found in {0}. Import a transfer package, or copy a batch folder there and click Reload.' -f $folder } else { '' })
+    $c.BatchEmpty.Text=$(
+        if ($entries.Count -eq 0) { 'Nothing found in {0}. Import a transfer package, or copy a batch folder there and click Reload.' -f $folder }
+        elseif ($g.BatchRows.Count -eq 0 -and (Test-GuiOrdinal $filter 'ToDo')) { 'Nothing is left to do here: {0} finished and hidden. Click Finished or All to see {1}.' -f $finishedCount,$(if ($finishedCount -eq 1) { 'it' } else { 'them' }) }
+        elseif ($g.BatchRows.Count -eq 0) { 'No finished batch here yet. Click To do or All.' }
+        else { '' })
 }
 
 function Update-PraGuiTaskView {
@@ -1771,7 +1888,7 @@ function Update-PraGuiTaskView {
         $c.SourceInfo.Text=$(if ((Test-GuiOrdinal $source 'Csv' -IgnoreCase) -and (Get-PraGuiField 'Csv')) { $text[1] } else { '' })
     }
     $c.BatchHelp.Text=switch ($action) {
-        'Convert' { 'Batches and packages found for this environment folder. Pick the one to continue; greyed ones have nothing to do in the cloud. A batch marked "finish it here" is missing its sync or its package: it is finished on this server, and the directory is not changed again.' }
+        'Convert' { 'Batches and packages found for this environment folder, those that need attention first. Pick the one to continue; the Finished ones are done and cannot be continued, and the greyed ones have nothing to do in the cloud. A batch marked "finish it here" is missing its sync or its package: it is finished on this server, and the directory is not changed again.' }
         'Recover' { if ((Test-GuiOrdinal $g.Mode 'New' -IgnoreCase)) { 'Pick the conversion batch to roll back.' } else { 'Pick the rollback to continue in the cloud.' } }
         'Finalize' { 'Pick the Finalize package to complete. A package appears when the cloud part of a rollback asks for a final AD restore.' }
         default { '' }
@@ -3191,7 +3308,7 @@ function Select-PraGuiTask {
     param([string]$Action)
     $g=$script:Gui
     if ($g.Run) { return }
-    $g.Action=$Action; $g.Mode='New'; $g.SelectedBatch=$null
+    $g.Action=$Action; $g.Mode='New'; $g.SelectedBatch=$null; $g.BatchFilter=''
     Update-PraGuiEnvLock
     Reset-PraGuiPreview
     $g.Controls.TaskError.Text=''
@@ -3251,7 +3368,7 @@ function Invoke-PraGuiClick {
                     }
                     4 { if ($g.LastRun) { Show-PraGuiPage 5 } }
                     5 {
-                        $g.Action=''; $g.Mode='New'; $g.SelectedBatch=$null; $g.Model=$null; $g.LastRun=$null
+                        $g.Action=''; $g.Mode='New'; $g.SelectedBatch=$null; $g.BatchFilter=''; $g.Model=$null; $g.LastRun=$null
                         Update-PraGuiEnvLock; Reset-PraGuiPreview
                         Show-PraGuiPage 2
                     }
@@ -3281,8 +3398,14 @@ function Invoke-PraGuiChoice {
     if (-not $g -or $g.Updating -gt 0) { return }
     if ($Name.StartsWith('Mode_',[StringComparison]::Ordinal)) {
         if ($g.Run) { return }
-        $g.Mode=$Name.Substring(5); $g.SelectedBatch=$null
+        $g.Mode=$Name.Substring(5); $g.SelectedBatch=$null; $g.BatchFilter=''
         Update-PraGuiEnvLock; Reset-PraGuiPreview; Update-PraGuiBatchList; Update-PraGuiView
+        return
+    }
+    if ($Name.StartsWith('Bf_',[StringComparison]::Ordinal)) {
+        if ($g.Run) { return }
+        $g.BatchFilter=$Name.Substring(3)
+        Update-PraGuiBatchList; Update-PraGuiView
         return
     }
     if ($Name.StartsWith('Fl_',[StringComparison]::Ordinal)) { $g.Filter=$Name.Substring(3); $g.VerView.Refresh(); return }
@@ -3341,7 +3464,7 @@ function New-PraGuiWindow {
         Form=$form; Controls=$controls; Timer=$timer; Root=[IO.Path]::GetFullPath($Root); ConfigPath=$ConfigPath; InitialConfigPath=$ConfigPath
         PkgCache=@{}; PkgQueue=(New-Object 'Collections.Generic.List[object]'); PkgJob=$null
         State=$null; Run=$null; OuLookup=$null; IdLookup=$null; IdentityProbe=$IdentityProbe; GroupProbe=$GroupProbe; Pending=$null; LastResult=$null; LastRun=$null; Model=$null; Updating=1; InTick=$false; Page=1
-        Action=''; Mode='New'; SelectedBatch=$null; EnvLock=$null; EnvSaved=$null; Defaults=$null; Detect=$null; Probe=$probe; NetProbe=$netProbe; NetSeconds=$NetworkSeconds; NetJob=$null; NetResult=$null
+        Action=''; Mode='New'; SelectedBatch=$null; BatchFilter=''; EnvLock=$null; EnvSaved=$null; Defaults=$null; Detect=$null; Probe=$probe; NetProbe=$netProbe; NetSeconds=$NetworkSeconds; NetJob=$null; NetResult=$null
         SyncProbe=$syncProbe; SyncSeconds=$SyncSeconds; SyncJob=$null; SyncResult=$null
         Previewed=$false; PreviewError=''; Filter='All'; HasFinalize=$false; KnownEnvironments=@()
         Lines=(New-Object 'Collections.ObjectModel.ObservableCollection[object]')

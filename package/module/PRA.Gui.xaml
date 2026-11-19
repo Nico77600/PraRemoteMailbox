@@ -238,13 +238,19 @@
           <TextBlock Text="{Binding Sub, Mode=OneWay}" Style="{StaticResource Hint}"/>
         </StackPanel>
         <Border x:Name="Pl" Grid.Column="2" Style="{StaticResource Pill}" Background="{DynamicResource PraInfoBg}">
-          <TextBlock x:Name="PlT" Text="{Binding State, Mode=OneWay}" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+          <StackPanel Orientation="Horizontal">
+            <TextBlock x:Name="PlG" FontFamily="Segoe Fluent Icons, Segoe MDL2 Assets" Text="{Binding Mark, Mode=OneWay}" FontSize="12" Margin="0,0,5,0" VerticalAlignment="Center" Foreground="{DynamicResource TextFillColorSecondaryBrush}">
+              <TextBlock.Style><Style TargetType="TextBlock"><Style.Triggers><DataTrigger Binding="{Binding Text, RelativeSource={RelativeSource Self}}" Value=""><Setter Property="Visibility" Value="Collapsed"/></DataTrigger></Style.Triggers></Style></TextBlock.Style>
+            </TextBlock>
+            <TextBlock x:Name="PlT" Text="{Binding State, Mode=OneWay}" FontSize="12" FontWeight="SemiBold" Foreground="{DynamicResource TextFillColorSecondaryBrush}"/>
+          </StackPanel>
         </Border>
       </Grid>
       <DataTemplate.Triggers>
-        <DataTrigger Binding="{Binding Level}" Value="Ok"><Setter TargetName="Pl" Property="Background" Value="{DynamicResource PraSuccessBg}"/><Setter TargetName="PlT" Property="Foreground" Value="{DynamicResource PraSuccess}"/></DataTrigger>
-        <DataTrigger Binding="{Binding Level}" Value="Warn"><Setter TargetName="Pl" Property="Background" Value="{DynamicResource PraCautionBg}"/><Setter TargetName="PlT" Property="Foreground" Value="{DynamicResource PraCaution}"/></DataTrigger>
-        <DataTrigger Binding="{Binding Level}" Value="Fail"><Setter TargetName="Pl" Property="Background" Value="{DynamicResource PraCriticalBg}"/><Setter TargetName="PlT" Property="Foreground" Value="{DynamicResource PraCritical}"/></DataTrigger>
+        <DataTrigger Binding="{Binding Level}" Value="Todo"><Setter TargetName="Pl" Property="Background" Value="{DynamicResource PraAccentSoft}"/><Setter TargetName="PlT" Property="Foreground" Value="{DynamicResource PraBrandText}"/><Setter TargetName="PlG" Property="Foreground" Value="{DynamicResource PraBrandText}"/></DataTrigger>
+        <DataTrigger Binding="{Binding Level}" Value="Ok"><Setter TargetName="Pl" Property="Background" Value="{DynamicResource PraSuccessBg}"/><Setter TargetName="PlT" Property="Foreground" Value="{DynamicResource PraSuccess}"/><Setter TargetName="PlG" Property="Foreground" Value="{DynamicResource PraSuccess}"/></DataTrigger>
+        <DataTrigger Binding="{Binding Level}" Value="Warn"><Setter TargetName="Pl" Property="Background" Value="{DynamicResource PraCautionBg}"/><Setter TargetName="PlT" Property="Foreground" Value="{DynamicResource PraCaution}"/><Setter TargetName="PlG" Property="Foreground" Value="{DynamicResource PraCaution}"/></DataTrigger>
+        <DataTrigger Binding="{Binding Level}" Value="Fail"><Setter TargetName="Pl" Property="Background" Value="{DynamicResource PraCriticalBg}"/><Setter TargetName="PlT" Property="Foreground" Value="{DynamicResource PraCritical}"/><Setter TargetName="PlG" Property="Foreground" Value="{DynamicResource PraCritical}"/></DataTrigger>
       </DataTemplate.Triggers>
     </DataTemplate>
 
@@ -742,6 +748,12 @@
                   <TextBlock x:Name="BatchHelp" Style="{StaticResource Hint}" FontSize="13" VerticalAlignment="Center"/>
                   <Button x:Name="BtnImport" Grid.Column="1" Content="Import package&#x2026;" Margin="12,0,0,0"/>
                 </Grid>
+                <WrapPanel x:Name="BatchFilterBar" Margin="0,0,0,4">
+                  <TextBlock Text="Show" Style="{StaticResource RowLabel}" VerticalAlignment="Center" Margin="0,0,10,6"/>
+                  <RadioButton x:Name="Bf_ToDo" GroupName="BatchFilter" Style="{StaticResource Seg}" Content="To do"/>
+                  <RadioButton x:Name="Bf_Finished" GroupName="BatchFilter" Style="{StaticResource Seg}" Content="Finished"/>
+                  <RadioButton x:Name="Bf_All" GroupName="BatchFilter" Style="{StaticResource Seg}" Content="All"/>
+                </WrapPanel>
                 <ListBox x:Name="BatchList" Style="{StaticResource PlainList}" ItemContainerStyle="{StaticResource BatchItem}" ItemTemplate="{StaticResource BatchT}" MaxHeight="270"/>
                 <TextBlock x:Name="BatchEmpty" Style="{StaticResource NoEmpty}" FontSize="13" Margin="0,4,0,0"/>
               </StackPanel>

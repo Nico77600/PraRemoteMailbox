@@ -437,6 +437,8 @@ Press **What next? →**. The page shows the **name of the package**. The tool m
 
 ![The list with the package selected. Number 1: the line of the package. Number 2: the pink pill Phase: Cloud, in the card What will happen on this server. Number 3: the button to continue](images/console-task-package-selected-light.png)
 
+The list shows the work that is **still to do**. A line with an orange pill needs your attention: **Partial**, **Cloud part pending** or **Cloud part stopped**. A batch that is **Finished** is done. It is hidden, and you cannot pick it. Press **Finished** or **All**, above the list, to see it.
+
 **You should see:** the line turns pink. At the bottom of the **Task** page, in the card **What will happen on this server**, a pink pill says **Phase: Cloud** (number 2 in the picture).
 
 **If not:** if you see no pill, click a big card first: the card appears at the bottom after that. A red line **Invalid** means the file is damaged or comes from another environment. Copy it again, with its `.sha256` file. Check that both servers have the same `Environment` in their settings file. If it still fails, stop and ask.
@@ -639,6 +641,8 @@ A **warning** is an orange word. It means "done, but read this". For example: *a
 On two servers, the **last** server writes a **global report**. It follows each person from the first server to the last one. For a move, the last server is the cloud server. For a rollback, it is the directory server after **Complete a rollback**. If no Finalize package was needed, it is the cloud server.
 
 ![The global report: the times of each server, then every person from end to end](images/report-global-light.png)
+
+The page opens fast, even with thousands of people. The totals are at the top. The people are in a list. Type a name in the search box, or pick **failed** or **pending** in the filter. Click a person to see the **journey**: what each server did, step by step, and the result. The errors and warnings are at the bottom, in pages. Next to the page there are three CSV files. Open them in Excel. One has a line per person. One has a line per step. One has a line per error or warning. **Nothing is left out.** A limit may leave something out, but this is rare. Then a card at the top says so. Its title is **Not everything was kept**. It tells you what is missing, how many, and where to find the full log.
 
 <!-- icon: lifebuoy -->
 ## 7. When something goes wrong

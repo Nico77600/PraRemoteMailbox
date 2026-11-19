@@ -419,16 +419,18 @@ function Get-PraFallbackNext {
     return @('Fix the problem named above, then run the same command again:', $same)
 }
 
-function Get-PraJsonOperation {
+function Get-PraJsonHeader {
     <#
     .SYNOPSIS
-        The Operation field of a batch JSON file, read without parsing the whole file.
+        Some scalar fields of a batch JSON file (Operation, BatchId, SourceBackupHash), read without parsing the whole file.
     .DESCRIPTION
-        A backup of thousands of objects is tens of megabytes; its Operation field is one of the first properties of the envelope.
-        The head of the file is read and the field is taken from it when only scalar properties come before it (a nested property of
-        the same name cannot be taken). Any other shape, or a file that cannot be read this way, is parsed in full as before.
+        A backup of thousands of objects is tens of megabytes; the scalar fields of its envelope come before its records. The head of the file is read and each field
+        is taken from it when only plain scalar properties (text without escapes, numbers, true, false, null) come before it, so that a nested property of the same name
+        is never taken. Any other shape, a field that is not there, or a file that cannot be read this way is parsed in full.
+    .OUTPUTS
+        An object with the requested fields (the whole parsed file when it had to be parsed).
     #>
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$Name)
     $head = ''
     try {
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
@@ -438,10 +440,34 @@ function Get-PraJsonOperation {
             $head = [Text.Encoding]::UTF8.GetString($buffer, 0, $count).TrimStart([char]0xFEFF)
         } finally { $stream.Dispose() }
     } catch { $head = '' }
-    $scalar = '(?:"(?:[^"\\]|\\[^u]|\\u[0-9a-fA-F]{4})*"|-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null)'
-    $match = [regex]::Match($head, '\A\s*\{(?:\s*"(?:[^"\\]|\\[^u]|\\u[0-9a-fA-F]{4})*"\s*:\s*' + $scalar + '\s*,)*\s*"Operation"\s*:\s*"([^"\\]*)"\s*[,}]')
-    if ($match.Success) { return $match.Groups[1].Value }
-    return [string](([IO.File]::ReadAllText($Path) | ConvertFrom-PraJson).Operation)
+    $values = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $open = [regex]::Match($head, '\A\s*\{')
+    if ($open.Success) {
+        $pair = [regex]::new('\G\s*"(?<n>[^"\\]*)"\s*:\s*(?:"(?<s>[^"\\]*)"|(?<x>-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null))\s*(?<end>,|\})')
+        $position = $open.Length
+        while ($true) {
+            $m = $pair.Match($head, $position)
+            if (-not $m.Success) { break }
+            $position = $m.Index + $m.Length
+            $key = $m.Groups['n'].Value
+            if (-not $values.ContainsKey($key)) { $values[$key] = $(if ($m.Groups['s'].Success) { $m.Groups['s'].Value } else { $m.Groups['x'].Value }) }
+            if (Test-PraOrdinalEqual $m.Groups['end'].Value '}') { break }
+        }
+    }
+    $header = [ordered]@{}
+    foreach ($field in $Name) {
+        if (-not $values.ContainsKey($field)) { return ([IO.File]::ReadAllText($Path) | ConvertFrom-PraJson) }
+        $header[$field] = $values[$field]
+    }
+    return [pscustomobject]$header
+}
+
+function Test-PraBatchSideFile {
+    <# True for the files of a batch folder that are not a batch file, by name: the proof (State-), the journal, the data of the global report (PhaseData-, PhaseEvents-) and any checksum file. #>
+    param([Parameter(Mandatory)][string]$Name)
+    if ($Name.EndsWith('.sha256', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    foreach ($prefix in @('State-', 'Journal-', 'PhaseData-', 'PhaseEvents-')) { if ($Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
 }
 
 function Get-PraBatchFile {
@@ -484,8 +510,8 @@ function Get-PraBatchFile {
     }
     $found = New-Object 'Collections.Generic.List[string]'
     foreach ($folder in $folders) {
-        foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not $_.Name.StartsWith('State-', [StringComparison]::OrdinalIgnoreCase) })) {
-            try { $operation = Get-PraJsonOperation $file.FullName } catch { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not (Test-PraBatchSideFile $_.Name) })) {
+            try { $operation = [string](Get-PraJsonHeader $file.FullName @('Operation')).Operation } catch { continue }
             # In a Finalize package only the manifest counts (the other JSON files are copies of the source batches).
             if ((Test-PraOrdinalIn $operation $Operations) -and ($folder.Name -match '^Batch-' -or (Test-PraOrdinalEqual $operation 'RecoverFinalize'))) { $found.Add($file.FullName) }
         }
@@ -625,6 +651,7 @@ function Get-PraFinalizeInput {
     }
     $context.Source = Import-PraBackup $context (Join-Path (Split-Path $path -Parent) $manifest.SourceBackupFile)
     $context.PhaseFolders = @(Split-Path $path -Parent)
+    if ($context.AllowMutation) { $context.PhaseWriteFolder = Split-Path $path -Parent }
     $context.Proof = Import-PraProof $context (Join-Path (Split-Path $path -Parent) $manifest.StateFile) $context.Source 'Recover'
     if (-not (Test-PraOrdinalIgnoreCaseEqual $context.Source.Hash $manifest.SourceBackupHash) -or -not (Test-PraOrdinalIgnoreCaseEqual $context.Proof.Hash $manifest.StateHash)) { throw 'Finalize package: manifest and proofs do not match.' }
     $records = @(Select-PraSourceRecord $context.Source); $seen = @{}
@@ -679,8 +706,14 @@ function Publish-PraTransferPackage {
     $context.HandOff = $Kind
     $phaseFolder = [string](Get-PraValue $context 'PhaseWriteFolder' '')
     if ($phaseFolder -and -not [bool](Get-PraValue $context 'PhaseDataSaved' $false)) {
-        try { $null = Save-PraPhaseData -Context $context -Folder $phaseFolder -HandOff $Kind; $context.PhaseDataSaved = $true }
+        $saved = ''
+        try { $saved = Save-PraPhaseData -Context $context -Folder $phaseFolder -HandOff $Kind; $context.PhaseDataSaved = $true }
         catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}): the package is complete, the other server will report this side as not available.' -f $_.Exception.Message) -Level Warning }
+        # The cloud phase of a Recover also leaves its data in the batch of the AD rollback, so that the console can tell that its cloud part is done.
+        if ($saved -and (Test-PraOrdinalIgnoreCaseEqual $Kind 'Finalize') -and $null -ne (Get-PraValue $context 'Proof' $null)) {
+            try { $null = Copy-PraPhaseFile -Path $saved -Destination (Split-Path $context.Proof.Path -Parent) }
+            catch { Write-PraLog -Context $context -Message ('The data of this phase could not be copied to the batch of the AD rollback ({0}).' -f $_.Exception.Message) -Level Detail }
+        }
     }
     try {
         $name = Get-PraTransferPackageName -Kind $Kind -Environment $context.Config.Environment -BatchId $BatchId
@@ -825,7 +858,7 @@ function Set-PraRowsAwaitCloud {
 }
 
 function Assert-PraBatchNotRolledBack {
-    <# A Convert batch that a Recover batch rolled back, or started to roll back, cannot be resumed: its objects are not converted any more (or not for certain), and a resume would hand over, or grant permissions, for a batch that no longer holds. #>
+    <# A Convert batch that a Recover batch rolled back, or started to roll back, cannot be resumed: its objects are not converted any more (or not for certain), and a resume would hand over, or grant permissions, for a batch whose conversion is undone. #>
     param([Parameter(Mandatory)][string[]]$ObjectGuid)
     $recover = Find-PraRecoverOfBatch -Context $context -SourceHash ([string]$context.Source.Hash) -ObjectGuid $ObjectGuid
     if ($null -eq $recover) { return }
@@ -1490,10 +1523,10 @@ try {
             $proofPath = ''
             if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover')) {
                 $batchFile = Get-PraBatchFile -Value $Batch -Operations @('Recover','Convert')
-                $batchData = [IO.File]::ReadAllText($batchFile) | ConvertFrom-PraJson
+                $batchData = Get-PraJsonHeader $batchFile @('Operation', 'BatchId')
                 if (Test-PraOrdinalEqual $batchData.Operation 'Recover') {
                     $proofPath = Join-Path (Split-Path $batchFile -Parent) ('State-' + $batchData.BatchId + '.json')
-                    $context.Source = Import-PraBackup $context (Find-PraConvertSource -Hash ([string]$batchData.SourceBackupHash))
+                    $context.Source = Import-PraBackup $context (Find-PraConvertSource -Hash ([string](Get-PraJsonHeader $batchFile @('SourceBackupHash')).SourceBackupHash))
                     $context.BatchId = Get-PraShortId $batchData.BatchId
                 }
                 elseif ($context.AllowMutation) { throw "Batch $Batch is a Convert batch: the cloud phase of a Recover needs the batch printed by its AD phase (it proves that AD was restored)." }
@@ -1505,10 +1538,10 @@ try {
                 $fromRecover = $false
                 if ($isCheck) {
                     # A Recover batch ID given to Check: the Convert batch that it rolled back is the source (as in the cloud phase of a Recover).
-                    $batchData = [IO.File]::ReadAllText($batchFile) | ConvertFrom-PraJson
+                    $batchData = Get-PraJsonHeader $batchFile @('Operation', 'BatchId')
                     if (Test-PraOrdinalEqual $batchData.Operation 'Recover') {
                         $fromRecover = $true
-                        $context.Source = Import-PraBackup $context (Find-PraConvertSource -Hash ([string]$batchData.SourceBackupHash))
+                        $context.Source = Import-PraBackup $context (Find-PraConvertSource -Hash ([string](Get-PraJsonHeader $batchFile @('SourceBackupHash')).SourceBackupHash))
                         $context.BatchId = Get-PraShortId ([string]$batchData.BatchId)
                         Write-PraItem -Context $context -Status Info -Text ('Batch {0} is a Recover batch: the Convert batch {1} that it rolled back is checked.' -f $context.BatchId, (Get-PraShortId ([string]$context.Source.Data.BatchId)))
                         if (-not (Test-PraOrdinalIgnoreCaseEqual $Expect 'Deprovisioned')) { Write-PraItem -Context $context -Status Warn -Text 'The default expectation is Provisioned; to check a rollback, give -Expect Deprovisioned.' }
@@ -1561,6 +1594,8 @@ try {
                 $context.Rows.Add($row)
             }
             $context.PhaseFolders = @(@(Split-Path $context.Source.Path -Parent) + $(if ($proofPath) { @(Split-Path $proofPath -Parent) } else { @() }))
+            # The cloud phase of a Convert keeps what it did in the batch folder, so that the console can tell a finished batch from one that is still to do.
+            if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { $context.PhaseWriteFolder = Split-Path $context.Source.Path -Parent }
             $convertedCount = $context.Rows.Count - $script:NotConverted.Count
             Send-PraPlanCount $convertedCount
             Write-PraItem -Context $context -Status Ok -Text ("Batch {0}: {1} object(s){2}" -f $context.BatchId, $convertedCount, $(if ($null -ne $context.Proof) { ', AD proof verified' } else { '' }))
@@ -1598,8 +1633,8 @@ try {
         Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { Invoke-PraRetentionCheck -Context $context -Rows $cloudRows }
         else { Invoke-PraCloudPhase -Context $context -Rows $cloudRows -Act $cloudAction }
-        # Each grant checked the backup cheaply; a cloud-only run that sent at least one ends with one complete check, so that it never ends without it.
-        if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and [int](Get-PraValue $context 'GrantsSent' 0) -gt 0) {
+        # Each grant checks the backup cheaply; a Convert that sent at least one (phase Cloud or Both) ends its grant work with one complete check.
+        if ($context.AllowMutation -and (Test-PraOrdinalIn $effectivePhase @('Cloud','Both') -IgnoreCase) -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and [int](Get-PraValue $context 'GrantsSent' 0) -gt 0) {
             try {
                 Assert-PraReceipt -Context $context -Receipt $context.Source -Full
                 Write-PraItem -Context $context -Status Ok -Icon Backup -Text ('Backup of the batch checked in full after {0} permission grant(s)' -f [int]$context.GrantsSent)

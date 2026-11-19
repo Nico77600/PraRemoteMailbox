@@ -29,6 +29,34 @@ BeforeAll {
     $global:PraGate.Package = Join-Path $global:PraGate.Root 'package-fixture'
     New-PraIntegrityFixture -SourcePackage $global:PraGate.Source -Destination $global:PraGate.Package -Changelog (Join-Path $global:PraGate.Release 'CHANGELOG.md')
     $env:PRA_GATE_NONET = 'SYNTHETIC-NO-NETWORK'
+    function global:Read-PraGlobalReportData {
+        # The data of a global report page decoded like the page does (gzip, base64, dictionary-indexed columns): Meta, Html, and one list of objects per dataset (Objects, Events, Issues).
+        param([Parameter(Mandatory)][string]$Path)
+        $html = [IO.File]::ReadAllText($Path, [Text.Encoding]::UTF8)
+        $metaMatch = [regex]::Match($html, '<script type="application/json" id="pra-meta">(.*?)</script>')
+        if (-not $metaMatch.Success) { throw 'pra-meta not found' }
+        $meta = $metaMatch.Groups[1].Value | ConvertFrom-Json -DateKind String
+        $sets = @{}
+        foreach ($kind in 'objects', 'events', 'issues') {
+            $fields = @($meta.$kind.fields)
+            $sets[$kind] = @{ Fields = $fields; Count = 0; Chunks = 0; Dict = @(for ($f = 0; $f -lt $fields.Count; $f++) { , (New-Object 'Collections.Generic.List[object]') }); Cols = @(for ($f = 0; $f -lt $fields.Count; $f++) { , (New-Object 'Collections.Generic.List[int]') }) }
+        }
+        foreach ($m in [regex]::Matches($html, '<script type="application/x-pra-chunk" data-kind="(\w+)" data-seq="(\d+)">([A-Za-z0-9+/=]*)</script>')) {
+            $set = $sets[$m.Groups[1].Value]
+            $reader = New-Object IO.StreamReader((New-Object IO.Compression.GZipStream((New-Object IO.MemoryStream (, [Convert]::FromBase64String($m.Groups[3].Value))), [IO.Compression.CompressionMode]::Decompress)), [Text.Encoding]::UTF8)
+            $chunk = $reader.ReadToEnd() | ConvertFrom-Json -AsHashtable -DateKind String
+            $reader.Dispose()
+            $set.Chunks++; $set.Count += [int]$chunk['n']
+            for ($f = 0; $f -lt $set.Fields.Count; $f++) { foreach ($v in $chunk['d'][$f]) { $set.Dict[$f].Add($v) }; $set.Cols[$f].AddRange([int[]]$chunk['c'][$f]) }
+        }
+        $lists = @{}
+        foreach ($kind in 'objects', 'events', 'issues') {
+            $set = $sets[$kind]; $list = New-Object 'Collections.Generic.List[object]'
+            for ($i = 0; $i -lt $set.Count; $i++) { $row = [ordered]@{}; for ($f = 0; $f -lt $set.Fields.Count; $f++) { $row[$set.Fields[$f]] = $set.Dict[$f][$set.Cols[$f][$i]] }; $list.Add([pscustomobject]$row) }
+            $lists[$kind] = $list
+        }
+        [pscustomobject]@{ Meta = $meta; Html = $html; Objects = $lists.objects; Events = $lists.events; Issues = $lists.issues; Chunks = [pscustomobject]@{ Objects = $sets.objects.Chunks; Events = $sets.events.Chunks; Issues = $sets.issues.Chunks } }
+    }
     $global:PraGate.AdSource = @'
 # SYNTHETIC fixture. No AD management assembly, provider, network or remoting.
 # System.DirectoryServices security descriptors below are created locally; never directory-bound.
@@ -3290,6 +3318,11 @@ function Get-PraGrantsApplied {
     if (-not $Context.ContainsKey('_PraGrantsApplied')) { $Context['_PraGrantsApplied']=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase) }
     return ,$Context['_PraGrantsApplied']
 }
+function Get-PraGrantsVerified {
+    param($Context)
+    if (-not $Context.ContainsKey('_PraGrantsVerified')) { $Context['_PraGrantsVerified']=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase) }
+    return ,$Context['_PraGrantsVerified']
+}
 function Get-PraGrantKey {
     param($Context,$Upn,$Right,$Trustee)
     return ($Upn+'|'+$Right+'|'+$Trustee)
@@ -4642,7 +4675,7 @@ Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single 
         [IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'tools\New-PraPackage.ps1')) | Should -Match 'ToolVersion'
         $literals=@(
             'package\Invoke-PraRemoteMailbox.ps1','package\PraRemoteMailbox.psm1','package\module\PRA.Common.psm1','package\module\PRA.Directory.psm1','package\module\PRA.Backup.psm1','package\module\PRA.Cloud.psm1'
-            'package\module\PRA.Gui.psm1','package\module\PRA.Gui.Directory.ps1','package\config\PraRemoteMailbox.config.psd1','package\templates\Report.template.html'
+            'package\module\PRA.Gui.psm1','package\module\PRA.Gui.Directory.ps1','package\config\PraRemoteMailbox.config.psd1','package\templates\Report.template.html','package\templates\GlobalReport.template.html'
             'tools\New-PraPackage.ps1','tools\Build-Documentation.ps1','tests\Invoke-TestGate.ps1','tests\IntegrityFixture.ps1'
             'tests\PackageIntegrity.Tests.ps1','tests\PraRemoteMailbox.Tests.ps1','tests\PraReport.Tests.ps1','tests\PraDocumentation.Tests.ps1','tools\New-DocumentationImages.ps1'
         )
@@ -6187,9 +6220,13 @@ Describe 'Release 3.0.0 - phase data and the global report across the two server
         @($model.Phases | ForEach-Object Label) -join '|' | Should -BeExactly "Convert $script:Dot AD|Convert $script:Dot Cloud"
         $model.Objects.Count | Should -Be 2
         @($model.Objects | ForEach-Object Verdict | Get-PraOrdinalUnique) -join ',' | Should -BeExactly 'done'
-        $html = [IO.File]::ReadAllText($report.Html)
+        $page = Read-PraGlobalReportData $report.Html
         # (the report is HTML: the middle dot is written as an entity)
-        foreach ($text in "Convert $script:Dot AD", "Convert $script:Dot Cloud", 'alice@contoso.com', 'bob.shared@contoso.com', 'Shared mailbox', 'User mailbox', 'backup written on the AD side', 'Polling.TimeoutMinutes: 60 -> 30') { $html | Should -Match ([regex]::Escape([Net.WebUtility]::HtmlEncode($text))) }
+        foreach ($text in "Convert $script:Dot AD", "Convert $script:Dot Cloud", 'Polling.TimeoutMinutes: 60 -> 30') { $page.Html | Should -Match ([regex]::Escape([Net.WebUtility]::HtmlEncode($text))) }
+        @($page.Objects | ForEach-Object Name | Sort-Object) -join '|' | Should -BeExactly 'alice@contoso.com|bob.shared@contoso.com'
+        ($page.Objects | Where-Object Name -eq 'alice@contoso.com').Type | Should -BeExactly 'User mailbox'
+        ($page.Objects | Where-Object Name -eq 'bob.shared@contoso.com').Type | Should -BeExactly 'Shared mailbox'
+        @($page.Events | Where-Object { $_.Text -eq 'backup written on the AD side' -and $_.Phase -eq "Convert $script:Dot AD" }).Count | Should -Be 1
         $rows = @(Import-Csv -LiteralPath $report.Csv -Delimiter ';')
         $rows.Count | Should -Be 2
         ($rows | Where-Object Name -eq 'alice@contoso.com').Sides | Should -Match 'Convert . AD: Handed over \| Convert . Cloud: Success'
@@ -6293,12 +6330,13 @@ Describe 'Release 3.0.0 - phase data and the global report across the two server
         $model.Counts.Pending | Should -Be 0
         $html = [IO.File]::ReadAllText($report.Html)
         $html | Should -Match '<span class="pill ok" title="Pending \(handed over to [^"]*\)">Handed over</span>'
-        $html | Should -Match '<span class="pill ok">Handed over</span>'
         $html | Should -Not -Match '<span class="pill warn">Pending</span>'
-        $html | Should -Match ([regex]::Escape([Net.WebUtility]::HtmlEncode("Pending (handed over to Convert $script:Dot Cloud)")))
+        $page = Read-PraGlobalReportData $report.Html
+        foreach ($object in $page.Objects) { $object.Stages | Should -Match 'Convert . AD: Handed over \| Convert . Cloud: Success' }
+        @($page.Events | Where-Object { $_.Step -eq 'Result of this phase' -and $_.Status -eq 'Handed over' -and $_.Text -like "Pending (handed over to Convert $script:Dot Cloud)*" }).Count | Should -Be 2
         $rows = @(Import-Csv -LiteralPath $report.Csv -Delimiter ';')
         ($rows | Where-Object Name -eq 'alice@contoso.com').Sides | Should -Match 'Convert . AD: Handed over \| Convert . Cloud: Success'
-        ($rows | Where-Object Name -eq 'alice@contoso.com').Journey | Should -Match 'result: Pending \(handed over to Convert . Cloud\)'
+        @(Import-Csv -LiteralPath $report.EventsCsv -Delimiter ';' | Where-Object { $_.Name -eq 'alice@contoso.com' -and $_.Step -eq 'Result of this phase' -and $_.Text -like 'Pending (handed over to Convert * Cloud)*' }).Count | Should -Be 1
     }
 
     It 'Recover AD -> Cloud -> Finalize: both intermediate phases and their Pending stages read "Handed over"; the last phase keeps its own status' {
@@ -6335,8 +6373,7 @@ Describe 'Release 3.0.0 - phase data and the global report across the two server
         $carol.Stages[0].StatusDisplay | Should -BeExactly 'Pending'
         $carol.Stages[0].HandedOverTo | Should -BeExactly ''
         $carol.Verdict | Should -BeExactly 'pending'
-        $html = [IO.File]::ReadAllText($report.Html)
-        $html | Should -Match '<span class="pill warn">Pending</span>'
+        (Read-PraGlobalReportData $report.Html).Objects | Where-Object Name -eq 'carol@contoso.com' | ForEach-Object { $_.Stages | Should -Match 'Convert . AD: Pending \| Convert . Cloud: -' }
         (@(Import-Csv -LiteralPath $report.Csv -Delimiter ';') | Where-Object Name -eq 'carol@contoso.com').Sides | Should -Match 'Convert . AD: Pending \| Convert . Cloud: -'
         # The last phase: Pending with no later phase stays Pending.
         $folder2 = New-GrFolder 'Batch-handed0500'
@@ -6364,9 +6401,10 @@ Describe 'Release 3.0.0 - phase data and the global report across the two server
         $html = [IO.File]::ReadAllText($report.Html)
         $html | Should -Not -Match '<script>alert'
         $html | Should -Not -Match '<img src=x'
-        $html | Should -Match '&lt;script&gt;alert\(1\)&lt;/script&gt;'
-        $html | Should -Match 'boom &lt;img'
         $html | Should -Match 'Cloud.Organization: &lt;x&gt; -&gt; &quot;y&quot;'
+        $page = Read-PraGlobalReportData $report.Html
+        @($page.Objects | Where-Object { $_.Name -eq ($evil + '@contoso.com') }).Count | Should -Be 1 -Because 'the data is stored as text, and the page script shows it as text'
+        @($page.Issues | Where-Object { $_.Message -eq 'boom <img src=x onerror=alert(1)>' }).Count | Should -Be 1
         (@(Import-Csv -LiteralPath $report.Csv -Delimiter ';') | Where-Object { $_.Name -like "'=*" }).Count | Should -Be 1
         ($ad.GlobalModel.Objects | Where-Object Name -eq '=cmd@contoso.com').Verdict | Should -BeExactly 'failed'
     }
@@ -6390,7 +6428,7 @@ Describe 'Release 3.0.0 - phase data and the global report across the two server
         $package = New-PraTransferPackage -Kind Convert -Environment GATE -BatchId 'abcd9999aa' -Folders @($folder) -OutboxFolder (Join-Path $script:GrRoot 'outbox')
         $info = Get-PraTransferPackage -Path $package.Path -Environment GATE
         $info.Valid | Should -BeTrue -Because $info.Error
-        $info.EntryCount | Should -Be 3 -Because 'the batch JSON, the phase data and its checksum'
+        $info.EntryCount | Should -Be 5 -Because 'the batch JSON, the phase data, its events file and the two checksums'
         $tampered = Join-Path $script:GrRoot 'tampered.zip'
         Copy-Item -LiteralPath $package.Path -Destination $tampered
         $zip = [IO.Compression.ZipFile]::Open($tampered, [IO.Compression.ZipArchiveMode]::Update)
@@ -7097,10 +7135,12 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgU
         (@(Get-PraList $phase 'Warnings') | ForEach-Object { $_.Message }) -join ' ' | Should -Match 'X500 missing in Exchange Online'
         $report=Write-PraGlobalReport -Context $context
         $html=[IO.File]::ReadAllText($report.Html)
-        $html | Should -Not -Match '<b>A&B</b>'
-        $html | Should -Match ([regex]::Escape('&lt;b&gt;A&amp;B&lt;/b&gt;'))
-        $html | Should -Match 'X500 missing in Exchange Online'
-        $csv=[IO.File]::ReadAllText($report.Csv)
+        $html | Should -Not -Match '<b>A&B</b>' -Because 'the page holds the message in its compressed data, and shows it as text'
+        $warnings = @((Read-PraGlobalReportData $report.Html).Issues | Where-Object { $_.Kind -ceq 'warning' })
+        $warnings.Count | Should -Be 1
+        $warnings[0].Message | Should -Match 'X500 missing in Exchange Online'
+        $warnings[0].Message | Should -Match ([regex]::Escape('<b>A&B</b>')) -Because 'the data keeps the text as it is'
+        $csv=[IO.File]::ReadAllText($report.IssuesCsv)
         $csv | Should -Match 'X500 missing in Exchange Online'
     }
     It 'two servers: the expected X500 list travels in the transfer package and is the one the cloud server proves' {
@@ -7397,9 +7437,16 @@ Describe 'Release 3.1.2 - Entra Connect sync through the real main: stop before 
             @([regex]::Matches($line.Sides, "Convert $dot AD:")).Count | Should -Be 1 -Because 'the AD side is a single stage'
             $line.Sides | Should -Match "^Convert $dot AD: (Success|Handed over)? ?"
             $line.Sides | Should -Match "Convert $dot Cloud:"
-            $line.Journey | Should -Match 'Earlier run' -Because 'the first AD run stays in the journey of the object'
-            $line.Journey | Should -Match 'not changed again' -Because 'the second run says it did not write AD'
         }
+        $events = @(Import-Csv -LiteralPath ([string]$third.MainResult.GlobalEventsCsvReport) -Delimiter ';' -Encoding utf8BOM)
+        foreach ($line in $lines) {
+            $mine = @($events | Where-Object { $_.ObjectGuid -eq $line.ObjectGuid })
+            @($mine | Where-Object Step -eq 'Earlier run').Count | Should -BeGreaterThan 0 -Because 'the first AD run stays in the journey of the object'
+            @($mine | Where-Object { $_.Text -match 'not changed again' }).Count | Should -BeGreaterThan 0 -Because 'the second run says it did not write AD'
+            [int]$line.EventCount | Should -Be $mine.Count
+        }
+        Test-Path -LiteralPath ([string]$third.MainResult.GlobalIssuesCsvReport) -PathType Leaf | Should -BeTrue
+        (($third.MainResult.NextSteps | Where-Object { $_ -match '^Global report data' }) -join ' ') | Should -Match ([regex]::Escape([string]$third.MainResult.GlobalEventsCsvReport))
         # Both runs stay in the timeline of the batch.
         $html = [IO.File]::ReadAllText($htmlPath)
         $timeline = [regex]::Match($html, '(?s)Batch timeline</h2>.*?</table>').Value
@@ -8004,6 +8051,26 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgU
         $text = ($records | ForEach-Object { [string]$_ }) -join "`n"
         $text | Should -Match ([regex]::Escape($icon + 'user1@gate.invalid: mailbox ready;') + ' X500 addresses not all visible yet, check [23] of 3 in [0-9]+ s')
     }
+    It 'the wait lines of the whole batch are not attributed to the object that was handled last; the lines about one object stay with it' -Tag 'Release320d' {
+        $context = $global:PraGate.CloudContext
+        $context.Once = $false; $context.TimeoutMinutes = 0.02; $context.Action = 'Convert'
+        $context.Journey = New-Object 'Collections.Generic.List[object]'
+        Register-PraObjectName $context '00000000-0000-0000-0000-000000000001' 'user1@gate.invalid'
+        $global:PraGate.CheckRow = New-PraRow $context ([pscustomobject][ordered]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; SamAccountName = 'user1@gate.invalid'; UserPrincipalName = 'user1@gate.invalid'; IsShared = $false
+            ExpectedX500 = [string[]]@($global:PraGate.X500Legacy, $global:PraGate.X500Oldest) })
+        $global:PraGate.X500Reply = [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid', $global:PraGate.X500Legacy) }
+        $null = @(InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $false; Exo = $true; Subprocess = $false; Binding = $global:PraGate.X500Binding } }
+            Mock Close-PraCloudSession { }
+            Mock Start-Sleep { [Threading.Thread]::Sleep(250) }
+            Mock Get-EXOMailbox { $global:PraGate.X500Reply }
+            Invoke-PraCloudPhase $global:PraGate.CloudContext @($global:PraGate.CheckRow) 'Convert' 6>&1
+        })
+        $texts = @($context.Journey | ForEach-Object { [string]$_.Text })
+        @($texts | Where-Object { $_ -match '^Check \d+: \d+ object\(s\) in Exchange Online' }).Count | Should -Be 0 -Because 'a line about the whole batch names no object'
+        @($texts | Where-Object { $_ -match '^Not ready yet' }).Count | Should -Be 0
+        @($texts | Where-Object { $_ -match 'user1@gate\.invalid: mailbox ready; X500 addresses not all visible yet' }).Count | Should -BeGreaterThan 0 -Because 'a line about one object stays in its journey'
+    }
 }
 
 Describe 'Release 3.1.3 - package files, sync wording, rollback command, Preview blockers, Check words (real main, synthetic)' -Tag 'Release313b' {
@@ -8568,7 +8635,9 @@ Describe 'Release 3.1.3 - every stop ends with a next step, and the Error block 
         $run.Output | Should -Match ([regex]::Escape("... and 8 more, see the report"))
         $more = $run.Output.LastIndexOf('... and 8 more, see the report'); $stop = $run.Output.LastIndexOf("Stopped at step 'Cloud' (operation CloudCheck, 13 object(s))")
         $more | Should -BeGreaterThan 0; $stop | Should -BeGreaterThan $more
-        $run.Output.Substring($more) | Should -Not -Match 'user[0-9]+@gate\.invalid: still not in the expected state' -Because 'the lines of the objects all come before the count of the others'
+        $end = $run.Output.IndexOf('RESULT: ', $more, [StringComparison]::Ordinal)
+        $end | Should -BeGreaterThan $more
+        $run.Output.Substring($more, $end - $more) | Should -Not -Match 'user[0-9]+@gate\.invalid: still not in the expected state' -Because 'the lines of the objects all come before the count of the others (the result object that follows is not part of the Error block)'
     }
     It 'a Convert cloud Preview that fails for another reason than the network proposes the Preview again' {
         $runtime = New-GateRuntime -Name 'preview-other-313e' -Case 'CloudOtherFailure'
@@ -9433,7 +9502,7 @@ AfterAll {
         [IO.File]::WriteAllText((Join-Path $env:PRA_GATE_EVIDENCE 'fixture-provenance.txt'),"SYNTHETIC ONLY. AD and ADSync from temporary PSModulePath; production main/Common/Directory copied unchanged. Main Cloud replaced by declared synthetic barrier. No real AD/EXO/Graph/ADSync executed. Temporary fixture root: $($global:PraGate.Root)")
     }
     if ([IO.Directory]::Exists($global:PraGate.Root)) { [IO.Directory]::Delete($global:PraGate.Root,$true) }
-    foreach ($name in @('New-GateUser','New-GateRuntime','New-GateContext','Get-GateEvents','Set-GateConfigText','Get-GateWrites','Save-GateDeltaEvidence','Invoke-GateProcess','New-GateSourceBundles','Get-GateCodec','Get-GateExpectedNodes','Assert-GateWireSnapshot','Save-GateOomEvidence')) { Remove-Item -LiteralPath ('Function:\'+$name) -ErrorAction SilentlyContinue }
+    foreach ($name in @('Read-PraGlobalReportData','New-GateUser','New-GateRuntime','New-GateContext','Get-GateEvents','Set-GateConfigText','Get-GateWrites','Save-GateDeltaEvidence','Invoke-GateProcess','New-GateSourceBundles','Get-GateCodec','Get-GateExpectedNodes','Assert-GateWireSnapshot','Save-GateOomEvidence')) { Remove-Item -LiteralPath ('Function:\'+$name) -ErrorAction SilentlyContinue }
     Remove-Variable PraGateAd,PraGate -Scope Global -ErrorAction SilentlyContinue
 }
 
@@ -9863,7 +9932,7 @@ Describe 'Release 3.2.0 - the global report: a later stage that covers the cloud
         @($user2.Stages[1].Steps | Where-Object Step -eq 'Earlier run').Count | Should -Be 1
         (@($user2.Stages[1].Steps | Where-Object Step -eq 'Earlier run')[0].Text) | Should -Match 'cloud: not ready in time'
         $html = [IO.File]::ReadAllText($report.Html)
-        $html | Should -Match 'Earlier run'
+        @((Read-PraGlobalReportData $report.Html).Events | Where-Object { $_.Step -eq 'Earlier run' -and $_.Text -match 'cloud: not ready in time' }).Count | Should -Be 1
         $html | Should -Not -Match '<div class="tile-label">Result</div><div class="tile-value">Failed</div>'
     }
     It 'an error that is not on the cloud side stays final, and so does a cloud error that no later stage covers' {
@@ -10141,8 +10210,9 @@ Describe 'Release 3.2.0 - scale: records are found in a dictionary, not by scann
             $script:PraTransferLimits.MaxTotalBytes | Should -Be 4294967296
             $script:PraPhaseLimits.MaxBytes | Should -Be 268435456
             $script:PraPhaseLimits.MaxJourney | Should -Be 1000000
-            $script:PraPhaseLimits.MaxIssues | Should -Be 10000
-            $script:PraPhaseLimits.DetailedObjects | Should -Be 10000
+            $script:PraPhaseLimits.ContainsKey('MaxIssues') | Should -BeFalse -Because 'the errors and warnings of a phase are not capped'
+            $script:PraPhaseLimits.ContainsKey('DetailedObjects') | Should -BeFalse -Because 'the page holds the journey of every object'
+            $script:PraPhaseLimits.ContainsKey('MaxStepsPerObject') | Should -BeFalse
         }
         $root = Join-Path $global:PraGate.Root ('limits-' + [guid]::NewGuid().ToString('N').Substring(0, 6))
         $id = 'a1b2c3d4e5f60718293a4b5c6d7e8f90'
@@ -10377,7 +10447,7 @@ Describe 'Release 3.2.0 - scale: the backup codec writes the bytes of its format
     }
 }
 
-Describe 'Release 3.2.0 - scale: the licence group is read once for the objects of a run, and the check that comes with every write reads the object itself (production Directory module, synthetic AD)' -Tag 'Release320c' {
+Describe 'Release 3.2.0 - the licence group checks read the object itself: the check of a write and the check before the final restore (production Directory module, synthetic AD)' -Tag 'Release320c' {
     BeforeEach {
         $global:PraGate.Runtime = New-GateRuntime -Name 'scale-group' -UserCount 4
         $env:PRA_GATE_STATE = $global:PraGate.Runtime.StatePath
@@ -10386,34 +10456,30 @@ Describe 'Release 3.2.0 - scale: the licence group is read once for the objects 
         $global:PraGate.Context = New-GateContext $global:PraGate.Runtime
         $global:PraGate.Context.LogFile = Join-Path $global:PraGate.Runtime.Root 'logs\scale-group.log'
     }
-    It 'reads a group of 5000 members once for 5000 objects, in any letter case, and again after a write to a group and after the keeping time' {
-        $global:PraGate.GroupScale = @{ Reads = 0; Members = [string[]]@(1..5000 | ForEach-Object { 'CN=Member{0},OU=Tests,DC=gate,DC=invalid' -f $_ }) }
-        $result = InModuleScope PRA.Directory {
-            Mock Get-PraGroup { $global:PraGate.GroupScale.Reads++; [pscustomobject]@{ ObjectGUID = [guid]'10000000-0000-0000-0000-000000000001'; DistinguishedName = 'CN=License,OU=Tests,DC=gate,DC=invalid'; member = $global:PraGate.GroupScale.Members } }
-            $context = @{}
-            $found = 0
-            foreach ($i in 1..5000) {
-                $read = Get-PraGroupMemberSet $context 'CN=License,OU=Tests,DC=gate,DC=invalid'
-                if ($read.Members.Contains(('cn=member{0},ou=tests,dc=gate,dc=invalid' -f $i))) { $found++ }
-            }
-            $stages = @{ Found = $found; Reads = $global:PraGate.GroupScale.Reads }
-            $stages.Stranger = (Get-PraGroupMemberSet $context 'cn=license,ou=tests,dc=gate,dc=invalid').Members.Contains('CN=Stranger,OU=Tests,DC=gate,DC=invalid')
-            $stages.SameGroupOtherCase = $global:PraGate.GroupScale.Reads
-            $context['PraGroupGeneration'] = 1
-            $null = Get-PraGroupMemberSet $context 'CN=License,OU=Tests,DC=gate,DC=invalid'
-            $stages.AfterWrite = $global:PraGate.GroupScale.Reads
-            $script:GroupMemberSeconds = 0
-            try { $null = Get-PraGroupMemberSet $context 'CN=License,OU=Tests,DC=gate,DC=invalid'; $null = Get-PraGroupMemberSet $context 'CN=License,OU=Tests,DC=gate,DC=invalid' }
-            finally { $script:GroupMemberSeconds = 30 }
-            $stages.AfterKeepingTime = $global:PraGate.GroupScale.Reads
-            $stages
+    It 'the check before the final restore reads the membership of the object fresh: a membership that someone else changed since the proof is refused at once, nothing is kept between two checks' {
+        $global:PraGate.Runtime = New-GateRuntime -Name 'followup-fresh'
+        $env:PRA_GATE_STATE = $global:PraGate.Runtime.StatePath
+        $env:PSModulePath = $global:PraGate.Runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Import-Module ActiveDirectory -Force -Global
+        $global:PraGate.Context = New-GateContext $global:PraGate.Runtime
+        $global:PraGate.Context.LogFile = Join-Path $global:PraGate.Runtime.Root 'logs\followup-fresh.log'
+        InModuleScope PRA.Directory {
+            $context = $global:PraGate.Context
+            $convert = @(New-PraPlan $context 'user1' 'Convert'; New-PraPlan $context 'user2' 'Convert')
+            $source = Invoke-PraAdBatch $context $convert 'Convert'
+            $context.Action = 'Recover'; $context.Source = $source; $context.SourceBackupHash = $source.Hash
+            $restore = @(foreach ($record in $source.Data.Records) { New-PraPlan $context $record.ObjectGuid 'Recover' $record })
+            $receipt = Invoke-PraAdBatch $context $restore 'Recover'
+            $proof = Import-PraProof $context $receipt.StatePath $source 'Recover'
+            $first = New-PraPlan $context 'user1' 'RestoreTag' $source.Data.Records[0]
+            { Assert-PraFollowupState $context $first $proof } | Should -Not -Throw
+            $before = @(Get-GateWrites $global:PraGate.Runtime).Count
+            $global:PraGateAd.Group.member = @($global:PraGateAd.Group.member) + [string]$global:PraGateAd.Users[0].DistinguishedName
+            $second = New-PraPlan $context 'user1' 'RestoreTag' $source.Data.Records[0]
+            { Assert-PraFollowupState $context $second $proof } | Should -Throw '*Finalize: licence group membership differs from the AD proof*'
+            @(Get-GateWrites $global:PraGate.Runtime).Count | Should -Be $before
+            $context.ContainsKey('PraGroupMembers') | Should -BeFalse
         }
-        $result.Found | Should -Be 5000
-        $result.Reads | Should -Be 1 -Because 'one read of the group for the 5000 objects'
-        $result.Stranger | Should -BeFalse
-        $result.SameGroupOtherCase | Should -Be 1 -Because 'the group named in another letter case is the same group'
-        $result.AfterWrite | Should -Be 2
-        $result.AfterKeepingTime | Should -Be 4 -Because 'with no keeping time, each request reads the group'
     }
     It 'the check of a write reads the group without its members and takes the membership of the object from the memberOf attribute that was just read' {
         $context = $global:PraGate.Context
@@ -10445,7 +10511,7 @@ Describe 'Release 3.2.0 - scale: the Operation of a batch file is read from its 
         Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
         $tokens = $null; $errors = $null
         $entryAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Package 'Invoke-PraRemoteMailbox.ps1'), [ref]$tokens, [ref]$errors)
-        $definition = $entryAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Get-PraJsonOperation' }, $true)[0].Extent.Text
+        $definition = $entryAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Get-PraJsonHeader' }, $true)[0].Extent.Text
         . ([scriptblock]::Create($definition))
     }
     It 'takes the Operation from the head of a large file without reading the rest, whatever the layout, and parses the whole file when the head does not tell' {
@@ -10455,21 +10521,21 @@ Describe 'Release 3.2.0 - scale: the Operation of a batch file is read from its 
         # The head tells: the file after the head is not JSON at all, so only a read of the head can answer.
         $head = Join-Path $folder 'head.json'
         [IO.File]::WriteAllText($head, ("{`r`n    ""SchemaVersion"":  3,`r`n    ""Operation"":  ""Convert"",`r`n    ""Records"":  [" + ('?' * 20000)), $utf8)
-        Get-PraJsonOperation $head | Should -BeExactly 'Convert'
+        (Get-PraJsonHeader $head @('Operation')).Operation | Should -BeExactly 'Convert'
         $compact = Join-Path $folder 'compact.json'
         [IO.File]::WriteAllText($compact, ('{"SchemaVersion":3,"RawFormat":"PraDataOnlyClixml-v1","Operation":"RecoverFinalize","Items":[' + ('?' * 20000)), (New-Object Text.UTF8Encoding($false)))
-        Get-PraJsonOperation $compact | Should -BeExactly 'RecoverFinalize'
+        (Get-PraJsonHeader $compact @('Operation')).Operation | Should -BeExactly 'RecoverFinalize'
         # The head does not tell: the Operation comes after a list, so the whole file is parsed and the field of the top level is the one that counts, not the one of a record.
         $late = Join-Path $folder 'late.json'
         [IO.File]::WriteAllText($late, ('{"SchemaVersion":3,' + $body + ',"Operation":"Recover"}'), $utf8)
-        Get-PraJsonOperation $late | Should -BeExactly 'Recover'
-        # An escape in the value and a file that is not JSON: the whole-file parse decides, as before.
+        (Get-PraJsonHeader $late @('Operation')).Operation | Should -BeExactly 'Recover'
+        # An escape in the value and a file that is not JSON: the whole-file parse decides.
         $escaped = Join-Path $folder 'escaped.json'
         [IO.File]::WriteAllText($escaped, '{"Operation":"Con\u0076ert","Records":[]}', $utf8)
-        Get-PraJsonOperation $escaped | Should -BeExactly 'Convert'
+        (Get-PraJsonHeader $escaped @('Operation')).Operation | Should -BeExactly 'Convert'
         $broken = Join-Path $folder 'broken.json'
         [IO.File]::WriteAllText($broken, '{"SchemaVersion":3,"Records":[', $utf8)
-        { Get-PraJsonOperation $broken } | Should -Throw
+        { Get-PraJsonHeader $broken @('Operation') } | Should -Throw
     }
     It 'writes the lines of one call to the log in the format of a single line, one write for all of them, and only for the Detail level' {
         $log = Join-Path $global:PraGate.Root ('lines-' + [guid]::NewGuid().ToString('N').Substring(0, 6) + '.log')
@@ -12113,7 +12179,7 @@ Export-ModuleMember -Function Get-EXORecipient, Get-EXOMailbox, Get-Mailbox, Get
         @($result.Own.Holds) | Should -BeExactly @('mbx40000000000000000000000000000002') -Because 'only the mailbox of the confirmed account decides'
         [bool]$result.Own.IdentityByUpn | Should -BeFalse
         $result.Two | Should -Match 'Exchange Online has 2 inactive mailboxes for user1@gate\.invalid and nothing tells which one belongs to this object'
-        $result.Two | Should -Match ([regex]::Escape('To list them, run: Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''user1@gate.invalid''" -Properties ExternalDirectoryObjectId,WhenSoftDeleted,InPlaceHolds'))
+        $result.Two | Should -Match ([regex]::Escape('To list them, run: Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''user1@gate.invalid''" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds'))
     }
     It 'the retention check reports an inactive mailbox of an earlier account as not this object''s mailbox: a warning, not covered, never a verdict from that mailbox' {
         $context = New-GateContext $global:PraGate.R10Runtime -Mode Preview -Action Check
@@ -12294,7 +12360,7 @@ Export-ModuleMember -Function Get-EXORecipient, Get-EXOMailbox, Get-Mailbox, Get
         }
         $global:PraGate.R10.Grants | Should -Be 1 -Because 'the second check read the permission as missing again, and did not send it again'
         $context.GrantsSent | Should -Be 1
-        [IO.File]::ReadAllText($context.LogFile) | Should -Match 'shared1@gate\.invalid: FullAccess to TRUSTEE1@Gate\.Invalid was already sent in this run; it is not sent again although the last read does not show it yet'
+        [IO.File]::ReadAllText($context.LogFile) | Should -Match 'shared1@gate\.invalid: FullAccess to TRUSTEE1@Gate\.Invalid was already sent in this run and read back as present; it is not sent again and the last read does not show it'
     }
     It 'the account of the identity check is used once for the Graph facts and never kept after a failure: the next check reads again' {
         $context = $global:PraGate.R10Context
@@ -12399,7 +12465,7 @@ Describe 'Release 3.2.0 - review of the journal fallback and the phase data limi
         $damaged.ShortId | Should -BeExactly 'a1a1a1a1'
         $global:PraGate.Remove('R10Case')
     }
-    It 'the phase data limits: one file at most MaxFileBytes (the size the writer can produce, a quarter of the total), the files of one report together at most MaxBytes, with the reason and the way out' {
+    It 'the phase data limits: the writer keeps a file to MaxFileBytes (a quarter of the total), the reader takes a file up to MaxBytes and the files of one report together up to MaxBytes, with the reason and the command to run again' {
         InModuleScope PRA.Common {
             $script:PraPhaseLimits.MaxFileBytes | Should -Be 67108864
             $script:PraPhaseLimits.MaxFileBytes | Should -Be ($script:PraPhaseLimits.MaxBytes / 4)
@@ -12422,39 +12488,33 @@ Describe 'Release 3.2.0 - review of the journal fallback and the phase data limi
         $one = & $make 'one'
         $small = Save-PraPhaseData -Context $one.Context -Folder $one.Folder
         $fullBytes = ([IO.FileInfo]$small).Length
-        $lessBytes = (New-Object Text.UTF8Encoding($false)).GetByteCount(((New-PraPhaseRecord -Context $one.Context -NoSteps) | ConvertTo-Json -Depth 8 -Compress))
-        $fullBytes | Should -BeGreaterThan ($lessBytes + 2000) -Because 'the steps make the file larger, so a limit can fall between the two'
-        $global:PraGate.R10Case = @{ File = $fullBytes; Less = $lessBytes; Folder = $one.Folder; Context = $one.Context; Second = (& $make 'two'); Third = (& $make 'three') }
+        $global:PraGate.R10Case = @{ File = $fullBytes; Folder = $one.Folder; Context = $one.Context; Second = (& $make 'two'); Third = (& $make 'three') }
         InModuleScope PRA.Common {
             $case = $global:PraGate.R10Case
             $saved = @{ File = $script:PraPhaseLimits.MaxFileBytes; Total = $script:PraPhaseLimits.MaxBytes }
             try {
-                # The writer drops the steps above the limit of one file, and the reader accepts what the writer wrote.
-                $script:PraPhaseLimits.MaxFileBytes = [long](($case.File + $case.Less) / 2)
-                $folder = Join-Path (Split-Path $case.Folder -Parent) 'fallback'; $null = New-Item -ItemType Directory -Path $folder -Force
-                $path = Save-PraPhaseData -Context $case.Context -Folder $folder
-                $global:PraGate.R10Case.Fallback = @{ Length = ([IO.FileInfo]$path).Length; Limit = $script:PraPhaseLimits.MaxFileBytes; Read = (Read-PraPhaseData -Folder @($folder) -Environment 'GATE') }
-                # A file above the limit of one file is refused with the size.
+                # A file above what the writer writes is still read (the limit of one file for the reader is the limit of the whole report).
                 $script:PraPhaseLimits.MaxFileBytes = 100
+                $global:PraGate.R10Case.Older = (Read-PraPhaseData -Folder @($case.Folder) -Environment 'GATE')
+                $script:PraPhaseLimits.MaxFileBytes = $saved.File
+                # A file above the limit of the reader is refused with the size.
+                $script:PraPhaseLimits.MaxBytes = 100
                 $global:PraGate.R10Case.TooBig = (Read-PraPhaseData -Folder @($case.Folder) -Environment 'GATE')
                 # Several files within the limit of one, together above the limit of the report: the file that does not fit is refused.
-                $script:PraPhaseLimits.MaxFileBytes = $saved.File
                 $script:PraPhaseLimits.MaxBytes = [long]($case.File * 2.5)
                 $set = Join-Path (Split-Path $case.Folder -Parent) 'set'; $null = New-Item -ItemType Directory -Path $set -Force
                 foreach ($context in @($case.Context, $case.Second.Context, $case.Third.Context)) { $null = Save-PraPhaseData -Context $context -Folder $set }
-                $global:PraGate.R10Case.Budget = (Read-PraPhaseData -Folder @($set) -Environment 'GATE')
+                $global:PraGate.R10Case.Budget = (Read-PraPhaseData -Folder @($set) -Environment 'GATE' -Context $case.Context)
             }
             finally { $script:PraPhaseLimits.MaxFileBytes = $saved.File; $script:PraPhaseLimits.MaxBytes = $saved.Total }
         }
         $case = $global:PraGate.R10Case
-        $case.Fallback.Length | Should -BeLessOrEqual $case.Fallback.Limit
-        $case.Fallback.Read.Phases.Count | Should -Be 1
-        $case.Fallback.Read.Problems.Count | Should -Be 0
+        $case.Older.Phases.Count | Should -Be 1 -Because 'the reader accepts a file larger than the writer keeps'
+        $case.Older.Problems.Count | Should -Be 0
         $case.TooBig.Phases.Count | Should -Be 0
         ($case.TooBig.Problems -join ' ') | Should -Match 'the size is not acceptable \(at most \d+ MB for one file\)'
         $case.Budget.Phases.Count | Should -Be 2 -Because 'the third file would take the files of the report above their total'
-        ($case.Budget.Problems -join ' ') | Should -Match 'not read: the files read before it already use \d+ MB of the \d+ MB allowed for one report\. Move the PhaseData files of other batches out of the batch folder'
-        $global:PraGate.Remove('R10Case')
+        ($case.Budget.Problems -join ' ') | Should -Match 'not read: the files read before it already use \d+ MB of the \d+ MB allowed for one report\. Move the PhaseData files of other batches out of the batch folder .* then run the same command again: \.\\Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -Mode Apply -Batch abcd1234'        $global:PraGate.Remove('R10Case')
     }
 }
 
@@ -12467,6 +12527,597 @@ Describe 'Release 3.2.0 - a cloud-only run that sent permission grants ends with
         $cloud = Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='Cloud';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=[string]$ad.MainResult.BatchId} -TimeoutSeconds 180
         $cloud.Output | Should -Match 'Backup of the batch checked in full after 13 permission grant\(s\)'
         $engine = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'))
-        $engine | Should -Match "Test-PraOrdinalIgnoreCaseEqual \`$effectivePhase 'Cloud'\) -and \(Test-PraOrdinalIgnoreCaseEqual \`$Action 'Convert'\) -and \[int\]\(Get-PraValue \`$context 'GrantsSent' 0\) -gt 0" -Because 'no grant sent, no extra check'
+        $engine | Should -Match ([regex]::Escape("(Test-PraOrdinalIn `$effectivePhase @('Cloud','Both') -IgnoreCase) -and (Test-PraOrdinalIgnoreCaseEqual `$Action 'Convert') -and [int](Get-PraValue `$context 'GrantsSent' 0) -gt 0")) -Because 'no grant sent, no extra check'
+    }
+}
+
+Describe 'Release 3.2.0 - second review of the cloud part: only a recognised not-found is an absent mailbox where absence confirms, an inactive mailbox without an account id, a grant read back as missing (production Cloud module, mocked boundaries, no network)' -Tag 'Release320c' {
+    BeforeAll {
+        $global:PraGate.R11Path = Join-Path $global:PraGate.Root 'PraGateR11Network.psm1'
+        $networkSource = @'
+if ($env:PRA_GATE_NONET -cne 'SYNTHETIC-NO-NETWORK') { throw 'Synthetic interlock absent.' }
+function Get-EXOMailbox { [CmdletBinding()]param($Identity, $ExternalDirectoryObjectId, $UserPrincipalName, $Filter, $Properties, $ResultSize, [switch]$InactiveMailboxOnly) throw 'SYNTHETIC BLOCK: EXO mailbox' }
+function Get-EXORecipient { [CmdletBinding()]param($Identity, $ExternalDirectoryObjectId, $UserPrincipalName, $Filter, $Properties, $ResultSize) throw 'SYNTHETIC BLOCK: EXO recipient' }
+function Get-ConnectionInformation { [CmdletBinding()]param() [pscustomobject]@{ TenantID = '20000000-0000-0000-0000-000000000002'; State = 'Connected'; TokenStatus = 'Active'; ConnectionId = '30000000-0000-0000-0000-000000000003'; ModuleName = $global:PraGate.R11Path } }
+Export-ModuleMember -Function Get-EXOMailbox, Get-EXORecipient, Get-ConnectionInformation
+'@
+        [IO.File]::WriteAllText($global:PraGate.R11Path, $networkSource, (New-Object Text.UTF8Encoding($true)))
+        Get-Module PRA.Cloud, PraGateR10Network, PraGateR9Network -All | Remove-Module -Force -ErrorAction SilentlyContinue
+        Import-Module $global:PraGate.R11Path -Global -Force
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Cloud.psm1') -Force -Global
+        $global:PraGate.R11Runtime = New-GateRuntime -Name 'review2-320c'
+        function global:New-R11Row {
+            param([string]$Upn = 'user1@gate.invalid', [string]$Guid = 'ab12cd34-0000-4000-8000-0000000000ef', [switch]$Shared, [hashtable]$Attributes = $null)
+            $record = [ordered]@{ ObjectGuid = $Guid; UserPrincipalName = $Upn; SamAccountName = $Upn.Split('@')[0]; IsShared = [bool]$Shared; SourceAnchor = [ordered]@{ ObjectGuid = ''; ConsistencyGuid = '' } }
+            if ($null -ne $Attributes) { $record.Attributes = $Attributes }
+            New-PraRow $global:PraGate.R11Context ([pscustomobject]$record)
+        }
+        function global:New-R11NotFound {
+            param([string]$Text)
+            $payload = @{ error = @{ code = 'NotFound'; message = $Text; details = @(@{ code = 'Context'; message = ('Ex6F9304|Microsoft.Exchange.Configuration.Tasks.ManagementObjectNotFoundException|' + $Text); target = '' }); innererror = @{ message = $Text; type = 'Microsoft.Exchange.Admin.OData.Core.ODataServiceException' } } }
+            'Error while querying REST service. HttpStatusCode=404 ErrorMessage=' + ($payload | ConvertTo-Json -Depth 6 -Compress)
+        }
+    }
+    BeforeEach {
+        $context = New-GateContext $global:PraGate.R11Runtime -Mode Apply -Action Convert
+        $context.Phase = 'Cloud'; $context.Once = $false; $context.CheckScope = 'Both'; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 5; $context.AllowMutation = $true
+        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Off'; TenantId = '20000000-0000-0000-0000-000000000002' }
+        $context.Config.SharedMailbox = @{ Enabled = $true; PermissionSource = 'AD'; GrantFullAccess = $true; GrantSendAs = $false; GrantSendOnBehalf = $false; AutoMapping = $false }
+        $context.LogFile = Join-Path $global:PraGate.R11Runtime.Root ('logs\review2-320c-' + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.log')
+        $global:PraGate.R11Context = $context
+        $global:PraGate.R11Binding = @{ TenantId = '20000000-0000-0000-0000-000000000002'; ConnectionId = '30000000-0000-0000-0000-000000000003'; ModuleLocation = $global:PraGate.R11Path; ModulePath = $global:PraGate.R11Path }
+        $global:PraGate.R11 = @{ Grants = 0; Seen = @{} }
+    }
+    AfterAll {
+        Remove-Item -LiteralPath 'Function:\New-R11Row', 'Function:\New-R11NotFound' -ErrorAction SilentlyContinue
+        Remove-Module PRA.Cloud, PraGateR11Network -Force -ErrorAction SilentlyContinue
+        foreach ($key in 'R11', 'R11Context', 'R11Binding', 'R11Runtime', 'R11Path', 'R11Case', 'R11Rows') { $global:PraGate.Remove($key) }
+    }
+    It 'where absence confirms (AbsenceConfirms) only an explicit not-found for the id is an absent mailbox: a 404 that does not name the id, a bare 404 and any other error are failed reads; elsewhere the broader match stays' {
+        $global:PraGate.R11Case = @{
+            Named = (New-R11NotFound "The operation couldn't be performed because object 'cccccccc-0000-0000-0000-000000000009' couldn't be found on 'SYNTH'.")
+            Other = (New-R11NotFound "The operation couldn't be performed because object 'somebody-else' couldn't be found on 'SYNTH'.")
+            Bare = 'Error while querying REST service. HttpStatusCode=404 something else'
+            Denied = 'Access denied. HttpStatusCode=403' }
+        $result = InModuleScope PRA.Cloud {
+            $answers = @{}
+            foreach ($name in 'Named', 'Other', 'Bare', 'Denied') {
+                $global:PraGate.R11Case.Current = $global:PraGate.R11Case[$name]
+                Mock Get-EXOMailbox { throw $global:PraGate.R11Case.Current }
+                foreach ($strict in $true, $false) {
+                    $p = @{ Upn = 'user9@gate.invalid'; VerifiedObjectIds = @{ 'user9@gate.invalid' = 'CCCCCCCC-0000-0000-0000-000000000009' }; AbsenceConfirms = $strict }
+                    try { $answers[$name + '|' + $strict] = (& $script:PraExoWorker 'Mailbox' $p $null $global:PraGate.R11Binding $null $null).Found } catch { $answers[$name + '|' + $strict] = 'throws' }
+                }
+            }
+            $answers
+        }
+        $result['Named|True'] | Should -BeFalse
+        $result['Named|False'] | Should -BeFalse
+        $result['Other|True'] | Should -BeExactly 'throws'
+        $result['Bare|True'] | Should -BeExactly 'throws'
+        $result['Denied|True'] | Should -BeExactly 'throws'
+        $result['Denied|False'] | Should -BeExactly 'throws'
+        $result['Other|False'] | Should -BeFalse -Because 'where absence only means "not yet" the broader match is kept'
+        $result['Bare|False'] | Should -BeFalse
+    }
+    It 'the cloud phase asks for AbsenceConfirms only in the deprovisioning check of a Recover that does not keep the shared mailbox' {
+        $global:PraGate.R11Case = @{ Seen = (New-Object 'Collections.Generic.List[string]') }
+        foreach ($case in @(@{ Act = 'Recover'; Preserve = $false }, @{ Act = 'Recover'; Preserve = $true }, @{ Act = 'Convert'; Preserve = $false })) {
+            $context = New-GateContext $global:PraGate.R11Runtime -Mode Apply -Action $case.Act
+            $context.Phase = 'Cloud'; $context.Once = $true; $context.CheckScope = 'Both'; $context.IntervalMinutes = 0; $context.TimeoutMinutes = 1; $context.AllowMutation = $true
+            $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $false; MailboxCheckVia = 'Exo'; RequiredSkuPartNumber = ''; IdentityCheck = 'Off'; TenantId = '20000000-0000-0000-0000-000000000002' }
+            $context.LogFile = Join-Path $global:PraGate.R11Runtime.Root 'logs\review2-absence.log'
+            $global:PraGate.R11Context = $context
+            $row = New-R11Row -Shared:$case.Preserve
+            $row.PreserveCloudMailbox = $case.Preserve
+            $global:PraGate.R11Rows = @($row); $global:PraGate.R11Case.Act = $case.Act
+            InModuleScope PRA.Cloud {
+                Mock Connect-PraCloudSession { param($Context) $Context['_PraCloudSession'] = @{ Graph = $false; Exo = $true; Subprocess = $false; Binding = $global:PraGate.R11Binding } }
+                Mock Close-PraCloudSession { }
+                Mock Start-Sleep { }
+                Mock Invoke-PraExo { if ($Operation -ceq 'Mailbox') { $global:PraGate.R11Case.Seen.Add(('{0}|{1}' -f $global:PraGate.R11Case.Act, $Params.AbsenceConfirms)) }; @{ Found = $false; Type = $null } }
+                Invoke-PraCloudPhase $global:PraGate.R11Context $global:PraGate.R11Rows $global:PraGate.R11Case.Act
+            }
+        }
+        @($global:PraGate.R11Case.Seen) | Should -Contain 'Recover|True'
+        @($global:PraGate.R11Case.Seen) | Should -Contain 'Recover|False'
+        @($global:PraGate.R11Case.Seen) | Should -Contain 'Convert|False'
+        @($global:PraGate.R11Case.Seen | Where-Object { $_ -like 'Convert|*' -and $_ -ne 'Convert|False' }).Count | Should -Be 0
+        $global:PraGate.Remove('R11Case')
+    }
+    It 'an inactive mailbox that carries no ExternalDirectoryObjectId is a candidate found by UPN (flagged), not an earlier account; several candidates are told apart by the recorded mailbox GUID, or stop with the command that lists them and what is missing' {
+        $mine = '5b0d1c7e-1111-4222-8333-944455556666'
+        $global:PraGate.R11Case = @{
+            Nameless = @([pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid'); ExternalDirectoryObjectId = ''; IsInactiveMailbox = $true; InPlaceHolds = @('mbx40000000000000000000000000000004'); ExchangeGuid = [guid]'00000000-0000-0000-0000-000000000001' })
+            Two = @(
+                [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid'); ExternalDirectoryObjectId = ''; IsInactiveMailbox = $true; InPlaceHolds = @('mbx40000000000000000000000000000001'); ExchangeGuid = [guid]'00000000-0000-0000-0000-000000000001' },
+                [pscustomobject]@{ RecipientTypeDetails = 'UserMailbox'; EmailAddresses = [string[]]@('SMTP:user1@gate.invalid'); ExternalDirectoryObjectId = $null; IsInactiveMailbox = $true; InPlaceHolds = @('mbx40000000000000000000000000000002'); ExchangeGuid = [guid]$mine }) }
+        $global:PraGate.R11Case.Mine = $mine
+        $result = InModuleScope PRA.Cloud {
+            Mock Get-EXOMailbox {
+                param($Identity, $ExternalDirectoryObjectId, $UserPrincipalName, $Filter, $Properties, $ResultSize, $InactiveMailboxOnly)
+                if ($Identity -or $ExternalDirectoryObjectId) { throw "The operation couldn't be performed because object 'x' couldn't be found on 'y'." }
+                if ($InactiveMailboxOnly) { $global:PraGate.R11Case.Current }
+            }
+            $confirmed = @{ 'user1@gate.invalid' = 'aaaaaaaa-0000-0000-0000-000000000001' }
+            $answers = @{}
+            $runs = @(@('One', 'Nameless', $confirmed, @()), @('Told', 'Two', @{}, @($global:PraGate.R11Case.Mine.ToUpperInvariant())), @('NoGuid', 'Two', $confirmed, @()), @('Wrong', 'Two', @{}, @('99999999-9999-9999-9999-999999999999')))
+            foreach ($run in $runs) {
+                $global:PraGate.R11Case.Current = $global:PraGate.R11Case[$run[1]]
+                try { $answers[$run[0]] = & $script:PraExoWorker 'Hold' @{ Upn = 'user1@gate.invalid'; VerifiedObjectIds = $run[2]; MailboxGuids = [string[]]$run[3] } $null $global:PraGate.R11Binding $null $null }
+                catch { $answers[$run[0]] = $_.Exception.Message }
+            }
+            $answers
+        }
+        $result.One.Found | Should -BeTrue
+        [bool]$result.One.IdentityByUpn | Should -BeTrue
+        [bool](Get-PraValue $result.One 'EarlierAccount' $false) | Should -BeFalse
+        $result.Told.Found | Should -BeTrue
+        @($result.Told.Holds) | Should -BeExactly @('mbx40000000000000000000000000000002') -Because 'the mailbox whose ExchangeGuid is the one recorded on premises'
+        [bool]$result.Told.IdentityByUpn | Should -BeTrue
+        $result.NoGuid | Should -Match 'Exchange Online has 2 inactive mailboxes for user1@gate\.invalid and nothing tells which one belongs to this object.* This object has no mailbox GUID recorded'
+        $result.NoGuid | Should -Match ([regex]::Escape('To list them, run: Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''user1@gate.invalid''" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds'))
+        $result.Wrong | Should -Match 'The mailbox GUID recorded for this object does not tell them apart either'
+        $global:PraGate.Remove('R11Case')
+    }
+    It 'the mailbox GUID of a record is the msExchMailboxGuid kept from Active Directory, as a GUID; a record without one, or with a damaged value, gives none' {
+        $guid = [guid]'5b0d1c7e-1111-4222-8333-944455556666'
+        $global:PraGate.R11Case = @{
+            Good = [pscustomobject]@{ Attributes = [pscustomobject]@{ msExchMailboxGuid = [pscustomobject]@{ Present = $true; Kind = 'Bytes'; Value = [Convert]::ToBase64String($guid.ToByteArray()) } } }
+            None = [pscustomobject]@{ Attributes = [pscustomobject]@{ msExchMailboxGuid = [pscustomobject]@{ Present = $false; Kind = 'Bytes'; Value = $null } } }
+            Bad = [pscustomobject]@{ Attributes = [pscustomobject]@{ msExchMailboxGuid = [pscustomobject]@{ Present = $true; Kind = 'Bytes'; Value = '###' } } }
+            Missing = [pscustomobject]@{ UserPrincipalName = 'user1@gate.invalid' } }
+        $answers = InModuleScope PRA.Cloud {
+            $c = $global:PraGate.R11Case
+            @{ Good = @(Get-PraRecordedMailboxGuid $c.Good); None = @(Get-PraRecordedMailboxGuid $c.None); Bad = @(Get-PraRecordedMailboxGuid $c.Bad); Missing = @(Get-PraRecordedMailboxGuid $c.Missing) }
+        }
+        $answers.Good | Should -BeExactly @($guid.ToString())
+        $answers.None.Count | Should -Be 0
+        $answers.Bad.Count | Should -Be 0
+        $answers.Missing.Count | Should -Be 0
+        $global:PraGate.Remove('R11Case')
+    }
+    It 'a grant that was sent and read back as present, and that a later read does not show, is not sent again and not counted as verified: the row is done with a warning that names the permission to check by hand' {
+        $global:PraGate.R11Rows = @(New-R11Row -Upn 'shared1@gate.invalid' -Shared)
+        Add-Member -InputObject $global:PraGate.R11Rows[0] -NotePropertyName ADVerified -NotePropertyValue $true -Force
+        $context = $global:PraGate.R11Context
+        $context.Approval = { param($Target, $Operation) $true }
+        $context.AssertCloudAuthorization = { param($Row) $true }
+        $context.JournalMutation = { param($Target, $Operation, $Status, $Detail) }
+        $second = InModuleScope PRA.Cloud {
+            Mock Invoke-PraExo {
+                if ($Operation -ceq 'Grant') { $global:PraGate.R11.Grants++; @{ TrusteeFound = $true; Verified = $true; Mutated = $true; Error = '' } }
+                else { @{ TrusteeFound = $true; Verified = $false; Mutated = $false } }
+            }
+            $row = $global:PraGate.R11Rows[0]
+            $request = @([pscustomobject]@{ Right = 'FullAccess'; Trustee = 'trustee1@gate.invalid' })
+            $null = Invoke-PraSharedPermission -Context $global:PraGate.R11Context -Row $row -Requests $request
+            $verifiedAfterGrant = (Get-PraGrantsVerified $global:PraGate.R11Context).Count
+            $row.Warnings = ''
+            $null = Invoke-PraSharedPermission -Context $global:PraGate.R11Context -Row $row -Requests $request
+            @{ Verified = $verifiedAfterGrant; Detail = [string]$row.PermDetail }
+        }
+        $global:PraGate.R11.Grants | Should -Be 1
+        $second.Verified | Should -Be 1 -Because 'the key is recorded once the grant is read back as present'
+        $second.Detail | Should -Match 'Permissions verified=0/1; .* to check by hand=1'
+        $row = $global:PraGate.R11Rows[0]
+        $row.Warnings | Should -Match 'shared1@gate\.invalid: 1 permission\(s\) were granted in this run but a later read does not show them: FullAccess for trustee1@gate\.invalid\. They were not sent again\. Check them by hand: Get-EXOMailboxPermission -Identity shared1@gate\.invalid'
+        $context.Warnings | Should -BeGreaterOrEqual 1
+        $context.Issues.Count | Should -Be 0
+    }
+    It 'a grant whose verification failed is not sent again either, and it is not recorded as read back: a later pass warns, never grants' {
+        $global:PraGate.R11Rows = @(New-R11Row -Upn 'shared1@gate.invalid' -Shared)
+        Add-Member -InputObject $global:PraGate.R11Rows[0] -NotePropertyName ADVerified -NotePropertyValue $true -Force
+        $context = $global:PraGate.R11Context
+        $context.Approval = { param($Target, $Operation) $true }
+        $context.AssertCloudAuthorization = { param($Row) $true }
+        $context.JournalMutation = { param($Target, $Operation, $Status, $Detail) }
+        $result = InModuleScope PRA.Cloud {
+            Mock Invoke-PraExo {
+                if ($Operation -ceq 'Grant') { $global:PraGate.R11.Grants++; @{ TrusteeFound = $true; Verified = $false; Mutated = $true; Error = 'Add returned, verification failed: SYNTHETIC' } }
+                else { @{ TrusteeFound = $true; Verified = $false; Mutated = $false } }
+            }
+            $row = $global:PraGate.R11Rows[0]
+            $request = @([pscustomobject]@{ Right = 'FullAccess'; Trustee = 'trustee1@gate.invalid' })
+            $first = try { $null = Invoke-PraSharedPermission -Context $global:PraGate.R11Context -Row $row -Requests $request; 'no error' } catch { $_.Exception.Message }
+            $null = Invoke-PraSharedPermission -Context $global:PraGate.R11Context -Row $row -Requests $request
+            @{ First = $first; Verified = (Get-PraGrantsVerified $global:PraGate.R11Context).Count }
+        }
+        $result.First | Should -Match 'verification failed'
+        $result.Verified | Should -Be 0
+        $global:PraGate.R11.Grants | Should -Be 1
+        $global:PraGate.R11Rows[0].Warnings | Should -Match 'Check them by hand'
+    }
+}
+
+Describe 'Release 3.2.0 - second review of the entry script and the console: the final backup check after a Both run, the side files of a batch folder are not read, the header of a batch file, a checksum that cannot be read is not kept (entry script functions, synthetic files)' -Tag 'Release320c' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+        $tokens = $null; $errors = $null
+        $entryAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $global:PraGate.Package 'Invoke-PraRemoteMailbox.ps1'), [ref]$tokens, [ref]$errors)
+        foreach ($name in 'Get-PraJsonHeader', 'Test-PraBatchSideFile', 'Get-PraBatchFile') {
+            $definition = $entryAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name }, $true)[0].Extent.Text
+            . ([scriptblock]::Create($definition))
+        }
+    }
+    It 'checks the backup in full after the grants of a Both run, with the same wording as a cloud-only run' {
+        $runtime = New-GateRuntime -Name 'grant-both-320c' -Shared13 -Case CloudGrantSent
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Mode='Apply';Phase='Both';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 240
+        $run.Output | Should -Match 'Backup of the batch checked in full after 13 permission grant\(s\)' -Because ($run.Output + $run.Error)
+        $engine = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'Invoke-PraRemoteMailbox.ps1'))
+        $engine | Should -Match ([regex]::Escape("(Test-PraOrdinalIn `$effectivePhase @('Cloud','Both') -IgnoreCase) -and (Test-PraOrdinalIgnoreCaseEqual `$Action 'Convert') -and [int](Get-PraValue `$context 'GrantsSent' 0) -gt 0"))
+    }
+    It 'knows the side files of a batch folder by name: the proof, the journal, the global report data and their events, and every checksum file; a batch file is not one' {
+        foreach ($name in 'State-abc.json', 'state-abc.json', 'Journal-abc.jsonl', 'PhaseData-2026-AD-1.json', 'PhaseEvents-2026-AD-1.jsonl', 'Convert-GATE-1.json.sha256', 'x.SHA256') { Test-PraBatchSideFile $name | Should -BeTrue -Because $name }
+        foreach ($name in 'Convert-GATE-20261117_100000-abcd1234.json', 'Recover-GATE-1.json', 'Finalize-abcd.json') { Test-PraBatchSideFile $name | Should -BeFalse -Because $name }
+    }
+    It 'Get-PraBatchFile does not read the side files of the folder: a side file that carries an Operation of a batch is not a second batch, and a file that is not JSON is not read at all' {
+        $folder = Join-Path $global:PraGate.Root ('Batch-' + [guid]::NewGuid().ToString('N')); $null = New-Item -ItemType Directory -Path $folder -Force
+        $utf8 = New-Object Text.UTF8Encoding($true)
+        [IO.File]::WriteAllText((Join-Path $folder 'Convert-GATE-1.json'), '{"SchemaVersion":3,"Operation":"Convert","BatchId":"a1b2c3d4e5f60718293a4b5c6d7e8f9","Records":[]}', $utf8)
+        foreach ($side in 'PhaseData-1.json', 'PhaseEvents-1.json', 'Journal-1.json', 'State-1.json') { [IO.File]::WriteAllText((Join-Path $folder $side), '{"Operation":"Convert","Records":[]}', $utf8) }
+        [IO.File]::WriteAllText((Join-Path $folder 'Convert-GATE-1.json.sha256'), '0' * 64, $utf8)
+        $context = @{ CurrentOperation = '' }
+        function Get-PraHash { param($Path) (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
+        $Action = 'Convert'
+        (Get-PraBatchFile -Value $folder -Operations @('Convert')) | Should -BeExactly (Join-Path $folder 'Convert-GATE-1.json')
+    }
+    It 'reads the fields of a batch envelope from its head (the rest of the file is not even JSON), and parses the file when a field is not in the head' {
+        $folder = Join-Path $global:PraGate.Root ('header-' + [guid]::NewGuid().ToString('N').Substring(0, 6)); $null = New-Item -ItemType Directory -Path $folder -Force
+        $utf8 = New-Object Text.UTF8Encoding($true)
+        $head = Join-Path $folder 'head.json'
+        [IO.File]::WriteAllText($head, ('{"SchemaVersion":3,"Operation":"Recover","RunId":"r","BatchId":"a1b2c3d4e5f60718293a4b5c6d7e8f9","SourceBackupHash":"' + ('ab' * 32) + '","Records":[' + ('?' * 20000)), $utf8)
+        $found = Get-PraJsonHeader $head @('Operation', 'BatchId', 'SourceBackupHash')
+        $found.Operation | Should -BeExactly 'Recover'
+        $found.BatchId | Should -BeExactly 'a1b2c3d4e5f60718293a4b5c6d7e8f9'
+        $found.SourceBackupHash | Should -BeExactly ('ab' * 32)
+        $late = Join-Path $folder 'late.json'
+        [IO.File]::WriteAllText($late, '{"SchemaVersion":3,"Records":[{"BatchId":"nested"}],"BatchId":"toplevel","Operation":"Convert"}', $utf8)
+        (Get-PraJsonHeader $late @('Operation', 'BatchId')).BatchId | Should -BeExactly 'toplevel' -Because 'a nested field of the same name is never taken'
+        $absent = Join-Path $folder 'absent.json'
+        [IO.File]::WriteAllText($absent, '{"SchemaVersion":3,"Operation":"Convert","Records":[{"X":1}]}', $utf8)
+        (Get-PraJsonHeader $absent @('SourceBackupHash')).PSObject.Properties['SourceBackupHash'] | Should -BeNullOrEmpty -Because 'the file was parsed and has no such field'
+    }
+}
+
+BeforeDiscovery {
+    $script:GdBrowserAvailable = [bool](@("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Google\Chrome\Application\chrome.exe") |
+            Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1)
+}
+
+Describe 'Release 3.2.0 - the global report holds every object, every journey line and every error and warning, and says so when a limit leaves something out (production Common module, synthetic data)' -Tag 'Release320d' {
+    BeforeAll {
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
+        $script:GdRoot = Join-Path $global:PraGate.Root ('lotd-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+        $null = New-Item -ItemType Directory -Path $script:GdRoot -Force
+        $script:Dot = [string][char]0x00B7
+        function global:New-GdRow {
+            param([int]$Index, [string]$Guid = '', [string]$Status = '', [string]$Name = '')
+            if (-not $Guid) { $Guid = '{0:x8}-0000-4000-8000-{1:x12}' -f $Index, $Index }
+            if (-not $Status) { $Status = if ($Index % 50 -eq 0) { 'Error' } elseif ($Index % 25 -eq 0) { 'Pending' } else { 'Success' } }
+            if (-not $Name) { $Name = if ($Index % 2) { 'User{0:0000}@Contoso.Example' -f $Index } else { 'user{0:0000}@contoso.example' -f $Index } }
+            [pscustomobject]@{ ObjectGuid = $Guid; SamAccountName = ('user{0:0000}' -f $Index); UserPrincipalName = $Name; Action = 'Convert'; IsShared = ($Index % 7 -eq 0); ADApplied = $true; ADVerified = $true
+                BackupPath = 'D:\PRA\Backups\Batch-x\Convert.json'; CloudStatus = $(if ($Status -ceq 'Error') { 'Error' } elseif ($Status -ceq 'Pending') { 'Pending' } else { 'Success' }); CloudDetail = ''; FinalStatus = $Status; Detail = 'synthetic detail'; Warnings = ''
+                LastOperation = ''; GroupAction = ''; CloudMailbox = $null; CloudLicense = $null; PreserveCloudMailbox = $false; PreserveLicense = $false; DeprovisionConfirmed = $false; PermDetail = ''; PermMissing = @() }
+        }
+        function global:New-GdContext {
+            param([string]$Action = 'Convert', [string]$Phase = 'Both', [string]$Name = 'run', [string[]]$PhaseFolders = @(), [int]$Minutes = 0)
+            @{ Root = $global:PraGate.Package; Version = '3.2.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = (Get-Date).AddMinutes($Minutes); Action = $Action; Mode = 'Apply'; Phase = $Phase
+                CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; StepTotal = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
+                Server = 'dc01.contoso.com'; Config = @{ Environment = 'GATE'; Cloud = @{ Organization = 'contoso.onmicrosoft.com' } }; AllowMutation = $true; ReportFolder = (Join-Path $script:GdRoot ('reports-' + $Name)); NoReport = $false; BatchId = 'abcd1234'
+                LogFile = (Join-Path $script:GdRoot ($Name + '.log')); NextSteps = @(); ExitCode = 0; CloudConnectFailed = $false; ResultStatus = ''; PhaseFolders = $PhaseFolders; ConfigOverrides = @() }
+        }
+        function global:New-GdFolder { param([string]$Name) $path = Join-Path $script:GdRoot $Name; $null = New-Item -ItemType Directory -Path $path -Force; $path }
+        function global:Add-GdJourney {
+            param([hashtable]$Context, [int]$LinesPerObject = 2, [string]$Text = 'step')
+            InModuleScope PRA.Common -Parameters @{ Context = $Context; Lines = $LinesPerObject; Text = $Text } {
+                foreach ($row in $Context.Rows.ToArray()) {
+                    Register-PraObjectName $Context $row.ObjectGuid $row.UserPrincipalName
+                    $Context.CurrentIdentity = $row.ObjectGuid
+                    for ($k = 1; $k -le $Lines; $k++) { Add-PraJourney -Context $Context -Status $(if ($k -eq 2 -and ($row.SamAccountName -like '*0')) { 'Warn' } else { 'Ok' }) -Text ('{0} {1} of {2}' -f $Text, $k, $row.SamAccountName) }
+                }
+                $Context.CurrentIdentity = ''
+            }
+        }
+        function global:Get-GdTally { param($Items, [string]$Property) $tally = @{}; foreach ($item in $Items) { $key = [string]$item.$Property; $tally[$key] = 1 + [int]$tally[$key] }; $tally }
+        function global:Invoke-GdBrowserDom {
+            param([Parameter(Mandatory)][string]$Path, [string]$Hash = '')
+            $browser = @("${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe", "$env:ProgramFiles\Google\Chrome\Application\chrome.exe") | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+            $browserProfile = Join-Path ([IO.Path]::GetTempPath()) ('pra-browser-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            try {
+                $start = [Diagnostics.ProcessStartInfo]::new($browser)
+                foreach ($argument in @('--headless=new', '--disable-gpu', '--no-first-run', "--user-data-dir=$browserProfile", '--virtual-time-budget=60000', '--dump-dom', (([Uri]$Path).AbsoluteUri + $Hash))) { $start.ArgumentList.Add($argument) }
+                $start.RedirectStandardOutput = $true; $start.RedirectStandardError = $true; $start.UseShellExecute = $false
+                $process = [Diagnostics.Process]::Start($start)
+                $output = $process.StandardOutput.ReadToEndAsync(); $null = $process.StandardError.ReadToEndAsync()
+                if (-not $process.WaitForExit(240000)) { $process.Kill($true) }
+                return $output.Result
+            } finally { Remove-Item -LiteralPath $browserProfile -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\New-GdRow', 'Function:\New-GdContext', 'Function:\New-GdFolder', 'Function:\Add-GdJourney', 'Function:\Get-GdTally', 'Function:\Invoke-GdBrowserDom' -ErrorAction SilentlyContinue }
+
+    It 'writes every object of a batch of 5,000 with its verdict: the model, the page data and the CSV file agree, with no cap and no notice about one, and the page stays small' {
+        $context = New-GdContext Convert Both 'big'
+        for ($i = 1; $i -le 5000; $i++) { $context.Rows.Add((New-GdRow $i)) }
+        Add-GdJourney $context 2
+        $report = Write-PraGlobalReport -Context $context
+        $model = $context.GlobalModel
+        $model.Objects.Count | Should -Be 5000
+        ($model.Counts.Failed, $model.Counts.Pending, $model.Counts.Warn, $model.Counts.Done) -join ',' | Should -BeExactly '100,100,400,4400'
+        $page = Read-PraGlobalReportData $report.Html
+        $page.Meta.objects.count | Should -Be 5000
+        $page.Objects.Count | Should -Be 5000
+        $guids = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::Ordinal)
+        foreach ($object in $page.Objects) { [void]$guids.Add([string]$object.ObjectGuid) }
+        $guids.Count | Should -Be 5000 -Because 'every object is in the page, once'
+        $tally = Get-GdTally $page.Objects 'Verdict'
+        ($tally['failed'], $tally['pending'], $tally['done with warnings'], $tally['done']) -join ',' | Should -BeExactly '100,100,400,4400'
+        $csv = @(Import-Csv -LiteralPath $report.Csv -Delimiter ';')
+        $csv.Count | Should -Be 5000
+        $csvTally = Get-GdTally $csv 'Verdict'
+        ($csvTally['failed'], $csvTally['pending'], $csvTally['done with warnings'], $csvTally['done']) -join ',' | Should -BeExactly '100,100,400,4400'
+        @($csv | Where-Object { $_.Sides -notmatch "^Convert . AD \+ Cloud: " }).Count | Should -Be 0 -Because 'the stages of every object are in the CSV'
+        $page.Meta.events.count | Should -Be 15000 -Because 'two steps and one result per object'
+        @(Import-Csv -LiteralPath $report.EventsCsv -Delimiter ';').Count | Should -Be 15000
+        $sum = 0; foreach ($line in $csv) { $sum += [int]$line.EventCount }
+        $sum | Should -Be 15000
+        $page.Html | Should -Not -MatchExactly 'More than' -Because 'no notice about a cap'
+        $page.Html.Length | Should -BeLessThan (3MB) -Because 'the page keeps its data compressed and shows a few rows at a time'
+        $page.Chunks.Objects | Should -BeGreaterThan 0
+        $script:GdBig = @{ Model = $context.GlobalModel; Report = $report; Page = $page }
+    }
+
+    It 'reads the same data from a page written in several chunks' {
+        $writer = New-Object IO.StringWriter
+        InModuleScope PRA.Common -Parameters @{ Model = $script:GdBig.Model; Writer = $writer; Templates = (Join-Path $global:PraGate.Package 'templates') } {
+            Write-PraGlobalReportHtml -Model $Model -Writer $Writer -TemplateFolder $Templates -ChunkRows 1500
+        }
+        $text = $writer.ToString()
+        ([regex]::Matches($text, 'data-kind="objects"')).Count | Should -Be 4
+        ([regex]::Matches($text, 'data-kind="events"')).Count | Should -Be 10
+        $path = Join-Path $script:GdRoot 'chunked.html'
+        [IO.File]::WriteAllText($path, $text, (New-Object Text.UTF8Encoding($true)))
+        $chunked = Read-PraGlobalReportData $path
+        $chunked.Objects.Count | Should -Be 5000
+        $chunked.Events.Count | Should -Be 15000
+        ($chunked.Objects[4999]).ObjectGuid | Should -BeExactly $script:GdBig.Page.Objects[4999].ObjectGuid
+        ($chunked.Events[14999]).Text | Should -BeExactly $script:GdBig.Page.Events[14999].Text
+    }
+
+    It 'says what a limit left out, with the count and where the full data is: journey lines above the limit, texts that were cut, lines that do not fit the events file' {
+        $folder = New-GdFolder 'Batch-cut00001'
+        $ad = New-GdContext Convert AD 'cut-ad' -Minutes -10
+        foreach ($i in 1..3) { $ad.Rows.Add((New-GdRow $i -Status 'Pending')) }
+        $saved = InModuleScope PRA.Common -Parameters @{ Context = $ad; Folder = $folder } {
+            $before = @{ Journey = $script:PraPhaseLimits.MaxJourney; Text = $script:PraPhaseLimits.MaxStepText; Events = $script:PraPhaseLimits.MaxEventsBytes }
+            try {
+                $script:PraPhaseLimits.MaxJourney = 5; $script:PraPhaseLimits.MaxStepText = 30
+                foreach ($row in $Context.Rows.ToArray()) {
+                    Register-PraObjectName $Context $row.ObjectGuid $row.UserPrincipalName
+                    $Context.CurrentIdentity = $row.ObjectGuid
+                    for ($k = 1; $k -le 4; $k++) { Add-PraJourney -Context $Context -Status 'Ok' -Text ('line {0} {1}' -f $k, ('x' * 60)) }
+                }
+                $Context.CurrentIdentity = ''
+                $script:PraPhaseLimits.MaxEventsBytes = 700
+                Save-PraPhaseData -Context $Context -Folder $Folder -HandOff 'Convert'
+            }
+            finally { $script:PraPhaseLimits.MaxJourney = $before.Journey; $script:PraPhaseLimits.MaxStepText = $before.Text; $script:PraPhaseLimits.MaxEventsBytes = $before.Events }
+        }
+        $header = [IO.File]::ReadAllText($saved) | ConvertFrom-Json -DateKind String
+        $header.Omitted.JourneyLines | Should -Be 7 -Because '12 lines were written by the run, 5 fit'
+        $header.Omitted.Texts | Should -BeGreaterOrEqual 5
+        $header.Omitted.EventLines | Should -BeGreaterThan 0 -Because 'the events file is limited to 700 bytes'
+        $header.Truncated | Should -BeTrue
+        $header.Phase.LogFile | Should -BeExactly 'cut-ad.log'
+        $cloud = New-GdContext Convert Cloud 'cut-cloud' -PhaseFolders @($folder)
+        foreach ($i in 1..3) { $cloud.Rows.Add((New-GdRow $i -Status 'Success')) }
+        $report = Write-PraGlobalReport -Context $cloud
+        $model = $cloud.GlobalModel
+        @($model.Omitted).Count | Should -Be 1 -Because 'only the phase that left something out is named'
+        $model.Omitted[0].Label | Should -BeExactly "Convert $script:Dot AD"
+        $model.Omitted[0].LogFile | Should -BeExactly 'cut-ad.log'
+        ($model.Omitted[0].Items -join ' | ') | Should -Match '7 journey line\(s\) were not kept \(more than 5 lines in one phase\)'
+        ($model.Omitted[0].Items -join ' | ') | Should -Match '\d+ text\(s\) were cut to their first characters'
+        ($model.Omitted[0].Items -join ' | ') | Should -Match '\d+ line\(s\) were not written to the events file of this phase'
+        $plain = [regex]::Replace([IO.File]::ReadAllText($report.Html), '(?s)<script.*?</script>', '')
+        $plain | Should -Match 'Not everything was kept'
+        $plain | Should -Match '7 journey line\(s\) were not kept'
+        $plain | Should -Match 'the log of that run: cut-ad\.log'
+        foreach ($leaf in @($report.Csv, $report.EventsCsv, $report.IssuesCsv)) { $plain | Should -Match ([regex]::Escape([IO.Path]::GetFileName($leaf))) -Because 'the page names the files that hold the data' }
+    }
+
+    It 'does not cut errors and warnings: 12,000 errors and 5,000 warnings of one phase are in the phase data, in the page, in the counts shown without script and in the issues CSV file' {
+        $folder = New-GdFolder 'Batch-issues001'
+        $ad = New-GdContext Convert AD 'issues-ad' -Minutes -10
+        foreach ($i in 1..3) { $ad.Rows.Add((New-GdRow $i -Status 'Pending')) }
+        for ($i = 1; $i -le 12000; $i++) { $ad.Issues.Add([pscustomobject]@{ Timestamp = '2026-11-18T08:00:00.0000000Z'; Phase = 'Active Directory'; Operation = 'Set'; Source = 'AD'; Identity = ('u{0}' -f $i); Message = ('synthetic error number {0}' -f $i) }) }
+        $ad.WarningList = New-Object 'Collections.Generic.List[object]'
+        for ($i = 1; $i -le 5000; $i++) { $ad.WarningList.Add([pscustomobject]@{ Timestamp = '2026-11-18 08:00:00'; Phase = 'Active Directory'; Message = ('synthetic warning number {0}' -f $i) }) }
+        $saved = Save-PraPhaseData -Context $ad -Folder $folder -HandOff 'Convert'
+        $read = Read-PraPhaseData -Folder @($folder) -Environment 'GATE'
+        @($read.Phases[0].Issues).Count | Should -Be 12000
+        @($read.Phases[0].Warnings).Count | Should -Be 5000
+        ([IO.File]::ReadAllText($saved) | ConvertFrom-Json -DateKind String).Truncated | Should -BeFalse
+        $cloud = New-GdContext Convert Cloud 'issues-cloud' -PhaseFolders @($folder)
+        foreach ($i in 1..3) { $cloud.Rows.Add((New-GdRow $i -Status 'Success')) }
+        $report = Write-PraGlobalReport -Context $cloud
+        $page = Read-PraGlobalReportData $report.Html
+        $page.Meta.issues.count | Should -Be 17000
+        $page.Issues.Count | Should -Be 17000
+        $kinds = Get-GdTally $page.Issues 'Kind'
+        ($kinds['error'], $kinds['warning']) -join ',' | Should -BeExactly '12000,5000'
+        @($page.Issues | Where-Object { $_.Message -ceq 'synthetic error number 12000' }).Count | Should -Be 1 -Because 'the last error is there'
+        $plain = [regex]::Replace($page.Html, '(?s)<script.*?</script>', '')
+        $plain | Should -Match "Convert (&#183;|$script:Dot) AD</td><td>12000</td><td>5000</td>"
+        $plain | Should -Match ([regex]::Escape([IO.Path]::GetFileName($report.IssuesCsv)))
+        @(Import-Csv -LiteralPath $report.IssuesCsv -Delimiter ';').Count | Should -Be 17000
+    }
+
+    It 'reads a phase without the file of its events and says so; the objects and their verdicts stay in the report (changed, missing and unchecked events file)' {
+        $cases = @(
+            @{ Name = 'changed'; Break = { param($events) [IO.File]::AppendAllText($events, ' ') }; Reason = 'the checksum of the events file does not match' }
+            @{ Name = 'missing'; Break = { param($events) [IO.File]::Delete($events); [IO.File]::Delete($events + '.sha256') }; Reason = 'the events file is missing' }
+            @{ Name = 'unchecked'; Break = { param($events) [IO.File]::Delete($events + '.sha256') }; Reason = 'the \.sha256 file of the events file is missing' }
+        )
+        foreach ($case in $cases) {
+            $folder = New-GdFolder ('Batch-events-' + $case.Name)
+            $ad = New-GdContext Convert AD ('ev-ad-' + $case.Name) -Minutes -10
+            foreach ($i in 1..2) { $ad.Rows.Add((New-GdRow $i -Status 'Pending')) }
+            Add-GdJourney $ad 2
+            $saved = Save-PraPhaseData -Context $ad -Folder $folder -HandOff 'Convert'
+            $events = @(Get-ChildItem -LiteralPath $folder -Filter 'PhaseEvents-*.jsonl')[0].FullName
+            & $case.Break $events
+            $read = Read-PraPhaseData -Folder @($folder) -Environment 'GATE'
+            $read.Phases.Count | Should -Be 1 -Because $case.Name
+            $read.Phases[0].EventsProblem | Should -Match $case.Reason -Because $case.Name
+            @($read.Phases[0].Issues).Count | Should -Be 0
+            $cloud = New-GdContext Convert Cloud ('ev-cloud-' + $case.Name) -PhaseFolders @($folder)
+            foreach ($i in 1..2) { $cloud.Rows.Add((New-GdRow $i -Status 'Success')) }
+            $report = Write-PraGlobalReport -Context $cloud
+            $cloud.GlobalModel.Objects.Count | Should -Be 2
+            @($cloud.GlobalModel.Objects | ForEach-Object Verdict | Get-PraOrdinalUnique) -join ',' | Should -BeExactly 'done'
+            ($cloud.GlobalModel.Omitted[0].Items -join ' ') | Should -Match ('not available: ' + $case.Reason)
+            [IO.File]::ReadAllText($report.Html) | Should -Match 'Not everything was kept'
+        }
+    }
+
+    It 'reads an events file as untrusted input: a line that is too long, not an object or not JSON is skipped and counted, the other lines are read' {
+        $path = Join-Path $script:GdRoot 'lines.jsonl'
+        $good = '{"K":"E","G":"g1","Time":"t","Step":"s","Status":"Ok","Text":"one"}'
+        $lines = @($good, ('{"K":"E","Text":"' + ('x' * 70000) + '"}'), 'not json at all', '[1,2,3]', '{"K":"E","Text":"broken"', '{"K":"W","Timestamp":"t","Phase":"p","Message":"warn"}', '', '   ', '{"a":}')
+        [IO.File]::WriteAllText($path, ($lines -join "`n"), (New-Object Text.UTF8Encoding($false)))
+        $read = InModuleScope PRA.Common -Parameters @{ Path = $path } { Read-PraEventLine -Path $Path }
+        $read.Items.Count | Should -Be 2
+        $read.Skipped | Should -Be 6
+        $read.Items[0].Text | Should -BeExactly 'one'
+        $read.Items[1].K | Should -BeExactly 'W'
+    }
+
+    It 'still reads the phase data of a version that kept the steps in the file, and says when it had left them out' {
+        $guid = [guid]::NewGuid().ToString()
+        $make = {
+            param([string]$Folder, [bool]$Truncated)
+            $record = [ordered]@{ SchemaVersion = 1; Kind = 'PhaseData'; Environment = 'GATE'; BatchId = 'abcd1234'; ToolVersion = '3.1.4'; Truncated = $Truncated
+                Phase = [ordered]@{ RunId = ('20261101_080000-' + [guid]::NewGuid().ToString('N')); Action = 'Convert'; Phase = 'AD'; Mode = 'Apply'; Computer = 'SRV1'; Account = 'CONTOSO\admin'; Server = 'dc01'; StartedUtc = '2026-11-01T08:00:00.0000000Z'; EndedUtc = '2026-11-01T08:10:00.0000000Z'
+                    Status = 'Pending'; ExitCode = 2; HandOff = 'Convert'; Overrides = @(); Settings = [ordered]@{ Environment = 'GATE' }; Steps = @(); Counts = [ordered]@{ Success = 0; Error = 0; Pending = 1; Skipped = 0; Planned = 0 } }
+                Objects = @([ordered]@{ ObjectGuid = $guid; Name = 'old@contoso.com'; SamAccountName = 'old'; UserPrincipalName = 'old@contoso.com'; IsShared = $false; Action = 'Convert'; FinalStatus = 'Pending'; CloudStatus = 'N/A'; ADApplied = $true; ADVerified = $true
+                        BackupPath = 'D:\b.json'; Detail = 'd'; CloudDetail = ''; Warnings = ''; Steps = @([ordered]@{ Time = '2026-11-01T08:01:00.0000000Z'; Step = 'Backup'; Status = 'Ok'; Text = 'old step' }) })
+                Issues = @([ordered]@{ Timestamp = 't'; Phase = 'p'; Operation = 'o'; Identity = 'i'; Source = 's'; Message = 'old error' }); Warnings = @() }
+            $file = Join-Path $Folder 'PhaseData-20261101080000-AD-aaaaaaaa.json'
+            [IO.File]::WriteAllText($file, ($record | ConvertTo-Json -Depth 8 -Compress), (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText($file + '.sha256', (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false)))
+        }
+        $folder = New-GdFolder 'Batch-old-steps'
+        & $make $folder $false
+        $read = Read-PraPhaseData -Folder @($folder) -Environment 'GATE'
+        $read.Phases.Count | Should -Be 1
+        $read.Phases[0].EventsProblem | Should -BeExactly ''
+        $read.Phases[0].Objects[0].Steps[0].Text | Should -BeExactly 'old step'
+        @($read.Phases[0].Issues).Count | Should -Be 1
+        $cloud = New-GdContext Convert Cloud 'old-cloud' -PhaseFolders @($folder)
+        $cloud.Rows.Add((New-GdRow 1 -Guid $guid.ToUpperInvariant() -Name 'OLD@contoso.com' -Status 'Success'))
+        $report = Write-PraGlobalReport -Context $cloud
+        $cloud.GlobalModel.Objects.Count | Should -Be 1 -Because 'the same object, whatever the letter case of its GUID and name'
+        $cloud.GlobalModel.Objects[0].Stages.Count | Should -Be 2
+        $page = Read-PraGlobalReportData $report.Html
+        @($page.Events | Where-Object { $_.Text -ceq 'old step' }).Count | Should -Be 1
+        @($page.Issues | Where-Object { $_.Message -ceq 'old error' }).Count | Should -Be 1
+        $left = New-GdFolder 'Batch-old-cut'
+        & $make $left $true
+        $cut = (Read-PraPhaseData -Folder @($left) -Environment 'GATE').Phases[0]
+        $cut.EventsProblem | Should -Match 'left out when it was saved'
+    }
+
+    It 'copies the events file with its PhaseData file and their checksums, never over a file that is there, and the copy reads the same data' {
+        $source = New-GdFolder 'Batch-copy-src'; $target = New-GdFolder 'Finalize-copy-dst'
+        $ad = New-GdContext Convert AD 'copy-ad' -Minutes -10
+        foreach ($i in 1..2) { $ad.Rows.Add((New-GdRow $i -Status 'Pending')) }
+        Add-GdJourney $ad 2
+        $saved = Save-PraPhaseData -Context $ad -Folder $source -HandOff 'Convert'
+        (Copy-PraPhaseData -SourceFolder @($source) -Destination $target) | Should -Be 1
+        @(Get-ChildItem -LiteralPath $target -File).Count | Should -Be 4 -Because 'the PhaseData file, the events file and their two checksums'
+        @(Get-ChildItem -LiteralPath $target -Filter 'PhaseEvents-*.jsonl').Count | Should -Be 1
+        (Copy-PraPhaseData -SourceFolder @($source) -Destination $target) | Should -Be 1 -Because 'a file that is there is left alone'
+        @(Get-ChildItem -LiteralPath $target -File).Count | Should -Be 4
+        $read = Read-PraPhaseData -Folder @($target) -Environment 'GATE'
+        $read.Problems.Count | Should -Be 0
+        $read.Phases[0].EventsProblem | Should -BeExactly ''
+        @($read.Phases[0].Objects[0].Steps).Count | Should -Be 2
+        $one = New-GdFolder 'Batch-copy-one'
+        Copy-PraPhaseFile -Path $saved -Destination $one
+        @(Get-ChildItem -LiteralPath $one -File).Count | Should -Be 4
+    }
+
+    It 'writes the CSV files with one line per journey line, UTF-8 with a byte order mark, a guard before a formula, and no journey column in the file of the objects' {
+        $context = New-GdContext Convert Both 'csv'
+        $context.Rows.Add((New-GdRow 1 -Name '=cmd@contoso.com'))
+        $context.Rows.Add((New-GdRow 2))
+        Add-GdJourney $context 3 '=evil'
+        $report = Write-PraGlobalReport -Context $context
+        foreach ($path in @($report.Csv, $report.EventsCsv, $report.IssuesCsv)) {
+            $bytes = [IO.File]::ReadAllBytes($path)
+            ('{0:X2}{1:X2}{2:X2}' -f $bytes[0], $bytes[1], $bytes[2]) | Should -Be 'EFBBBF'
+        }
+        $objects = @(Import-Csv -LiteralPath $report.Csv -Delimiter ';')
+        $objects[0].PSObject.Properties.Name | Should -Not -Contain 'Journey'
+        $objects[0].PSObject.Properties.Name | Should -Contain 'EventCount'
+        ($objects | Where-Object ObjectGuid -eq (New-GdRow 1).ObjectGuid).Name | Should -BeExactly "'=cmd@contoso.com"
+        $events = @(Import-Csv -LiteralPath $report.EventsCsv -Delimiter ';')
+        $events.Count | Should -Be 8 -Because 'three steps and one result for each of two objects'
+        @($events | Where-Object { $_.Text -like "'=evil*" }).Count | Should -Be 6 -Because 'a text that starts like a formula gets an apostrophe'
+        @($events | Where-Object { $_.Text -like '=*' }).Count | Should -Be 0
+        [int]$objects[0].EventCount | Should -Be 4
+        @(Get-Content -LiteralPath $report.IssuesCsv)[0] | Should -Match 'Phase.*Kind.*Time.*Step.*Object.*Message'
+    }
+
+    It 'writes the page of a batch with nothing in it, and still gives the summary and the CSV files when the template is missing' {
+        $context = New-GdContext Convert Both 'empty'
+        $report = Write-PraGlobalReport -Context $context
+        $report.Html | Should -Not -BeNullOrEmpty
+        $page = Read-PraGlobalReportData $report.Html
+        $page.Objects.Count | Should -Be 0
+        $page.Events.Count | Should -Be 0
+        @(Import-Csv -LiteralPath $report.Csv -Delimiter ';').Count | Should -Be 0
+        @(Get-Content -LiteralPath $report.EventsCsv)[0] | Should -Match 'ObjectGuid'
+        $model = Get-PraGlobalModel -Context $context
+        $writer = New-Object IO.StringWriter
+        InModuleScope PRA.Common -Parameters @{ Model = $model; Writer = $writer; Folder = (Join-Path $script:GdRoot 'no-templates') } { Write-PraGlobalReportHtml -Model $Model -Writer $Writer -TemplateFolder $Folder }
+        $writer.ToString() | Should -Match 'Template missing: only the CSV files hold the objects'
+    }
+
+    It 'has no external resource and no network call in the page, and its script keeps nothing the data could close' {
+        $template = [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'templates\GlobalReport.template.html'))
+        $template | Should -Not -Match 'https?://'
+        $template | Should -Not -Match '(?i)<link\b|@import|\bsrc\s*=|(?<![a-z])url\(|<iframe|<img|<object|<embed'
+        $template | Should -Not -Match '(?i)\bfetch\s*\(|XMLHttpRequest|WebSocket|sendBeacon|\bimport\s*\(|EventSource|navigator\.serviceWorker|innerHTML|insertAdjacentHTML|document\.write'
+        $template | Should -Match '\{\{DATA\}\}'
+        $script:GdBig.Page.Html | Should -Not -Match 'https?://'
+    }
+
+    It 'runs the script of the page in a headless browser: every object and every line is decoded, at most 200 rows are in the page, and a journey opens from the name in any letter case' -Skip:(-not $script:GdBrowserAvailable) {
+        $dom = Invoke-GdBrowserDom -Path $script:GdBig.Report.Html -Hash '#object=USER0007@contoso.EXAMPLE'
+        $dom | Should -Match 'data-state="ready"'
+        $dom | Should -Match 'data-objects="5000"'
+        $dom | Should -Match 'data-events="15000"'
+        $dom | Should -Match '5,000 object\(s\), no filter'
+        $rows = ([regex]::Matches($dom, 'class="grid-row')).Count
+        $rows | Should -BeGreaterThan 0
+        $rows | Should -BeLessOrEqual 200
+        $dom | Should -Match '<h2 id="journey-title">Journey of User0007@Contoso\.Example</h2>'
+        $dom | Should -Match '<dialog id="journey"[^>]* data-events="3"'
+        $dom | Should -Match 'Result of this phase'
+    }
+
+    It 'says plainly that the data is incomplete, and shows no object, when a chunk of the page is missing' -Skip:(-not $script:GdBrowserAvailable) {
+        $text = [IO.File]::ReadAllText($script:GdBig.Report.Html)
+        $first = [regex]::Match($text, '<script type="application/x-pra-chunk" data-kind="events"[^>]*>[^<]*</script>\r?\n')
+        $first.Success | Should -BeTrue
+        $tampered = Join-Path $script:GdRoot 'tampered.html'
+        [IO.File]::WriteAllText($tampered, $text.Remove($first.Index, $first.Length), (New-Object Text.UTF8Encoding($true)))
+        $dom = Invoke-GdBrowserDom -Path $tampered
+        $dom | Should -Match 'data-state="error"'
+        $dom | Should -Match 'The report data is incomplete'
+        $dom | Should -Not -Match 'class="grid-row'
     }
 }

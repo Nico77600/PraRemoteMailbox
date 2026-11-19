@@ -237,30 +237,46 @@ $script:PraExoWorker = {
     function Mailbox {
         param([string]$Upn,[switch]$Hold)
         $properties = @('RecipientTypeDetails','EmailAddresses','LegacyExchangeDN','ExternalDirectoryObjectId')
-        if ($Hold) { $properties += @('IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled') }
+        if ($Hold) { $properties += @('IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled','ExchangeGuid') }
         $byId = Confirmed $Upn
         if ($byId) {
+            # Where an absent mailbox is the expected answer (AbsenceConfirms: the deprovisioning check of a Recover), only an explicit, recognised "not found" for this id counts as absent;
+            # any other error is a failed read. Elsewhere an absent mailbox only means "not yet", and the broader match stays.
             try { $items = @(Get-EXOMailbox -ExternalDirectoryObjectId $byId -Properties $properties -ErrorAction Stop) }
-            catch { if ($_.Exception.Message -notmatch "(?i)couldn.t be found|couldn.t find|HttpStatusCode=404|ManagementObjectNotFoundException") { throw }; $items = @() }
+            catch {
+                $absent = MissingRecipient $_ $byId
+                if (-not $absent -and -not [bool](V $P 'AbsenceConfirms' $false)) { $absent = ($_.Exception.Message -match "(?i)couldn.t be found|couldn.t find|HttpStatusCode=404|ManagementObjectNotFoundException") }
+                if (-not $absent) { throw }
+                $items = @()
+            }
         }
         else { $items = @(Get-EXOMailbox -Filter (ExactFilter $Upn) -Properties $properties -ResultSize Unlimited -ErrorAction Stop) }
         $inactiveByUpn = $false
         if ($Hold -and $items.Count -eq 0) {
             # The inactive mailbox of a deleted account has no account to confirm and another ExternalDirectoryObjectId than a live account with the same UPN.
-            # Without a confirmed account it is found by UPN, and several candidates are an ambiguity, never a guess. With a confirmed account, an inactive
-            # mailbox that carries another ExternalDirectoryObjectId belongs to an earlier account: it is not the mailbox of this object and never decides the verdict.
+            # Without a confirmed account it is found by UPN. With a confirmed account, an inactive mailbox that carries another ExternalDirectoryObjectId belongs to an
+            # earlier account: it is not the mailbox of this object and never decides the verdict. One that carries none is a candidate found by UPN. Several candidates
+            # are told apart by the mailbox GUID recorded on premises (ExchangeGuid) when the record has one; otherwise they are an ambiguity, never a guess.
             $items = @(Get-EXOMailbox -Filter (ExactFilter $Upn) -Properties $properties -ResultSize Unlimited -InactiveMailboxOnly -ErrorAction Stop)
             if ($byId) {
                 $own = @($items | Where-Object { SameIgnoreCase ([string](V $_ 'ExternalDirectoryObjectId' '')) $byId })
-                if (-not $own.Count -and $items.Count) {
+                $nameless = @($items | Where-Object { [string]::IsNullOrWhiteSpace([string](V $_ 'ExternalDirectoryObjectId' '')) })
+                if ($own.Count) { $items = $own }
+                elseif ($nameless.Count) { $items = $nameless }
+                elseif ($items.Count) {
                     return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@(); EarlierAccount=$true; EarlierCount=[int]$items.Count }
                 }
-                $items = $own
             }
-            elseif ($items.Count -gt 1) {
-                throw ("Exchange Online has $($items.Count) inactive mailboxes for $Upn and nothing tells which one belongs to this object: the retention cannot be checked for it. To list them, run: Get-EXOMailbox -InactiveMailboxOnly -Filter ""$(ExactFilter $Upn)"" -Properties ExternalDirectoryObjectId,WhenSoftDeleted,InPlaceHolds | Format-List Name,ExternalDirectoryObjectId,WhenSoftDeleted,InPlaceHolds. Then check by hand, in the Microsoft Purview portal, the retention of the mailbox of this object.")
+            if ($items.Count -gt 1 -and -not ($byId -and @($items | Where-Object { SameIgnoreCase ([string](V $_ 'ExternalDirectoryObjectId' '')) $byId }).Count)) {
+                $guids = @(V $P 'MailboxGuids' @() | Where-Object { $_ })
+                $matching = @($items | Where-Object { $exchangeGuid = [string](V $_ 'ExchangeGuid' ''); $exchangeGuid -and (InSetIgnoreCase $exchangeGuid $guids) })
+                if ($matching.Count -ne 1) {
+                    $recorded = if ($guids.Count) { ' The mailbox GUID recorded for this object does not tell them apart either.' } else { ' This object has no mailbox GUID recorded (it was not an on-premises mailbox, or the record is older), so nothing tells them apart.' }
+                    throw ("Exchange Online has $($items.Count) inactive mailboxes for $Upn and nothing tells which one belongs to this object: the retention cannot be checked for it.$recorded To list them, run: Get-EXOMailbox -InactiveMailboxOnly -Filter ""$(ExactFilter $Upn)"" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds | Format-List Name,ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds. Then check by hand, in the Microsoft Purview portal, the retention of the mailbox of this object.")
+                }
+                $items = $matching
             }
-            $inactiveByUpn = (-not $byId -and $items.Count -eq 1)
+            $inactiveByUpn = ($items.Count -eq 1 -and -not ($byId -and (SameIgnoreCase ([string](V $items[0] 'ExternalDirectoryObjectId' '')) $byId)))
         }
         if ($items.Count -gt 1) { throw "Exchange Online mailbox not unique: $Upn" }
         if ($items.Count -eq 0) { return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@() } }
@@ -1282,6 +1298,13 @@ function Get-PraGrantsApplied {
     return ,$Context['_PraGrantsApplied']
 }
 
+function Get-PraGrantsVerified {
+    <# The grants of this run that were sent and then read back as present (the same keys): a later read that does not show one is a permission to check by hand, never a reason to send it again. #>
+    param([hashtable]$Context)
+    if (-not $Context.ContainsKey('_PraGrantsVerified')) { $Context['_PraGrantsVerified']=New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase) }
+    return ,$Context['_PraGrantsVerified']
+}
+
 function Invoke-PraPermissionGrant {
     param([hashtable]$Context,$Row,[hashtable]$Params)
     if ($Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or -not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or
@@ -1316,6 +1339,7 @@ function Invoke-PraPermissionGrant {
         $res = Invoke-PraExo -Context $Context -Operation 'Grant' -Params $Params -Permit $permit -OnApplied $onApplied -OnProgress $onProgress
         $verified=Get-PraValue $res 'Verified' $false
         if ($verified -isnot [bool] -or -not $verified) { throw ([string](Get-PraValue $res 'Error' 'Permission re-read not confirmed.')) }
+        [void](Get-PraGrantsVerified $Context).Add((Get-PraGrantKey -Context $Context -Upn $target -Right ([string]$Params.Right) -Trustee ([string]$Params.Trustee)))
         $null = & $Context.JournalMutation $target $operation 'Verified' ($detail+'; Mutated='+(Get-PraValue $res 'Mutated' $false))
     } catch {
         $failure=$_.Exception.Message
@@ -1337,7 +1361,7 @@ function Invoke-PraSharedPermission {
     #>
     [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='Low')]
     param([hashtable]$Context,$Row,[object[]]$Requests)
-    $Row.PermMissing=@(); $verified=0; $toGrant=0; $missing=New-Object 'System.Collections.Generic.List[string]'
+    $Row.PermMissing=@(); $verified=0; $toGrant=0; $missing=New-Object 'System.Collections.Generic.List[string]'; $byHand=New-Object 'System.Collections.Generic.List[string]'
     $cfg=Get-PraValue $Context.Config 'SharedMailbox' @{}
     $upn=[string](Get-PraValue $Row 'UserPrincipalName' '')
     $preview=((Test-PraOrdinalEqual $Context.Action 'Convert') -and (-not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or -not $Context.AllowMutation -or $WhatIfPreference))
@@ -1351,9 +1375,12 @@ function Invoke-PraSharedPermission {
         }
         if ((Get-PraValue $r 'Verified' $false) -ne $true) {
             if ($preview) { $toGrant++; continue }
-            if ((Get-PraGrantsApplied $Context).Contains((Get-PraGrantKey -Context $Context -Upn $upn -Right ([string]$request.Right) -Trustee ([string]$request.Trustee)))) {
-                $null=Write-PraLog -Context $Context -Message ("{0}: {1} to {2} was already sent in this run; it is not sent again although the last read does not show it yet" -f $upn,$request.Right,$request.Trustee) -Level Detail
-                $verified++; continue
+            $grantKey=Get-PraGrantKey -Context $Context -Upn $upn -Right ([string]$request.Right) -Trustee ([string]$request.Trustee)
+            if ((Get-PraGrantsApplied $Context).Contains($grantKey)) {
+                # Sent in this run: never sent again, and not counted as verified either. The read does not show it: the permission is to check by hand.
+                $null=Write-PraLog -Context $Context -Message ("{0}: {1} to {2} was already sent in this run{3}; it is not sent again and the last read does not show it" -f $upn,$request.Right,$request.Trustee,$(if ((Get-PraGrantsVerified $Context).Contains($grantKey)) { ' and read back as present' } else { '' })) -Level Detail
+                [void]$byHand.Add(('{0} for {1}' -f $request.Right,$request.Trustee))
+                continue
             }
             if ($Context.AllowMutation -isnot [bool] -or -not $Context.AllowMutation -or -not (Test-PraOrdinalEqual $Context.Mode 'Apply') -or
                 -not (Test-PraOrdinalEqual $Context.Action 'Convert') -or -not (Test-PraOrdinalIn $Context.Phase @('Cloud','Both')) -or $WhatIfPreference) { throw 'Permission missing and writes are not allowed in this mode.' }
@@ -1371,8 +1398,14 @@ function Invoke-PraSharedPermission {
         $verified++
     }
     $Row.PermDetail="Permissions verified=$verified/$($Requests.Count); to grant=$toGrant; trustees missing in Exchange Online=$($missing.Count)"
+    if ($byHand.Count) { $Row.PermDetail+="; to check by hand=$($byHand.Count)" }
     if ($missing.Count) { throw ($Row.PermDetail+': '+($missing -join ', ')) }
-    if (($verified+$toGrant) -ne $Requests.Count) { throw $Row.PermDetail }
+    if (($verified+$toGrant+$byHand.Count) -ne $Requests.Count) { throw $Row.PermDetail }
+    if ($byHand.Count) {
+        $note=('{0}: {1} permission(s) were granted in this run but a later read does not show them: {2}. They were not sent again. Check them by hand: Get-EXOMailboxPermission -Identity {0} | Format-Table User,AccessRights; Get-EXORecipientPermission -Identity {0} | Format-Table Trustee,AccessRights' -f $upn,$byHand.Count,($byHand -join '; '))
+        $Row.Warnings=([string](Get-PraValue $Row 'Warnings' '') + '; ' + $note).Trim(' ',';')
+        Write-PraItem -Context $Context -Status Warn -Text $note
+    }
     return $toGrant
 }
 
@@ -1384,7 +1417,7 @@ function Get-PraGraphFactProperty {
 }
 
 function Get-PraGraphFact {
-    <# The Graph facts of one account. The account is read by the Entra id confirmed for the object (by UPN when none is known). -Account: the user already read with these properties (the identity check), used once instead of a second read. #>
+    <# The Graph facts of one account. The account is read by the Entra id confirmed for the object (by UPN when none is known). -Account: the user already read with these properties (the identity check), taken as the answer of the first read (the account is then not read again). #>
     param([hashtable]$Context,[string]$Upn,[bool]$Mailbox,[bool]$License,[bool]$Addresses=$false,$Account=$null)
     if (-not (Get-PraCloudSession $Context).Graph) { throw 'Microsoft Graph required but not connected.' }
     Assert-PraGraphSession $Context
@@ -1521,6 +1554,16 @@ function Write-PraUnfinishedFailure {
     if (-not $unfinished.Count) { Write-PraCloudFailure -Context $Context -Row $null -ErrorRecord $ErrorRecord }
 }
 
+function Get-PraRecordedMailboxGuid {
+    <# The mailbox GUID that the record kept from Active Directory (msExchMailboxGuid, before the conversion), as a GUID text; none when the record has none. #>
+    param($Record)
+    $state = Get-PraValue (Get-PraValue $Record 'Attributes' $null) 'msExchMailboxGuid' $null
+    $value = [string](Get-PraValue $state 'Value' '')
+    if (-not $value) { return }
+    try { $bytes = [Convert]::FromBase64String($value) } catch { return }
+    if ($bytes.Length -eq 16) { ([guid]::new($bytes)).ToString() }
+}
+
 function Write-PraSignOutWarning {
     <# The sign-out of the cloud sessions failed: a warning, never an error of an object (what the run did is not changed by it). #>
     param([hashtable]$Context,[Parameter(Mandatory)][string]$Message)
@@ -1619,6 +1662,7 @@ function Invoke-PraCloudPhase {
         $stopRun=$null; $graphStop=$false
         do {
             $attempt++; $pending=@($states | Where-Object { -not $_.Done })
+            $Context.CurrentIdentity=''
             $null=Write-PraLog -Context $Context -Message ("Check {0}: {1} object(s) in Exchange Online" -f $attempt, $pending.Count) -Level Info
             foreach ($s in $pending) {
                 $row=$s.Row; $Context.CurrentIdentity=[string](Get-PraValue $row 'ObjectGuid' $s.Upn); $Context.CurrentOperation='CloudCheck'
@@ -1641,7 +1685,7 @@ function Invoke-PraCloudPhase {
                         $facts=Get-PraGraphFact -Context $Context -Upn $s.Upn -Mailbox $s.GraphMailbox -License $s.License -Addresses ([bool]($null -ne $s.X500 -and $s.GraphMailbox)) -Account $account
                     }
                     if ($s.ExoMailbox) {
-                        $m=Invoke-PraExo -Context $Context -Operation 'Mailbox' -Params @{ Upn=$s.Upn }
+                        $m=Invoke-PraExo -Context $Context -Operation 'Mailbox' -Params @{ Upn=$s.Upn; AbsenceConfirms=((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover') -and -not $s.PreserveMailbox) }
                         if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) {
                             if ($s.PreserveMailbox) {
                                 $mbok=(Get-PraValue $m 'Found' $false) -eq $true -and (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $m 'Type' '') 'SharedMailbox')
@@ -1740,8 +1784,10 @@ function Invoke-PraCloudPhase {
             $notReady=@($pending | Where-Object { -not $_.CoreDone })
             # A Check says what it waits for: a mailbox that was never converted (still on-premises) does not reach the expected state, and the wait is long. -Once looks once.
             $checkHint=if ((Test-PraOrdinalIgnoreCaseEqual $Context.Action 'Check')) { ' Waiting for {0}. A mailbox that is still on-premises never gets there without a Convert; with -Once the check looks once and stops.' -f $(if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { 'the mailbox to be deprovisioned (a MailUser) in Exchange Online' } else { 'the mailbox to exist in Exchange Online' }) } else { '' }
+            $Context.CurrentIdentity=''
             if ($notReady.Count) { Write-PraItem -Context $Context -Status Info -Icon Clock -Text ("Not ready yet: {0} - next check in {1:0} s (waiting up to {2} min in total).{3}" -f ((@($notReady | Select-Object -First 20 | ForEach-Object { $_.Upn }) -join ', ') + $(if ($notReady.Count -gt 20) { ' and {0} more (all of them are in the log)' -f ($notReady.Count - 20) } else { '' })), $seconds, $Context.TimeoutMinutes, $checkHint) }
-            foreach ($s in @($pending | Where-Object { $_.CoreDone })) { Write-PraItem -Context $Context -Status Info -Icon Clock -Text ("{0}: mailbox ready; X500 addresses not all visible yet, check {1} of {2} in {3:0} s" -f $s.Upn, ([int]$s.X500Reads + 1), $x500MaxReads, $seconds) }
+            foreach ($s in @($pending | Where-Object { $_.CoreDone })) { $Context.CurrentIdentity=[string](Get-PraValue $s.Row 'ObjectGuid' $s.Upn); Write-PraItem -Context $Context -Status Info -Icon Clock -Text ("{0}: mailbox ready; X500 addresses not all visible yet, check {1} of {2} in {3:0} s" -f $s.Upn, ([int]$s.X500Reads + 1), $x500MaxReads, $seconds) }
+            $Context.CurrentIdentity=''
             foreach ($s in $pending) { $null=Write-PraLog -Context $Context -Message ("{0} | {1}" -f $s.Upn, $s.Row.CloudDetail) -Level Detail }
             $intervalSeconds=[Math]::Max(1,([double]$Context.IntervalMinutes*60))
             $waitText=if ((Test-PraOrdinalIgnoreCaseEqual $Act 'Recover')) { 'Waiting for Exchange Online to finish deprovisioning' } elseif ((Test-PraOrdinalIgnoreCaseEqual $Act 'Convert')) { 'Waiting for the mailbox and licence to appear in Exchange Online' } else { 'Waiting for Exchange Online' }
@@ -1848,7 +1894,8 @@ function Invoke-PraRetentionCheck {
                     if ([bool](Get-PraValue $Context 'GraphRefused' $false)) { $graphStop=$true; break }
                     continue
                 }
-                $h=Invoke-PraExo -Context $Context -Operation 'Hold' -Params @{ Upn=$holdUpn }
+                $holdSource=Get-PraValue $row 'BackupRec' $null; if ($null -eq $holdSource) { $holdSource=$row }
+                $h=Invoke-PraExo -Context $Context -Operation 'Hold' -Params @{ Upn=$holdUpn; MailboxGuids=[string[]]@(Get-PraRecordedMailboxGuid $holdSource) }
                 $row.CloudMailbox=[bool](Get-PraValue $h 'Found' $false)
                 if ([bool](Get-PraValue $h 'EarlierAccount' $false)) {
                     $note=('{0}: not this object''s mailbox. Exchange Online has an inactive mailbox with this UPN, but it belongs to an earlier account (another ExternalDirectoryObjectId than the account confirmed for this object), so its retention does not count for this object. To see it, run: Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''{1}''" -Properties ExternalDirectoryObjectId,WhenSoftDeleted | Format-List Name,ExternalDirectoryObjectId,WhenSoftDeleted' -f $holdUpn, $holdUpn.Replace("'","''"))

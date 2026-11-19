@@ -380,7 +380,7 @@ function Write-PraRawObjectStart {
 
 function Write-PraRawNode {
     param([hashtable]$State,$Descriptor,[int]$Depth)
-    # The element calls of Write-PraRawObjectStart and Write-PraRawElement written out: the same XML, a node costs a handful of calls instead of dozens.
+    # The elements of a node are written with direct writer calls (no helper function call per element), which keeps the cost of a node to a few calls.
     $writer = $State.Writer; $ns = $script:PraRawNamespace; $culture = $script:PraRawCulture; $escape = $script:PraRawEscape
     $writer.WriteStartElement('Obj',$ns); $writer.WriteAttributeString('RefId',$State.RefId.ToString($culture)); $State.RefId++
     $writer.WriteStartElement('MS',$ns)
@@ -459,7 +459,7 @@ function Write-PraRawCapture {
             Write-PraRawObjectStart $state 'Attributes'; $writer.WriteStartElement('DCT',$script:PraRawNamespace)
             $ns = $script:PraRawNamespace; $escape = $script:PraRawEscape
             foreach ($name in $snapshot.Attributes.Keys) {
-                # Write-PraRawElement (the key) and Write-PraRawObjectStart (the value) written out: the same XML.
+                # An entry of the dictionary: the key and the value elements are written with direct writer calls.
                 $writer.WriteStartElement('En',$ns)
                 $writer.WriteStartElement('S',$ns); $writer.WriteAttributeString('N','Key')
                 if ($name.Length -gt 0) { if ($escape.IsMatch($name)) { Write-PraRawString $writer $name } else { $writer.WriteString($name) } }

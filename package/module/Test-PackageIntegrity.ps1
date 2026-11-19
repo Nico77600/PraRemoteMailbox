@@ -42,6 +42,7 @@ $required = @(
     'module\Test-PackageIntegrity.ps1'
     'module\PRA.Gui.xaml'
     'templates\Report.template.html'
+    'templates\GlobalReport.template.html'
     'config\Targets.sample.csv'
     'config\SharedPermissions.sample.csv'
     'README.md'

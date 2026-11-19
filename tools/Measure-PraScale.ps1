@@ -10,7 +10,7 @@
       Journal       one line appended to the batch journal, and the journal readers of a partial batch
       CloudPhase    the cloud phase bookkeeping (Invoke-PraCloudPhase) with every Microsoft 365 call replaced by a local answer
       Report        the per-run CSV and HTML report
-      GlobalReport  the phase data, the global model, the global HTML and CSV report
+      GlobalReport  the phase data and its events file (12 journey lines for each object, one error for each 20 objects), then the global model, the global HTML page and its three CSV files, with their sizes
       GuiState      the state read of the console (Read-PraGuiState), cold and warm, on a backup folder of batches
     Nothing is written outside -WorkFolder. The package is copied with the signature check substituted (tests\IntegrityFixture.ps1).
 .PARAMETER Count
@@ -259,12 +259,30 @@ if ($Step -contains 'Report') {
         & (Get-Module PRA.Common) { param($c, $r) Write-PraReport $c $r } $batchContext $reports
     }
 }
+$reportSizes = New-Object 'Collections.Generic.List[object]'
 if ($Step -contains 'GlobalReport') {
     $batchContext.PhaseFolders = @($batchFolder)
-    $null = Measure-Step 'GlobalReport' "phase data, model, HTML and CSV of $Count objects" {
+    $journeyLines = 12
+    & (Get-Module PRA.Common) {
+        param($context, $lines)
+        $index = 0
+        foreach ($row in $context.Rows.ToArray()) {
+            $index++
+            Register-PraObjectName $context ([string]$row.ObjectGuid) ([string]$row.UserPrincipalName)
+            $context.CurrentIdentity = [string]$row.ObjectGuid
+            for ($k = 1; $k -le $lines; $k++) { Add-PraJourney -Context $context -Status $(if ($k -eq 7 -and $index % 25 -eq 0) { 'Warn' } else { 'Ok' }) -Text ('Step {0} of the object {1}: a journey line with a realistic message length, as the engine writes it for each action.' -f $k, $index) }
+            if ($index % 20 -eq 0) { $context.CurrentOperation = 'Set-ADUser'; Add-PraIssue $context ('Synthetic error for the object {0}' -f $index) 'Execution' }
+        }
+        $context.CurrentIdentity = ''
+    } $batchContext $journeyLines
+    $null = Measure-Step 'PhaseData' "phase data and events file of $Count objects, $journeyLines journey lines each" {
         $null = Save-PraPhaseData -Context $batchContext -Folder $batchFolder
-        $null = Write-PraGlobalReport -Context $batchContext
     }
+    $globalFiles = Measure-Step 'GlobalReport' "model, HTML and CSV files of $Count objects" { Write-PraGlobalReport -Context $batchContext }
+    foreach ($file in @(Get-ChildItem -LiteralPath $batchFolder -File | Where-Object { $_.Name -like 'PhaseData-*' -or $_.Name -like 'PhaseEvents-*' })) { $reportSizes.Add([pscustomobject]@{ File = $file.Name; MB = [math]::Round($file.Length / 1MB, 2) }) }
+    foreach ($key in @($globalFiles.Keys | Sort-Object)) { if ($globalFiles[$key]) { $reportSizes.Add([pscustomobject]@{ File = (Split-Path ([string]$globalFiles[$key]) -Leaf); MB = [math]::Round((Get-Item -LiteralPath ([string]$globalFiles[$key])).Length / 1MB, 2) }) } }
+    foreach ($size in $reportSizes) { Write-Host ('               {0,8:N2} MB   {1}' -f $size.MB, $size.File) }
+    Write-Host ('               peak working set of this process: {0:N0} MB' -f ([Diagnostics.Process]::GetCurrentProcess().PeakWorkingSet64 / 1MB))
 }
 if ($Step -contains 'GuiState') {
     Import-Module (Join-Path $fixture 'module\PRA.Gui.psm1') -Force -Global
@@ -285,7 +303,7 @@ if ($Step -contains 'GuiState') {
     }
 }
 
-$result = [pscustomobject]@{ Count = $Count; Package = $Package; PowerShell = [string]$PSVersionTable.PSVersion; Timings = $timings.ToArray() }
+$result = [pscustomobject]@{ Count = $Count; Package = $Package; PowerShell = [string]$PSVersionTable.PSVersion; Timings = $timings.ToArray(); ReportFiles = $reportSizes.ToArray() }
 if ($OutputPath) { [IO.File]::WriteAllText($OutputPath, ($result | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false))) }
 if ($ownWork) { Remove-Item -LiteralPath $WorkFolder -Recurse -Force -ErrorAction SilentlyContinue }
 $result

@@ -46,7 +46,7 @@ function global:Get-PraExpectedInventory {
         'Invoke-PraRemoteMailbox.ps1', 'PraRemoteMailbox.psd1', 'PraRemoteMailbox.psm1'
         'module\PRA.Common.psm1', 'module\PRA.Directory.psm1', 'module\PRA.Backup.psm1', 'module\PRA.Cloud.psm1', 'module\PRA.Gui.psm1'
         'module\PRA.Gui.Directory.ps1', 'module\Test-PackageIntegrity.ps1', 'module\PRA.Gui.xaml'
-        'templates\Report.template.html'
+        'templates\Report.template.html', 'templates\GlobalReport.template.html'
         'config\Targets.sample.csv', 'config\SharedPermissions.sample.csv'
         'README.md', 'LICENSE'
         'docs\PraRemoteMailbox-Guide.html', 'docs\PraRemoteMailbox-Guide.md', 'docs\PraRemoteMailbox-UserGuide.html', 'docs\PraRemoteMailbox-UserGuide.md'
