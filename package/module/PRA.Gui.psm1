@@ -257,7 +257,7 @@ function Get-PraGuiBatchCore {
         foreach ($record in $records) {
             if ($null -eq $record) { continue }
             if ([bool](Get-PraGuiValue $record 'IsShared' $false)) { $shared++ }
-            if ([bool](Get-PraGuiValue (Get-PraGuiValue $record 'Retention' $null) 'Enabled' $false) -and -not [bool](Get-PraGuiValue $record 'PreserveCloudMailbox' $false)) { $tagged.Add([pscustomobject]@{ ObjectGuid=[string](Get-PraGuiValue $record 'ObjectGuid' ''); UserPrincipalName=[string](Get-PraGuiValue $record 'UserPrincipalName' '') }) }
+            if (Test-PraRetentionCheckRecord -Record $record) { $tagged.Add([pscustomobject]@{ ObjectGuid=[string](Get-PraGuiValue $record 'ObjectGuid' ''); UserPrincipalName=[string](Get-PraGuiValue $record 'UserPrincipalName' ''); IsShared=[bool](Get-PraGuiValue $record 'IsShared' $false); Retention=[pscustomobject]@{ Enabled=$true } }) }
         }
         $schema = Get-PraGuiValue $data 'SchemaVersion' 1
         $core.Data = [pscustomobject]@{
@@ -302,7 +302,8 @@ function Get-PraGuiRetentionProofText {
     $certificate=[bool][string](Get-PraGuiValue (Get-PraGuiValue $config 'Cloud' $null) 'AppId' '')
     $folders=@((Join-Path $backup 'Inbox'),(Join-Path $backup 'Outbox'),(Split-Path ([string]$row.Path) -Parent))
     try {
-        $tagged=@(Get-PraGuiValue (Get-PraGuiValue $row 'Data' $null) 'TaggedRows' @())
+        $keepShared=[bool](Get-PraGuiValue (Get-PraGuiValue $config 'SharedMailbox' $null) 'KeepCloudSharedOnRecover' $false)
+        $tagged=@(@(Get-PraGuiValue (Get-PraGuiValue $row 'Data' $null) 'TaggedRows' @()) | Where-Object { Test-PraRetentionCheckRecord -Record $_ -PreserveCloudMailbox ($keepShared -and [bool](Get-PraGuiValue $_ 'IsShared' $false)) })
         if (-not $tagged.Count) { return 'No object of this batch carries the retention tag: the Recover has no retention to check, and no retention proof is needed.' }
         $proof=Get-PraRetentionProof -Folder $folders -BatchId ([string]$row.BatchId) -Environment ([string]$config.Environment) -MaxAgeHours ([int]$config.Retention.ProofMaxAgeHours) -Row $tagged -Cache $script:PraGuiProofCache -SourceBackupHash (Get-PraGuiStampedHash ([string]$row.Path)) -PolicyGuid ([string](Get-PraGuiValue (Get-PraGuiValue $config 'Retention' $null) 'PolicyGuid' ''))
     } catch { return ('The retention proof cannot be looked for: {0}. To see what these folders hold, run: Get-ChildItem -LiteralPath {1} -Filter ''RetentionProof-*''. Then choose Refresh in the window.' -f ($_.Exception.Message -replace '\s+',' '),(ConvertTo-PraGuiPowerShellLiteral $folders[0])) }
@@ -311,12 +312,13 @@ function Get-PraGuiRetentionProofText {
     $withoutText=if ($without) { ', {0} without a mailbox in Exchange Online (nothing to retain; the run warns about them)' -f $without } else { '' }
     if ($proof.Found -and $proof.Complete) {
         $use=if ($certificate) { 'This server asks Exchange Online itself (certificate sign-in): the run reads this proof only when Exchange Online cannot be reached.' } else { 'This server cannot sign in to Exchange Online without a person: the run uses this proof.' }
-        return ('A valid retention proof was found: {0} hours old, {1} of {2} mailbox(es) covered{3}. {4}' -f $age,$proof.CoveredCount,$proof.ObjectCount,$withoutText,$use)
+        return ('A valid retention proof was found: {0} hours old, {1} of {2} mailbox(es) covered{3}. {4}' -f $age,($tagged.Count - $without),$tagged.Count,$withoutText,$use)
     }
     if ($proof.Found) {
         $use=if ($certificate) { 'It matters only if Exchange Online cannot be reached.' } else { 'The run cannot use it.' }
-        return ('A retention proof was found ({0} hours old) but it does not cover every mailbox: {1}. {2}' -f $age,$proof.Reason,$use)
+        return ('A retention proof was found ({0} hours old) but it does not cover every mailbox: {1}. {2} The run leaves out the objects that are already rolled back or were not converted, which only the run can tell: this is an estimate.' -f $age,$proof.Reason,$use)
     }
+    if ($proof.PolicyGuidInvalid) { return ('No retention proof can be used: {0}. Correct Retention.PolicyGuid in the settings of the window or in the configuration file.' -f $proof.Reason) }
     if ($certificate) { return ('No valid retention proof for this batch ({0}). This server asks Exchange Online itself (certificate sign-in), so a proof matters only if Exchange Online cannot be reached: then run Check with Expected state Retained on the cloud server and copy the two proof files to the folder {1}.' -f $proof.Reason,$folders[0]) }
     return ('No valid retention proof for this batch ({0}). This server cannot sign in to Exchange Online without a person, so the run needs one: run Check with Expected state Retained on the cloud server, then copy the two proof files (RetentionProof-...json and its .sha256 file) to the folder {1}.' -f $proof.Reason,$folders[0])
 }

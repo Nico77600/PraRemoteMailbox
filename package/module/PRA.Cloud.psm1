@@ -323,59 +323,57 @@ $script:PraExoWorker = {
         if ($items.Count -eq 0) { return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@() } }
         return (MailboxResult $items[0] $Upn $inactiveByUpn)
     }
-    # The retention check of many mailboxes: the active and the inactive mailboxes that carry the retention tag are read in two server-side searches per tag, then each row is matched in memory
-    # with the rules of Mailbox. A row that the bulk read cannot settle on its own (no active mailbox with the tag, an earlier account, an ambiguity, an inactive mailbox not told by its mailbox GUID)
-    # is left out of the answer: the caller reads it with Mailbox.
+    # The retention check of many mailboxes: the ACTIVE mailboxes that carry the retention tag and one of the UPNs of the rows (about 50 at a time) are read with a server-side filter,
+    # then each row is matched in memory: by the confirmed Entra id when there is one, else by UPN, exactly one mailbox. A row that this cannot settle (no tagged active mailbox, several, an inactive mailbox)
+    # is left out of the answer: the caller reads it with Mailbox, whose rules decide.
     function HoldBulk {
         $properties = @('RecipientTypeDetails','ExternalDirectoryObjectId','UserPrincipalName','IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled','ExchangeGuid')
-        $activeByUpn = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
-        $activeById = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
-        $inactiveByUpn = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
-        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        $activeCount = 0; $inactiveCount = 0
+        $results = New-Object 'System.Collections.Generic.List[object]'
+        $activeCount = 0; $searches = 0
         $add = {
             param($Index,[string]$Key,$Item)
             $list = $null
             if (-not $Index.TryGetValue($Key,[ref]$list)) { $list = New-Object 'System.Collections.Generic.List[object]'; $Index[$Key] = $list }
             $list.Add($Item)
         }
-        $tags = V $P 'Filters' @()
-        foreach ($tag in @($tags)) {
-            $attribute = [string](V $tag 'Attribute' ''); $value = [string](V $tag 'Value' '')
+        $groups = V $P 'Groups' @()
+        foreach ($group in @($groups)) {
+            $attribute = [string](V $group 'Attribute' ''); $value = [string](V $group 'Value' '')
             if ($attribute -notmatch '\ACustomAttribute([1-9]|1[0-5])\z' -or [string]::IsNullOrWhiteSpace($value) -or $value -match '[\r\n\x00]') { throw 'Invalid retention tag filter.' }
-            $filter = "$attribute -eq '$($value.Replace("'","''"))'"
-            foreach ($mailbox in @(Get-EXOMailbox -Filter $filter -Properties $properties -ResultSize Unlimited -ErrorAction Stop)) {
-                if (-not $seen.Add('A|' + [string](V $mailbox 'ExternalDirectoryObjectId' '') + '|' + [string](V $mailbox 'ExchangeGuid' '') + '|' + [string](V $mailbox 'UserPrincipalName' ''))) { continue }
-                $activeCount++
-                & $add $activeByUpn ([string](V $mailbox 'UserPrincipalName' '')) $mailbox
-                & $add $activeById ([string](V $mailbox 'ExternalDirectoryObjectId' '')) $mailbox
-            }
-            foreach ($mailbox in @(Get-EXOMailbox -Filter $filter -Properties $properties -ResultSize Unlimited -InactiveMailboxOnly -ErrorAction Stop)) {
-                if (-not $seen.Add('I|' + [string](V $mailbox 'ExternalDirectoryObjectId' '') + '|' + [string](V $mailbox 'ExchangeGuid' '') + '|' + [string](V $mailbox 'UserPrincipalName' ''))) { continue }
-                $inactiveCount++
-                & $add $inactiveByUpn ([string](V $mailbox 'UserPrincipalName' '')) $mailbox
-            }
-        }
-        $results = New-Object 'System.Collections.Generic.List[object]'
-        $requestRows = V $P 'Rows' @()
-        foreach ($row in @($requestRows)) {
-            $rowUpn = [string](V $row 'Upn' ''); $rowId = [string](V $row 'ById' ''); $answer = $null
-            try {
-                $candidates = $null
-                $found = if ($rowId) { $activeById.TryGetValue($rowId,[ref]$candidates) } else { $activeByUpn.TryGetValue($rowUpn,[ref]$candidates) }
-                if ($found -and $candidates.Count -eq 1) { $answer = MailboxResult $candidates[0] $rowUpn $false }
-                elseif (-not $found) {
-                    $rowGuids = V $row 'MailboxGuids' @()
-                    $items = $null
-                    if (@($rowGuids).Count -and [bool](V $row 'GuidKept' $false) -and $inactiveByUpn.TryGetValue($rowUpn,[ref]$items)) {
-                        $pick = PickInactive $rowUpn $rowId $rowGuids $true @($items)
-                        if ($null -eq $pick.Earlier -and @($pick.Items).Count -eq 1 -and (InGuidSet (V $pick.Items[0] 'ExchangeGuid' '') $rowGuids)) { $answer = MailboxResult $pick.Items[0] $rowUpn ([bool]$pick.InactiveByUpn) }
-                    }
+            $tagFilter = "($attribute -eq '$($value.Replace("'","''"))')"
+            $rowsValue = V $group 'Rows' @()
+            $rowList = @($rowsValue)
+            for ($offset = 0; $offset -lt $rowList.Count; $offset += 50) {
+                $chunk = @($rowList[$offset..([Math]::Min($offset + 49, $rowList.Count - 1))])
+                $names = New-Object 'System.Collections.Generic.List[string]'
+                $seenName = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+                foreach ($row in $chunk) {
+                    $rowUpn = [string](V $row 'Upn' '')
+                    if ([string]::IsNullOrWhiteSpace($rowUpn) -or $rowUpn -match '[\r\n\x00]' -or -not $seenName.Add($rowUpn)) { continue }
+                    $names.Add("(UserPrincipalName -eq '$($rowUpn.Replace("'","''"))')")
                 }
-            } catch { $answer = $null }
-            if ($null -ne $answer) { $answer.Key = [string](V $row 'Key' ''); $results.Add($answer) }
+                if (-not $names.Count) { continue }
+                $filter = $tagFilter + ' -and (' + ($names -join ' -or ') + ')'
+                $byUpn = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
+                $byId = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
+                $searches++
+                foreach ($mailbox in @(Get-EXOMailbox -Filter $filter -Properties $properties -ResultSize Unlimited -ErrorAction Stop)) {
+                    $activeCount++
+                    & $add $byUpn ([string](V $mailbox 'UserPrincipalName' '')) $mailbox
+                    & $add $byId ([string](V $mailbox 'ExternalDirectoryObjectId' '')) $mailbox
+                }
+                foreach ($row in $chunk) {
+                    $rowUpn = [string](V $row 'Upn' ''); $rowId = [string](V $row 'ById' ''); $answer = $null
+                    try {
+                        $candidates = $null
+                        $found = if ($rowId) { $byId.TryGetValue($rowId,[ref]$candidates) } else { $byUpn.TryGetValue($rowUpn,[ref]$candidates) }
+                        if ($found -and $candidates.Count -eq 1 -and -not [bool](V $candidates[0] 'IsInactiveMailbox' $false)) { $answer = MailboxResult $candidates[0] $rowUpn $false }
+                    } catch { $answer = $null }
+                    if ($null -ne $answer) { $answer.Key = [string](V $row 'Key' ''); $results.Add($answer) }
+                }
+            }
         }
-        return @{ Found=$true; Results=$results.ToArray(); ActiveCount=[int]$activeCount; InactiveCount=[int]$inactiveCount }
+        return @{ Found=$true; Results=$results.ToArray(); ActiveCount=[int]$activeCount; Searches=[int]$searches }
     }
     function NormalizeAcl {
         param([object[]]$Entries,[string]$Right,$Target)
@@ -1957,6 +1955,7 @@ function Resolve-PraRetentionPolicyGuid {
         $beforeIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId })
         $session.ExoAttempted=$true
         try { Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop | Out-Null }
+        catch { $Context.CloudConnectFailed=$true; throw }
         finally {
             $newIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId } | Where-Object { -not (Test-PraOrdinalIgnoreCaseIn $_ $beforeIds) })
             $session.OwnedExoIds=@($session.OwnedExoIds)+$newIds
@@ -2124,20 +2123,28 @@ function Test-PraRetentionCoverage {
     .DESCRIPTION
         Never records an error of the run. A mailbox that the policy does not hold is in NotCovered; a mailbox that could not be read, or whose policy is not named, is in Unverified (the rest are Unverified too once a
         failure would stop every other read). A row without a mailbox in Exchange Online has nothing to retain (NoMailbox, listed in NoMailboxList). The rows of the caller are not changed.
-        With 20 rows or more, the mailboxes that carry the retention tag are read in bulk (one search of the active and one of the inactive mailboxes per tag, whatever the number of rows) and each row is matched in memory
-        with the rules of the read of one mailbox; a row that the bulk read does not settle is read on its own. Microsoft Entra ID accounts are confirmed one by one (kept for the cloud part that follows).
+        With 20 rows or more, the active mailboxes that carry the retention tag are read in bulk (a server-side filter on the tag and on about 50 UPNs at a time, so 100 searches for 5,000 objects) and each row is
+        matched in memory by its confirmed account, else by its UPN; a row that this does not settle with exactly one tagged active mailbox (none, several, an inactive mailbox) is read on its own, whose rules decide.
+        No bulk read is made once a failure has stopped the reads. Microsoft Entra ID accounts are confirmed one by one (kept for the cloud part that follows).
         The check has its own retry budget: what it spends is not taken from the budget of the cloud part.
         -CloseSession signs out of the sessions that this check opened; without it the session stays open for the cloud part that follows.
     .OUTPUTS
-        Checked, Covered, NoMailbox, NoMailboxList, NotCovered and Unverified (each entry: ObjectGuid, Upn, Reason), StopReason, CouldNotAsk (nothing could be answered because Exchange Online could not be reached or asked: no
-        sign-in, no answer, throttling, the policy not named), PolicyGuid, BulkCalls, BulkResolved and SingleReads.
+        Checked, Covered, NoMailbox, NoMailboxList, NotCovered and Unverified (each entry: ObjectGuid, Upn, Reason), StopReason, PolicyGuid, BulkCalls, Searches (bulk searches of Exchange Online), BulkResolved, SingleReads and
+        CouldNotAsk: true only when Exchange Online could not be reached or asked (the sign-in failed, no answer, throttling, the policy not named) and every row that is not covered is Unverified with that one reason of the run;
+        any answer about one object (a mailbox not held, another account, not unique, an ambiguity) leaves it false.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,[switch]$CloseSession)
-    $result=[pscustomobject]@{ Checked=0; Covered=0; NoMailbox=0; NoMailboxList=(New-Object 'Collections.Generic.List[object]'); NotCovered=(New-Object 'Collections.Generic.List[object]'); Unverified=(New-Object 'Collections.Generic.List[object]'); StopReason=''; CouldNotAsk=$false; PolicyGuid=''; BulkCalls=0; BulkResolved=0; SingleReads=0 }
-    $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=''
+    $result=[pscustomobject]@{ Checked=0; Covered=0; NoMailbox=0; NoMailboxList=(New-Object 'Collections.Generic.List[object]'); NotCovered=(New-Object 'Collections.Generic.List[object]'); Unverified=(New-Object 'Collections.Generic.List[object]'); StopReason=''; CouldNotAsk=$false; PolicyGuid=''; BulkCalls=0; Searches=0; BulkResolved=0; SingleReads=0 }
+    $flags=@{ Reach=$false }
+    $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$false
     $addEntry={ param($List,$Row,[string]$Reason) $List.Add([pscustomobject]@{ ObjectGuid=[string](Get-PraValue $Row 'ObjectGuid' ''); Upn=[string](Get-PraValue $Row 'UserPrincipalName' ''); Reason=$Reason }) }
-    $finish={ $result.NotCovered=[object[]]$result.NotCovered.ToArray(); $result.Unverified=[object[]]$result.Unverified.ToArray(); $result.NoMailboxList=[object[]]$result.NoMailboxList.ToArray(); $result }
+    $finish={
+        $result.NotCovered=[object[]]$result.NotCovered.ToArray(); $result.Unverified=[object[]]$result.Unverified.ToArray(); $result.NoMailboxList=[object[]]$result.NoMailboxList.ToArray()
+        $rowSpecific=@($result.Unverified | Where-Object { -not (Test-PraOrdinalEqual ([string]$_.Reason) $result.StopReason) }).Count
+        $result.CouldNotAsk=($flags.Reach -and $result.NotCovered.Count -eq 0 -and $rowSpecific -eq 0)
+        $result
+    }
     $hadRetry=$Context.ContainsKey('_PraRetry'); $savedRetry=$null
     if ($hadRetry) { $savedRetry=$Context['_PraRetry']; [void]$Context.Remove('_PraRetry') }
     try {
@@ -2146,7 +2153,7 @@ function Test-PraRetentionCoverage {
         $named=[bool][string](Get-PraValue $cfg 'PolicyGuid' '') -or ([bool][string](Get-PraValue $cfg 'PolicyName' '') -and [bool](Get-PraValue $cfg 'UseComplianceSession' $false) -and -not [string](Get-PraValue $cloud 'AppId' ''))
         if (-not $named) {
             $result.StopReason='Retention.PolicyGuid is not set in the configuration file (and the policy cannot be found from its name), so the retention policy of the mailboxes cannot be told.'
-            $result.CouldNotAsk=$true
+            $flags.Reach=$true
             foreach ($row in $Rows) { & $addEntry $result.Unverified $row $result.StopReason }
             return (& $finish)
         }
@@ -2155,7 +2162,7 @@ function Test-PraRetentionCoverage {
         catch {
             $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $_
             if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
-            $result.StopReason=$failed.Reason; $result.CouldNotAsk=[bool]$failed.Stops
+            $result.StopReason=$failed.Reason; $flags.Reach=([bool]$failed.Stops -or [bool](Get-PraValue $Context 'CloudConnectFailed' $false))
             foreach ($row in $Rows) { & $addEntry $result.Unverified $row $result.StopReason }
             return (& $finish)
         }
@@ -2174,7 +2181,7 @@ function Test-PraRetentionCoverage {
                 $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $Failure -Upn $Upn
                 if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
                 & $addEntry $result.Unverified $Row $failed.Reason
-                if ($failed.Stops) { $result.StopReason=$failed.Reason; $result.CouldNotAsk=$true }
+                if ($failed.Stops) { $result.StopReason=$failed.Reason; $flags.Reach=$true }
             }
         }
         $identityOn=Test-PraIdentityCheck $Context
@@ -2193,37 +2200,37 @@ function Test-PraRetentionCoverage {
             $work.Add([pscustomobject]@{ Row=$row; Shadow=$shadow; Upn=$upn; Source=$source; Hold=$null })
         }
         $byKey=$null
-        if ($work.Count -ge $script:PraRetentionBulkMinimum) {
-            $filters=New-Object 'Collections.Generic.List[object]'; $knownFilters=New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        if ($work.Count -ge $script:PraRetentionBulkMinimum -and -not $result.StopReason) {
+            $groups=New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
             $verified=if ($identityOn) { (Get-PraCloudSession $Context).Verified } else { @{} }
-            $requests=New-Object 'Collections.Generic.List[object]'
             for ($index=0; $index -lt $work.Count; $index++) {
                 $entry=$work[$index]
                 $tag=Get-PraValue $entry.Source 'Retention' $null
                 $attribute=[string](Get-PraValue $tag 'Attribute' ''); $value=[string](Get-PraValue $tag 'Value' '')
-                if ($attribute -match '\AextensionAttribute(?<n>[1-9]|1[0-5])\z' -and $value) {
-                    $custom='CustomAttribute'+$Matches.n
-                    if ($knownFilters.Add($custom+'='+$value)) { $filters.Add(@{ Attribute=$custom; Value=$value }) }
-                }
+                if ($attribute -notmatch '\AextensionAttribute(?<n>[1-9]|1[0-5])\z' -or -not $value) { continue }
+                $custom='CustomAttribute'+$Matches.n
+                $groupKey=$custom+'='+$value
+                if (-not $groups.ContainsKey($groupKey)) { $groups[$groupKey]=@{ Attribute=$custom; Value=$value; Rows=(New-Object 'Collections.Generic.List[object]') } }
                 $confirmed=''; if ($identityOn -and $verified.ContainsKey($entry.Upn)) { $confirmed=[string]$verified[$entry.Upn] }
-                $requests.Add(@{ Key=[string]$index; Upn=$entry.Upn; ById=$confirmed; MailboxGuids=[string[]]@(Get-PraRecordedMailboxGuid $entry.Source); GuidKept=(Test-PraMailboxGuidKept $entry.Source) })
+                $groups[$groupKey].Rows.Add(@{ Key=[string]$index; Upn=$entry.Upn; ById=$confirmed })
             }
-            if ($filters.Count) {
+            if ($groups.Count) {
                 $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=''
                 try {
-                    $bulk=Invoke-PraExo -Context $Context -Operation 'HoldBulk' -Params @{ Rows=$requests.ToArray(); Filters=$filters.ToArray() }
-                    $result.BulkCalls++
+                    $request=@(foreach ($group in $groups.Values) { @{ Attribute=$group.Attribute; Value=$group.Value; Rows=$group.Rows.ToArray() } })
+                    $bulk=Invoke-PraExo -Context $Context -Operation 'HoldBulk' -Params @{ Groups=$request }
+                    $result.BulkCalls++; $result.Searches=[int](Get-PraValue $bulk 'Searches' 0)
                     $byKey=New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::Ordinal)
                     $answers=Get-PraValue $bulk 'Results' @()
                     foreach ($answered in @($answers)) { $byKey[[string](Get-PraValue $answered 'Key' '')]=$answered }
-                    $null=Write-PraLog -Context $Context -Message ('Retention read in bulk: {0} active and {1} inactive mailbox(es) carry the retention tag; {2} of the {3} object(s) settled by them' -f (Get-PraValue $bulk 'ActiveCount' 0), (Get-PraValue $bulk 'InactiveCount' 0), $byKey.Count, $work.Count) -Level Detail
+                    $null=Write-PraLog -Context $Context -Message ('Retention read in bulk: {0} tagged active mailbox(es) found in {1} search(es); {2} of the {3} object(s) settled by them' -f (Get-PraValue $bulk 'ActiveCount' 0), $result.Searches, $byKey.Count, $work.Count) -Level Detail
                 }
                 catch {
                     $failure=$_
                     $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $failure
                     if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
                     $null=Write-PraLog -Context $Context -Message ('The bulk read of the mailboxes that carry the retention tag failed ({0}): they are read one by one' -f ($failed.Reason -replace '\s+',' ')) -Level Detail
-                    if ($failed.Stops) { $result.StopReason=$failed.Reason; $result.CouldNotAsk=$true }
+                    if ($failed.Stops) { $result.StopReason=$failed.Reason; $flags.Reach=$true }
                     $byKey=$null
                 }
             }

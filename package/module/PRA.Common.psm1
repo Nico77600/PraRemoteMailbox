@@ -1756,7 +1756,7 @@ function Write-PraReportHtml {
         'Duration' = (Format-PraDuration ((Get-Date) - [datetime]$Context.StartTime).TotalSeconds)
         'Run ID' = [string]$Context.RunId
         'Run settings changed' = ((@(Get-PraList $Context 'ConfigOverrides') | ForEach-Object { [string]$_ }) -join '; ')
-        'Retention proof accepted' = $(if ($null -ne (Get-PraValue $Context 'RetentionProofAccepted' $null)) { (Get-PraPhaseSetting -Context $Context)['Retention proof accepted'] } else { '' })
+        'Retention proof accepted' = $(if ((Get-PraPhaseSetting -Context $Context).Contains('Retention proof accepted')) { (Get-PraPhaseSetting -Context $Context)['Retention proof accepted'] } else { '' })
     }
     $metaHtml = New-Object Text.StringBuilder
     foreach ($key in $meta.Keys) { if ($meta[$key]) { [void]$metaHtml.AppendFormat('<div><span>{0}</span>{1}</div>', (ConvertTo-PraHtmlText $key), (ConvertTo-PraHtmlText $meta[$key])) } }
@@ -2391,8 +2391,8 @@ function Write-PraRetentionProof {
     .SYNOPSIS
         Writes the retention proof of a Convert batch in a folder (with its .sha256 file): what the retention check found, per object, at this time.
     .DESCRIPTION
-        -Object: ObjectGuid, Upn and Verdict (Covered, NotCovered, NoMailbox or NotChecked). The proof says Covered true for a Covered object and false for the others;
-        NoMailbox is said by itself (true: nothing to retain). Both are always true or false. The file is never replaced: its name carries the time.
+        -Object: ObjectGuid, Upn and Verdict (Covered, NotCovered, NoMailbox or NotChecked; anything else is NotChecked). Each entry says its Verdict, and Covered and NoMailbox as booleans that agree with it
+        (Covered true only for Covered, NoMailbox true only for NoMailbox). The file is never replaced: its name carries the time.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$BatchId, [string]$SourceBackupHash = '', [Parameter(Mandatory)][string]$Environment,
@@ -2402,9 +2402,11 @@ function Write-PraRetentionProof {
     $coveredCount = 0
     foreach ($item in $Object) {
         $verdict = [string]$item.Verdict
-        $covered = Test-PraOrdinalIgnoreCaseEqual $verdict 'Covered'
+        $known = @('Covered', 'NotCovered', 'NoMailbox', 'NotChecked') | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_ $verdict } | Select-Object -First 1
+        if (-not $known) { $known = 'NotChecked' }
+        $covered = Test-PraOrdinalEqual $known 'Covered'
         if ($covered) { $coveredCount++ }
-        $entries.Add([ordered]@{ ObjectGuid = [string]$item.ObjectGuid; Upn = [string]$item.Upn; Covered = $covered; NoMailbox = (Test-PraOrdinalIgnoreCaseEqual $verdict 'NoMailbox') })
+        $entries.Add([ordered]@{ ObjectGuid = [string]$item.ObjectGuid; Upn = [string]$item.Upn; Verdict = $known; Covered = $covered; NoMailbox = (Test-PraOrdinalEqual $known 'NoMailbox') })
     }
     $record = [ordered]@{
         SchemaVersion = 1; Kind = 'RetentionProof'; BatchId = $BatchId.ToLowerInvariant(); SourceBackupHash = $SourceBackupHash; Environment = $Environment
@@ -2423,10 +2425,10 @@ function Read-PraRetentionProofFile {
     .SYNOPSIS
         Reads one retention proof file: its checksum file must be there and match, and the content must be a retention proof of the right shape. Never throws.
     .DESCRIPTION
-        The file is read once (at most 64 MB); the SHA-256 and the content are those same bytes. Every entry must have a boolean Covered and a boolean NoMailbox, an ObjectGuid that is
+        The file is read once (at most 64 MB); the SHA-256 and the content are those same bytes. Every entry must have a Verdict (Covered, NotCovered, NotChecked or NoMailbox), a boolean Covered and a boolean NoMailbox that agree with it, an ObjectGuid that is
         a GUID when it has one, and no entry may repeat an object (by ObjectGuid, or by UPN): otherwise the proof is not valid and Reason says which entry.
     .OUTPUTS
-        Valid, Transient (the file could not be read: not a statement about its content), Reason, Path, Sha256, BatchId, Environment, CreatedUtc (UTC), SourceBackupHash, PolicyGuid, ObjectCount, CoveredCount, NoMailboxCount and Objects (Guid, HasGuid, Upn, Covered, NoMailbox).
+        Valid, Transient (the file could not be read: not a statement about its content), Reason, Path, Sha256, BatchId, Environment, CreatedUtc (UTC), SourceBackupHash, PolicyGuid, ObjectCount, CoveredCount, NoMailboxCount and Objects (Guid, HasGuid, Upn, Verdict, Covered, NoMailbox).
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
@@ -2468,11 +2470,15 @@ function Read-PraRetentionProofFile {
             $isCovered = Get-PraValue $entry 'Covered' $null; $isNoMailbox = Get-PraValue $entry 'NoMailbox' $null
             if ($isCovered -isnot [bool] -or $isNoMailbox -isnot [bool]) { $result.Reason = ('entry {0} does not say true or false for Covered and NoMailbox' -f $position); return $result }
             if ($isCovered -and $isNoMailbox) { $result.Reason = ('entry {0} says both Covered and NoMailbox' -f $position); return $result }
+            $verdict = [string](Get-PraValue $entry 'Verdict' '')
+            if (-not $verdict) { $result.Reason = ('entry {0} has no Verdict (a proof written by an earlier build is not accepted)' -f $position); return $result }
+            if (-not (Test-PraOrdinalIn $verdict @('Covered', 'NotCovered', 'NotChecked', 'NoMailbox'))) { $result.Reason = ('entry {0} has an unknown Verdict' -f $position); return $result }
+            if (((Test-PraOrdinalEqual $verdict 'Covered') -xor $isCovered) -or ((Test-PraOrdinalEqual $verdict 'NoMailbox') -xor $isNoMailbox)) { $result.Reason = ('entry {0}: its Verdict {1} does not agree with its Covered and NoMailbox' -f $position, $verdict); return $result }
             if ($guidText -and -not $seenGuid.Add($guid)) { $result.Reason = ('the object {0} is in the proof more than once (entry {1})' -f $guid, $position); return $result }
             if ($upn -and -not $seenUpn.Add($upn)) { $result.Reason = ('the UPN {0} is in the proof more than once (entry {1})' -f $upn, $position); return $result }
             if ($isCovered) { $covered++ }
             if ($isNoMailbox) { $noMailbox++ }
-            $entries.Add([pscustomobject]@{ Guid = $guid; HasGuid = [bool]$guidText; Upn = $upn; Covered = [bool]$isCovered; NoMailbox = [bool]$isNoMailbox })
+            $entries.Add([pscustomobject]@{ Guid = $guid; HasGuid = [bool]$guidText; Upn = $upn; Verdict = $verdict; Covered = [bool]$isCovered; NoMailbox = [bool]$isNoMailbox })
         }
         $result.BatchId = [string](Get-PraValue $data 'BatchId' ''); $result.Environment = [string](Get-PraValue $data 'Environment' ''); $result.SourceBackupHash = [string](Get-PraValue $data 'SourceBackupHash' '')
         $result.CreatedUtc = $created.ToUniversalTime(); $result.PolicyGuid = [string[]]@(if ($null -ne $data.PSObject.Properties['PolicyGuid']) { $data.PolicyGuid })
@@ -2483,17 +2489,16 @@ function Read-PraRetentionProofFile {
     return $result
 }
 
-function Test-PraRetentionProofCoverage {
-    <# What one valid proof says about the objects of a Recover: Complete, Missing (UPN, else ObjectGuid, of the objects it does not cover) and NoMailbox (the objects it says have no mailbox). An object is found by ObjectGuid; its UPN counts only for a proof entry that has no ObjectGuid. #>
-    param([Parameter(Mandatory)]$Read, [object[]]$Row, [switch]$WholeProof)
-    $answer = [pscustomobject]@{ Complete = $false; Missing = [string[]]@(); NoMailbox = @(); Reason = '' }
-    if ($WholeProof) {
-        $open = @($Read.Objects | Where-Object { -not ($_.Covered -or $_.NoMailbox) })
-        $answer.Complete = ($Read.ObjectCount -gt 0 -and $open.Count -eq 0)
-        if (-not $answer.Complete) { $answer.Reason = '{0} of the {1} object(s) of the proof are not covered' -f ($Read.ObjectCount - $Read.CoveredCount - $Read.NoMailboxCount), $Read.ObjectCount }
-        $answer.NoMailbox = @($Read.Objects | Where-Object { $_.NoMailbox } | ForEach-Object { [pscustomobject]@{ ObjectGuid = $(if ($_.HasGuid) { $_.Guid.ToString() } else { '' }); Upn = $_.Upn } })
-        return $answer
-    }
+function Test-PraRetentionCheckRecord {
+    <# True when a Recover checks the retention of the object of this record: the record carries the retention tag and the cloud mailbox is not kept on purpose (-PreserveCloudMailbox). The gate of the run and the console use this one rule. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Record, [bool]$PreserveCloudMailbox = $false)
+    return ((-not $PreserveCloudMailbox) -and [bool](Get-PraValue (Get-PraValue $Record 'Retention' $null) 'Enabled' $false))
+}
+
+function Get-PraRetentionProofIndex {
+    <# The entries of one valid proof by ObjectGuid, by UPN for the entries that have no ObjectGuid, and by UPN. #>
+    param([Parameter(Mandatory)]$Read)
     $byGuid = New-Object 'Collections.Generic.Dictionary[guid,object]'
     $byUpnWithoutGuid = New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
     $byUpn = New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
@@ -2501,20 +2506,66 @@ function Test-PraRetentionProofCoverage {
         if ($entry.HasGuid) { $byGuid[$entry.Guid] = $entry } elseif ($entry.Upn) { $byUpnWithoutGuid[$entry.Upn] = $entry }
         if ($entry.Upn) { $byUpn[$entry.Upn] = $entry }
     }
-    $missing = New-Object 'Collections.Generic.List[string]'
-    $without = New-Object 'Collections.Generic.List[object]'
-    foreach ($item in $Row) {
-        $entry = $null
-        $itemUpn = [string](Get-PraValue $item 'UserPrincipalName' ''); $itemGuidText = [string](Get-PraValue $item 'ObjectGuid' '')
-        $itemGuid = [guid]::Empty
-        if ($itemGuidText -and [guid]::TryParse($itemGuidText, [ref]$itemGuid) -and $itemGuid -ne [guid]::Empty) {
-            if (-not $byGuid.TryGetValue($itemGuid, [ref]$entry)) { $entry = $null; if ($itemUpn) { [void]$byUpnWithoutGuid.TryGetValue($itemUpn, [ref]$entry) } }
-        }
-        elseif ($itemUpn) { [void]$byUpn.TryGetValue($itemUpn, [ref]$entry) }
-        if ($null -eq $entry -or -not ($entry.Covered -or $entry.NoMailbox)) { $missing.Add($(if ($itemUpn) { $itemUpn } else { $itemGuidText })); continue }
-        if ($entry.NoMailbox) { $without.Add([pscustomobject]@{ ObjectGuid = $itemGuidText; Upn = $itemUpn }) }
+    return [pscustomobject]@{ Read = $Read; ByGuid = $byGuid; ByUpnWithoutGuid = $byUpnWithoutGuid; ByUpn = $byUpn }
+}
+
+function Find-PraRetentionProofEntry {
+    <# The entry of an index for an object of a Recover: by ObjectGuid; the UPN counts only for an entry that has no ObjectGuid (a row without ObjectGuid is found by its UPN). $null when the proof does not list the object. #>
+    param([Parameter(Mandatory)]$Index, [Parameter(Mandatory)]$Item)
+    $entry = $null
+    $itemUpn = [string](Get-PraValue $Item 'UserPrincipalName' ''); $itemGuidText = [string](Get-PraValue $Item 'ObjectGuid' '')
+    $itemGuid = [guid]::Empty
+    if ($itemGuidText -and [guid]::TryParse($itemGuidText, [ref]$itemGuid) -and $itemGuid -ne [guid]::Empty) {
+        if (-not $Index.ByGuid.TryGetValue($itemGuid, [ref]$entry)) { $entry = $null; if ($itemUpn) { [void]$Index.ByUpnWithoutGuid.TryGetValue($itemUpn, [ref]$entry) } }
     }
-    $answer.Missing = [string[]]$missing.ToArray(); $answer.NoMailbox = $without.ToArray(); $answer.Complete = ($missing.Count -eq 0)
+    elseif ($itemUpn) { [void]$Index.ByUpn.TryGetValue($itemUpn, [ref]$entry) }
+    return $entry
+}
+
+function Get-PraRetentionProofDecision {
+    <#
+    .SYNOPSIS
+        What the valid proofs of a batch say about the objects of a Recover: for each object, the newest proof that lists it with a definitive verdict (Covered, NoMailbox or NotCovered) decides; NotChecked leaves the decision to an older proof.
+    .PARAMETER Read
+        The valid proofs, newest first.
+    .OUTPUTS
+        Complete (every object is Covered or NoMailbox), Missing (UPN, else ObjectGuid, of the objects without a covering verdict), Blocked (objects whose newest definitive verdict is NotCovered: Upn, ObjectGuid, Proof), NoMailbox (Upn, ObjectGuid),
+        Used (the proofs that decided at least one object, newest first) and Notes (a newer proof that changes the answer of an older one).
+    #>
+    param([Parameter(Mandatory)][object[]]$Read, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Row)
+    $indexes = @($Read | ForEach-Object { Get-PraRetentionProofIndex -Read $_ })
+    $missing = New-Object 'Collections.Generic.List[string]'; $blocked = New-Object 'Collections.Generic.List[object]'; $without = New-Object 'Collections.Generic.List[object]'
+    $used = New-Object 'Collections.Generic.HashSet[int]'
+    $changes = New-Object 'Collections.Generic.Dictionary[string,int]' -ArgumentList ([StringComparer]::Ordinal)
+    foreach ($item in $Row) {
+        $itemUpn = [string](Get-PraValue $item 'UserPrincipalName' ''); $itemGuidText = [string](Get-PraValue $item 'ObjectGuid' '')
+        $label = $(if ($itemUpn) { $itemUpn } else { $itemGuidText })
+        $decidedAt = -1; $decidedVerdict = ''; $deferredAt = New-Object 'Collections.Generic.List[int]'
+        for ($i = 0; $i -lt $indexes.Count; $i++) {
+            $entry = Find-PraRetentionProofEntry -Index $indexes[$i] -Item $item
+            if ($null -eq $entry) { continue }
+            if (Test-PraOrdinalEqual $entry.Verdict 'NotChecked') { $deferredAt.Add($i); continue }
+            if ($decidedAt -lt 0) { $decidedAt = $i; $decidedVerdict = [string]$entry.Verdict; continue }
+            if ((Test-PraOrdinalEqual $decidedVerdict 'NotCovered') -xor (Test-PraOrdinalEqual $entry.Verdict 'NotCovered')) {
+                $key = 'override|{0}|{1}' -f $decidedAt, $i; $changes[$key] = 1 + $(if ($changes.ContainsKey($key)) { $changes[$key] } else { 0 })
+            }
+            break
+        }
+        if ($decidedAt -lt 0) { $missing.Add($label); continue }
+        [void]$used.Add($decidedAt)
+        foreach ($deferred in $deferredAt) { if ($deferred -lt $decidedAt) { $key = 'defer|{0}|{1}' -f $deferred, $decidedAt; $changes[$key] = 1 + $(if ($changes.ContainsKey($key)) { $changes[$key] } else { 0 }) } }
+        if (Test-PraOrdinalEqual $decidedVerdict 'NotCovered') { $blocked.Add([pscustomobject]@{ Upn = $itemUpn; ObjectGuid = $itemGuidText; Proof = [IO.Path]::GetFileName([string]$indexes[$decidedAt].Read.Path) }); $missing.Add($label); continue }
+        if (Test-PraOrdinalEqual $decidedVerdict 'NoMailbox') { $without.Add([pscustomobject]@{ ObjectGuid = $itemGuidText; Upn = $itemUpn }) }
+    }
+    $notes = New-Object 'Collections.Generic.List[string]'
+    foreach ($pair in $changes.GetEnumerator()) {
+        $part = $pair.Key.Split('|'); $first = [IO.Path]::GetFileName([string]$indexes[[int]$part[1]].Read.Path); $second = [IO.Path]::GetFileName([string]$indexes[[int]$part[2]].Read.Path)
+        if (Test-PraOrdinalEqual $part[0] 'override') { $notes.Add(('The newer retention proof {0} gives another answer than {1} for {2} object(s) of this Recover: the newer one decides.' -f $first, $second, $pair.Value)) }
+        else { $notes.Add(('The retention proof {0} did not check {1} object(s) of this Recover: the answer of {2} is used for them.' -f $first, $pair.Value, $second)) }
+    }
+    $order = [int[]]@($used); [Array]::Sort($order)
+    $usedProofs = @($order | ForEach-Object { $indexes[$_].Read })
+    $answer = [pscustomobject]@{ Complete = ($missing.Count -eq 0); Missing = [string[]]$missing.ToArray(); Blocked = $blocked.ToArray(); NoMailbox = $without.ToArray(); Used = $usedProofs; Notes = [string[]]$notes.ToArray(); Reason = '' }
     if (-not $answer.Complete) { $answer.Reason = '{0} of the {1} object(s) of this Recover are not covered in it' -f $missing.Count, @($Row).Count }
     return $answer
 }
@@ -2522,21 +2573,27 @@ function Test-PraRetentionProofCoverage {
 function Get-PraRetentionProof {
     <#
     .SYNOPSIS
-        The retention proof that lets a Recover go on when Exchange Online cannot be asked: the newest proof of the Convert batch, in these folders, that is intact, of this batch and Environment, not older than -MaxAgeHours, that covers every object.
+        The retention proof that lets a Recover go on when Exchange Online cannot be asked: the proofs of the Convert batch, in these folders, that are intact, of this batch and Environment, not older than -MaxAgeHours, and what they say about each object.
     .DESCRIPTION
-        Read only. -Row (objects with ObjectGuid and UserPrincipalName): the objects of the Recover; Complete is true when the proof says Covered (or NoMailbox: nothing to retain) for every one of them, and Missing lists the
-        UPNs that it does not. Without -Row, Complete says that every object of the proof is covered. An object is found by its ObjectGuid; its UPN counts only for a proof entry that has no ObjectGuid, so the
-        same UPN with another ObjectGuid is not covered. -SourceBackupHash (the hash of the Convert batch file) and -PolicyGuid (Retention.PolicyGuid, when the configuration sets one) must agree with the proof when they are given.
-        A file that is not usable is skipped. When the newest usable proof does not cover everything, the newest usable proof that does is taken (same batch, Environment, age and checks); when none does, the newest usable
-        one is reported with what it misses. Reason tells why the newest candidate was refused or incomplete.
+        Read only. -Row (objects with ObjectGuid and UserPrincipalName): the objects of the Recover. For each object the newest usable proof that lists it with a definitive verdict (Covered, NoMailbox, NotCovered) decides; a NotChecked
+        verdict leaves it to an older proof; an object whose newest definitive verdict is NotCovered blocks, whatever older proofs said. Complete is true when every object is Covered (or NoMailbox: nothing to retain); Missing lists the
+        UPNs that are not, and Blocked those that a proof says are not held. Without -Row, Complete says that every object of the newest usable proof is covered. An object is found by its ObjectGuid; its UPN counts only for a proof entry that
+        has no ObjectGuid, so the same UPN with another ObjectGuid is not covered. -SourceBackupHash (the hash of the Convert batch file) and -PolicyGuid (Retention.PolicyGuid, when the configuration sets one) must agree with the proof;
+        a -PolicyGuid that is not a GUID refuses every proof (PolicyGuidInvalid). A file that is not usable is skipped; Reason tells why the newest candidate was refused or what is not covered.
     .OUTPUTS
-        Found (a usable proof exists), Complete, Reason, Path, Sha256, CreatedUtc, AgeHours, ObjectCount, CoveredCount, NoMailbox (objects the proof says have no mailbox), Missing, PolicyGuid, FutureDated (a candidate was refused for its time),
-        Superseded (newer usable proofs that do not cover everything), Candidates (files looked at).
+        Found (a usable proof exists), Complete, Reason, Path, Sha256, CreatedUtc, AgeHours, ObjectCount, CoveredCount (of the newest usable proof), NoMailbox (objects that a proof says have no mailbox), Missing, Blocked, PolicyGuid,
+        Proofs (the proofs that decided an object: Path, Sha256, CreatedUtc, PolicyGuid, ObjectCount), Notes (a newer proof that changes the answer of an older one), FutureDated, PolicyGuidInvalid, Candidates (files looked at).
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Folder, [Parameter(Mandatory)][string]$BatchId, [Parameter(Mandatory)][string]$Environment,
         [ValidateRange(1, 720)][int]$MaxAgeHours = 24, [AllowEmptyCollection()][object[]]$Row, [hashtable]$Cache, [string]$SourceBackupHash = '', [string]$PolicyGuid = '')
-    $result = [pscustomobject][ordered]@{ Found = $false; Complete = $false; Reason = ''; Path = ''; Sha256 = ''; CreatedUtc = [datetime]::MinValue; AgeHours = [double]0; ObjectCount = 0; CoveredCount = 0; NoMailbox = @(); Missing = [string[]]@(); PolicyGuid = [string[]]@(); FutureDated = $false; Superseded = [string[]]@(); Candidates = 0 }
+    $result = [pscustomobject][ordered]@{ Found = $false; Complete = $false; Reason = ''; Path = ''; Sha256 = ''; CreatedUtc = [datetime]::MinValue; AgeHours = [double]0; ObjectCount = 0; CoveredCount = 0; NoMailbox = @(); Missing = [string[]]@(); Blocked = @(); PolicyGuid = [string[]]@(); Proofs = @(); Notes = [string[]]@(); FutureDated = $false; PolicyGuidInvalid = $false; Candidates = 0 }
+    $wantedPolicy = [guid]::Empty
+    if ($PolicyGuid -and (-not [guid]::TryParse($PolicyGuid, [ref]$wantedPolicy) -or $wantedPolicy -eq [guid]::Empty)) {
+        $result.PolicyGuidInvalid = $true
+        $result.Reason = 'Retention.PolicyGuid of this configuration ({0}) is not a GUID, so no proof can be matched to the policy' -f $PolicyGuid
+        return $result
+    }
     $id = $BatchId.ToLowerInvariant()
     $files = New-Object 'Collections.Generic.List[string]'
     $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
@@ -2546,13 +2603,10 @@ function Get-PraRetentionProof {
     }
     $result.Candidates = $files.Count
     if (-not $files.Count) { $result.Reason = 'no retention proof of this batch was found'; return $result }
-    $wantedPolicy = [guid]::Empty
-    if ($PolicyGuid -and (-not [guid]::TryParse($PolicyGuid, [ref]$wantedPolicy) -or $wantedPolicy -eq [guid]::Empty)) { $wantedPolicy = [guid]::Empty; $PolicyGuid = '' }
     $now = [DateTime]::UtcNow
     $withRows = $PSBoundParameters.ContainsKey('Row') -and $null -ne $Row
     $byTime = @($files | ForEach-Object { [pscustomobject]@{ Name = [IO.Path]::GetFileName($_); Path = $_ } } | Get-PraOrdinalSorted -Property Name -Descending)
-    $chosen = $null; $chosenJudge = $null; $firstReason = ''
-    $incomplete = New-Object 'Collections.Generic.List[string]'
+    $valid = New-Object 'Collections.Generic.List[object]'; $firstReason = ''
     foreach ($candidate in $byTime) {
         $file = [string]$candidate.Path
         $stamp = ''
@@ -2572,16 +2626,24 @@ function Get-PraRetentionProof {
         elseif ($read.CreatedUtc -gt $now.AddMinutes(5)) { $why = 'its time is in the future (the clocks of the two servers differ by more than 5 minutes)'; $result.FutureDated = $true }
         elseif (($now - $read.CreatedUtc).TotalHours -gt $MaxAgeHours) { $why = ('it is {0} hours old, the limit is {1} (Retention.ProofMaxAgeHours)' -f ($now - $read.CreatedUtc).TotalHours.ToString('0.#', [Globalization.CultureInfo]::InvariantCulture), $MaxAgeHours) }
         if ($why) { if (-not $firstReason) { $firstReason = ('{0}: {1}' -f [IO.Path]::GetFileName($file), $why) }; continue }
-        $judge = if ($withRows) { Test-PraRetentionProofCoverage -Read $read -Row $Row } else { Test-PraRetentionProofCoverage -Read $read -WholeProof }
-        if ($null -eq $chosen) { $chosen = $read; $chosenJudge = $judge }
-        if ($judge.Complete) { $chosen = $read; $chosenJudge = $judge; break }
-        $incomplete.Add([IO.Path]::GetFileName($file))
+        $valid.Add($read)
     }
-    if ($null -eq $chosen) { $result.Reason = $firstReason; return $result }
-    $result.Found = $true; $result.Path = $chosen.Path; $result.Sha256 = $chosen.Sha256; $result.CreatedUtc = $chosen.CreatedUtc; $result.AgeHours = [Math]::Max(0.0, ($now - $chosen.CreatedUtc).TotalHours)
-    $result.ObjectCount = $chosen.ObjectCount; $result.CoveredCount = $chosen.CoveredCount; $result.PolicyGuid = $chosen.PolicyGuid
-    $result.Complete = [bool]$chosenJudge.Complete; $result.Missing = $chosenJudge.Missing; $result.NoMailbox = @($chosenJudge.NoMailbox); $result.Reason = [string]$chosenJudge.Reason
-    if ($chosenJudge.Complete) { $result.Superseded = [string[]]@($incomplete.ToArray()) }
+    if (-not $valid.Count) { $result.Reason = $firstReason; return $result }
+    $newest = $valid[0]
+    $result.Found = $true; $result.Path = $newest.Path; $result.Sha256 = $newest.Sha256; $result.CreatedUtc = $newest.CreatedUtc; $result.AgeHours = [Math]::Max(0.0, ($now - $newest.CreatedUtc).TotalHours)
+    $result.ObjectCount = $newest.ObjectCount; $result.CoveredCount = $newest.CoveredCount; $result.PolicyGuid = $newest.PolicyGuid
+    $summary = { param($Proof) [pscustomobject]@{ Path = [string]$Proof.Path; Sha256 = [string]$Proof.Sha256; CreatedUtc = $Proof.CreatedUtc; PolicyGuid = [string[]]@($Proof.PolicyGuid); ObjectCount = [int]$Proof.ObjectCount } }
+    if ($withRows) {
+        $decision = Get-PraRetentionProofDecision -Read $valid.ToArray() -Row $Row
+        $result.Complete = $decision.Complete; $result.Missing = $decision.Missing; $result.Blocked = @($decision.Blocked); $result.NoMailbox = @($decision.NoMailbox); $result.Notes = $decision.Notes; $result.Reason = $decision.Reason
+        $result.Proofs = @($decision.Used | ForEach-Object { & $summary $_ })
+        return $result
+    }
+    $open = @($newest.Objects | Where-Object { -not ($_.Covered -or $_.NoMailbox) })
+    $result.Complete = ($newest.ObjectCount -gt 0 -and $open.Count -eq 0)
+    if (-not $result.Complete) { $result.Reason = '{0} of the {1} object(s) of the proof are not covered' -f ($newest.ObjectCount - $newest.CoveredCount - $newest.NoMailboxCount), $newest.ObjectCount }
+    $result.NoMailbox = @($newest.Objects | Where-Object { $_.NoMailbox } | ForEach-Object { [pscustomobject]@{ ObjectGuid = $(if ($_.HasGuid) { $_.Guid.ToString() } else { '' }); Upn = $_.Upn } })
+    $result.Proofs = @(& $summary $newest)
     return $result
 }
 
@@ -2937,9 +2999,9 @@ function Get-PraPhaseSetting {
     $settings['Entra Connect policy'] = [string](Get-PraValue (Get-PraValue $config 'EntraConnect' @{}) 'PolicyType' '')
     $settings['AD replication before the sync'] = [string]([bool](Get-PraValue (Get-PraValue $config 'Directory' @{}) 'ForceReplication' $false))
     $settings['Retention check before Recover'] = [string]([bool](Get-PraValue (Get-PraValue $config 'Retention' @{}) 'CheckBeforeRecover' $true))
-    $proof = Get-PraValue $Context 'RetentionProofAccepted' $null
-    if ($null -ne $proof) {
-        $settings['Retention proof accepted'] = '{0} (SHA-256 {1}, created {2} UTC, policy {3}, {4} object(s))' -f [IO.Path]::GetFileName([string]$proof.Path), $proof.Sha256, ([datetime]$proof.CreatedUtc).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $(if (@($proof.PolicyGuid).Count) { @($proof.PolicyGuid) -join ', ' } else { '(none recorded)' }), $proof.ObjectCount
+    $accepted = Get-PraValue $Context 'RetentionProofAccepted' $null
+    if ($null -ne $accepted -and @($accepted).Count) {
+        $settings['Retention proof accepted'] = (@($accepted | ForEach-Object { '{0} (SHA-256 {1}, created {2} UTC, policy {3}, {4} object(s))' -f [IO.Path]::GetFileName([string]$_.Path), $_.Sha256, ([datetime]$_.CreatedUtc).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $(if (@($_.PolicyGuid).Count) { @($_.PolicyGuid) -join ', ' } else { '(none recorded)' }), $_.ObjectCount }) -join '; ')
     }
     return $settings
 }
@@ -3923,7 +3985,7 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-PraImmutableId, Get-PraSourceAnchor, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Copy-PraPhaseFile, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Write-PraGlobalEventsCsv, Write-PraGlobalIssuesCsv, Get-PraGlobalJourney, Test-PraBatchSideFile, Write-PraRetentionProof, Get-PraRetentionProof, Get-PraConvertCloudDone, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, New-PraRecordIndex, Get-PraRecordIndex, Find-PraRecord, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-PraImmutableId, Get-PraSourceAnchor, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Copy-PraPhaseFile, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Write-PraGlobalEventsCsv, Write-PraGlobalIssuesCsv, Get-PraGlobalJourney, Test-PraBatchSideFile, Write-PraRetentionProof, Get-PraRetentionProof, Test-PraRetentionCheckRecord, Get-PraConvertCloudDone, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, New-PraRecordIndex, Get-PraRecordIndex, Find-PraRecord, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Test-PraOwnEntryProcess, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
