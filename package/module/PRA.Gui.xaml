@@ -775,6 +775,11 @@
                   <TextBlock Style="{StaticResource Icon}" Text="&#xEA39;" Foreground="{DynamicResource PraCritical}" Margin="0,2,8,0"/>
                   <TextBlock x:Name="BlockText" Style="{StaticResource Hint}" Foreground="{DynamicResource PraCritical}" FontSize="13" MaxWidth="900"/>
                 </StackPanel>
+                <StackPanel x:Name="RetentionBox" Margin="0,10,0,0" Visibility="Collapsed">
+                  <CheckBox x:Name="F_AcceptRetention" Content="Go on even if the retention policy does not hold every mailbox, or if that cannot be checked (this run only)"/>
+                  <TextBlock x:Name="RetentionHint" Style="{StaticResource Hint}" FontSize="13" Margin="0,4,0,0" MaxWidth="900" TextWrapping="Wrap"/>
+                  <TextBlock x:Name="RetentionProofText" Style="{StaticResource Hint}" FontSize="13" Margin="0,4,0,0" MaxWidth="900" TextWrapping="Wrap" Visibility="Collapsed"/>
+                </StackPanel>
               </StackPanel>
               <Button x:Name="BtnFixHome" Grid.Column="2" Content="Fix on the Setup page" VerticalAlignment="Center" Visibility="Collapsed"/>
             </Grid>

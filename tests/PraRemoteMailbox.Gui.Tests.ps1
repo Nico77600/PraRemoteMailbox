@@ -2341,8 +2341,10 @@ Describe 'Release 3.2.0 - the console does not keep a checksum that it could not
 Describe 'Release 3.2.0 - the console tells a finished batch from one that is still to do, a partial or pending one stands out, and a finished one never looks continuable (synthetic, no engine)' -Tag 'Release320d' {
     BeforeAll {
         function Write-GuiPhaseData {
-            param([string]$Folder, [string]$Action, [string]$Side, [string]$Status, [int]$Pending = 0, [string]$HandOff = '', [string]$Stamp = '20261116101010')
-            $record = [ordered]@{ SchemaVersion = 2; Kind = 'PhaseData'; Environment = 'GuiSynthetic'; BatchId = 'abcd1234'; ToolVersion = '3.2.0'; Truncated = $false
+            param([string]$Folder, [string]$Action, [string]$Side, [string]$Status, [int]$Pending = 0, [string]$HandOff = '', [string]$Stamp = '20261116101010', [string]$BatchId = '', [string]$Environment = 'GuiSynthetic')
+            # The data of a run names the batch of the folder it is written in.
+            if (-not $BatchId) { $BatchId = (Split-Path $Folder -Leaf) -replace '^(Batch|Finalize)-', ''; $BatchId = $BatchId.Substring(0, [Math]::Min(8, $BatchId.Length)) }
+            $record = [ordered]@{ SchemaVersion = 2; Kind = 'PhaseData'; Environment = $Environment; BatchId = $BatchId; ToolVersion = '3.2.0'; Truncated = $false
                 Phase = [ordered]@{ RunId = ('20261116_101010-' + [guid]::NewGuid().ToString('N')); Action = $Action; Phase = $Side; Mode = 'Apply'; Computer = 'SRV1'; Account = 'CONTOSO\admin'; Server = 'dc01'
                     StartedUtc = '2026-11-16T10:10:10.0000000Z'; EndedUtc = '2026-11-16T10:20:10.0000000Z'; Status = $Status; ExitCode = 0; HandOff = $HandOff; Overrides = @(); Settings = [ordered]@{ Environment = 'GuiSynthetic' }; Steps = @()
                     Counts = [ordered]@{ Success = 1; Error = 0; Pending = $Pending; Skipped = 0; Planned = 0 } }
@@ -2468,6 +2470,35 @@ Describe 'Release 3.2.0 - the console tells a finished batch from one that is st
         $clock.Elapsed.TotalSeconds | Should -BeLessThan 5 -Because 'only the first bytes of the file are read, and the answer is kept while the file does not change'
     }
 
+    It 'does not take a phase data file for a batch that it is not: another batch, another Environment, no checksum file or a checksum that does not match count as no phase data, and a file that cannot be opened just now is not remembered as unreadable' -Tag 'Release320f' {
+        $runtime = New-GuiTestRoot
+        $progress = { param($folder, $environment) & (Get-Module PRA.Gui) { param($f, $e) Get-PraGuiBatchProgress $f 'Convert' $e } $folder $environment }
+        $other = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $other.Folder 'Convert' 'Cloud' 'Success' -BatchId 'FFFFFFFF'
+        (& $progress $other.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'the file names another batch'
+        $null = Write-GuiPhaseData $other.Folder 'Convert' 'Cloud' 'Success' -Stamp '20261116121212' -BatchId $other.Id.ToUpperInvariant().Substring(0, 8)
+        (& $progress $other.Folder 'GuiSynthetic').Kind | Should -BeExactly 'Finished' -Because 'the batch id is compared in any letter case'
+        $env = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $env.Folder 'Convert' 'Cloud' 'Success' -Environment 'Another'
+        (& $progress $env.Folder 'guisynthetic').Kind | Should -BeExactly 'None' -Because 'the file is for another Environment'
+        (& $progress $env.Folder '').Kind | Should -BeExactly 'Finished' -Because 'an empty Environment is not compared'
+        $sum = New-GuiTestBatch -Runtime $runtime
+        $path = Write-GuiPhaseData $sum.Folder 'Convert' 'Cloud' 'Success'
+        $good = [IO.File]::ReadAllText($path + '.sha256')
+        Remove-Item -LiteralPath ($path + '.sha256') -Force
+        (& $progress $sum.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'no checksum file: the batch is not shown as finished'
+        [IO.File]::WriteAllText($path + '.sha256', ('0' * 64))
+        (& $progress $sum.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'the checksum does not match the file'
+        [IO.File]::WriteAllText($path + '.sha256', $good.ToUpperInvariant())
+        (& $progress $sum.Folder 'GuiSynthetic').Kind | Should -BeExactly 'Finished' -Because 'a checksum file written afterwards is read at the next refresh, in any letter case'
+        $busy = New-GuiTestBatch -Runtime $runtime
+        $busyPath = Write-GuiPhaseData $busy.Folder 'Convert' 'Cloud' 'Success'
+        $lock = [IO.File]::Open($busyPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try { (& $progress $busy.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'the file is held by another process' }
+        finally { $lock.Dispose() }
+        (& $progress $busy.Folder 'GuiSynthetic').Kind | Should -BeExactly 'Finished' -Because 'the failed read was not kept'
+    }
+
     It 'shows the sections in the window: To do is shown first for a list that continues a batch, Finished and All are one click away, a finished batch cannot be picked, and an empty section says why' {
         $runtime = New-GuiTestRoot
         $todo = New-GuiTestBatch -Runtime $runtime
@@ -2548,5 +2579,249 @@ try {
             $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
             $out.Result | Should -Match 'SECTIONS-PASS'
         } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.2.0 - the console: the retention override, the header of the activity log, the old files of logs\gui, the steps after a valid run, Ctrl+C and the time limit of the OU lookup (synthetic, no engine)' -Tag 'Release320e' {
+    It 'the request, the command line and the guard carry -AcceptRetentionRisk for the AD part of a Recover only, whatever the letter case of the words' -TestCases @(
+        @{Action='Recover';Phase='AD';Batch='01234567';Expected=$true}
+        @{Action='recover';Phase='both';Batch='01234567';Expected=$true}
+        @{Action='RECOVER';Phase='BOTH';Batch='01234567';Expected=$true}
+        @{Action='Recover';Phase='Cloud';Batch='01234567';Expected=$false}
+        @{Action='Convert';Phase='Both';Batch='';Expected=$false}
+        @{Action='Finalize';Phase='AD';Batch='01234567';Expected=$false}
+        @{Action='Check';Phase='Cloud';Batch='01234567';Expected=$false}
+    ) {
+        param($Action,$Phase,$Batch,$Expected)
+        $request=New-PraGuiRequest -Action $Action -Phase $Phase -Batch $Batch -AcceptRetentionRisk $true
+        [bool]$request.AcceptRetentionRisk | Should -Be $Expected
+        $command=Get-PraGuiCommand -Root 'C:\Synthetic root' -ConfigPath 'C:\Synthetic root\config.psd1' -Request $request
+        ($command.Tokens -contains '-AcceptRetentionRisk') | Should -Be $Expected
+        ($command.Display -match '-AcceptRetentionRisk') | Should -Be $Expected
+        $plain=New-PraGuiRequest -Action $Action -Phase $Phase -Batch $Batch
+        [bool]$plain.AcceptRetentionRisk | Should -BeFalse
+        (Get-PraGuiCommand -Root 'C:\Synthetic root' -ConfigPath 'C:\Synthetic root\config.psd1' -Request $plain).Tokens | Should -Not -Contain '-AcceptRetentionRisk'
+    }
+    It 'the switch changes the guard of the Preview: an Apply after the box was ticked or cleared needs a new Preview' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $without=Get-PraGuiGuard $runtime.Root $runtime.Config (New-PraGuiRequest -Action Recover -Phase AD -Batch $batch.Path)
+        $with=Get-PraGuiGuard $runtime.Root $runtime.Config (New-PraGuiRequest -Action Recover -Phase AD -Batch $batch.Path -AcceptRetentionRisk $true)
+        $with | Should -Not -Be $without
+        Get-PraGuiGuard $runtime.Root $runtime.Config (New-PraGuiRequest -Action Recover -Phase AD -Batch $batch.Path -AcceptRetentionRisk $true) | Should -Be $with
+    }
+    It 'the window has the checkbox on the Recover task, off by default, and the engine switch is documented in the entry script' {
+        $xaml=Get-Content -LiteralPath (Join-Path $script:GuiProjectRoot 'module\PRA.Gui.xaml') -Raw
+        $xaml | Should -Match 'x:Name="F_AcceptRetention"'
+        $xaml | Should -Not -Match 'F_AcceptRetention"[^>]*IsChecked="True"'
+        $gui=Get-Content -LiteralPath $script:GuiModule -Raw
+        $gui | Should -Match 'F_AcceptRetention\.Add_Checked'
+        $gui | Should -Match 'F_AcceptRetention\.IsChecked=\$false'
+        (Get-Content -LiteralPath (Join-Path $script:GuiProjectRoot 'Invoke-PraRemoteMailbox.ps1') -Raw) | Should -Match '\[switch\]\$AcceptRetentionRisk'
+    }
+    It 'the header of the activity log says where the complete log is, and goes back to the plain title' {
+        Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
+        & (Get-Module PRA.Gui) {
+            $expander=[pscustomobject]@{ Header='Activity log' }
+            $script:Gui=@{ Controls=@{ LogExpander=$expander } }
+            try {
+                Set-PraGuiLogHeader 'C:\Synthetic root\logs\run.log'
+                $expander.Header | Should -BeOfType ([Windows.Controls.TextBlock])
+                $expander.Header.Text | Should -BeExactly ('Activity log: the last {0} lines. The complete log is in C:\Synthetic root\logs\run.log' -f $script:PraGuiLogLines)
+                Set-PraGuiLogHeader ''
+                $expander.Header | Should -BeExactly 'Activity log'
+            } finally { $script:Gui=$null }
+        }
+        $text=Get-Content -LiteralPath $script:GuiModule -Raw
+        $text | Should -Match "Set-PraGuiLogHeader \(\`$base\+'\.stdout\.txt'\)"
+        $text | Should -Match 'if \(\$logFile\) \{ Set-PraGuiLogHeader \$logFile \}'
+    }
+    It 'after a valid run a step that never started is Skip, the running one is Ok; after a failed run the running one is Fail and the others stay Pending' {
+        & (Get-Module PRA.Gui) {
+            foreach ($valid in @($true,$false)) {
+                $rows=@('Ok','Running','Wait','Pending','Skip','Warn' | ForEach-Object { New-PraGuiRow @{ Status=$_; Note='n'; NoteBase='n'; NextAt=1; Progress=[double]0.5 } })
+                Close-PraGuiRunStep -Step $rows -Valid $valid
+                $states=@($rows | ForEach-Object { $_.Status }) -join ','
+                if ($valid) { $states | Should -BeExactly 'Ok,Ok,Ok,Skip,Skip,Warn' }
+                else { $states | Should -BeExactly 'Ok,Fail,Fail,Pending,Skip,Warn' }
+                $rows[1].Progress | Should -Be 1
+            }
+        }
+        Get-Content -LiteralPath $script:GuiModule -Raw | Should -Match 'Close-PraGuiRunStep -Step @\(\$g\.Model\.Steps\) -Valid \$valid'
+    }
+    It 'the window removes what it left in logs\gui more than 30 days ago, files and run folders, and nothing else' {
+        $runtime=New-GuiTestRoot
+        $gui=Join-Path $runtime.Root 'logs\gui'
+        $old=(Get-Date).AddDays(-31); $recent=(Get-Date).AddDays(-29)
+        $null=New-Item -ItemType Directory -Path (Join-Path $gui 'run-old'),(Join-Path $gui 'run-recent') -Force
+        Write-GuiTestFile (Join-Path $gui 'run-old\effective.config.psd1') '@{ }'
+        Write-GuiTestFile (Join-Path $gui 'run-recent\effective.config.psd1') '@{ }'
+        foreach ($name in @('a-old.events.jsonl','a-old.stdout.txt','b-recent.stdout.txt','OU-OLD.json')) { Write-GuiTestFile (Join-Path $gui $name) 'x' }
+        Write-GuiTestFile (Join-Path $runtime.Root 'logs\engine-old.log') 'engine log, never touched'
+        Write-GuiTestFile (Join-Path $runtime.Root 'reports\report-old.html') 'report, never touched'
+        foreach ($path in @((Join-Path $gui 'a-old.events.jsonl'),(Join-Path $gui 'a-old.stdout.txt'),(Join-Path $gui 'OU-OLD.json'),(Join-Path $gui 'run-old\effective.config.psd1'),(Join-Path $gui 'run-old'),(Join-Path $runtime.Root 'logs\engine-old.log'),(Join-Path $runtime.Root 'reports\report-old.html'))) { (Get-Item -LiteralPath $path).LastWriteTime=$old }
+        foreach ($path in @((Join-Path $gui 'b-recent.stdout.txt'),(Join-Path $gui 'run-recent\effective.config.psd1'),(Join-Path $gui 'run-recent'))) { (Get-Item -LiteralPath $path).LastWriteTime=$recent }
+        Remove-PraGuiOldLog -Root $runtime.Root | Should -Be 4
+        @(Get-ChildItem -LiteralPath $gui -Force | ForEach-Object Name | Sort-Object) -join ',' | Should -BeExactly 'b-recent.stdout.txt,run-recent'
+        Test-Path -LiteralPath (Join-Path $runtime.Root 'logs\engine-old.log') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $runtime.Root 'reports\report-old.html') | Should -BeTrue
+        Remove-PraGuiOldLog -Root $runtime.Root | Should -Be 0
+        Remove-PraGuiOldLog -Root (Join-Path $runtime.Root 'does-not-exist') | Should -Be 0
+    }
+    It 'a file of logs\gui that is held open is left, the others are removed, and nothing is thrown' {
+        $runtime=New-GuiTestRoot
+        $gui=Join-Path $runtime.Root 'logs\gui'
+        foreach ($name in @('held.stdout.txt','free.stdout.txt')) { Write-GuiTestFile (Join-Path $gui $name) 'x'; (Get-Item -LiteralPath (Join-Path $gui $name)).LastWriteTime=(Get-Date).AddDays(-60) }
+        $lock=[IO.File]::Open((Join-Path $gui 'held.stdout.txt'),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { { Remove-PraGuiOldLog -Root $runtime.Root } | Should -Not -Throw } finally { $lock.Dispose() }
+        @(Get-ChildItem -LiteralPath $gui | ForEach-Object Name) | Should -BeExactly @('held.stdout.txt')
+    }
+    It 'Show-PraGui prunes logs\gui and keeps Ctrl+C out of the window only while it is open, only when the input is a console, and gives the setting back' {
+        $text=Get-Content -LiteralPath $script:GuiModule -Raw
+        $body=[regex]::Match($text,'(?s)function Show-PraGui \{.*?\r?\n\}\r?\n').Value
+        $body | Should -Match 'Remove-PraGuiOldLog -Root \$Root'
+        $body | Should -Match '\[Console\]::IsInputRedirected'
+        $body.IndexOf('TreatControlCAsInput=$true') | Should -BeGreaterThan 0
+        $body.IndexOf('TreatControlCAsInput=$true') | Should -BeLessThan $body.IndexOf('ShowDialog()')
+        $body.IndexOf('finally') | Should -BeGreaterThan $body.IndexOf('ShowDialog()')
+        $body.Substring($body.IndexOf('finally')) | Should -Match 'TreatControlCAsInput=\$previousCtrlC'
+        Get-Command -Module PRA.Gui -Name Remove-PraGuiOldLog | Should -Not -BeNullOrEmpty
+    }
+    It 'an OU lookup that does not answer within its time limit is stopped, says so, and frees the window; one that is within its time is left alone' {
+        $info=New-Object Diagnostics.ProcessStartInfo
+        $info.FileName=(Join-Path $PSHOME 'pwsh.exe'); $info.Arguments='-NoProfile -NonInteractive -Command Start-Sleep -Seconds 120'; $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+        $process=[Diagnostics.Process]::Start($info)
+        $processId=$process.Id; $processStart=$process.StartTime
+        $global:PraOuProcess=$process; $global:PraOuMessages=New-Object 'Collections.Generic.List[string]'
+        try {
+            Mock Show-PraGuiError { $global:PraOuMessages.Add($Message) } -ModuleName PRA.Gui
+            Mock Set-PraGuiBusy { } -ModuleName PRA.Gui
+            Mock Update-PraGuiView { } -ModuleName PRA.Gui
+            Mock Sync-PraGuiTimer { } -ModuleName PRA.Gui
+            & (Get-Module PRA.Gui) {
+                $global:PraOuStopped=0
+                $timer=[pscustomobject]@{}; Add-Member -InputObject $timer -MemberType ScriptMethod -Name Stop -Value { $global:PraOuStopped=[int]$global:PraOuStopped+1 }
+                $script:Gui=@{ Timer=$timer; OuLookup=@{ Process=$global:PraOuProcess; Output=[pscustomobject]@{IsCompleted=$false}; Errors=[pscustomobject]@{IsCompleted=$false}; Path='none'; Base='none'; Clock=[Diagnostics.Stopwatch]::StartNew() } }
+                try {
+                    Complete-PraGuiOuLookup
+                    $script:Gui.OuLookup | Should -Not -BeNullOrEmpty -Because 'the time limit is not reached'
+                    $global:PraOuMessages.Count | Should -Be 0
+                    $script:PraGuiOuLookupSeconds | Should -Be 60
+                    $script:Gui.OuLookup.Clock=[Diagnostics.Stopwatch]::StartNew()
+                    $keep=$script:PraGuiOuLookupSeconds; $script:PraGuiOuLookupSeconds=0
+                    Start-Sleep -Milliseconds 30
+                    Complete-PraGuiOuLookup
+                    $script:PraGuiOuLookupSeconds=$keep
+                    $script:Gui.OuLookup | Should -BeNullOrEmpty
+                } finally { $script:Gui=$null }
+            }
+            $global:PraOuMessages.Count | Should -Be 1
+            $global:PraOuMessages[0] | Should -Match 'Active Directory did not answer within 0 seconds'
+            $global:PraOuMessages[0] | Should -Match 'type the distinguished name of the OU'
+            $deadline=[datetime]::UtcNow.AddSeconds(10)
+            while ((Get-Process -Id $processId -ErrorAction SilentlyContinue) -and [datetime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            $still=Get-Process -Id $processId -ErrorAction SilentlyContinue
+            ($null -eq $still -or $still.StartTime -ne $processStart) | Should -BeTrue -Because 'the lookup process is stopped'
+        } finally {
+            $left=Get-Process -Id $processId -ErrorAction SilentlyContinue
+            if ($left -and $left.StartTime -eq $processStart) { $left.Kill() }
+            Remove-Variable PraOuProcess,PraOuMessages,PraOuStopped -Scope Global -ErrorAction SilentlyContinue
+        }
+        (Get-Content -LiteralPath $script:GuiModule -Raw) | Should -Match 'Clock=\[Diagnostics\.Stopwatch\]::StartNew\(\) \}\r?\n    Set-PraGuiBusy \$true\r?\n    Add-PraGuiLine ''Reading the OUs'
+    }
+}
+
+Describe 'Release 3.2.0 - the console: the retention checkbox in the window (synthetic window, no engine)' -Tag 'Release320e' {
+    It 'shows the checkbox for a Recover whose AD part runs on this server only, cleared at the start and whenever the task changes, and sends it to the request and to the command line' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $probe = Join-Path $runtime.Root 'wpf-probe-retention.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$BatchPath)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$true; Role='Both' } }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect
+$g.Form.Show()
+try {
+ $c=$g.Controls
+ Click $g 'BtnNext'
+ $c.T_Convert.IsChecked=$true; Pump 80
+ if($c.RetentionBox.Visibility -ne 'Collapsed'){throw 'A Convert has no retention check'}
+ $c.T_Recover.IsChecked=$true; Pump 80
+ if($c.RetentionBox.Visibility -ne 'Visible'){throw 'A Recover whose AD part runs here shows the box'}
+ if($c.F_AcceptRetention.IsChecked){throw 'The box starts cleared'}
+ if($c.RetentionHint.Text -notmatch 'checks that the retention policy holds them'){throw ('Hint: '+$c.RetentionHint.Text)}
+ $c.F_AcceptRetention.IsChecked=$true; Pump 80
+ $g.SelectedBatch=[pscustomobject]@{ Path=$BatchPath }
+ $request=& (Get-Module PRA.Gui) { Get-PraGuiWindowRequest 'Apply' }
+ if(-not $request.AcceptRetentionRisk -or $request.Phase -ne 'Both'){throw ('The request does not carry the box: '+($request|ConvertTo-Json -Compress))}
+ $display=(& (Get-Module PRA.Gui) { param($r) (Get-PraGuiCommand $script:Gui.Root $script:Gui.ConfigPath $r).Display } $request)
+ if($display -notmatch '-AcceptRetentionRisk'){throw ('The command line does not carry the box: '+$display)}
+ $c.Mode_Continue.IsChecked=$true; Pump 80
+ if($c.RetentionBox.Visibility -ne 'Collapsed' -or $c.F_AcceptRetention.IsChecked){throw 'The cloud part never checks the retention: the box goes away and is cleared'}
+ $c.Mode_New.IsChecked=$true; Pump 80
+ if($c.RetentionBox.Visibility -ne 'Visible' -or $c.F_AcceptRetention.IsChecked){throw 'Back on the AD part: the box is shown again, still cleared'}
+ $c.F_AcceptRetention.IsChecked=$true; Pump 80
+ $c.T_Convert.IsChecked=$true; Pump 80
+ $c.T_Recover.IsChecked=$true; Pump 80
+ if($c.F_AcceptRetention.IsChecked){throw 'Another task cleared the box: the acceptance is never carried to another run'}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('RETENTION-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config, '-BatchPath', $batch.Path)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(180000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'RETENTION-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.2.0 - the console shows whether the retention proof of the selected batch is found, and how old it is (synthetic, no engine)' -Tag 'Release320e' {
+    It 'says that no proof is usable (with the reason), that one is found and covers every mailbox (with its age), or that it does not cover every mailbox' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $inbox = Join-Path $runtime.Root 'Backups\Inbox'
+        $global:PraGuiProofCase = @{ Batch = $batch; Backup = (Join-Path $runtime.Root 'Backups'); Inbox = $inbox }
+        $text = {
+            & (Get-Module PRA.Gui) {
+                $case = $global:PraGuiProofCase
+                $config = [pscustomobject]@{ Environment = 'GUISYNTHETIC'; Storage = [pscustomobject]@{ BackupFolder = $case.Backup }; Retention = [pscustomobject]@{ ProofMaxAgeHours = 24 } }
+                $script:Gui = @{ SelectedBatch = [pscustomobject]@{ BatchId = $case.Batch.Id; Path = $case.Batch.Path }; State = [pscustomobject]@{ Config = $config } }
+                try { Get-PraGuiRetentionProofText } finally { $script:Gui = $null }
+            }
+        }
+        (& $text) | Should -Match '^No valid retention proof for this batch \(no retention proof of this batch was found\)\. Run Check'
+        $objects = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'Covered' }, [pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000002'; Upn = 'b@example.invalid'; Verdict = 'NotCovered' })
+        $null = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -Environment 'guisynthetic' -Object $objects
+        (& $text) | Should -Match '^A retention proof was found \(\d+(\.\d)? hours old\) but it does not cover every mailbox: 1 of the 2 object\(s\) of the proof are not covered\.$'
+        Start-Sleep -Milliseconds 30
+        $null = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -Environment 'GuiSynthetic' -Object @($objects | ForEach-Object { [pscustomobject]@{ ObjectGuid = $_.ObjectGuid; Upn = $_.Upn; Verdict = 'Covered' } })
+        (& $text) | Should -Match '^A valid retention proof was found: \d+(\.\d)? hours old, 2 of 2 mailbox\(es\) covered\. This server can use it'
+        Remove-Variable PraGuiProofCase -Scope Global
+    }
+    It 'shows the proof line only for the AD part of a Recover, in the window, and a proof file in a batch folder is a side file there' {
+        $xaml = Get-Content -LiteralPath (Join-Path $script:GuiProjectRoot 'module\PRA.Gui.xaml') -Raw
+        $xaml | Should -Match 'x:Name="RetentionProofText"'
+        $text = Get-Content -LiteralPath $script:GuiModule -Raw
+        $text | Should -Match "Test-GuiOrdinal \(Get-PraGuiPhase\) 'AD' -IgnoreCase\)\) \{ Get-PraGuiRetentionProofText \}"
+        (& (Get-Module PRA.Gui) { Test-PraGuiBatchSideFile 'RetentionProof-abcdef01-20261119101010000.json' }) | Should -BeTrue
+        (& (Get-Module PRA.Gui) { Test-PraGuiBatchSideFile 'retentionproof-abcdef01-20261119101010000.json.sha256' }) | Should -BeTrue
+        (& (Get-Module PRA.Gui) { Test-PraGuiBatchSideFile 'Convert-x.json' }) | Should -BeFalse
     }
 }

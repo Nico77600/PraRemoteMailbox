@@ -99,6 +99,14 @@ $script:PraExoWorker = {
         return $false
     }
     function InSetIgnoreCase { param($Value,$Set) return (InSet -Value $Value -Set $Set -IgnoreCase) }
+    function InGuidSet {
+        # A GUID is compared by value, whatever its text format (braces, hyphens, case). Text that is not a GUID never matches.
+        param($Value,$Set)
+        $left=[guid]::Empty
+        if (-not [guid]::TryParse([string]$Value,[ref]$left) -or $left -eq [guid]::Empty) { return $false }
+        foreach ($item in @($Set)) { $right=[guid]::Empty; if ([guid]::TryParse([string]$item,[ref]$right) -and $right.Equals($left)) { return $true } }
+        return $false
+    }
     function Session {
         param([string]$Right='')
         $tenant=[string](V $SessionBinding 'TenantId' (V $P 'TenantId' ''))
@@ -267,9 +275,14 @@ $script:PraExoWorker = {
                     return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@(); EarlierAccount=$true; EarlierCount=[int]$items.Count }
                 }
             }
-            if ($items.Count -gt 1 -and -not ($byId -and @($items | Where-Object { SameIgnoreCase ([string](V $_ 'ExternalDirectoryObjectId' '')) $byId }).Count)) {
-                $guids = @(V $P 'MailboxGuids' @() | Where-Object { $_ })
-                $matching = @($items | Where-Object { $exchangeGuid = [string](V $_ 'ExchangeGuid' ''); $exchangeGuid -and (InSetIgnoreCase $exchangeGuid $guids) })
+            $guids = @(V $P 'MailboxGuids' @() | Where-Object { $_ })
+            $foundById = [bool]($byId -and @($items | Where-Object { SameIgnoreCase ([string](V $_ 'ExternalDirectoryObjectId' '')) $byId }).Count)
+            if ($items.Count -eq 1 -and $guids.Count -and -not $foundById -and -not (InGuidSet (V $items[0] 'ExchangeGuid' '') $guids)) {
+                # A single candidate found by UPN is this object's mailbox only when it carries the mailbox GUID recorded for the object.
+                return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@(); EarlierAccount=$true; EarlierCount=1 }
+            }
+            if ($items.Count -gt 1 -and -not $foundById) {
+                $matching = @($items | Where-Object { InGuidSet (V $_ 'ExchangeGuid' '') $guids })
                 if ($matching.Count -ne 1) {
                     $recorded = if ($guids.Count) { ' The mailbox GUID recorded for this object does not tell them apart either.' } else { ' This object has no mailbox GUID recorded (it was not an on-premises mailbox, or the record is older), so nothing tells them apart.' }
                     throw ("Exchange Online has $($items.Count) inactive mailboxes for $Upn and nothing tells which one belongs to this object: the retention cannot be checked for it.$recorded To list them, run: Get-EXOMailbox -InactiveMailboxOnly -Filter ""$(ExactFilter $Upn)"" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds | Format-List Name,ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds. Then check by hand, in the Microsoft Purview portal, the retention of the mailbox of this object.")
@@ -1776,6 +1789,7 @@ function Invoke-PraCloudPhase {
                     else { Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $failure -Upn $s.Upn -Extra ([string]$row.PermDetail); $s.Done=$true }
                 }
             }
+            $Context.CurrentIdentity=''
             if ($null -ne $stopRun -or $graphStop) { break }
             $pending=@($states | Where-Object { -not $_.Done })
             if (-not $pending.Count -or $Context.Once -or $clock.Elapsed.TotalSeconds -ge $timeout) { break }
@@ -1797,7 +1811,8 @@ function Invoke-PraCloudPhase {
         } while ($true)
         $preview=(-not $Context.AllowMutation -and (Test-PraOrdinalIn $Context.Action @('Convert','Recover')))
         if ($graphStop) {
-            foreach ($s in @($states | Where-Object { -not $_.Done -and $_.CoreDone })) { Complete-PraX500Check -Context $Context -State $s }
+            foreach ($s in @($states | Where-Object { -not $_.Done -and $_.CoreDone })) { $Context.CurrentIdentity=[string](Get-PraValue $s.Row 'ObjectGuid' $s.Upn); Complete-PraX500Check -Context $Context -State $s }
+            $Context.CurrentIdentity=''
             $unfinished=@($states | Where-Object { -not $_.Done })
             foreach ($s in $unfinished) {
                 $s.Row.CloudStatus='Pending'; $s.Row.FinalStatus='Pending'
@@ -1806,7 +1821,8 @@ function Invoke-PraCloudPhase {
             $null=Write-PraLog -Context $Context -Message ('Microsoft Graph refused a read: {0} object(s) were not finished and nothing more is asked of Microsoft Graph in this run' -f $unfinished.Count) -Level Detail
         }
         elseif ($null -ne $stopRun) {
-            foreach ($s in @($states | Where-Object { -not $_.Done -and $_.CoreDone })) { Complete-PraX500Check -Context $Context -State $s }
+            foreach ($s in @($states | Where-Object { -not $_.Done -and $_.CoreDone })) { $Context.CurrentIdentity=[string](Get-PraValue $s.Row 'ObjectGuid' $s.Upn); Complete-PraX500Check -Context $Context -State $s }
+            $Context.CurrentIdentity=''
             $unfinished=@($states | Where-Object { -not $_.Done })
             foreach ($s in $unfinished) {
                 $s.Row.CloudStatus='Pending'; $s.Row.FinalStatus='Pending'
@@ -1817,6 +1833,7 @@ function Invoke-PraCloudPhase {
         }
         else { foreach ($s in $states) {
             if ($s.Done) { continue }
+            $Context.CurrentIdentity=[string](Get-PraValue $s.Row 'ObjectGuid' $s.Upn)
             if ($s.CoreDone) { Complete-PraX500Check -Context $Context -State $s; continue }
             if ($preview) {
                 $s.Row.CloudStatus='Pending'; $s.Row.FinalStatus='Planned'; $Context.NotYetExpected=[int]$Context.NotYetExpected+1
@@ -1831,13 +1848,106 @@ function Invoke-PraCloudPhase {
                 $Context.CloudNotReached=[int]$Context.CloudNotReached+1
                 Write-PraCloudError -Context $Context -Row $s.Row -Message $message -Technical ('Expected state not reached (timeout or -Once): '+$s.Row.CloudDetail)
             }
-        } }
+        }; $Context.CurrentIdentity='' }
     } catch {
         Write-PraUnfinishedFailure -Context $Context -Rows $Rows -ErrorRecord $_ -What 'finished'
     } finally {
         try { Close-PraCloudSession $Context }
         catch { Write-PraSignOutWarning -Context $Context -Message ([string]$_.Exception.Message) }
     }
+}
+
+function Get-PraRetentionVerdictError {
+    <# The exception of a retention check that is an answer about the mailbox, not a failure to ask: Kind is NoMailbox (nothing to retain), PolicyUnknown (the policy is not named, so coverage cannot be told) or NotCovered. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][ValidateSet('NoMailbox','PolicyUnknown','NotCovered')][string]$Kind,[Parameter(Mandatory)][string]$Message)
+    $failure=[System.InvalidOperationException]::new($Message)
+    $failure.Data['PraRetention']=$Kind
+    return $failure
+}
+
+function Resolve-PraRetentionPolicyGuid {
+    <# Signs in to Exchange Online and returns the GUID of the retention policy (N format): Retention.PolicyGuid, else the policy found from Retention.PolicyName in an interactive compliance session (Retention.UseComplianceSession). $null when neither is set. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context)
+    $cfg=Get-PraValue $Context.Config 'Retention' @{}; $raw=[string](Get-PraValue $cfg 'PolicyGuid' '')
+    $guid=$null; $parsed=[guid]::Empty
+    if ($raw) {
+        if (-not [guid]::TryParse($raw,[ref]$parsed) -or $parsed -eq [guid]::Empty) { throw 'Retention.PolicyGuid is not a GUID.' }
+        $guid=$parsed.ToString('N')
+    }
+    try { Connect-PraCloudSession -Context $Context -NeedGraph (Test-PraIdentityCheck $Context) -NeedExo $true }
+    catch { $Context.CloudConnectFailed=$true; throw }
+    $cloud=Get-PraValue $Context.Config 'Cloud' @{}; $name=[string](Get-PraValue $cfg 'PolicyName' '')
+    if (-not $guid -and $name -and [bool](Get-PraValue $cfg 'UseComplianceSession' $false) -and -not [string](Get-PraValue $cloud 'AppId' '')) {
+        $Context.CurrentOperation='ResolveRetentionPolicy'
+        $session=Get-PraCloudSession $Context
+        if ($session.Subprocess) { throw 'Interactive policy lookup (Connect-IPPSSession) is not possible with the Exchange Online child process.' }
+        $beforeIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId })
+        $session.ExoAttempted=$true
+        try { Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop | Out-Null }
+        finally {
+            $newIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId } | Where-Object { -not (Test-PraOrdinalIgnoreCaseIn $_ $beforeIds) })
+            $session.OwnedExoIds=@($session.OwnedExoIds)+$newIds
+        }
+        try {
+            $readPolicy={ param($Identity) Get-RetentionCompliancePolicy -Identity $Identity -ErrorAction Stop }
+            $policies=@(Invoke-PraCloudCall -Context $Context -Call 'Get-RetentionCompliancePolicy' -Script $readPolicy -ArgumentList @($name))
+            if ($policies.Count -ne 1) { throw 'Retention policy not found or not unique.' }
+            $raw=[string](Get-PraValue $policies[0] 'Guid' '')
+            if (-not $raw) { $raw=[string](Get-PraValue $policies[0] 'ExchangeObjectId' '') }
+            if (-not [guid]::TryParse($raw,[ref]$parsed) -or $parsed -eq [guid]::Empty) { throw 'Retention policy GUID missing or invalid.' }
+            $guid=$parsed.ToString('N')
+        } finally {
+            foreach ($id in $newIds) { Disconnect-ExchangeOnline -ConnectionId $id -Confirm:$false -ErrorAction Stop 6>$null | Out-Null }
+        }
+    }
+    return $guid
+}
+
+function Test-PraRetentionRow {
+    <# Reads the mailbox of one row in Exchange Online and tells whether the retention policy $Guid holds it: 'Covered' (the row is a success, its detail says so) or 'Failed' (an identity check failed and was recorded as an error). Any other answer is thrown: a verdict (Get-PraRetentionVerdictError) or the failure of a call. -Strict: a failed identity check is thrown instead of recorded. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)]$Row,[AllowNull()][string]$Guid,[switch]$Strict)
+    $holdUpn=[string](Get-PraValue $Row 'UserPrincipalName' '')
+    # An inactive mailbox has no account in Microsoft Entra ID any more: it is found by UPN only. An account that exists must be the synchronised one.
+    if (Test-PraIdentityCheck $Context) {
+        $identity=Confirm-PraCloudIdentity -Context $Context -State @{ Row=$Row; Upn=$holdUpn; Requests=@(); PlainText='' } -Throw:$Strict
+        if (Test-PraOrdinalEqual $identity 'Failed') { return 'Failed' }
+    }
+    $holdSource=Get-PraValue $Row 'BackupRec' $null; if ($null -eq $holdSource) { $holdSource=$Row }
+    $h=Invoke-PraExo -Context $Context -Operation 'Hold' -Params @{ Upn=$holdUpn; MailboxGuids=[string[]]@(Get-PraRecordedMailboxGuid $holdSource) }
+    $Row.CloudMailbox=[bool](Get-PraValue $h 'Found' $false)
+    if ([bool](Get-PraValue $h 'EarlierAccount' $false)) {
+        $note=('{0}: not this object''s mailbox. Exchange Online has an inactive mailbox with this UPN, but it belongs to an earlier account (another ExternalDirectoryObjectId than the account confirmed for this object, or another mailbox GUID than the one recorded for it), so its retention does not count for this object. To see it, run: Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''{1}''" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted | Format-List Name,ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted' -f $holdUpn, $holdUpn.Replace("'","''"))
+        Write-PraItem -Context $Context -Status Warn -Text $note
+        $Row.Warnings=([string](Get-PraValue $Row 'Warnings' '') + '; ' + $note).Trim(' ',';')
+        throw (Get-PraRetentionVerdictError -Kind NoMailbox -Message 'Not covered by the policy: the only inactive mailbox with this UPN is not this object''s mailbox (it belongs to an earlier account). Retention: Found=False; EarlierAccount=True')
+    }
+    if ([bool](Get-PraValue $h 'IdentityByUpn' $false)) {
+        $note=('{0}: the inactive mailbox is found by its UPN only: its account is deleted, so it cannot be confirmed against Active Directory. Check that it is the mailbox of this object.' -f $holdUpn)
+        Write-PraItem -Context $Context -Status Warn -Text $note
+        $Row.Warnings=([string](Get-PraValue $Row 'Warnings' '') + '; ' + $note).Trim(' ',';')
+    }
+    $holds=Get-PraValue $h 'Holds' @(); $holds=@($holds | Where-Object { $null -ne $_ })
+    $included=$false; $excluded=$false; $deleteOnly=$false
+    foreach ($hold in $holds) {
+        if ([string]$hold -match '^(?<excluded>-)?(?:mbx|grp|skp|UniH)?(?<id>[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})(?::(?<action>[123]))?\z') {
+            if (Test-PraOrdinalIgnoreCaseEqual ($Matches.id -replace '-','') $Guid) {
+                if ($Matches.ContainsKey('excluded')) { $excluded=$true }
+                elseif ($Matches.ContainsKey('action') -and (Test-PraOrdinalIgnoreCaseEqual $Matches.action '1')) { $deleteOnly=$true }
+                else { $included=$true }
+            }
+        }
+    }
+    $Row.CloudDetail="Retention: Found=$($Row.CloudMailbox); Inactive=$(Get-PraValue $h 'IsInactive' $false); Litigation=$(Get-PraValue $h 'Litigation' $false); RetentionHold=$(Get-PraValue $h 'RetentionHold' $false); Holds=[$($holds -join ',')]"
+    if (-not $Row.CloudMailbox) { throw (Get-PraRetentionVerdictError -Kind NoMailbox -Message ('Mailbox not found (active or inactive). '+$Row.CloudDetail)) }
+    if (-not $Guid) { throw (Get-PraRetentionVerdictError -Kind PolicyUnknown -Message ('Policy unknown: set Retention.PolicyGuid (a hold may exist, check it manually). '+$Row.CloudDetail)) }
+    if ($excluded -or $deleteOnly -or -not $included) { throw (Get-PraRetentionVerdictError -Kind NotCovered -Message ('Not covered by the policy (or excluded, or delete-only); an adaptive scope can take several days. '+$Row.CloudDetail)) }
+    $Row.CloudStatus='Success'; if (-not (Test-PraOrdinalIgnoreCaseEqual $Row.FinalStatus 'Error')) { $Row.FinalStatus='Success' }
+    $Row.CloudDetail+=' | COVERED (GUID='+$Guid+')'
+    $null=Write-PraLog -Context $Context -Message $Row.CloudDetail -Level $(if ($Strict) { 'Detail' } else { 'Success' })
+    return 'Covered'
 }
 
 function Invoke-PraRetentionCheck {
@@ -1850,84 +1960,24 @@ function Invoke-PraRetentionCheck {
     $Context.CurrentPhase='Retention'; $Context.CurrentOperation='Prepare'; $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$false; $Context.NetworkFailure=$false; $Context.GraphRefused=$false
     try {
         if ($Rows.Count -eq 0) { return }
-        $cfg=Get-PraValue $Context.Config 'Retention' @{}; $raw=[string](Get-PraValue $cfg 'PolicyGuid' '')
-        $guid=$null; $parsed=[guid]::Empty
-        if ($raw) {
-            if (-not [guid]::TryParse($raw,[ref]$parsed) -or $parsed -eq [guid]::Empty) { throw 'Retention.PolicyGuid is not a GUID.' }
-            $guid=$parsed.ToString('N')
-        }
-        try { Connect-PraCloudSession -Context $Context -NeedGraph (Test-PraIdentityCheck $Context) -NeedExo $true }
-        catch { $Context.CloudConnectFailed=$true; throw }
-        $cloud=Get-PraValue $Context.Config 'Cloud' @{}; $name=[string](Get-PraValue $cfg 'PolicyName' '')
-        if (-not $guid -and $name -and [bool](Get-PraValue $cfg 'UseComplianceSession' $false) -and -not [string](Get-PraValue $cloud 'AppId' '')) {
-            $Context.CurrentOperation='ResolveRetentionPolicy'
-            $session=Get-PraCloudSession $Context
-            if ($session.Subprocess) { throw 'Interactive policy lookup (Connect-IPPSSession) is not possible with the Exchange Online child process.' }
-            $beforeIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId })
-            $session.ExoAttempted=$true
-            try { Connect-IPPSSession -ShowBanner:$false -ErrorAction Stop | Out-Null }
-            finally {
-                $newIds=@(Get-ConnectionInformation -ErrorAction Stop | ForEach-Object { [string]$_.ConnectionId } | Where-Object { -not (Test-PraOrdinalIgnoreCaseIn $_ $beforeIds) })
-                $session.OwnedExoIds=@($session.OwnedExoIds)+$newIds
-            }
-            try {
-                $readPolicy={ param($Identity) Get-RetentionCompliancePolicy -Identity $Identity -ErrorAction Stop }
-                $policies=@(Invoke-PraCloudCall -Context $Context -Call 'Get-RetentionCompliancePolicy' -Script $readPolicy -ArgumentList @($name))
-                if ($policies.Count -ne 1) { throw 'Retention policy not found or not unique.' }
-                $raw=[string](Get-PraValue $policies[0] 'Guid' '')
-                if (-not $raw) { $raw=[string](Get-PraValue $policies[0] 'ExchangeObjectId' '') }
-                if (-not [guid]::TryParse($raw,[ref]$parsed) -or $parsed -eq [guid]::Empty) { throw 'Retention policy GUID missing or invalid.' }
-                $guid=$parsed.ToString('N')
-            } finally {
-                foreach ($id in $newIds) { Disconnect-ExchangeOnline -ConnectionId $id -Confirm:$false -ErrorAction Stop 6>$null | Out-Null }
-            }
-        }
+        $guid=Resolve-PraRetentionPolicyGuid -Context $Context
+        $Context.RetentionPolicyGuid=[string]$guid
         $stopRun=$null; $graphStop=$false
         foreach ($row in $Rows) {
             Add-Member -InputObject $row -NotePropertyName DeprovisionConfirmed -NotePropertyValue $false -Force
+            Add-Member -InputObject $row -NotePropertyName RetentionVerdict -NotePropertyValue 'NotChecked' -Force
             $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=[string](Get-PraValue $row 'ObjectGuid' '')
             $row.CloudMailbox=$null; $row.CloudLicense=$null; $row.CloudStatus='Pending'
             try {
-                $holdUpn=[string](Get-PraValue $row 'UserPrincipalName' '')
-                # An inactive mailbox has no account in Microsoft Entra ID any more: it is found by UPN only. An account that exists must be the synchronised one.
-                if ((Test-PraIdentityCheck $Context) -and (Test-PraOrdinalEqual (Confirm-PraCloudIdentity -Context $Context -State @{ Row=$row; Upn=$holdUpn; Requests=@(); PlainText='' }) 'Failed')) {
+                if (Test-PraOrdinalEqual (Test-PraRetentionRow -Context $Context -Row $row -Guid $guid) 'Failed') {
                     if ([bool](Get-PraValue $Context 'GraphRefused' $false)) { $graphStop=$true; break }
                     continue
                 }
-                $holdSource=Get-PraValue $row 'BackupRec' $null; if ($null -eq $holdSource) { $holdSource=$row }
-                $h=Invoke-PraExo -Context $Context -Operation 'Hold' -Params @{ Upn=$holdUpn; MailboxGuids=[string[]]@(Get-PraRecordedMailboxGuid $holdSource) }
-                $row.CloudMailbox=[bool](Get-PraValue $h 'Found' $false)
-                if ([bool](Get-PraValue $h 'EarlierAccount' $false)) {
-                    $note=('{0}: not this object''s mailbox. Exchange Online has an inactive mailbox with this UPN, but it belongs to an earlier account (another ExternalDirectoryObjectId than the account confirmed for this object), so its retention does not count for this object. To see it, run: Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''{1}''" -Properties ExternalDirectoryObjectId,WhenSoftDeleted | Format-List Name,ExternalDirectoryObjectId,WhenSoftDeleted' -f $holdUpn, $holdUpn.Replace("'","''"))
-                    Write-PraItem -Context $Context -Status Warn -Text $note
-                    $row.Warnings=([string](Get-PraValue $row 'Warnings' '') + '; ' + $note).Trim(' ',';')
-                    throw ('Not covered by the policy: the only inactive mailbox with this UPN is not this object''s mailbox (it belongs to an earlier account). Retention: Found=False; EarlierAccount=True')
-                }
-                if ([bool](Get-PraValue $h 'IdentityByUpn' $false)) {
-                    $note=('{0}: the inactive mailbox is found by its UPN only: its account is deleted, so it cannot be confirmed against Active Directory. Check that it is the mailbox of this object.' -f $holdUpn)
-                    Write-PraItem -Context $Context -Status Warn -Text $note
-                    $row.Warnings=([string](Get-PraValue $row 'Warnings' '') + '; ' + $note).Trim(' ',';')
-                }
-                $holds=Get-PraValue $h 'Holds' @(); $holds=@($holds | Where-Object { $null -ne $_ })
-                $included=$false; $excluded=$false; $deleteOnly=$false
-                foreach ($hold in $holds) {
-                    if ([string]$hold -match '^(?<excluded>-)?(?:mbx|grp|skp|UniH)?(?<id>[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})(?::(?<action>[123]))?\z') {
-                        if (Test-PraOrdinalIgnoreCaseEqual ($Matches.id -replace '-','') $guid) {
-                            if ($Matches.ContainsKey('excluded')) { $excluded=$true }
-                            elseif ($Matches.ContainsKey('action') -and (Test-PraOrdinalIgnoreCaseEqual $Matches.action '1')) { $deleteOnly=$true }
-                            else { $included=$true }
-                        }
-                    }
-                }
-                $row.CloudDetail="Retention: Found=$($row.CloudMailbox); Inactive=$(Get-PraValue $h 'IsInactive' $false); Litigation=$(Get-PraValue $h 'Litigation' $false); RetentionHold=$(Get-PraValue $h 'RetentionHold' $false); Holds=[$($holds -join ',')]"
-                if (-not $row.CloudMailbox) { throw ('Mailbox not found (active or inactive). '+$row.CloudDetail) }
-                if (-not $guid) { throw ('Policy unknown: set Retention.PolicyGuid (a hold may exist, check it manually). '+$row.CloudDetail) }
-                if ($excluded -or $deleteOnly -or -not $included) { throw ('Not covered by the policy (or excluded, or delete-only); an adaptive scope can take several days. '+$row.CloudDetail) }
-                $row.CloudStatus='Success'; if (-not (Test-PraOrdinalIgnoreCaseEqual $row.FinalStatus 'Error')) { $row.FinalStatus='Success' }
-                $row.CloudDetail+=' | COVERED (GUID='+$guid+')'
-                $null=Write-PraLog -Context $Context -Message $row.CloudDetail -Level Success
+                $row.RetentionVerdict='Covered'
             } catch {
                 $failure=$_
+                $verdictKind=[string]$failure.Exception.Data['PraRetention']
+                if (Test-PraOrdinalIn $verdictKind @('NoMailbox','NotCovered')) { $row.RetentionVerdict=$verdictKind }
                 # The retry time of the run is used up: ONE error for the run, the rows not checked stay Pending (never one error per row).
                 if ((Get-PraRetryState $Context).RunExhausted) { $stopRun=$failure; break }
                 if ($failure.Exception.Data['PraGraph'] -eq $true) {
@@ -1959,7 +2009,93 @@ function Invoke-PraRetentionCheck {
     }
 }
 
-Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,Invoke-PraRetentionCheck,Close-PraCloudSession
+function Get-PraRetentionFailureReason {
+    <# The plain reason why one retention read failed, and whether the same failure will stop every other read (the retry time of the run, a refusal of Microsoft Graph, no answer, throttling). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)]$ErrorRecord,[string]$Upn='')
+    $prefix=$(if ($Upn) { $Upn + ': ' } else { '' })
+    $raw=[string]$ErrorRecord.Exception.Message
+    if ((Get-PraRetryState $Context).RunExhausted -or $ErrorRecord.Exception.Data['PraRunBudget'] -eq $true) { return [pscustomobject]@{ Reason=$raw; Stops=$true; Technical=$(if ($null -ne $ErrorRecord.Exception.InnerException) { [string]$ErrorRecord.Exception.InnerException.Message } else { '' }) } }
+    if ($ErrorRecord.Exception.Data['PraGraph'] -eq $true) {
+        $refusal=Get-PraGraphRefusal -ErrorRecord $ErrorRecord -Upn $Upn
+        if ($null -ne $refusal) { return [pscustomobject]@{ Reason=$refusal.Message; Stops=$true; Technical=$refusal.Technical } }
+    }
+    $network=Get-PraNetworkFailure $ErrorRecord
+    if ($null -ne $network) { return [pscustomobject]@{ Reason=('{0}Microsoft 365 did not answer (network){1}.' -f $prefix, $(if ($network.Host) { ': ' + $network.Host } else { '' })); Stops=$true; Technical=$raw } }
+    $info=Get-PraCloudFailureInfo $ErrorRecord
+    if ($info.Throttled) { return [pscustomobject]@{ Reason=('{0}Microsoft 365 limited the requests or was unavailable (HTTP {1}).' -f $prefix, $info.Status); Stops=$true; Technical=$raw } }
+    return [pscustomobject]@{ Reason=($prefix + $raw); Stops=$false; Technical='' }
+}
+
+function Test-PraRetentionCoverage {
+    <#
+    .SYNOPSIS
+        Before a Recover removes the cloud mailboxes: for each row, tells whether the retention policy holds the mailbox (read only: one read of Exchange Online per row, within the retry budgets of the run).
+    .DESCRIPTION
+        Never records an error of the run. A mailbox that the policy does not hold is in NotCovered; a mailbox that could not be read, or whose policy is not named, is in Unverified (the rest are Unverified too once a
+        failure would stop every other read). A row without a mailbox in Exchange Online has nothing to retain (NoMailbox). The rows of the caller are not changed.
+        -CloseSession signs out of the sessions that this check opened; without it the session stays open for the cloud part that follows.
+    .OUTPUTS
+        Checked, Covered, NoMailbox, NotCovered and Unverified (each entry: ObjectGuid, Upn, Reason), StopReason and PolicyGuid.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,[switch]$CloseSession)
+    $result=[pscustomobject]@{ Checked=0; Covered=0; NoMailbox=0; NotCovered=(New-Object 'Collections.Generic.List[object]'); Unverified=(New-Object 'Collections.Generic.List[object]'); StopReason=''; PolicyGuid='' }
+    $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=''
+    $addEntry={ param($List,$Row,[string]$Reason) $List.Add([pscustomobject]@{ ObjectGuid=[string](Get-PraValue $Row 'ObjectGuid' ''); Upn=[string](Get-PraValue $Row 'UserPrincipalName' ''); Reason=$Reason }) }
+    $finish={ $result.NotCovered=[object[]]$result.NotCovered.ToArray(); $result.Unverified=[object[]]$result.Unverified.ToArray(); $result }
+    try {
+        if ($Rows.Count -eq 0) { return (& $finish) }
+        $cfg=Get-PraValue $Context.Config 'Retention' @{}; $cloud=Get-PraValue $Context.Config 'Cloud' @{}
+        $named=[bool][string](Get-PraValue $cfg 'PolicyGuid' '') -or ([bool][string](Get-PraValue $cfg 'PolicyName' '') -and [bool](Get-PraValue $cfg 'UseComplianceSession' $false) -and -not [string](Get-PraValue $cloud 'AppId' ''))
+        if (-not $named) {
+            $result.StopReason='Retention.PolicyGuid is not set in the configuration file (and the policy cannot be found from its name), so the retention policy of the mailboxes cannot be told.'
+            foreach ($row in $Rows) { & $addEntry $result.Unverified $row $result.StopReason }
+            return (& $finish)
+        }
+        $guid=$null
+        try { $guid=Resolve-PraRetentionPolicyGuid -Context $Context }
+        catch {
+            $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $_
+            if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
+            $result.StopReason=$failed.Reason
+            foreach ($row in $Rows) { & $addEntry $result.Unverified $row $result.StopReason }
+            return (& $finish)
+        }
+        $result.PolicyGuid=[string]$guid
+        foreach ($row in $Rows) {
+            if ($result.StopReason) { & $addEntry $result.Unverified $row $result.StopReason; continue }
+            $objectGuid=[string](Get-PraValue $row 'ObjectGuid' ''); $upn=[string](Get-PraValue $row 'UserPrincipalName' '')
+            $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=$objectGuid
+            $source=Get-PraValue $row 'BackupRec' $null; if ($null -eq $source) { $source=$row }
+            $shadow=[pscustomobject]@{ ObjectGuid=$objectGuid; UserPrincipalName=$upn; BackupRec=$source; CloudMailbox=$null; CloudLicense=$null; CloudStatus='Pending'; CloudDetail=''; FinalStatus='Planned'; Warnings=''; Detail='' }
+            $result.Checked++
+            try { $null=Test-PraRetentionRow -Context $Context -Row $shadow -Guid $guid -Strict; $result.Covered++ }
+            catch {
+                $failure=$_
+                $kind=[string]$failure.Exception.Data['PraRetention']
+                if (Test-PraOrdinalEqual $kind 'NoMailbox') { $result.NoMailbox++; $null=Write-PraLog -Context $Context -Message ('{0}: no mailbox to retain in Exchange Online: {1}' -f $upn, $failure.Exception.Message) -Level Detail }
+                elseif (Test-PraOrdinalEqual $kind 'NotCovered') { & $addEntry $result.NotCovered $row $failure.Exception.Message }
+                elseif (Test-PraOrdinalEqual $kind 'PolicyUnknown') { & $addEntry $result.Unverified $row $failure.Exception.Message }
+                else {
+                    $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $failure -Upn $upn
+                    if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
+                    & $addEntry $result.Unverified $row $failed.Reason
+                    if ($failed.Stops) { $result.StopReason=$failed.Reason }
+                }
+            }
+        }
+        return (& $finish)
+    } finally {
+        $Context.CurrentIdentity=''
+        if ($CloseSession) {
+            try { Close-PraCloudSession $Context }
+            catch { Write-PraSignOutWarning -Context $Context -Message ([string]$_.Exception.Message) }
+        }
+    }
+}
+
+Export-ModuleMember -Function Initialize-PraCloudPreflight,Invoke-PraCloudPhase,Invoke-PraRetentionCheck,Test-PraRetentionCoverage,Close-PraCloudSession
 
 # SIG # Begin signature block
 # MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor

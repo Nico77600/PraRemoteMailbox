@@ -170,13 +170,26 @@
     # ---------------------------------------------------------------------
     # Retention tag: written at Convert so that an adaptive scope of a Purview retention policy
     # keeps the old mailbox (extensionAttributeN on-premises = CustomAttributeN in Exchange Online).
-    # Recover restores the original value. PolicyGuid is only used by -Action Check -Expect Retained.
+    # Recover restores the original value. PolicyGuid is used by -Action Check -Expect Retained and by the
+    # retention check that comes before a Recover.
+    #   CheckBeforeRecover = $true : before it removes the cloud mailboxes, a Recover (Preview and Apply, AD part) reads each mailbox that
+    #                  carries the retention tag and checks that the retention policy holds it. The Apply STOPS, before any change, when a
+    #                  mailbox is not covered or cannot be checked (for instance PolicyGuid is empty); the Preview says so and the Apply
+    #                  is then refused. -AcceptRetentionRisk (a checkbox in the window) goes on for ONE run: the run says so in a warning.
+    #   CheckBeforeRecover = $false: the check is off for every run. Each Recover says so once, in a warning; it never claims the check passed.
+    #   ProofMaxAgeHours   : two-server setup. The AD server often cannot ask Exchange Online. A Check -Expect Retained -Batch <id> on the cloud
+    #                  server writes a retention proof (RetentionProof-...json and its .sha256 file, in its Backups\Outbox folder). Copied to the
+    #                  Backups\Inbox folder of the AD server, it stands in for the check of a Recover (phase AD) when it is intact, of this batch
+    #                  and Environment, not older than this many hours (1 to 720), and covers every object of the Recover. Where Exchange Online
+    #                  can be asked (phase Both, or a certificate sign-in), the check itself decides and no proof is read.
     # ---------------------------------------------------------------------
     Retention = @{
         Enabled              = $true
         PolicyName           = 'PRA-Converted-Retention'
         PolicyGuid           = ''            # (Get-RetentionCompliancePolicy '<name>').Guid
         UseComplianceSession = $false        # find the GUID from PolicyName (interactive Connect-IPPSSession)
+        CheckBeforeRecover   = $true         # $false = no retention check before a Recover
+        ProofMaxAgeHours     = 24            # age limit of a retention proof from the cloud server (1 to 720 hours)
         Tag = @{
             Enabled   = $true
             Attribute = 'extensionAttribute1'

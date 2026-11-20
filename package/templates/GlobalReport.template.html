@@ -3,14 +3,15 @@
     PRA Remote Mailbox - global report template (every object, from the first server to the last)
     Author  : Nicolas Fabert
     Version : 3.1.4
-    PRA.Common.psm1 (Write-PraGlobalReportHtml) replaces the markers below. Texts are HTML-encoded by the code:
-      {{TITLE}} {{HEADING}} {{SUBTITLE}} {{VERSION}}  texts of the header (the title of the page, the heading, the line under it, the tool version)
-      {{TILES}}        tiles (Result, Objects, Done, Done with warnings, Failed, Pending, Skipped, Journey lines)
-      {{NOTICES}}      cards that need attention: side not available, files that could not be read, what a limit left out, errors and warnings per phase
-      {{TIMELINE}}     "Batch timeline" card: one row per phase (server, operator, times, status)
-      {{SETTINGS}}     "Run settings changed from the configuration file" card
-      {{DATA_NOTICE}}  plain sentence for the no-JavaScript fallback: how many objects, journey lines, errors and warnings the data holds, and the CSV files that hold them all
-      {{DATA}}         (the LAST occurrence in the file) the data, streamed by the code: the compressed chunks, then a JSON header (script elements)
+    PRA.Common.psm1 (Write-PraGlobalReportHtml) replaces the markers below in one pass. Texts are HTML-encoded by the code. The markers are written here with a space inside
+    the braces so that this comment is not changed; in the page they have none (the name between two pairs of braces):
+      {{ TITLE }} {{ HEADING }} {{ SUBTITLE }} {{ VERSION }}  texts of the header (the title of the page, the heading, the line under it, the tool version)
+      {{ TILES }}        tiles (Result, Objects, Done, Done with warnings, Failed, Pending, Skipped, Journey lines)
+      {{ NOTICES }}      cards that need attention: side not available, files that could not be read, what a limit left out, errors and warnings per phase
+      {{ TIMELINE }}     "Batch timeline" card: one row per phase (server, operator, times, status)
+      {{ SETTINGS }}     "Run settings changed from the configuration file" card
+      {{ DATA_NOTICE }}  plain sentence for the no-JavaScript fallback: how many objects, journey lines, errors and warnings the data holds, and the CSV files that hold them all
+      {{ DATA }}         (the LAST occurrence without a space in the file) the data, streamed by the code: the compressed chunks, then a JSON header (script elements)
     The summary above is plain HTML and stays readable when scripts are blocked. The objects, their journey lines and the errors and warnings are NOT HTML tables: they are
     stored as dictionary-indexed columns in gzip+base64 chunks (compression is not encryption), decoded by the script at the end of this file. The objects are shown through a
     virtual grid (at most 200 rows exist in the page at any time); the journey of an object is built from its lines when its row is clicked and is shown in pages of 100 lines;

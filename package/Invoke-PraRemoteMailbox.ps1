@@ -93,6 +93,12 @@
     list), then read back on each of them. A domain controller that does not confirm is a warning that names it; the synchronisation still runs and the
     Next steps say how to run it again later. Needs the right to replicate a single object (normally Domain Admins). A Preview never replicates.
 
+.PARAMETER AcceptRetentionRisk
+    Recover, AD part only. Before it removes the cloud mailboxes, a Recover reads each mailbox that carries the retention tag and checks that the retention policy holds it
+    (Retention.CheckBeforeRecover in the configuration file). The Apply stops, before any change, when a mailbox is not covered or cannot be checked. This switch goes on for
+    this one run anyway: the run lists what is not covered in a warning, in the log, in the summary and in the report. It is not remembered. The check itself is turned off in
+    the configuration file (Retention.CheckBeforeRecover = $false), not here.
+
 .PARAMETER Force
     Apply without the confirmation prompt (scheduled or unattended runs). Never skips a safety check.
     The single confirmation of an Apply is also skipped when -Confirm is given explicitly, with either value:
@@ -183,6 +189,7 @@ param(
     [string]$ConfigPath,
     [Parameter(ParameterSetName = 'Run')][string]$BaseConfigPath,
     [Parameter(ParameterSetName = 'Run')][switch]$ForceAdReplication,
+    [Parameter(ParameterSetName = 'Run')][switch]$AcceptRetentionRisk,
     [Parameter(ParameterSetName = 'Run')][switch]$Force,
     [Parameter(ParameterSetName = 'Run')][switch]$Once,
     [Parameter(ParameterSetName = 'Run')][switch]$PassThru,
@@ -330,6 +337,7 @@ function Get-PraCommandLine {
         if ($CsvPath -and -not $CsvOverride -and (& $keepSelector 'CsvPath')) { $parts += '-CsvPath ' + (ConvertTo-PraLiteral $(if ($OtherServer) { [IO.Path]::GetFileName($CsvPath) } else { $CsvPath })) }
         if ((Test-PraOrdinalIgnoreCaseEqual $ActionName 'Check') -and -not (Test-PraOrdinalIgnoreCaseEqual $Expect 'Provisioned')) { $parts += "-Expect $Expect" }
         if ($Once) { $parts += '-Once' }
+        if ($AcceptRetentionRisk -and (Test-PraOrdinalIgnoreCaseEqual $ActionName 'Recover') -and -not (Test-PraOrdinalIgnoreCaseEqual $PhaseName 'Cloud')) { $parts += '-AcceptRetentionRisk' }
     }
     # A file made by this run for the objects that are still to convert replaces the CSV of the run.
     if ($CsvOverride) { $parts += '-CsvPath ' + (ConvertTo-PraLiteral $CsvOverride) }
@@ -460,14 +468,6 @@ function Get-PraJsonHeader {
         $header[$field] = $values[$field]
     }
     return [pscustomobject]$header
-}
-
-function Test-PraBatchSideFile {
-    <# True for the files of a batch folder that are not a batch file, by name: the proof (State-), the journal, the data of the global report (PhaseData-, PhaseEvents-) and any checksum file. #>
-    param([Parameter(Mandatory)][string]$Name)
-    if ($Name.EndsWith('.sha256', [StringComparison]::OrdinalIgnoreCase)) { return $true }
-    foreach ($prefix in @('State-', 'Journal-', 'PhaseData-', 'PhaseEvents-')) { if ($Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
-    return $false
 }
 
 function Get-PraBatchFile {
@@ -708,7 +708,7 @@ function Publish-PraTransferPackage {
     if ($phaseFolder -and -not [bool](Get-PraValue $context 'PhaseDataSaved' $false)) {
         $saved = ''
         try { $saved = Save-PraPhaseData -Context $context -Folder $phaseFolder -HandOff $Kind; $context.PhaseDataSaved = $true }
-        catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}): the package is complete, the other server will report this side as not available.' -f $_.Exception.Message) -Level Warning }
+        catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}): the package is complete and the other server can go on, but its global report will say that this side is not available. To find the cause, check the rights on the batch folder with: Get-Acl -LiteralPath ''{1}'' | Format-List Owner, AccessToString  and the free space with: Get-PSDrive -PSProvider FileSystem' -f $_.Exception.Message, $phaseFolder.Replace("'", "''")) -Level Warning }
         # The cloud phase of a Recover also leaves its data in the batch of the AD rollback, so that the console can tell that its cloud part is done.
         if ($saved -and (Test-PraOrdinalIgnoreCaseEqual $Kind 'Finalize') -and $null -ne (Get-PraValue $context 'Proof' $null)) {
             try { $null = Copy-PraPhaseFile -Path $saved -Destination (Split-Path $context.Proof.Path -Parent) }
@@ -790,6 +790,162 @@ function Test-PraCloudModuleAvailable {
     if ($signsIn) { $context.NoChangeMade = $true; $context.CurrentIdentity = ''; throw ('The cloud part cannot run on this server. {0} Nothing was changed.' -f $text) }
     Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('The cloud part will not be possible on this server. {0}' -f $text)
     $context.ApplyBlockers = @(Get-PraList $context 'ApplyBlockers') + 'install or update the cloud modules with the commands in the warning above'
+}
+
+function Get-PraRetentionProofFolder {
+    <# The folders where a retention proof is looked for, as for a transfer package: Inbox, Outbox (under Storage.BackupFolder) and the folder of the Convert batch. #>
+    $folders = @((Join-Path $context.BackupFolder 'Inbox'), (Join-Path $context.BackupFolder 'Outbox'))
+    if ($null -ne $context.Source -and [string](Get-PraValue $context.Source 'Path' '')) { $folders += (Split-Path ([string]$context.Source.Path) -Parent) }
+    return [string[]]$folders
+}
+
+function Save-PraRetentionProof {
+    <#
+    .SYNOPSIS
+        Check -Expect Retained on a batch: writes the retention proof (the verdict of each object) in the Outbox folder, with its .sha256 file, for the AD server that cannot ask Exchange Online.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
+    if ($null -eq $context.Source -or -not $Batch -or -not $Rows.Count) { return }
+    $objects = New-Object 'Collections.Generic.List[object]'
+    $checked = 0
+    foreach ($row in $Rows) {
+        $verdict = [string](Get-PraValue $row 'RetentionVerdict' 'NotChecked')
+        if (-not (Test-PraOrdinalEqual $verdict 'NotChecked')) { $checked++ }
+        $objects.Add([pscustomobject]@{ ObjectGuid = [string]$row.ObjectGuid; Upn = [string]$row.UserPrincipalName; Verdict = $verdict })
+    }
+    if (-not $checked) { return }
+    $context.CurrentOperation = 'Write-RetentionProof'; $context.CurrentIdentity = ''
+    try {
+        $guids = @([string](Get-PraValue $context 'RetentionPolicyGuid' ''))
+        $written = Write-PraRetentionProof -Folder (Join-Path $context.BackupFolder 'Outbox') -BatchId ([string]$context.Source.Data.BatchId) -SourceBackupHash ([string]$context.Source.Hash) -Environment ([string]$context.Config.Environment) -PolicyGuid $guids -Object $objects.ToArray()
+        Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Retention proof written: {0} of {1} object(s) covered ({2})' -f $written.CoveredCount, $written.ObjectCount, $written.Path) -Detail $written.Path
+        $next = Get-PraCommandLine -ActionName 'Recover' -PhaseName 'AD' -ModeName 'Preview' -BatchId (Get-PraShortId ([string]$context.Source.Data.BatchId)) -OtherServer
+        $context.NextSteps = @(Get-PraList $context 'NextSteps') + @(('For the Recover on the AD server, copy these two files to its Backups\Inbox folder (valid {0} hours): {1} and {2}. Then run there:' -f $context.Config.Retention.ProofMaxAgeHours, $written.Path, $written.Sidecar), $next)
+    }
+    catch { Write-PraItem -Context $context -Status Warn -Icon Batch -Text ('The retention proof could not be written ({0}): the check itself is not affected.' -f $_.Exception.Message) }
+}
+
+function Invoke-PraRetentionGate {
+    <#
+    .SYNOPSIS
+        Recover, AD part: before the cloud mailboxes are removed, checks that the retention policy holds each mailbox that carries the retention tag (Retention.CheckBeforeRecover).
+    .DESCRIPTION
+        Read only, one read of Exchange Online per mailbox. Apply: a mailbox that the policy does not hold, or that cannot be checked, STOPS the run here, before the confirmation and before any change,
+        unless -AcceptRetentionRisk was given (then a warning, the summary and the report say so). Preview: the same answer as warnings; the Apply is refused until it is fixed.
+        Retention.CheckBeforeRecover = $false: no check, said once in a warning.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Plans)
+    if (-not [bool]$context.Config.Retention.CheckBeforeRecover) {
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text 'The retention check before a Recover is turned off (Retention.CheckBeforeRecover = $false in the configuration file): the mailboxes are removed from Exchange Online without checking that the retention policy holds them.'
+        return
+    }
+    $context.CurrentOperation = 'Check-Retention'; $context.CurrentIdentity = ''
+    $rows = New-Object 'Collections.Generic.List[object]'
+    foreach ($plan in $Plans) {
+        if (Test-PraOrdinalEqual $plan.Operation 'AlreadyRecovered') { continue }
+        if ([bool]$plan.Row.PreserveCloudMailbox) { continue }
+        if ([bool](Get-PraValue (Get-PraValue $plan.Row.BackupRec 'Retention' $null) 'Enabled' $false)) { $rows.Add($plan.Row) }
+    }
+    if (-not $rows.Count) {
+        Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('Retention: none of the {0} object(s) carries the retention tag, so there is no retention to check before the mailboxes are removed.' -f $Plans.Count)
+        return
+    }
+    $needGraph = -not (Test-PraOrdinalIgnoreCaseEqual ([string]$context.Config.Cloud.IdentityCheck) 'Off')
+    $report = Get-PraCloudModuleReport -MinExo ([string]$context.Config.Exo.MinModuleVersion)
+    $modulesOk = $report.Exo.Ok -and ($report.Graph.Ok -or -not $needGraph)
+    # Exchange Online is the authority wherever this run can ask it without a person (phase Both, or a certificate sign-in). On the AD part of a two-server setup
+    # the proof that a Check wrote on the cloud server stands in for it, when it is intact, recent, of this batch and covers every object.
+    $liveAuthority = $modulesOk -and ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -or [bool][string]$context.Config.Cloud.AppId)
+    $script:RetentionProofReason = ''
+    if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD') -and -not $liveAuthority) {
+        $proof = Get-PraRetentionProof -Folder (Get-PraRetentionProofFolder) -BatchId ([string]$context.Source.Data.BatchId) -Environment ([string]$context.Config.Environment) -MaxAgeHours ([int]$context.Config.Retention.ProofMaxAgeHours) -Row $rows.ToArray()
+        if ($proof.Found -and $proof.Complete) {
+            Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: accepted from the retention proof {0} ({1} hours old, written by a Check on the cloud server): the {2} object(s) that carry the retention tag are covered' -f [IO.Path]::GetFileName($proof.Path), $proof.AgeHours.ToString('0.#', [Globalization.CultureInfo]::InvariantCulture), $rows.Count)
+            if ($AcceptRetentionRisk) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text '-AcceptRetentionRisk was given and is not needed: the retention proof covers every mailbox.' }
+            return
+        }
+        $script:RetentionProofReason = if ($proof.Reason) { [string]$proof.Reason } else { 'no usable retention proof' }
+        if ($proof.Missing.Count) { Write-PraLog -Context $context -Message ('Retention proof {0}: not covered or not in it: {1}' -f [IO.Path]::GetFileName($proof.Path), ($proof.Missing -join ', ')) -Level Detail }
+    }
+    if ($modulesOk) {
+        Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
+        $keepSession = $context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')
+        $answer = Test-PraRetentionCoverage -Context $context -Rows $rows.ToArray() -CloseSession:(-not $keepSession)
+    }
+    else {
+        $unavailable = 'The cloud modules of this server cannot check the retention. ' + ($report.Messages -join ' ')
+        $answer = [pscustomobject]@{ Checked = 0; Covered = 0; NoMailbox = 0; NotCovered = @(); StopReason = $unavailable
+            Unverified = @(foreach ($row in $rows) { [pscustomobject]@{ ObjectGuid = [string]$row.ObjectGuid; Upn = [string]$row.UserPrincipalName; Reason = $unavailable } }) }
+    }
+    $context.CurrentOperation = 'Check-Retention'; $context.CurrentIdentity = ''
+    $notCovered = @($answer.NotCovered); $unverified = @($answer.Unverified)
+    $bad = $notCovered.Count + $unverified.Count
+    $without = if ($answer.NoMailbox) { ' ({0} without a mailbox in Exchange Online: nothing to retain)' -f $answer.NoMailbox } else { '' }
+    if (-not $bad) {
+        Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: the retention policy holds the {0} mailbox(es) that carry the retention tag{1}' -f $answer.Covered, $without)
+        if ($AcceptRetentionRisk) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text '-AcceptRetentionRisk was given and is not needed: every mailbox is held.' }
+        return
+    }
+    $lines = New-Object 'Collections.Generic.List[string]'
+    foreach ($entry in $notCovered) { $lines.Add(('Retention not covered | {0} | {1}' -f $entry.Upn, $entry.Reason)) }
+    foreach ($entry in $unverified) { $lines.Add(('Retention not checked | {0} | {1}' -f $entry.Upn, $entry.Reason)) }
+    Write-PraLog -Context $context -Lines $lines.ToArray() -Level Detail
+    $shorten = { param([string]$Text) if ($Text.Length -gt 300) { $Text.Substring(0, 300) + '...' } else { $Text } }
+    $limit = 10; $shown = 0
+    foreach ($entry in $notCovered) {
+        if ($shown -ge $limit) { break }
+        $context.CurrentIdentity = [string]$entry.ObjectGuid
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the retention policy does not hold this mailbox. {1}' -f $entry.Upn, (& $shorten ([string]$entry.Reason)))
+        $shown++
+    }
+    $context.CurrentIdentity = ''
+    if ([string]$answer.StopReason) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('The retention of {0} mailbox(es) could not be checked: {1}' -f $unverified.Count, (& $shorten ([string]$answer.StopReason))) }
+    else {
+        foreach ($entry in $unverified) {
+            if ($shown -ge $limit) { break }
+            $context.CurrentIdentity = [string]$entry.ObjectGuid
+            Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the retention of this mailbox could not be checked. {1}' -f $entry.Upn, (& $shorten ([string]$entry.Reason)))
+            $shown++
+        }
+        $context.CurrentIdentity = ''
+    }
+    if ($bad -gt $shown -and -not [string]$answer.StopReason) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('{0} more mailbox(es) are listed in the log.' -f ($bad - $shown)) }
+    $summary = '{0} mailbox(es) held, {1} not held by the retention policy, {2} not checked{3}' -f $answer.Covered, $notCovered.Count, $unverified.Count, $without
+    if ($script:RetentionProofReason) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('No retention proof stands in for the check: {0}.' -f $script:RetentionProofReason) }
+    if ($AcceptRetentionRisk) {
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('Retention risk accepted for this run (-AcceptRetentionRisk). {0}. The {1} mailbox(es) that are not held or not checked are removed from Exchange Online without a retention hold of the policy.' -f $summary, $bad)
+        $context.ConfigOverrides = @(@(Get-PraList $context 'ConfigOverrides') + ('Retention check before Recover: {0} mailbox(es) not held or not checked, accepted for this run (-AcceptRetentionRisk)' -f $bad))
+        return
+    }
+    $check = (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId (Get-PraShortId ([string]$context.Source.Data.BatchId))) + ' -Expect Retained'
+    $typedBatch = if ($script:PreviewPackage) { $script:PreviewPackage } elseif ($script:PackageArgument) { $script:PackageArgument } else { $Batch }
+    $again = Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -ModeName 'Preview' -BatchId $typedBatch -KeepFilters
+    $anyway = (Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -BatchId $typedBatch -KeepFilters) + ' -AcceptRetentionRisk'
+    if (-not $context.AllowMutation) {
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}. The Apply will be refused as things stand.' -f $summary)
+        $context.ApplyBlockers = @(Get-PraList $context 'ApplyBlockers') + ('make the retention policy hold the mailboxes named above (see them with: {0}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $check)
+        return
+    }
+    $steps = @()
+    $policyName = [string]$context.Config.Retention.PolicyName
+    if (-not [string]$context.Config.Retention.PolicyGuid) {
+        $steps += 'The retention policy is not named in the configuration file. Read its GUID in a Security and Compliance session, then put it in Retention.PolicyGuid:'
+        $steps += ('Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity {0}).Guid' -f (ConvertTo-PraLiteral $policyName))
+    }
+    $steps += 'Make the retention policy hold the mailboxes named above (an adaptive scope can take several days). To see what Exchange Online says about each mailbox, run the Check (read only):'
+    $steps += $check
+    if (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD') {
+        $steps += ('This server cannot ask Exchange Online: run the Check above on the cloud server (with the batch folder there). It also writes a retention proof, RetentionProof-...json and its .sha256 file, valid {0} hours, in the Backups\Outbox folder of that server.' -f $context.Config.Retention.ProofMaxAgeHours)
+        $steps += ('Copy those two files to the folder {0} of this server, then run the Preview of the Recover again.' -f (Join-Path $context.BackupFolder 'Inbox'))
+        if ($script:RetentionProofReason) { $steps += ('Why no proof was accepted: {0}.' -f $script:RetentionProofReason) }
+    }
+    $steps += 'Then run the Preview of the Recover again:'
+    $steps += $again
+    $steps += 'To turn this check off for every run, set Retention.CheckBeforeRecover = $false in the configuration file (not recommended).'
+    $steps += 'To go on anyway, for this one run only (the mailboxes that are not held are removed without a retention hold of the policy), add -AcceptRetentionRisk to the Apply:'
+    $steps += $anyway
+    $context.NextSteps = $steps; $context.NextOnFailure = $true; $context.NoChangeMade = $true
+    throw ('Recover stopped before any change: the retention policy does not hold {0} mailbox(es) and {1} could not be checked ({2} object(s) carry the retention tag). Nothing was changed.' -f $notCovered.Count, $unverified.Count, $rows.Count)
 }
 
 function Confirm-PraApply {
@@ -1167,6 +1323,9 @@ try {
     foreach ($difference in $configDifferences) {
         Write-PraItem -Context $context -Status Info -Icon Config -Text ('Run setting: {0} {1} (configuration file: {2})' -f $difference.Key, $(if ($difference.Effective) { $difference.Effective } else { '(empty)' }), $(if ($difference.Base) { $difference.Base } else { '(empty)' }))
     }
+    if ($AcceptRetentionRisk -and -not ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover') -and (Test-PraOrdinalIn $effectivePhase @('Both','AD') -IgnoreCase))) {
+        Write-PraItem -Context $context -Status Warn -Text '-AcceptRetentionRisk only applies to the Active Directory part of a Recover (-Phase Both or AD): it is ignored in this run.'
+    }
 
     # Steps of this run (numbered x/total in the console).
     $steps = switch ($Action) {
@@ -1452,15 +1611,22 @@ try {
         Write-PraStep -Context $context -Title 'Planned restore' -Icon Plan
         $plans = @(foreach ($record in $records) {
                 $operation = if ($record.IsShared -and -not $context.KeepCloudShared) { 'Deprovision' } else { 'Recover' }
-                New-PraPlan $context $record.ObjectGuid $operation $record
+                New-PraPlan $context $record.ObjectGuid $operation $record -CheckDrift
             })
         if ($plans.Count) {
             $null = Show-PraPlanSummary $plans
             Invoke-PraAdPreview $context $plans
         }
+        $drifted = New-Object 'Collections.Generic.List[object]'
+        foreach ($plan in $plans) { if (@($plan.Drift).Count) { $drifted.Add($plan) } }
+        if ($drifted.Count) {
+            $context.CurrentOperation = 'Check-ObjectState'; $context.CurrentIdentity = ''
+            Write-PraItem -Context $context -Status Warn -Icon Plan -Text ('{0} of the {1} object(s) changed since this batch left them (named above): the saved values are put back over what is there now. Read their PLANNED values before the Apply.' -f $drifted.Count, $plans.Count)
+        }
         if ($plans.Count) { Test-PraSyncAvailable }
+        if ($plans.Count) { Invoke-PraRetentionGate $plans }
         if ($context.AllowMutation -and $plans.Count) {
-            Confirm-PraApply ("Roll back the {0} object(s) listed above? Users get their on-premises attributes back; shared mailboxes are first deprovisioned in Exchange Online." -f $plans.Count)
+            Confirm-PraApply ("Roll back the {0} object(s) listed above?{1} Users get their on-premises attributes back; shared mailboxes are first deprovisioned in Exchange Online." -f $plans.Count, $(if ($drifted.Count) { ' {0} of them changed since the batch left them: their current values are overwritten.' -f $drifted.Count } else { '' }))
         }
         if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) {
             if ($context.AllowMutation -and $plans.Count) {
@@ -1631,7 +1797,7 @@ try {
         Initialize-PraCloudAuthority
         if ((Test-PraOrdinalIgnoreCaseEqual $cloudAction 'Convert')) { Initialize-PraGrantSetting }
         Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
-        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { Invoke-PraRetentionCheck -Context $context -Rows $cloudRows }
+        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { Invoke-PraRetentionCheck -Context $context -Rows $cloudRows; Save-PraRetentionProof -Rows $cloudRows }
         else { Invoke-PraCloudPhase -Context $context -Rows $cloudRows -Act $cloudAction }
         # Each grant checks the backup cheaply; a Convert that sent at least one (phase Cloud or Both) ends its grant work with one complete check.
         if ($context.AllowMutation -and (Test-PraOrdinalIn $effectivePhase @('Cloud','Both') -IgnoreCase) -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and [int](Get-PraValue $context 'GrantsSent' 0) -gt 0) {

@@ -230,7 +230,7 @@ Describe 'Module manifest - PraRemoteMailbox.psd1 and its root module' {
         ([regex]::Matches($root, '(?m)^\s*Import-Module ')).Count | Should -Be 2
         $script:ManifestData.ContainsKey('NestedModules') | Should -BeFalse
         $entry = [IO.File]::ReadAllText((Join-Path $script:Source 'Invoke-PraRemoteMailbox.ps1'))
-        ([regex]::Matches($entry, 'Import-Module \(Join-Path \$PSScriptRoot ''module\\PRA\.Cloud\.psm1''\)')).Count | Should -Be 3
+        ([regex]::Matches($entry, 'Import-Module \(Join-Path \$PSScriptRoot ''module\\PRA\.Cloud\.psm1''\)')).Count | Should -Be 4
         ([regex]::Matches($entry, 'Import-Module \(Join-Path \$PSScriptRoot ''module\\PRA\.Gui\.psm1''\)')).Count | Should -Be 1
     }
     It 'loads the exact list of the manifest, and only PRA.Common, PRA.Directory and PRA.Backup, in a fresh process' {

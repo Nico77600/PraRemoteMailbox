@@ -108,6 +108,21 @@ Describe 'Report writer' {
         $text | Should -Match 'id="pra-meta"'
         ([regex]::Matches($text, '<script type="application/x-pra-chunk" data-kind=')).Count | Should -Be 1
     }
+    It 'replaces the markers of the template in one pass: a value that holds a marker is written as it is, and the comment that lists the markers is not changed' -Tag 'Release320f' {
+        $template = [IO.File]::ReadAllText((Join-Path $script:Repo 'package\templates\Report.template.html'), [Text.Encoding]::UTF8)
+        $comment = [regex]::Match($template, '(?s)<!--.*?-->').Value
+        $comment | Should -Not -Match '\{\{[A-Z_]+\}\}' -Because 'the markers are written with a space in the comment, so that it is not replaced'
+        $context = New-PraSyntheticContext -PackageRoot $script:Package -Rows 3
+        $context.Version = '{{TILES}}'
+        $context.Server = 'dc{{DATA_NOTICE}}.contoso.com'
+        $outcome = & (Get-Module PRA.Common) { param($c) Get-PraOutcome $c } $context
+        $text = & (Get-Module PRA.Common) { param($c, $o) Get-PraReportHtml -Context $c -Outcome $o } $context $outcome
+        [regex]::Match($text, '(?s)<!--.*?-->').Value | Should -BeExactly $comment
+        ([regex]::Matches($text, 'class="tile-label"')).Count | Should -Be 8 -Because 'the tiles are written once'
+        $text | Should -Match 'v\{\{TILES\}\}'
+        $text | Should -Match 'dc\{\{DATA_NOTICE\}\}\.contoso\.com'
+        ([regex]::Matches($text, '<div class="tiles">')).Count | Should -Be 1
+    }
     It 'cuts chunks on the row limit and on the text-size limit, with dictionary index 0 reserved for null' {
         $context = New-PraSyntheticContext -PackageRoot $script:Package -Rows 25
         $outcome = & (Get-Module PRA.Common) { param($c) Get-PraOutcome $c } $context

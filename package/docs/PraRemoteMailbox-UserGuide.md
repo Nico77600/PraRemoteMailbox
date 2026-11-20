@@ -92,9 +92,16 @@ Read the table from the top. Each row is one step. Do the steps in this order.
 | **1 · Move, directory part** | Directory server | **Move mailboxes to Exchange Online**, then **Start a new batch (Active Directory part)**. The pill says **Phase: AD**. | `PRA-PROD-Convert-490cc62e-for-Cloud.zip` | The cloud server |
 | **2 · Move, cloud part** | Cloud server | **Move mailboxes to Exchange Online**, then **Continue a batch (cloud part)**, then **Import package…** | The global report | Nowhere. The move is done. |
 | **Wait** | Both servers | Nothing. Keep the `Backups` folder. Write down the batch ID. | Nothing | Nowhere |
+| **Before step 3 · Check the retention** | Cloud server | Run the command given under this table. | `RetentionProof-….json` and its `.sha256` file | The directory server, folder `Backups\Inbox` |
 | **3 · Roll back, directory part** | Directory server | **Roll back a conversion**. Pick the batch of the move. | `PRA-PROD-Recover-5ad39f71-for-Cloud.zip` | The cloud server |
 | **4 · Roll back, cloud part** | Cloud server | **Roll back a conversion**, then **Continue a rollback (cloud part)**, then **Import package…** | `PRA-PROD-Finalize-b7d41a9c-for-AD.zip`, only if something remains for the directory | The directory server |
 | **5 · Complete the rollback** | Directory server | **Complete a rollback**, then **Import package…** | The global report | Nowhere. The rollback is done. |
+
+The directory server often cannot reach Microsoft 365. It cannot see the retention by itself. So the cloud server looks first. On the cloud server, type this command with the batch ID of the move:
+
+`.\Invoke-PraRemoteMailbox.ps1 -Action Check -Batch 490cc62e -Expect Retained`
+
+It only reads. It writes a small proof of what it saw, in the folder `Backups\Outbox`. Copy the two `RetentionProof` files to the folder `Backups\Inbox` of the directory server. The proof is good for 24 hours. The rollback of step 3 uses it when it covers every mailbox. The page **Task** says if a proof was found, and how old it is. If the proof is old, damaged or incomplete, the rollback is refused. The **Next steps** then give the same command again.
 
 Step 5 exists only if step 4 wrote a Finalize package. Shared mailboxes need it. So do mailboxes with a retention tag. If step 4 writes no package, it ends with the global report. The rollback is then done.
 
@@ -496,6 +503,8 @@ On a directory server of a two-server rollback, the pink pill at the bottom says
 
 **If not:** a red number means the tool refuses something. Read the reason. Stop and ask.
 
+**The retention check.** A rollback removes the cloud mailboxes. Before that, the Preview checks that your retention policy holds each one. Read the yellow lines of the Preview. If a mailbox is **not held**, the rollback is **refused**. It is also refused if the tool **could not check**. Nothing is changed. The **Next steps** say why and give the commands. Ask the person who looks after retention to fix the policy. Then press **Preview** again. On the page **Task**, one box lets a rollback go on anyway. It works for **one** run only. Tick it only if you accept that these mailboxes are removed without the hold of the policy. The run lists them in its warnings.
+
 ### 3 · Wait and read
 
 **Do:** wait for **Done**. This can take **up to an hour**. Then press **What next? →** and **Open report**.
@@ -671,6 +680,8 @@ Find what you **see** in the left column. The middle column says what it **means
 | A **step turns red** during the run | The tool stopped on purpose, at the first error. | Do not click anything. Take a photo. Stop and ask. The people already done are kept. The **Next steps** page names the commands: continue the people already moved, move the others later, or roll the batch back. |
 | The run ends with **Error** and says it was **interrupted** | The window or the black console was closed, or the run was stopped (Ctrl+C), before the end. What it did is kept: nothing is undone. | Do not start the move again. Read the **Next steps** page: it gives the command that goes on with the same batch. |
 | A batch is marked **Partial: 3 of 10 converted** | The move stopped at its first error. Three people were moved and checked, the other seven were not moved. | Continue the batch to finish the three people. Move the others in a new move after the cause is fixed, or roll the whole batch back. Ask your administrator. |
+| *Recover stopped before any change: the retention policy does not hold …* | Before a rollback removes the cloud mailboxes, the tool checks that the retention policy holds them. It does not hold some of them, or the tool could not check. **Nothing was changed.** | Read the yellow lines of the Preview and the **Next steps**. Ask the person who looks after retention to fix the policy, then run the **Preview** again. To go on anyway, for one run, tick the box on the **Task** page. |
+| A yellow line says *… changed since this batch left them* | Some people were changed after the move (an address was added, or they were moved again). The rollback puts the saved values back over them. | Read the planned values of these people in the **Preview** before the real run. Nothing is blocked. |
 | A package line is red: **Invalid** | The file is damaged, comes from another environment, or its `.zip.sha256` file is not next to it. | Copy the `.zip` and the `.zip.sha256` files again, together in the same folder, without renaming them. Check that both servers have the same `Environment`. |
 | *Active Directory replication was NOT confirmed on …* | One directory server did not receive the change in time. | Read the **Next steps** page. It says to start the synchronisation again later. Ask your administrator. |
 | The result says **Pending** | A part remains. It is **not** an error. | Do what the **Next steps** page says. On two servers: carry the package to the other server. |

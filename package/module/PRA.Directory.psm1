@@ -1256,6 +1256,11 @@ function Write-PraAdDelta {
     }
     if (-not $consoleLines.Count) { Write-PraHost @(@('         '), @('no change: the object is already in the expected state', 'DarkGray')) }
     elseif ($unchanged) { Write-PraHost @(@('         '), @(('{0} other managed attribute(s) unchanged (full values in the log)' -f $unchanged), 'DarkGray')) }
+    $drift = @(if ($null -ne $Plan.PSObject.Properties['Drift']) { $Plan.Drift })
+    if ($drift.Count -and (Test-PraOrdinalIgnoreCaseEqual $Stage 'Planned')) {
+        $Context.CurrentIdentity = [string]$record.ObjectGuid
+        Write-PraLog -Context $Context -Level Warning -Message ('{0}: changed since the batch left it ({1}). The saved values are put back over what is there now: check the PLANNED values above before the Apply.' -f $record.SamAccountName, ($drift -join ', '))
+    }
     if ($permissionText) {
         # Who will get access in Exchange Online: a few names on screen, the complete list in the log.
         foreach ($right in @('FullAccess', 'SendAs', 'SendOnBehalf')) {
@@ -1270,9 +1275,18 @@ function Write-PraAdDelta {
         $ignoredEntries = Get-PraValue (Get-PraValue $Context '_PraIgnoredTrustees' @{}) ([string]$record.ObjectGuid) @()
         $ignoredEntries = @($ignoredEntries | Where-Object { $_ })
         if ($ignoredEntries.Count) {
-            # A warning, not an error: the account no longer exists, so nothing can be granted to it.
-            Write-PraLog -Context $Context -Level Warning -Message ('{0}: {1} permission entr{2} ignored, account unknown in AD (deleted, or from another domain): {3}' -f
+            # A warning, not an error: the account no longer exists or is not a user or a group, so nothing can be granted to it.
+            Write-PraLog -Context $Context -Level Warning -Message ('{0}: {1} permission entr{2} ignored, account unknown in AD (deleted, or from another domain) or not a user or a group: {3}' -f
                 $record.SamAccountName, $ignoredEntries.Count, $(if ($ignoredEntries.Count -gt 1) { 'ies' } else { 'y' }), ($ignoredEntries -join '; '))
+        }
+        $deniedTable = Get-PraValue $Context '_PraDeniedTrustees' @{}
+        $denied = if ($deniedTable.ContainsKey([string]$record.ObjectGuid)) { $deniedTable[[string]$record.ObjectGuid] } else { $null }
+        if ($null -ne $denied -and (Test-PraOrdinalIgnoreCaseEqual $Stage 'Planned')) {
+            $deniedList = @($denied.Entries)
+            $grantedList = @($denied.Granted)
+            Write-PraLog -Context $Context -Level Warning -Message ('{0}: {1} Deny entr{2} on premises ({3}). Exchange Online is given Allow entries only, so {4} not reproduced.{5}' -f
+                $record.SamAccountName, $deniedList.Count, $(if ($deniedList.Count -gt 1) { 'ies' } else { 'y' }), ($deniedList -join '; '), $(if ($deniedList.Count -gt 1) { 'they are' } else { 'it is' }),
+                $(if ($grantedList.Count) { ' Denied here and granted anyway (directly or through a group): {0}. They get access in Exchange Online: remove it there after the conversion if they must stay denied.' -f ($grantedList -join ', ') } else { '' }))
         }
     }
 }
@@ -1340,6 +1354,30 @@ function Get-PraX500Difference {
     $same = ($a.Count -eq $b.Count)
     if ($same) { for ($i = 0; $i -lt $a.Count; $i++) { if (-not (Test-PraOrdinalEqual ([string]$a[$i]) ([string]$b[$i]))) { $same = $false; break } } }
     return [pscustomobject]@{ OtherEqual = $same; Added = [string[]]$added.ToArray(); Removed = [string[]]@($removed) }
+}
+
+function Get-PraStateDrift {
+    <#
+    .SYNOPSIS
+        The managed attributes that are not in the state a Convert batch left them in: the names of those whose current value is neither the value the batch wrote nor the original value that Recover restores.
+    .DESCRIPTION
+        Read only. -Current and -Original are the typed states of the attributes (as captured now and as saved before the conversion); -Planned is the state the batch wrote (PlannedAttributes).
+        proxyAddresses: the X500 addresses that Exchange hybrid writeback adds are not a difference. A record without PlannedAttributes (an old batch) has no drift.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)]$Current, $Planned, $Original, [Parameter(Mandatory)][string[]]$Name)
+    $names = New-Object 'Collections.Generic.List[string]'
+    if ($null -eq $Planned -or $null -eq $Original) { return [string[]]$names.ToArray() }
+    foreach ($attribute in $Name) {
+        $wrote = Get-PraValue $Planned $attribute $null; $was = Get-PraValue $Original $attribute $null; $now = $Current[$attribute]
+        if ($null -eq $wrote -or $null -eq $was -or $null -eq $now) { continue }
+        if (Test-PraOrdinalEqual $attribute 'proxyAddresses') {
+            if (-not (Get-PraX500Difference $now $wrote).OtherEqual -and -not (Get-PraX500Difference $now $was).OtherEqual) { $names.Add($attribute) }
+        }
+        elseif (-not (Test-PraStateEqual -Left $now -Right $wrote) -and -not (Test-PraStateEqual -Left $now -Right $was)) { $names.Add($attribute) }
+    }
+    return [string[]]$names.ToArray()
 }
 
 function Get-PraExpectedX500 {
@@ -1491,21 +1529,27 @@ function Expand-PraTrustee {
     return $result
 }
 
+function Test-PraWellKnownTrusteeSid {
+    <# True for the accounts that are never reproduced as trustees: BUILTIN, NT AUTHORITY and the Domain, Enterprise and Schema Admins groups. #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][Security.Principal.SecurityIdentifier]$Sid)
+    return ($Sid.Value -match '^S-1-5-32-' -or $Sid.Value -match '^S-1-5-[0-9]+\z' -or $Sid.Value -match '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-(512|518|519)\z')
+}
+
 function Resolve-PraAclTrustee {
     <#
     .SYNOPSIS
         UPN(s) behind the SID of an ACE. Well-known and administrative accounts/groups are ignored.
     .DESCRIPTION
-        A SID that no AD object carries any more (deleted account, or an account of another domain) cannot
-        receive a permission in Exchange Online: it is added to -Unknown and ignored. The caller reports it
-        as a warning (console, log, report). Unknown SIDs are not cached, so every mailbox reports them.
+        A SID that no AD object carries any more (deleted account, or an account of another domain), and an account that is neither a user nor a group (a computer, a managed service
+        account, a foreign security principal), cannot receive a permission in Exchange Online: it is added to -Unknown (the SID, and the object class when there is one) and ignored.
+        The caller reports it as a warning (console, log, report). Unknown SIDs are not cached, so every mailbox reports them.
     #>
     [CmdletBinding()]
     param([hashtable]$Context, $Reference, [Collections.Generic.List[string]]$Unknown)
     $sid = if ($Reference -is [Security.Principal.SecurityIdentifier]) { $Reference } else { $Reference.Translate([Security.Principal.SecurityIdentifier]) }
-    # BUILTIN, NT AUTHORITY and Domain/Enterprise/Schema Admins are never reproduced.
-    if ($sid.Value -match '^S-1-5-32-' -or $sid.Value -match '^S-1-5-[0-9]+\z' -or
-        $sid.Value -match '^S-1-5-21-[0-9]+-[0-9]+-[0-9]+-(512|518|519)\z') { return }
+    if (Test-PraWellKnownTrusteeSid -Sid $sid) { return }
     # Named accounts and groups (Organization Management, Exchange Trusted Subsystem, ...) are filtered by name once the SID is
     # resolved to its AD object (see $excludedGroups below); the ACE reference is a SID here, so a name pattern could never match.
     $cache = Get-PraPermissionCache -Context $Context
@@ -1522,6 +1566,12 @@ function Resolve-PraAclTrustee {
         return
     }
     if ($objects.Count -ne 1) { throw "Permission trustee not unique in AD: $($sid.Value)" }
+    if ($null -ne $Unknown -and -not (Test-PraOrdinalIgnoreCaseEqual ([string]$objects[0].objectClass) 'user') -and -not (Test-PraOrdinalIgnoreCaseEqual ([string]$objects[0].objectClass) 'group')) {
+        Write-PraLog -Context $Context -Message ("PERMISSIONS TRUSTEE | SID=$($sid.Value) | $($objects[0].objectClass), not a user or a group: ignored") -Level Detail
+        $unsupported = '{0} ({1})' -f $sid.Value, $objects[0].objectClass
+        if (-not $Unknown.Contains($unsupported)) { $Unknown.Add($unsupported) }
+        return
+    }
     $excludedGroups = @('Domain Admins','Enterprise Admins','Schema Admins','Organization Management','Exchange Trusted Subsystem','Exchange Servers','Exchange Windows Permissions','Managed Availability Servers','Delegated Setup')
     if ((Test-PraOrdinalIgnoreCaseEqual $objects[0].objectClass 'group') -and ((Test-PraOrdinalIn -IgnoreCase (Get-PraValue $objects[0] 'sAMAccountName' '') $excludedGroups) -or (Test-PraOrdinalIn -IgnoreCase (Get-PraValue $objects[0] 'Name' '') $excludedGroups))) {
         Add-PraPermissionCache -Context $Context -Key $key -Upns @()
@@ -1530,6 +1580,30 @@ function Resolve-PraAclTrustee {
     $result = [string[]]@(Expand-PraTrustee -Context $Context -Object $objects[0])
     Add-PraPermissionCache -Context $Context -Key $key -Upns $result
     return $result
+}
+
+function Get-PraDeniedTrustee {
+    <#
+    .SYNOPSIS
+        Who a Deny entry of a permission descriptor refuses: Name (the account as the directory names it, else its SID) and Upns (the user, or the members of the group), both empty for an account that is never reproduced.
+    .DESCRIPTION
+        Read only. Exchange Online is given Allow entries only, so a Deny entry is not reproduced; this tells the operator who it concerns. An account that cannot be resolved is named by its SID with no UPN.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$Context, $Reference)
+    try { $sid = if ($Reference -is [Security.Principal.SecurityIdentifier]) { $Reference } else { $Reference.Translate([Security.Principal.SecurityIdentifier]) } }
+    catch { return [pscustomobject]@{ Name = [string]$Reference; Upns = [string[]]@() } }
+    if (Test-PraWellKnownTrusteeSid -Sid $sid) { return $null }
+    if (-not $Context.ContainsKey('_PraSidNames')) { $Context['_PraSidNames'] = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase) }
+    $name = $null
+    if (-not $Context['_PraSidNames'].TryGetValue($sid.Value, [ref]$name)) {
+        try { $name = [string]$sid.Translate([Security.Principal.NTAccount]).Value } catch { $name = $sid.Value }
+        $Context['_PraSidNames'][$sid.Value] = $name
+    }
+    $upns = [string[]]@()
+    try { $upns = [string[]]@(Resolve-PraAclTrustee -Context $Context -Reference $sid -Unknown (New-Object 'Collections.Generic.List[string]')) }
+    catch { Write-PraLog -Context $Context -Message ('PERMISSIONS DENIED TRUSTEE | SID={0} | not resolved: {1}' -f $sid.Value, $_.Exception.Message) -Level Detail }
+    return [pscustomobject]@{ Name = $name; Upns = $upns }
 }
 
 function Get-PraSharedPermission {
@@ -1552,9 +1626,22 @@ function Get-PraSharedPermission {
     $send = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $behalf = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     # SIDs of the ACEs that no AD object carries any more: ignored, reported as a warning (Write-PraAdDelta).
-    $unknownSendAs = New-Object 'Collections.Generic.List[string]'; $unknownFullAccess = New-Object 'Collections.Generic.List[string]'
+    $unknownSendAs = New-Object 'Collections.Generic.List[string]'; $unknownFullAccess = New-Object 'Collections.Generic.List[string]'; $unknownBehalf = New-Object 'Collections.Generic.List[string]'
     if (-not $Context.ContainsKey('_PraIgnoredTrustees')) { $Context['_PraIgnoredTrustees'] = @{} }
     [void]$Context['_PraIgnoredTrustees'].Remove(([guid]$User.ObjectGUID).ToString())
+    # Deny entries are not reproduced (Exchange Online is given Allow entries only): who they refuse, and who of them is granted anyway, is reported as a warning (Write-PraAdDelta).
+    $deniedEntries = New-Object 'Collections.Generic.List[string]'
+    $deniedFull = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase); $deniedSend = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    if (-not $Context.ContainsKey('_PraDeniedTrustees')) { $Context['_PraDeniedTrustees'] = @{} }
+    [void]$Context['_PraDeniedTrustees'].Remove(([guid]$User.ObjectGUID).ToString())
+    $noteDenied = {
+        param([string]$Right, $Ace, $Upns)
+        $who = Get-PraDeniedTrustee -Context $Context -Reference $Ace.IdentityReference
+        if ($null -eq $who) { return }
+        $entry = '{0} to {1}' -f $Right, $who.Name
+        if (-not $deniedEntries.Contains($entry)) { $deniedEntries.Add($entry) }
+        foreach ($deniedUpn in $who.Upns) { [void]$Upns.Add($deniedUpn) }
+    }
     if (-not $settings.Enabled) { return @{ FullAccess=@(); SendAs=@(); SendOnBehalf=@() } }
     Write-PraLog -Context $Context -Message "Shared mailbox permissions | DC=$($Context.Server) | $($User.DistinguishedName) | source=$($settings.PermissionSource)" -Level Debug
     # The configured text is mapped to its official spelling by ordinal comparison before the switch (culture-sensitive string matching ignores zero-weight characters).
@@ -1571,6 +1658,10 @@ function Get-PraSharedPermission {
                     $ace.ActiveDirectoryRights -match 'ExtendedRight' -and (Test-PraOrdinalIgnoreCaseEqual ([string]$ace.ObjectType) 'ab721a54-1e2f-11d0-9819-00aa0040529b')) {
                     foreach ($upn in @(Resolve-PraAclTrustee -Context $Context -Reference $ace.IdentityReference -Unknown $unknownSendAs)) { [void]$send.Add($upn) }
                 }
+                elseif ((Test-PraOrdinalIgnoreCaseEqual $ace.AccessControlType 'Deny') -and $ace.ActiveDirectoryRights -match 'ExtendedRight' -and
+                    (Test-PraOrdinalIn ([string]$ace.ObjectType) @('ab721a54-1e2f-11d0-9819-00aa0040529b', '00000000-0000-0000-0000-000000000000') -IgnoreCase)) {
+                    & $noteDenied 'SendAs' $ace $deniedSend
+                }
             }
             if ($null -eq $User.PSObject.Properties['msExchMailboxSecurityDescriptor']) { throw 'msExchMailboxSecurityDescriptor not read.' }
             $mailboxSecurity = $User.msExchMailboxSecurityDescriptor
@@ -1583,6 +1674,9 @@ function Get-PraSharedPermission {
                 foreach ($ace in $fullRules) {
                     if ((Test-PraOrdinalIgnoreCaseEqual $ace.AccessControlType 'Allow') -and -not $ace.IsInherited -and (([int]$ace.ActiveDirectoryRights -band 1) -eq 1)) {
                         foreach ($upn in @(Resolve-PraAclTrustee -Context $Context -Reference $ace.IdentityReference -Unknown $unknownFullAccess)) { [void]$full.Add($upn) }
+                    }
+                    elseif ((Test-PraOrdinalIgnoreCaseEqual $ace.AccessControlType 'Deny') -and (([int]$ace.ActiveDirectoryRights -band 1) -eq 1)) {
+                        & $noteDenied 'FullAccess' $ace $deniedFull
                     }
                 }
             }
@@ -1629,6 +1723,11 @@ function Get-PraSharedPermission {
                 $Context.CurrentOperation = 'Resolve-PublicDelegate'; $Context.CurrentIdentity = [string]$dn
                 $delegateProperties = @('objectClass', 'userPrincipalName', 'sAMAccountName') + @(if (Test-PraConsistencyGuidSchema -Context $Context) { 'mS-DS-ConsistencyGuid' })
                 $delegate = Get-ADObject -Identity $dn -Properties $delegateProperties -Server $Context.Server -ErrorAction Stop
+                if (-not (Test-PraOrdinalIn ([string]$delegate.objectClass) @('user', 'group') -IgnoreCase)) {
+                    $unknownBehalf.Add(('{0} ({1})' -f $dn, $delegate.objectClass))
+                    Write-PraLog -Context $Context -Message ("PERMISSIONS DELEGATE | $dn | $($delegate.objectClass), not a user or a group: ignored") -Level Detail
+                    continue
+                }
                 $upns = [string[]]@(Expand-PraTrustee -Context $Context -Object $delegate)
                 Add-PraPermissionCache -Context $Context -Key $key -Upns $upns
             }
@@ -1636,8 +1735,12 @@ function Get-PraSharedPermission {
         }
     }
     Write-PraMemoryStage -Context $Context -Stage 'PERMISSIONS CAPTURED' -Identity ([string]$User.ObjectGUID) -Detail ("FullAccess=$($full.Count) SendAs=$($send.Count) SendOnBehalf=$($behalf.Count)")
-    $ignored = @(@($unknownFullAccess | ForEach-Object { "FullAccess $_" }) + @($unknownSendAs | ForEach-Object { "SendAs $_" }))
+    $ignored = @(@($unknownFullAccess | ForEach-Object { "FullAccess $_" }) + @($unknownSendAs | ForEach-Object { "SendAs $_" }) + @($unknownBehalf | ForEach-Object { "SendOnBehalf $_" }))
     if ($ignored.Count) { $Context['_PraIgnoredTrustees'][([guid]$User.ObjectGUID).ToString()] = [string[]]$ignored }
+    if ($deniedEntries.Count) {
+        $granted = @(@($deniedFull | Where-Object { $full.Contains($_) } | ForEach-Object { "FullAccess $_" }) + @($deniedSend | Where-Object { $send.Contains($_) } | ForEach-Object { "SendAs $_" }))
+        $Context['_PraDeniedTrustees'][([guid]$User.ObjectGUID).ToString()] = @{ Entries = [string[]]$deniedEntries.ToArray(); Granted = [string[]]$granted }
+    }
     return @{ FullAccess=@($full | Get-PraOrdinalSorted -IgnoreCase); SendAs=@($send | Get-PraOrdinalSorted -IgnoreCase); SendOnBehalf=@($behalf | Get-PraOrdinalSorted -IgnoreCase) }
 }
 #endregion
@@ -1680,12 +1783,15 @@ function New-PraPlan {
         Record of the Convert backup (Recover, Deprovision, RestoreTag).
     .PARAMETER RestoreRetention
         Recover: also restore the original retention tag (Finalize step).
+    .PARAMETER CheckDrift
+        Recover and Deprovision, first rollback of an object: Drift names the managed attributes that are neither in the state the Convert batch left them in nor in their original state (the X500 addresses
+        of the hybrid writeback are not a difference): the saved values are put back over them.
     .OUTPUTS
-        Plan: User (light), RawSnapshot (full capture), Record (backup record), Kinds, Desired, Row, Operation.
+        Plan: User (light), RawSnapshot (full capture), Record (backup record), Kinds, Desired, Row, Operation, Drift.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions','',Justification='Reads and in-memory preparation only; writes are in Invoke-PraAdWrite.')]
     [CmdletBinding()]
-    param([hashtable]$Context, [string]$Identity, [ValidateSet('Convert','Recover','Deprovision','RestoreTag')][string]$Operation, $SourceRecord = $null, [switch]$RestoreRetention)
+    param([hashtable]$Context, [string]$Identity, [ValidateSet('Convert','Recover','Deprovision','RestoreTag')][string]$Operation, $SourceRecord = $null, [switch]$RestoreRetention, [switch]$CheckDrift)
     $Context.CurrentOperation = $Operation; $Context.CurrentIdentity = $Identity
     $config = $Context.Config
     if ($null -ne $SourceRecord) { Assert-PraDomain $Context ([string]$SourceRecord.DistinguishedName) }
@@ -1774,6 +1880,10 @@ function New-PraPlan {
             throw 'Old backup without the GUID of the licence group: removal refused (a group with the same DN may have been re-created). Have the backup migrated before restoring this batch.'
         }
     }
+    $drift = [string[]]@()
+    if ($CheckDrift -and $null -ne $SourceRecord -and ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover') -or ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Deprovision') -and -not $alreadyRecovered -and $remoteState))) {
+        $drift = [string[]]@(Get-PraStateDrift -Current $before -Planned (Get-PraValue $SourceRecord 'PlannedAttributes' $null) -Original (Get-PraValue $SourceRecord 'Attributes' $null) -Name @($kinds.Keys))
+    }
     if ((Test-PraOrdinalIgnoreCaseEqual $Operation 'RestoreTag') -or ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover') -and $RestoreRetention -and $tagEnabled)) {
         $original = $SourceRecord.Attributes.$tagAttr
         if (-not (Test-PraStateEqual $before[$tagAttr] $original) -and
@@ -1809,7 +1919,13 @@ function New-PraPlan {
     $ignoredTable = if ($Context.ContainsKey('_PraIgnoredTrustees')) { $Context['_PraIgnoredTrustees'] } else { @{} }
     $ignoredEntries = if ($ignoredTable.ContainsKey($record.ObjectGuid)) { $ignoredTable[$record.ObjectGuid] } else { @() }
     $ignoredEntries = @($ignoredEntries | Where-Object { $_ })
-    if ($shared -and (Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert') -and $ignoredEntries.Count) { $row.Warnings = 'Permission entries ignored (account unknown in AD): ' + ($ignoredEntries -join '; ') }
+    if ($shared -and (Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert') -and $ignoredEntries.Count) { $row.Warnings = 'Permission entries ignored (account unknown in AD, or not a user or a group): ' + ($ignoredEntries -join '; ') }
+    $deniedTable = if ($Context.ContainsKey('_PraDeniedTrustees')) { $Context['_PraDeniedTrustees'] } else { @{} }
+    if ($shared -and (Test-PraOrdinalIgnoreCaseEqual $Operation 'Convert') -and $deniedTable.ContainsKey($record.ObjectGuid)) {
+        $deniedEntry = $deniedTable[$record.ObjectGuid]
+        $row.Warnings = (([string]$row.Warnings) + '; Deny entries not reproduced: ' + (@($deniedEntry.Entries) -join ', ') + $(if (@($deniedEntry.Granted).Count) { '; granted anyway: ' + (@($deniedEntry.Granted) -join ', ') } else { '' })).Trim(' ', ';')
+    }
+    if ($drift.Count) { $row.Warnings = ([string]$row.Warnings + '; Changed since the batch left it, the saved values are put back over: ' + ($drift -join ', ')).Trim(' ', ';') }
     $row.IsShared = $shared; $row.SharedFullAccess = @($permissions.FullAccess); $row.SharedSendAs = @($permissions.SendAs); $row.SharedSendOnBehalf = @($permissions.SendOnBehalf)
     $row.DeproPending = ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Deprovision') -and -not $alreadyRecovered); $row.Detail = "Operation=$Operation ; routing=$routing" + $(if ($keptX500.Count) { " ; $($keptX500.Count) cloud X500 address(es) kept" } else { '' }); $row.LastOperation = 'Prepared'
     $plannedOperation = if ($alreadyRecovered) { 'AlreadyRecovered' } else { $Operation }
@@ -1819,7 +1935,7 @@ function New-PraPlan {
     $rawSnapshot = ConvertTo-PraRawSnapshot -User $user -CapturedUtc $record.CapturedUtc
     $lightUser = [pscustomobject]@{ ObjectGUID=[guid]$record.ObjectGuid; DistinguishedName=$record.DistinguishedName; uSNChanged=[int64]$record.CapturedUsnChanged }
     Write-PraMemoryStage -Context $Context -Stage 'PROJECTION END' -Identity $record.ObjectGuid -Detail ("attributes=$($rawSnapshot.Attributes.Count) FullAccess=$(@($permissions.FullAccess).Count) SendAs=$(@($permissions.SendAs).Count) SendOnBehalf=$(@($permissions.SendOnBehalf).Count)")
-    return [pscustomobject]@{ User=$lightUser; RawSnapshot=$rawSnapshot; Record=$record; Kinds=$kinds; Desired=$desired; Row=$row; Operation=$plannedOperation; ExpectedUsnChanged=$record.CapturedUsnChanged; Previewed=$false }
+    return [pscustomobject]@{ User=$lightUser; RawSnapshot=$rawSnapshot; Record=$record; Kinds=$kinds; Desired=$desired; Row=$row; Operation=$plannedOperation; ExpectedUsnChanged=$record.CapturedUsnChanged; Previewed=$false; Drift=$drift }
 }
 #endregion
 

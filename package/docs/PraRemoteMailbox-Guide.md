@@ -159,10 +159,10 @@ arrow | Pre-check | every holder found in Exchange Online
 cloud | Grant | once, then re-read
 ```
 
-1. Only explicit *Allow* entries are kept: inherited and *Deny* entries are ignored.
+1. Only explicit *Allow* entries are kept: inherited entries are ignored. A *Deny* entry is not reproduced either (Exchange Online is given *Allow* entries only), but it is **reported as a warning** under the shared mailbox, with the accounts it refuses; when one of them is granted anyway (directly, or through a group that is expanded to its users), the warning names it: it gets the access in Exchange Online, and the permission must be removed there after the conversion if it has to stay denied.
 2. System and administration accounts are never reproduced: SELF, `NT AUTHORITY\…`, `BUILTIN\…`, Domain / Enterprise / Schema Admins, Organization Management, Exchange Trusted Subsystem, Exchange Servers, Exchange Windows Permissions, Managed Availability Servers, Delegated Setup — plus the accounts listed in `SharedMailbox.ExcludeTrusteeSamAccountNames` (service accounts, for example).
 3. A **group** is expanded to its users, nested groups included: Exchange Online receives one permission **per user** (UPN), never the group itself (lab T16). A user added to the group later does not get the access by itself.
-4. An entry that points to an account **no longer in AD** ("Account Unknown": deleted account, or an account of another domain) cannot be granted: it is **ignored and reported as a warning** — a yellow `▲` line under the shared mailbox, a `[WARN]` line in the log, the `Warnings` column of the CSV, and the *Warnings* tile and card of the HTML report. The run goes on and its exit code does not change. Every other holder must exist in AD with a UPN.
+4. An entry that points to an account **no longer in AD** ("Account Unknown": deleted account, or an account of another domain), or to an account that is **neither a user nor a group** (a computer, a managed service account, a foreign security principal; a mail contact among the `publicDelegates`), cannot be granted: it is **ignored and reported as a warning** — a yellow `▲` line under the shared mailbox, a `[WARN]` line in the log, the `Warnings` column of the CSV, and the *Warnings* tile and card of the HTML report. The run goes on and its exit code does not change. Every other holder must exist in AD with a UPN.
 5. The lists are saved in the backup of the batch (`SharedPermissions` of each record): the proof of what was granted.
 6. Apply (phase `Both`): **before any AD write**, every holder is looked up in Exchange Online. An unknown holder stops the run before AD is changed. A user still on-premises is fine: Entra Connect has synchronised it as a mail user.
 7. When the cloud shared mailbox exists: `Add-MailboxPermission` (FullAccess, with `AutoMapping`), `Add-RecipientPermission` (SendAs), `Set-Mailbox -GrantSendOnBehalfTo` (SendOnBehalf). A permission already present is only verified; a missing one is granted **once**, then re-read until Exchange Online shows it. In a hybrid organisation, Entra Connect usually brings `publicDelegates` along with the mailbox: SendOnBehalf is then already there and only verified (lab T16).
@@ -194,6 +194,9 @@ check | Done | on-premises again
 - **Users** get their original attributes back and leave the licence group (unless they were already members before Convert).
 - **Shared mailboxes** are first **deprovisioned** in Exchange Online (`msExchRemoteRecipientType` 8, MailUser): their on-premises attributes come back only when Exchange Online confirms that the cloud mailbox is gone. Otherwise two mailboxes would exist for the same object.
 - The **retention tag** keeps the value `Converted` until the cloud check, then gets its original value back.
+- **Before anything is changed**, the Recover looks at what it is about to overwrite and at what it is about to remove:
+  - An object whose managed attributes are neither in the state the Convert left them in nor in their original state (an address added during the disaster, a later Convert of the same object) is named in a warning in the Preview and the Apply: the saved values are put back over what is there now, and the confirmation question says how many objects are concerned. The `X500:` addresses that the hybrid writeback adds are not a difference.
+  - Each mailbox that carries the retention tag must be **held by the retention policy** in Exchange Online. When one is not, or when that cannot be checked, the **Apply stops before any change**, with the reason and the commands to go on. The Preview shows the same answer as warnings and says that the Apply will be refused. `-AcceptRetentionRisk` (a checkbox in the console) goes on for one run, and the configuration file can turn the check off (*Retention* in [chapter 6](#6-configuration)).
 - On two servers, the cloud server writes a **Finalize package** that the AD server applies (`-Action Finalize`).
 
 ### The four actions
@@ -497,11 +500,31 @@ converge is a **warning that names it**; the synchronisation still runs, and the
 | Setting | Meaning |
 |---|---|
 | `Retention.Enabled` | `$true` (default): the retention tag is written at Convert and restored at Recover. |
-| `Retention.PolicyName`, `PolicyGuid` | The Purview retention policy used by `-Action Check -Expect Retained` (default name `PRA-Converted-Retention`; the policy is created outside the tool). `PolicyGuid` is used directly when set. |
+| `Retention.PolicyName`, `PolicyGuid` | The Purview retention policy used by `-Action Check -Expect Retained` and by the retention check before a Recover (default name `PRA-Converted-Retention`; the policy is created outside the tool). `PolicyGuid` is used directly when set. |
 | `Retention.UseComplianceSession` | `$true`: find the GUID from `PolicyName` through an interactive `Connect-IPPSSession`. |
+| `Retention.ProofMaxAgeHours` | `24` (default), 1 to 720: how old a retention proof from the cloud server may be to stand in for the check on the AD server (see *Two servers* below). |
+| `Retention.CheckBeforeRecover` | `$true` (default): before it removes the cloud mailboxes, a Recover reads each mailbox that carries the retention tag and checks that the retention policy holds it (see below). `$false`: no check, in every run; each Recover says so once, in a warning, and never claims that the check passed. |
 | `Retention.Tag.Enabled`, `Attribute`, `Value` | The AD attribute (`extensionAttribute1` to `15`) and the value (`Converted`) written at Convert. |
 
 `Retention.Tag` writes `Converted` in `extensionAttribute1` (by default) at Convert. In Exchange Online it becomes `CustomAttribute1`: an **adaptive scope** of a Purview retention policy can use it, so that the cloud mailbox is kept (inactive mailbox) when Recover deprovisions it. The policy itself is created outside the tool; `-Action Check -Expect Retained` checks the holds (`PolicyGuid`).
+
+**The retention check before a Recover** (`Retention.CheckBeforeRecover`, on by default). A Recover removes the cloud mailboxes, so before the confirmation, in the Preview and in the Apply (phase `Both` or `AD`), it reads in Exchange Online each mailbox whose record carries the retention tag (one read per mailbox, with the retries and the time limits of `Cloud.RetryBudgetObjectSeconds` and `Cloud.RetryBudgetRunMinutes`; a batch of thousands of mailboxes is read once each) and checks that the policy of `Retention.PolicyGuid` holds it. A mailbox with no cloud mailbox has nothing to retain. A mailbox kept on purpose (`SharedMailbox.KeepCloudSharedOnRecover`) is not read.
+
+| Answer | Preview | Apply |
+|---|---|---|
+| Every mailbox is held | one line says so | goes on |
+| A mailbox is **not held** (not in the policy, excluded, delete-only, an adaptive scope that has not caught up), or **cannot be checked** (`Retention.PolicyGuid` empty, Microsoft 365 not reachable from this server, the cloud modules missing) | warnings name the first ten mailboxes (all are in the log) and say that the Apply will be refused | **stops before any change**, exit code 1: the reason, then the commands to go on (the read-only `Check -Expect Retained` for each mailbox, the Preview again, the same Apply with `-AcceptRetentionRisk`, and the GUID lookup when `PolicyGuid` is empty) |
+| `-AcceptRetentionRisk` is given | the Preview tells what it would accept | goes on; a **warning** names what is accepted (console, log, summary, report), and the run lists it among the run settings changed |
+
+`-AcceptRetentionRisk` applies to **one run** and is never remembered; in the console it is a checkbox of the Recover page that is cleared after each Apply. It is accepted for the AD part of a Recover only; anywhere else the run says that it is ignored. `Retention.CheckBeforeRecover = $false` turns the check off for every run: each Recover then prints one warning (`The retention check before a Recover is turned off`) and the settings of the report show it.
+
+**Two servers: the retention proof.** The AD server often cannot reach Microsoft 365, so its Recover cannot read the retention. The cloud server reads it for it:
+
+1. On the cloud server (it needs the batch folder, as for any Check): `.\Invoke-PraRemoteMailbox.ps1 -Action Check -Batch <convert or recover batch> -Expect Retained`. The Check is read only, and it also writes the **retention proof** in `Backups\Outbox`: `RetentionProof-<batch id>-<time>.json` and its `.sha256` file. The file holds the batch ID, the Environment, the time (UTC), the GUID of the policy that was checked and, for each object (ObjectGuid and UPN), `Covered` true, false or not checked (a mailbox that does not exist in Exchange Online has nothing to retain and is marked `NoMailbox`).
+2. Copy the two files, together, to `Backups\Inbox` of the AD server (the folder where it already looks for transfer packages).
+3. On the AD server, the Recover (`-Phase AD`) accepts the proof when its checksum matches its `.sha256` file, its batch ID is the one of the Convert batch being rolled back, its Environment is the one of the configuration, it is not older than `Retention.ProofMaxAgeHours` (default 24, from 1 to 720) and it says `Covered` (or `NoMailbox`) for **every** object of the Recover. Letter case does not matter for the Environment or the UPNs. The run then says `Retention: accepted from the retention proof …` and asks nothing of Exchange Online. In any other case the Recover blocks as above, says why no proof was accepted, and the Next steps give the Check to run on the cloud server, the folder where to bring the proof back, the Preview to run again and, last, `-AcceptRetentionRisk`.
+
+The proof replaces the live check only where Exchange Online cannot be asked: on the AD part when the server has no certificate sign-in (`Cloud.AppId`) or no cloud modules. With phase `Both`, or with a certificate sign-in, the check of Exchange Online decides and the proof is never read. The console shows, on the Recover task (AD part), whether a proof is found for the selected batch and how old it is; the checkbox stays the override. The console's own Check tile checks one mailbox and writes no proof: use the command above.
 
 ### Files
 
@@ -668,7 +691,16 @@ Microsoft sign-in dialog. If the sign-in dialog cannot open, use the certificate
 `Exo.DisableWAM = $true` (browser sign-in). The activity log shows the engine's own console lines as they arrive
 (sign-in messages, waits, warnings), without repeating the events it already displays; the complete output is kept
 in `logs\gui\<id>.stdout.txt` and `.stderr.txt` (the raw bytes of the child, in the console code page of the
-computer).
+computer). The activity log keeps the last 2,000 lines of a run: its header says where the complete log is (the file of the engine
+once the run has ended).
+
+**What the window leaves behind.** When it opens, the window removes what it left in `logs\gui` more than 30 days ago (the event and output
+files of the runs, the results of the lookups, and the `run-...` folders with the effective copy of the configuration of a run); the logs and the reports of the engine are not in that folder and stay.
+Ctrl+C typed in the console that started the window is not sent to the window (it would stop the window and its handlers): close the window, or wait for a run to end. The OU lookup (**Pick an OU...**)
+stops after 60 seconds with a message when the domain controller does not answer, and the window can be closed again.
+After a valid run, a step that was announced and not run is shown as skipped, not as waiting.
+
+**Recover and the retention check.** On the Recover task, when the AD part runs on this server, the Task page shows a checkbox, *Go on even if the retention policy does not hold every mailbox, or if that cannot be checked (this run only)*. It is the window's form of `-AcceptRetentionRisk`: it applies to the next Preview or Apply only, changing it voids the Preview, and it is cleared after an Apply. The Preview of the Recover reports what the retention check found; tick the box only after reading it ([chapter 6](#retention)).
 
 Why a child process and not the window's own session: a child keeps the cloud modules out of the window (Graph before Exchange Online),
 keeps the operation atomic (the window cannot be closed mid-batch), leaves the
@@ -779,6 +811,8 @@ Use the batch ID of the Convert (summary, report, or the folder name `Backups\Ba
 
 Users get their original attributes back and leave the licence group. Shared mailboxes are first removed from Exchange Online; their on-premises attributes come back when Exchange Online confirms it (up to `Polling.TimeoutMinutes`), in the same run. Their on-premises permissions were never changed.
 
+The Preview also checks that the retention policy holds the mailboxes that carry the retention tag; the Apply stops before any change when it does not (see *Retention* in [chapter 6](#retention)). To go on anyway, for this one run: `.\Invoke-PraRemoteMailbox.ps1 -Action Recover -Batch 1d5ac20b -Mode Apply -AcceptRetentionRisk`.
+
 ### Recipe 6 — Check, at any time
 
 ```powershell
@@ -802,6 +836,7 @@ Cloud server | `.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase Cloud -Batc
 ### Scenario D — Recover on two servers
 
 ```steps
+Cloud server | `-Action Check -Batch <convert id> -Expect Retained` — read only; writes the retention proof (`RetentionProof-<batch id>-<time>.json` and its `.sha256` file) in `Backups\Outbox`. Copy both files to `Backups\Inbox` of the AD server (valid `Retention.ProofMaxAgeHours`, 24 hours by default). Without a proof, the AD server cannot read the retention and the next step is refused.
 AD server | `-Action Recover -Phase AD -Batch <convert id> -Mode Apply` — users restored, shared mailboxes deprovisioned. Exit code 2: next step required.
 Copy | Copy `PRA-<Environment>-Recover-<id8>-for-Cloud.zip` **and its `.sha256` file** to the cloud server, into the same folder: the package holds the new Recover batch **and** the original Convert batch.
 Cloud server | `-Action Recover -Phase Cloud -Batch '<recover package>.zip' -Mode Apply` — checks the deprovisioning and writes the Finalize package `PRA-<Environment>-Finalize-<id8>-for-AD.zip`.
@@ -897,7 +932,7 @@ for Convert (AD, then Cloud) as for Recover (AD, Cloud, then Finalize), whatever
   `GlobalEventsCsvReport` and `GlobalIssuesCsvReport`, and the Next steps name their paths.
 - **Nothing is cut silently.** What a limit leaves out is counted in the header of the phase data and shown in the card **Not everything was kept** of the page, with the phase, the count and where
   the complete data is (the log of that run, named in the card with the machine that wrote it). The limits are: more than 200,000 objects in one phase; more than 1,000,000 journey lines in one phase;
-  a text longer than 300 characters (a step) or 2,000 characters (a detail), which ends with `...`; lines that would take the events file of a phase above 1 GB. An events file that is missing,
+  a text longer than 300 characters (a step) or 2,000 characters (a detail), which ends with `...`; objects that would take the PhaseData file of a phase above 64 MB (the last objects of the list are left out, counted in the card, and their journey lines stay in the events file under their name); lines that would take the events file of a phase above 96 MB. An events file that is missing,
   changed, without its `.sha256` or unreadable is not used: the phase is shown without its steps, errors and warnings, and the card says why. A line of an events file that is longer than 65,536
   characters or is not a JSON object is skipped and counted. **Errors and warnings have no limit**: every one is in the page, in the issues CSV and in the counts of the plain summary. At most
   200 PhaseData files of a folder are read for one report, the newest first, and the report says how many older ones were not read.
@@ -905,13 +940,13 @@ for Convert (AD, then Cloud) as for Recover (AD, Cloud, then Finalize), whatever
   is listed as *not available (folder from an older version or copied manually)*; the verdicts then come from the sides that were carried.
 - **Privacy.** Names, statuses and messages only: no secret, no token. The plain summary is HTML-encoded and the page script shows every value as text, never as markup; spreadsheet formulas are neutralised in
   the CSV; the files are private like the other reports and backups.
-- The `.sha256` next to a PhaseData file is an integrity check, not proof of origin: the protection against a changed file is the SHA-256 of every entry in `transfer.json`, verified at import; the report decides nothing from this data.
+- The `.sha256` next to a PhaseData file is an integrity check, not proof of origin: the protection against a changed file is the SHA-256 of every entry in `transfer.json`, verified at import; the report decides nothing from this data. The console only reads the header of a PhaseData file, to label a batch (cloud part done, pending, stopped, handed over), and only when its `.sha256` matches the file and the file names the batch of its folder and the Environment of that batch; a file that fails one of these counts as no data, and a file that cannot be opened just now is read again at the next refresh.
 - **A cloud part completed by a later run.** When the cloud part of a phase Both run failed (objects not ready in time) and `-Phase Cloud -Batch <id>` completed it, the verdict of the object follows the later run: the cloud error of the earlier run stays in its journey as an *Earlier run* line and does not make the object *failed*.
 - **Phase Both** uses the same layout (one phase). The per-phase HTML report also lists the run settings changed (the per-phase CSV keeps its 22 columns).
 
 ### Warnings
 
-A warning never stops the run and never changes the exit code; it says that something was **left aside on purpose** and should be read. Today: the permission entries of a shared mailbox that point to an account no longer in AD ([chapter 2](#2-how-it-works)), and an X500 address missing in Exchange Online ([chapter 2](#2-how-it-works), *X500 addresses*). It is shown in four places: a yellow `▲` line in the console under the object, `[WARN]` in the log, the `Warnings` column of the CSV, and in the HTML report (*Warnings* tile, *Warnings* card, yellow mark on the row). The summary card of the console turns yellow and shows the last warnings.
+A warning never stops the run and never changes the exit code; it says that something was **left aside on purpose** and should be read. Today: the permission entries of a shared mailbox that point to an account no longer in AD or that is not a user or a group, and the *Deny* entries that are not reproduced ([chapter 2](#2-how-it-works)); the objects that a Recover finds changed since the batch left them, and the retention that a Recover accepted or did not check ([chapter 6](#retention)); and an X500 address missing in Exchange Online ([chapter 2](#2-how-it-works), *X500 addresses*). It is shown in four places: a yellow `▲` line in the console under the object, `[WARN]` in the log, the `Warnings` column of the CSV, and in the HTML report (*Warnings* tile, *Warnings* card, yellow mark on the row). The summary card of the console turns yellow and shows the last warnings.
 
 ![Report of a run with a warning on a shared mailbox (synthetic example data)](images/report-phase-warning-light.png)
 
@@ -988,7 +1023,8 @@ The package is **verified completely before anything is written**:
 - the SHA-256 of **every entry** is computed from the stream and compared to the manifest, **before the first byte is written**.
 
 Then each folder is extracted under `Storage.BackupFolder` with its original name, as a **private folder** (leaf-only ACL, like the backups). A folder that already exists with **identical** files is accepted
-(importing twice is harmless); a folder with any different, extra or missing file is **refused**, and nothing is left half-extracted. The normal flow then continues and **every proof and hash check of the engine is unchanged**:
+(importing twice is harmless, and so is running the cloud phase again from the same package); the files that a run writes into a batch folder afterwards (the proof `State-*`, the journal `Journal-*`, the report data
+`PhaseData-*` and `PhaseEvents-*`, and the `.sha256` files) are kept as they are and are never replaced or supplied by a package; a folder with any different or missing file of the package, or any other extra file, is **refused**, and nothing is left half-extracted. The normal flow then continues and **every proof and hash check of the engine is unchanged**:
 the package replaces the copy of the folders, not the verifications.
 
 ```powershell
@@ -1003,7 +1039,7 @@ A batch of **5,000 objects** is supported. The checks that grew with the square 
 - Each write checks the fields of the backup, the record of the object and the length and last write time of the files; the complete check runs when the backup is read, after every 200 such checks and before the AD proof is written. The AD proof is read in full once per run by the cloud phase; each permission grant then costs a comparison of stamps.
 - The Active Directory part, the Entra Connect wait and the Exchange Online wait are not made faster by this: the AD part reads and re-reads each object several times (each write is preceded and followed by a read of the object), and the Entra Connect and Exchange Online waits are those of the services. The licence group is not read in full for each object: whether an object is a member comes from its own memberOf attribute, and a group of thousands of members is read once for the objects of a run. On the synthetic data, planning takes about 0.05 s per object, the AD part about 0.2 s per object after the backup (about 18 minutes for 5,000 objects), and reading the AD proof and the per-object checks of the cloud phase about 14 minutes for 5,000 objects.
 - The console keeps what it read of each batch file while the file and its `.sha256` file are unchanged, so a refresh costs a listing of the folder. A reload after a new batch reads that batch only. A failure to read a file (a lock) is never kept, and the **Reload** link forgets everything the window kept about batch files and CSV files.
-- The bounds that remain: a transfer package is refused above 2 GB for one entry and 4 GB in all (with the message *too large*); a phase keeps at most 200,000 objects and 1,000,000 journey lines, and drops no error or warning; the global report holds every object, every journey line and every error and warning, and names in a card what a limit left out; one events file is at most 1 GB; a PhaseData file is read up to 256 MB (the writer keeps at most 64 MB) and the PhaseData files read for one report at most 256 MB together (a file that would pass it is not read: the report says so and gives the command to run again after the files of other batches are moved out of the batch folder). A Convert that sent permission grants (phase Cloud or Both) ends its grant work with one complete check of the backup.
+- The bounds that remain: a transfer package is refused above 2 GB for one entry and 4 GB in all (with the message *too large*); a phase keeps at most 200,000 objects and 1,000,000 journey lines, and drops no error or warning; the global report holds every object, every journey line and every error and warning, and names in a card what a limit left out; one events file, and all the events files of one report together, are at most 96 MB (measured on synthetic data: an events file of 50 MB, 141,000 lines for 5,000 objects, is read in about 50 s with 1.2 GB of memory, and the whole global report takes about 105 s and 3.3 GB; the memory is about 65 times the size of the events files, so the limit keeps the report within about 6 GB); a PhaseData file is read up to 256 MB (the writer keeps at most 64 MB) and the PhaseData files read for one report at most 256 MB together (a file that would pass it is not read: the report says so and gives the command to run again after the files of other batches are moved out of the batch folder). A Convert that sent permission grants (phase Cloud or Both) ends its grant work with one complete check of the backup.
 - The global report, measured at 5,000 objects with 12 journey lines each (synthetic data, one workstation): writing the phase data takes about 20 s (2.8 MB for the header and the objects, 14 MB for the events file), and the report about 52 s (the model, a page of 0.6 MB and three CSV files of 1.6 MB, 15 MB and 0.03 MB). Version 3.1.4 took about 16 s and 84 s for a page of 18 MB with one table row for each journey line. In the browser the page keeps about 1,300 elements whatever the number of objects (at most 200 grid rows, 100 error rows and 100 journey rows), and decodes its data in a fraction of a second.
 - `tools\Measure-PraScale.ps1` times these steps on synthetic data (no directory, no tenant, no network): `pwsh -File .\tools\Measure-PraScale.ps1 -Count 5000`. Run the heavy steps (`BackupSave`, `AdBatch`, `ProofImport`) with a smaller `-Count` first: they take hours at 5,000.
 
@@ -1154,6 +1190,9 @@ After a change of the engine, repeat the campaign of [annex B](#annex-b--lab-tes
 |---|---|---|
 | `Configuration: unknown setting X` | typing mistake or setting of another version | compare with [chapter 6](#6-configuration) |
 | `Batch <id> not found under ...` | the batch folder is not in `Storage.BackupFolder` | copy the whole `Batch-...` / `Finalize-...` folder there, or give the path of the JSON file |
+| `Recover stopped before any change: the retention policy does not hold N mailbox(es) and M could not be checked` | the retention check before a Recover ([chapter 6](#retention)): a mailbox that carries the retention tag is not held by the policy, or Exchange Online could not be read, or `Retention.PolicyGuid` is empty | nothing was changed. Run the read-only `-Action Check -Batch <id> -Expect Retained` (the Next steps give it), fix the policy or the `PolicyGuid`, and run the Preview again. To go on anyway for one run, add `-AcceptRetentionRisk` to the Apply |
+| `No retention proof stands in for the check: …` (warning of a Recover, AD part, on a server that cannot ask Exchange Online) | the proof written by the Check on the cloud server is missing, older than `Retention.ProofMaxAgeHours`, of another batch or Environment, damaged (its SHA-256 does not match its `.sha256` file), or does not cover every object | run the `Check -Batch <id> -Expect Retained` of the Next steps on the cloud server, copy the two `RetentionProof-…` files to `Backups\Inbox` of this server, then run the Preview again. `-AcceptRetentionRisk` is the last resort |
+| `N of the M object(s) changed since this batch left them` (warning) | a Recover found attributes that are neither as the Convert left them nor as they were before it (an address added during the disaster, a later Convert of the same object) | read the PLANNED values of the objects named above: the saved values are put back over what is there now. Nothing is blocked |
 | `The Convert batch used by this Recover is not in ...` | cloud phase of a Recover without the original Convert batch | copy the `Batch-<convert id>` folder too |
 | `Batch ... is a Convert batch: the cloud phase of a Recover needs the batch printed by its AD phase` | wrong ID | use the ID printed by `Recover -Phase AD` |
 | `EntraConnect.Sync = $true but the ADSync module is not on this server` | AD part not on the Entra Connect server | set `EntraConnect.Server`, or run on the Entra Connect server, or `Sync = $false` |

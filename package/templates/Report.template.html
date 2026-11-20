@@ -3,13 +3,14 @@
     PRA Remote Mailbox - HTML report template
     Author  : Nicolas Fabert
     Version : 3.1.4
-    PRA.Common.psm1 (Write-PraReportHtml) replaces the markers below. Texts are HTML-encoded by the code:
-      {{TITLE}} {{SUBTITLE}} {{VERSION}}  texts of the header
-      {{META}}         run details (action, environment, batch, DC, computer, start, duration, run ID)
-      {{TILES}}        result tiles (Result, Objects, Done, Pending, Errors, Warnings, Planned, Skipped)
-      {{NEXT}}         "Next step" card (empty when there is none)
-      {{DATA_NOTICE}}  plain sentence for the no-JavaScript fallback: how many rows, errors and warnings the data holds
-      {{DATA}}         (the LAST occurrence in the file) the data, streamed by the code: the compressed chunks, then a JSON header (script elements)
+    PRA.Common.psm1 (Write-PraReportHtml) replaces the markers below in one pass. Texts are HTML-encoded by the code. The markers are written here with a space inside
+    the braces so that this comment is not changed; in the page they have none (the name between two pairs of braces):
+      {{ TITLE }} {{ SUBTITLE }} {{ VERSION }}  texts of the header
+      {{ META }}         run details (action, environment, batch, DC, computer, start, duration, run ID)
+      {{ TILES }}        result tiles (Result, Objects, Done, Pending, Errors, Warnings, Planned, Skipped)
+      {{ NEXT }}         "Next step" card (empty when there is none)
+      {{ DATA_NOTICE }}  plain sentence for the no-JavaScript fallback: how many rows, errors and warnings the data holds
+      {{ DATA }}         (the LAST occurrence without a space in the file) the data, streamed by the code: the compressed chunks, then a JSON header (script elements)
     The object rows, the run errors and the warnings are NOT HTML tables: they are stored as dictionary-indexed
     columns in gzip+base64 chunks (compression is not encryption), decoded by the script at the end of this file and
     displayed through virtual grids (at most 200 data rows exist in the page at any time, whatever the row count).

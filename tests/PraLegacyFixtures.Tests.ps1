@@ -116,7 +116,7 @@ BeforeAll {
     # Production functions of the entry script, extracted unchanged (they read $context, $Batch, $Identity, $Scope).
     $tokens = $null; $errors = $null
     $mainAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'package\Invoke-PraRemoteMailbox.ps1'), [ref]$tokens, [ref]$errors)
-    $wanted = @('Get-PraShortId', 'Get-PraJsonHeader', 'Test-PraBatchSideFile', 'Get-PraBatchFile', 'Select-PraSourceRecord', 'Get-PraFinalizeInput')
+    $wanted = @('Get-PraShortId', 'Get-PraJsonHeader', 'Get-PraBatchFile', 'Select-PraSourceRecord', 'Get-PraFinalizeInput')
     $script:EntryFunctions = (@($mainAst.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in $wanted }, $true) | ForEach-Object { $_.Extent.Text }) -join "`n")
 }
 
