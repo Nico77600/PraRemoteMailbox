@@ -181,7 +181,9 @@
     #                  server writes a retention proof (RetentionProof-...json and its .sha256 file, in its Backups\Outbox folder). Copied to the
     #                  Backups\Inbox folder of the AD server, it stands in for the check of a Recover (phase AD) when it is intact, of this batch
     #                  and Environment, not older than this many hours (1 to 720), and covers every object of the Recover. Where Exchange Online
-    #                  can be asked (phase Both, or a certificate sign-in), the check itself decides and no proof is read.
+    #                  can be asked (phase Both, a certificate sign-in, or an interactive console) its answer decides and the proof is read only
+    #                  when Exchange Online cannot be reached. The hours are the setting of the server that reads the proof (the AD server).
+    #                  The proof must also be of the same Convert batch file and, when PolicyGuid is set here, of that policy.
     # ---------------------------------------------------------------------
     Retention = @{
         Enabled              = $true

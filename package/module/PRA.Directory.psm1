@@ -1642,6 +1642,8 @@ function Get-PraSharedPermission {
         if (-not $deniedEntries.Contains($entry)) { $deniedEntries.Add($entry) }
         foreach ($deniedUpn in $who.Upns) { [void]$Upns.Add($deniedUpn) }
     }
+    # An ACE grants or refuses an extended right when its rights hold the extended-right bit (0x100) or full control (GenericAll, as a mask or as the rights that the directory expands it to).
+    $hasExtendedRight = { param($Rights) if ($Rights -is [string]) { return [bool]($Rights -match 'ExtendedRight|GenericAll') }; $mask = [int64]$Rights; return ((($mask -band 0x100) -ne 0) -or (($mask -band 0x10000000) -ne 0)) }
     if (-not $settings.Enabled) { return @{ FullAccess=@(); SendAs=@(); SendOnBehalf=@() } }
     Write-PraLog -Context $Context -Message "Shared mailbox permissions | DC=$($Context.Server) | $($User.DistinguishedName) | source=$($settings.PermissionSource)" -Level Debug
     # The configured text is mapped to its official spelling by ordinal comparison before the switch (culture-sensitive string matching ignores zero-weight characters).
@@ -1655,10 +1657,10 @@ function Get-PraSharedPermission {
             $sendRules = if ($security -is [Security.AccessControl.ObjectSecurity]) { $security.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) } else { $security.Access }
             foreach ($ace in $sendRules) {
                 if ((Test-PraOrdinalIgnoreCaseEqual $ace.AccessControlType 'Allow') -and -not $ace.IsInherited -and
-                    $ace.ActiveDirectoryRights -match 'ExtendedRight' -and (Test-PraOrdinalIgnoreCaseEqual ([string]$ace.ObjectType) 'ab721a54-1e2f-11d0-9819-00aa0040529b')) {
+                    (& $hasExtendedRight $ace.ActiveDirectoryRights) -and (Test-PraOrdinalIgnoreCaseEqual ([string]$ace.ObjectType) 'ab721a54-1e2f-11d0-9819-00aa0040529b')) {
                     foreach ($upn in @(Resolve-PraAclTrustee -Context $Context -Reference $ace.IdentityReference -Unknown $unknownSendAs)) { [void]$send.Add($upn) }
                 }
-                elseif ((Test-PraOrdinalIgnoreCaseEqual $ace.AccessControlType 'Deny') -and $ace.ActiveDirectoryRights -match 'ExtendedRight' -and
+                elseif ((Test-PraOrdinalIgnoreCaseEqual $ace.AccessControlType 'Deny') -and (& $hasExtendedRight $ace.ActiveDirectoryRights) -and
                     (Test-PraOrdinalIn ([string]$ace.ObjectType) @('ab721a54-1e2f-11d0-9819-00aa0040529b', '00000000-0000-0000-0000-000000000000') -IgnoreCase)) {
                     & $noteDenied 'SendAs' $ace $deniedSend
                 }

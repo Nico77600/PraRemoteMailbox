@@ -101,7 +101,7 @@ The directory server often cannot reach Microsoft 365. It cannot see the retenti
 
 `.\Invoke-PraRemoteMailbox.ps1 -Action Check -Batch 490cc62e -Expect Retained`
 
-It only reads. It writes a small proof of what it saw, in the folder `Backups\Outbox`. Copy the two `RetentionProof` files to the folder `Backups\Inbox` of the directory server. The proof is good for 24 hours. The rollback of step 3 uses it when it covers every mailbox. The page **Task** says if a proof was found, and how old it is. If the proof is old, damaged or incomplete, the rollback is refused. The **Next steps** then give the same command again.
+It only reads. It writes a small proof of what it saw, in the folder `Backups\Outbox`. Copy the two `RetentionProof` files to the folder `Backups\Inbox` of the directory server. The directory server accepts a proof for 24 hours. That is its own setting. The rollback of step 3 uses the proof only if the directory server cannot ask Exchange Online. The proof must cover every mailbox. The proof is a checked file, not a signature. Only the people who run the tool should write in the folder `Backups\Inbox`. The page **Task** says if a proof was found, and how old it is. If the proof is old, damaged or incomplete, the rollback is refused. The **Next steps** then give the same command again.
 
 Step 5 exists only if step 4 wrote a Finalize package. Shared mailboxes need it. So do mailboxes with a retention tag. If step 4 writes no package, it ends with the global report. The rollback is then done.
 

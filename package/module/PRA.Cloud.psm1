@@ -73,7 +73,7 @@ $ErrorActionPreference = 'Stop'
 
 # Fixed worker body, also run in the child process: no code or cmdlet name ever comes from data.
 $script:PraExoWorker = {
-    param([ValidateSet('Probe','Preflight','Mailbox','Recipient','Hold','Permission','Grant')][string]$Operation,$P,$Permit,$SessionBinding,$OnApplied,$OnProgress)
+    param([ValidateSet('Probe','Preflight','Mailbox','Recipient','Hold','HoldBulk','Permission','Grant')][string]$Operation,$P,$Permit,$SessionBinding,$OnApplied,$OnProgress)
     Set-StrictMode -Version Latest
     $ErrorActionPreference = 'Stop'
     function V {
@@ -242,13 +242,65 @@ $script:PraExoWorker = {
         $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
         return @{ Found=$true; Type=$type; Keys=@($keys | Where-Object { $seenKeys.Add([string]$_) }); ObjectId=$oid; PrimarySmtpAddress=$smtp }
     }
+    # The inactive mailbox of a deleted account has no account to confirm and another ExternalDirectoryObjectId than a live account with the same UPN.
+    # Without a confirmed account it is found by UPN. With a confirmed account, an inactive mailbox that carries another ExternalDirectoryObjectId belongs to an
+    # earlier account: it is not the mailbox of this object and never decides the verdict. One that carries none is a candidate found by UPN. Several candidates
+    # are told apart by the mailbox GUID recorded on premises (ExchangeGuid) when the record has one; otherwise they are an ambiguity, never a guess.
+    # A single candidate found by UPN must carry the recorded mailbox GUID only when the record shows that the GUID was kept on the cloud mailbox (GuidKept).
+    # Used by the read of one mailbox and by the in-memory match of a bulk read: one rule set.
+    function PickInactive {
+        param([string]$Upn,[string]$ById,[object[]]$Guids,[bool]$GuidKept,[object[]]$Items)
+        $items=@($Items)
+        $earlier={ param([int]$Count) @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@(); EarlierAccount=$true; EarlierCount=$Count } }
+        if ($ById) {
+            $own = @($items | Where-Object { SameIgnoreCase ([string](V $_ 'ExternalDirectoryObjectId' '')) $ById })
+            $nameless = @($items | Where-Object { [string]::IsNullOrWhiteSpace([string](V $_ 'ExternalDirectoryObjectId' '')) })
+            if ($own.Count) { $items = $own }
+            elseif ($nameless.Count) { $items = $nameless }
+            elseif ($items.Count) { return @{ Earlier=(& $earlier ([int]$items.Count)); Items=@(); InactiveByUpn=$false } }
+        }
+        $recorded = @(); foreach ($group in @($Guids)) { foreach ($each in @($group)) { if ($each) { $recorded += [string]$each } } }
+        $foundById = [bool]($ById -and @($items | Where-Object { SameIgnoreCase ([string](V $_ 'ExternalDirectoryObjectId' '')) $ById }).Count)
+        if ($items.Count -eq 1 -and $GuidKept -and $recorded.Count -and -not $foundById -and -not (InGuidSet (V $items[0] 'ExchangeGuid' '') $recorded)) {
+            return @{ Earlier=(& $earlier 1); Items=@(); InactiveByUpn=$false }
+        }
+        if ($items.Count -gt 1 -and -not $foundById) {
+            $matching = @($items | Where-Object { InGuidSet (V $_ 'ExchangeGuid' '') $recorded })
+            if ($matching.Count -ne 1) {
+                $tellApart = if ($recorded.Count) { ' The mailbox GUID recorded for this object does not tell them apart either.' } else { ' This object has no mailbox GUID recorded (it was not an on-premises mailbox, or the record is older), so nothing tells them apart.' }
+                throw ("Exchange Online has $($items.Count) inactive mailboxes for $Upn and nothing tells which one belongs to this object: the retention cannot be checked for it.$tellApart To list them, run: Get-EXOMailbox -InactiveMailboxOnly -Filter ""$(ExactFilter $Upn)"" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds | Format-List Name,ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds. Then check by hand, in the Microsoft Purview portal, the retention of the mailbox of this object.")
+            }
+            $items = $matching
+        }
+        $inactiveByUpn = ($items.Count -eq 1 -and -not ($ById -and (SameIgnoreCase ([string](V $items[0] 'ExternalDirectoryObjectId' '')) $ById)))
+        return @{ Earlier=$null; Items=$items; InactiveByUpn=[bool]$inactiveByUpn }
+    }
+    function MailboxResult {
+        param($Item,[string]$Upn,[bool]$InactiveByUpn)
+        $m = $Item; $type = [string](V $m 'RecipientTypeDetails')
+        if (-not $type) { throw "Mailbox type not returned: $Upn" }
+        $mailboxOid=[string](V $m 'ExternalDirectoryObjectId' ''); $confirmed=V (V $P 'VerifiedObjectIds' @{}) $Upn
+        if (-not $InactiveByUpn -and $mailboxOid -and $null -ne $confirmed -and $confirmed -and -not (SameIgnoreCase $mailboxOid $confirmed)) { throw "The Exchange Online mailbox is not the Microsoft Entra ID account confirmed for this object: $Upn" }
+        $holds = V -Object $m -Name 'InPlaceHolds' -Default @()
+        # EmailAddresses (every proxy address of the mailbox, X500 included): whether Exchange Online returned the property at all is kept apart from "empty".
+        $hasAddresses = if ($m -is [System.Collections.IDictionary]) { $m.Contains('EmailAddresses') } else { $null -ne $m.PSObject.Properties['EmailAddresses'] }
+        $rawAddresses = V -Object $m -Name 'EmailAddresses' -Default @()
+        # Exchange Online never lists the LegacyExchangeDN of a mailbox in its own EmailAddresses, but Entra Connect may have written it on premises as an X500 address
+        # while the object was still a MailUser: the mailbox counts as carrying X500:<its own LegacyExchangeDN> (the whole value is compared ignoring case, like every X500).
+        $ownDn = [string](V -Object $m -Name 'LegacyExchangeDN' -Default '')
+        $addressList = @($rawAddresses | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        if ($ownDn -and -not (InSetIgnoreCase ('X500:' + $ownDn) $addressList)) { $addressList += ('X500:' + $ownDn) }
+        return @{ Found=$true; Type=$type; Holds=@($holds | Where-Object { $null -ne $_ }); IsInactive=[bool](V -Object $m -Name 'IsInactiveMailbox' -Default $false)
+            Litigation=[bool](V -Object $m -Name 'LitigationHoldEnabled' -Default $false); RetentionHold=[bool](V -Object $m -Name 'RetentionHoldEnabled' -Default $false)
+            HasAddresses=[bool]$hasAddresses; Addresses=[string[]]$addressList; IdentityByUpn=[bool]$InactiveByUpn }
+    }
     function Mailbox {
         param([string]$Upn,[switch]$Hold)
         $properties = @('RecipientTypeDetails','EmailAddresses','LegacyExchangeDN','ExternalDirectoryObjectId')
         if ($Hold) { $properties += @('IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled','ExchangeGuid') }
         $byId = Confirmed $Upn
         if ($byId) {
-            # Where an absent mailbox is the expected answer (AbsenceConfirms: the deprovisioning check of a Recover), only an explicit, recognised "not found" for this id counts as absent;
+            # Where an absent mailbox is the expected answer (AbsenceConfirms: the deprovisioning check of a Recover, the retention check), only an explicit, recognised "not found" for this id counts as absent;
             # any other error is a failed read. Elsewhere an absent mailbox only means "not yet", and the broader match stays.
             try { $items = @(Get-EXOMailbox -ExternalDirectoryObjectId $byId -Properties $properties -ErrorAction Stop) }
             catch {
@@ -261,54 +313,69 @@ $script:PraExoWorker = {
         else { $items = @(Get-EXOMailbox -Filter (ExactFilter $Upn) -Properties $properties -ResultSize Unlimited -ErrorAction Stop) }
         $inactiveByUpn = $false
         if ($Hold -and $items.Count -eq 0) {
-            # The inactive mailbox of a deleted account has no account to confirm and another ExternalDirectoryObjectId than a live account with the same UPN.
-            # Without a confirmed account it is found by UPN. With a confirmed account, an inactive mailbox that carries another ExternalDirectoryObjectId belongs to an
-            # earlier account: it is not the mailbox of this object and never decides the verdict. One that carries none is a candidate found by UPN. Several candidates
-            # are told apart by the mailbox GUID recorded on premises (ExchangeGuid) when the record has one; otherwise they are an ambiguity, never a guess.
-            $items = @(Get-EXOMailbox -Filter (ExactFilter $Upn) -Properties $properties -ResultSize Unlimited -InactiveMailboxOnly -ErrorAction Stop)
-            if ($byId) {
-                $own = @($items | Where-Object { SameIgnoreCase ([string](V $_ 'ExternalDirectoryObjectId' '')) $byId })
-                $nameless = @($items | Where-Object { [string]::IsNullOrWhiteSpace([string](V $_ 'ExternalDirectoryObjectId' '')) })
-                if ($own.Count) { $items = $own }
-                elseif ($nameless.Count) { $items = $nameless }
-                elseif ($items.Count) {
-                    return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@(); EarlierAccount=$true; EarlierCount=[int]$items.Count }
-                }
-            }
-            $guids = @(V $P 'MailboxGuids' @() | Where-Object { $_ })
-            $foundById = [bool]($byId -and @($items | Where-Object { SameIgnoreCase ([string](V $_ 'ExternalDirectoryObjectId' '')) $byId }).Count)
-            if ($items.Count -eq 1 -and $guids.Count -and -not $foundById -and -not (InGuidSet (V $items[0] 'ExchangeGuid' '') $guids)) {
-                # A single candidate found by UPN is this object's mailbox only when it carries the mailbox GUID recorded for the object.
-                return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@(); EarlierAccount=$true; EarlierCount=1 }
-            }
-            if ($items.Count -gt 1 -and -not $foundById) {
-                $matching = @($items | Where-Object { InGuidSet (V $_ 'ExchangeGuid' '') $guids })
-                if ($matching.Count -ne 1) {
-                    $recorded = if ($guids.Count) { ' The mailbox GUID recorded for this object does not tell them apart either.' } else { ' This object has no mailbox GUID recorded (it was not an on-premises mailbox, or the record is older), so nothing tells them apart.' }
-                    throw ("Exchange Online has $($items.Count) inactive mailboxes for $Upn and nothing tells which one belongs to this object: the retention cannot be checked for it.$recorded To list them, run: Get-EXOMailbox -InactiveMailboxOnly -Filter ""$(ExactFilter $Upn)"" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds | Format-List Name,ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted,InPlaceHolds. Then check by hand, in the Microsoft Purview portal, the retention of the mailbox of this object.")
-                }
-                $items = $matching
-            }
-            $inactiveByUpn = ($items.Count -eq 1 -and -not ($byId -and (SameIgnoreCase ([string](V $items[0] 'ExternalDirectoryObjectId' '')) $byId)))
+            $candidates = @(Get-EXOMailbox -Filter (ExactFilter $Upn) -Properties $properties -ResultSize Unlimited -InactiveMailboxOnly -ErrorAction Stop)
+            $recordedGuids = V $P 'MailboxGuids' @()
+            $pick = PickInactive $Upn $byId $recordedGuids ([bool](V $P 'GuidKept' $false)) $candidates
+            if ($null -ne $pick.Earlier) { return $pick.Earlier }
+            $items = @($pick.Items); $inactiveByUpn = [bool]$pick.InactiveByUpn
         }
         if ($items.Count -gt 1) { throw "Exchange Online mailbox not unique: $Upn" }
         if ($items.Count -eq 0) { return @{ Found=$false; Type=$null; Holds=@(); IsInactive=$false; Litigation=$false; RetentionHold=$false; HasAddresses=$false; Addresses=[string[]]@() } }
-        $m = $items[0]; $type = [string](V $m 'RecipientTypeDetails')
-        if (-not $type) { throw "Mailbox type not returned: $Upn" }
-        $mailboxOid=[string](V $m 'ExternalDirectoryObjectId' ''); $confirmed=V (V $P 'VerifiedObjectIds' @{}) $Upn
-        if (-not $inactiveByUpn -and $mailboxOid -and $null -ne $confirmed -and $confirmed -and -not (SameIgnoreCase $mailboxOid $confirmed)) { throw "The Exchange Online mailbox is not the Microsoft Entra ID account confirmed for this object: $Upn" }
-        $holds = V -Object $m -Name 'InPlaceHolds' -Default @()
-        # EmailAddresses (every proxy address of the mailbox, X500 included): whether Exchange Online returned the property at all is kept apart from "empty".
-        $hasAddresses = if ($m -is [System.Collections.IDictionary]) { $m.Contains('EmailAddresses') } else { $null -ne $m.PSObject.Properties['EmailAddresses'] }
-        $rawAddresses = V -Object $m -Name 'EmailAddresses' -Default @()
-        # Exchange Online never lists the LegacyExchangeDN of a mailbox in its own EmailAddresses, but Entra Connect may have written it on premises as an X500 address
-        # while the object was still a MailUser: the mailbox counts as carrying X500:<its own LegacyExchangeDN> (the whole value is compared ignoring case, like every X500).
-        $ownDn = [string](V -Object $m -Name 'LegacyExchangeDN' -Default '')
-        $addressList = @($rawAddresses | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
-        if ($ownDn -and -not (InSetIgnoreCase ('X500:' + $ownDn) $addressList)) { $addressList += ('X500:' + $ownDn) }
-        return @{ Found=$true; Type=$type; Holds=@($holds | Where-Object { $null -ne $_ }); IsInactive=[bool](V -Object $m -Name 'IsInactiveMailbox' -Default $false)
-            Litigation=[bool](V -Object $m -Name 'LitigationHoldEnabled' -Default $false); RetentionHold=[bool](V -Object $m -Name 'RetentionHoldEnabled' -Default $false)
-            HasAddresses=[bool]$hasAddresses; Addresses=[string[]]$addressList; IdentityByUpn=[bool]$inactiveByUpn }
+        return (MailboxResult $items[0] $Upn $inactiveByUpn)
+    }
+    # The retention check of many mailboxes: the active and the inactive mailboxes that carry the retention tag are read in two server-side searches per tag, then each row is matched in memory
+    # with the rules of Mailbox. A row that the bulk read cannot settle on its own (no active mailbox with the tag, an earlier account, an ambiguity, an inactive mailbox not told by its mailbox GUID)
+    # is left out of the answer: the caller reads it with Mailbox.
+    function HoldBulk {
+        $properties = @('RecipientTypeDetails','ExternalDirectoryObjectId','UserPrincipalName','IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled','ExchangeGuid')
+        $activeByUpn = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
+        $activeById = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
+        $inactiveByUpn = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        $activeCount = 0; $inactiveCount = 0
+        $add = {
+            param($Index,[string]$Key,$Item)
+            $list = $null
+            if (-not $Index.TryGetValue($Key,[ref]$list)) { $list = New-Object 'System.Collections.Generic.List[object]'; $Index[$Key] = $list }
+            $list.Add($Item)
+        }
+        $tags = V $P 'Filters' @()
+        foreach ($tag in @($tags)) {
+            $attribute = [string](V $tag 'Attribute' ''); $value = [string](V $tag 'Value' '')
+            if ($attribute -notmatch '\ACustomAttribute([1-9]|1[0-5])\z' -or [string]::IsNullOrWhiteSpace($value) -or $value -match '[\r\n\x00]') { throw 'Invalid retention tag filter.' }
+            $filter = "$attribute -eq '$($value.Replace("'","''"))'"
+            foreach ($mailbox in @(Get-EXOMailbox -Filter $filter -Properties $properties -ResultSize Unlimited -ErrorAction Stop)) {
+                if (-not $seen.Add('A|' + [string](V $mailbox 'ExternalDirectoryObjectId' '') + '|' + [string](V $mailbox 'ExchangeGuid' '') + '|' + [string](V $mailbox 'UserPrincipalName' ''))) { continue }
+                $activeCount++
+                & $add $activeByUpn ([string](V $mailbox 'UserPrincipalName' '')) $mailbox
+                & $add $activeById ([string](V $mailbox 'ExternalDirectoryObjectId' '')) $mailbox
+            }
+            foreach ($mailbox in @(Get-EXOMailbox -Filter $filter -Properties $properties -ResultSize Unlimited -InactiveMailboxOnly -ErrorAction Stop)) {
+                if (-not $seen.Add('I|' + [string](V $mailbox 'ExternalDirectoryObjectId' '') + '|' + [string](V $mailbox 'ExchangeGuid' '') + '|' + [string](V $mailbox 'UserPrincipalName' ''))) { continue }
+                $inactiveCount++
+                & $add $inactiveByUpn ([string](V $mailbox 'UserPrincipalName' '')) $mailbox
+            }
+        }
+        $results = New-Object 'System.Collections.Generic.List[object]'
+        $requestRows = V $P 'Rows' @()
+        foreach ($row in @($requestRows)) {
+            $rowUpn = [string](V $row 'Upn' ''); $rowId = [string](V $row 'ById' ''); $answer = $null
+            try {
+                $candidates = $null
+                $found = if ($rowId) { $activeById.TryGetValue($rowId,[ref]$candidates) } else { $activeByUpn.TryGetValue($rowUpn,[ref]$candidates) }
+                if ($found -and $candidates.Count -eq 1) { $answer = MailboxResult $candidates[0] $rowUpn $false }
+                elseif (-not $found) {
+                    $rowGuids = V $row 'MailboxGuids' @()
+                    $items = $null
+                    if (@($rowGuids).Count -and [bool](V $row 'GuidKept' $false) -and $inactiveByUpn.TryGetValue($rowUpn,[ref]$items)) {
+                        $pick = PickInactive $rowUpn $rowId $rowGuids $true @($items)
+                        if ($null -eq $pick.Earlier -and @($pick.Items).Count -eq 1 -and (InGuidSet (V $pick.Items[0] 'ExchangeGuid' '') $rowGuids)) { $answer = MailboxResult $pick.Items[0] $rowUpn ([bool]$pick.InactiveByUpn) }
+                    }
+                }
+            } catch { $answer = $null }
+            if ($null -ne $answer) { $answer.Key = [string](V $row 'Key' ''); $results.Add($answer) }
+        }
+        return @{ Found=$true; Results=$results.ToArray(); ActiveCount=[int]$activeCount; InactiveCount=[int]$inactiveCount }
     }
     function NormalizeAcl {
         param([object[]]$Entries,[string]$Right,$Target)
@@ -420,7 +487,7 @@ $script:PraExoWorker = {
         return $false
     }
     # The ValidateSet of the worker accepts any casing and, under ICU, names with an invisible character: only the exact names pass.
-    if (-not (InSet $Operation @('Probe','Preflight','Mailbox','Recipient','Hold','Permission','Grant'))) { throw 'Unknown Exchange Online operation.' }
+    if (-not (InSet $Operation @('Probe','Preflight','Mailbox','Recipient','Hold','HoldBulk','Permission','Grant'))) { throw 'Unknown Exchange Online operation.' }
     $binding=Session
     if ((SameIgnoreCase $Operation 'Probe')) { [void]$binding.Remove('Command'); return @{ Connected=$true; Binding=$binding } }
     $SessionBinding=$binding
@@ -444,6 +511,7 @@ $script:PraExoWorker = {
         'Mailbox' { return (Mailbox $upn) }
         'Recipient' { return (Recipient $upn) }
         'Hold' { return (Mailbox $upn -Hold) }
+        'HoldBulk' { return (HoldBulk) }
     }
     $trustee = [string](V $P 'Trustee'); $right = [string](V $P 'Right')
     if (-not (InSetIgnoreCase $right @('FullAccess','SendAs','SendOnBehalf'))) { throw 'Unknown permission.' }
@@ -1041,7 +1109,7 @@ if ($failure) { exit 1 }; exit 0
 }
 
 function Invoke-PraExo {
-    param([hashtable]$Context,[ValidateSet('Probe','Preflight','Mailbox','Recipient','Hold','Permission','Grant')][string]$Operation,[hashtable]$Params=@{},$Permit=$null,$OnApplied=$null,$OnProgress=$null)
+    param([hashtable]$Context,[ValidateSet('Probe','Preflight','Mailbox','Recipient','Hold','HoldBulk','Permission','Grant')][string]$Operation,[hashtable]$Params=@{},$Permit=$null,$OnApplied=$null,$OnProgress=$null)
     $session = Get-PraCloudSession $Context
     if (-not $session.Exo) { throw 'Exchange Online connection required but not available.' }
     if (-not $session.Subprocess -and -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue (Get-PraValue $session 'Binding' $null) 'TenantId' '')) ([string](Get-PraValue (Get-PraValue $Context.Config 'Cloud' @{}) 'TenantId' '')))) { throw 'Exchange Online tenant of the session differs from Cloud.TenantId.' }
@@ -1857,6 +1925,9 @@ function Invoke-PraCloudPhase {
     }
 }
 
+# From this many rows the retention check reads the tagged mailboxes in bulk instead of one by one.
+$script:PraRetentionBulkMinimum = 20
+
 function Get-PraRetentionVerdictError {
     <# The exception of a retention check that is an answer about the mailbox, not a failure to ask: Kind is NoMailbox (nothing to retain), PolicyUnknown (the policy is not named, so coverage cannot be told) or NotCovered. #>
     [CmdletBinding()]
@@ -1905,27 +1976,28 @@ function Resolve-PraRetentionPolicyGuid {
     return $guid
 }
 
-function Test-PraRetentionRow {
-    <# Reads the mailbox of one row in Exchange Online and tells whether the retention policy $Guid holds it: 'Covered' (the row is a success, its detail says so) or 'Failed' (an identity check failed and was recorded as an error). Any other answer is thrown: a verdict (Get-PraRetentionVerdictError) or the failure of a call. -Strict: a failed identity check is thrown instead of recorded. #>
+function Test-PraMailboxGuidKept {
+    <# True when the batch left the mailbox GUID on the object (msExchMailboxGuid is still present in the state that the Convert wrote), so that the cloud mailbox carries the recorded GUID. False when the Convert cleared it, and for a record that does not say. #>
+    param($Record)
+    $planned = Get-PraValue (Get-PraValue $Record 'PlannedAttributes' $null) 'msExchMailboxGuid' $null
+    if ($null -eq $planned) { return $false }
+    return [bool](Get-PraValue $planned 'Present' $false)
+}
+
+function Get-PraRetentionHoldDecision {
+    <# The verdict of the retention policy $Guid for one mailbox, from the answer of the Hold read ($Hold): 'Covered' (the row is a success, its detail says so); any other answer is thrown as a verdict (Get-PraRetentionVerdictError). Shared by the read of one mailbox and by the match of a bulk read. #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)]$Row,[AllowNull()][string]$Guid,[switch]$Strict)
-    $holdUpn=[string](Get-PraValue $Row 'UserPrincipalName' '')
-    # An inactive mailbox has no account in Microsoft Entra ID any more: it is found by UPN only. An account that exists must be the synchronised one.
-    if (Test-PraIdentityCheck $Context) {
-        $identity=Confirm-PraCloudIdentity -Context $Context -State @{ Row=$Row; Upn=$holdUpn; Requests=@(); PlainText='' } -Throw:$Strict
-        if (Test-PraOrdinalEqual $identity 'Failed') { return 'Failed' }
-    }
-    $holdSource=Get-PraValue $Row 'BackupRec' $null; if ($null -eq $holdSource) { $holdSource=$Row }
-    $h=Invoke-PraExo -Context $Context -Operation 'Hold' -Params @{ Upn=$holdUpn; MailboxGuids=[string[]]@(Get-PraRecordedMailboxGuid $holdSource) }
+    param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)]$Row,[Parameter(Mandatory)]$Hold,[AllowNull()][string]$Guid,[string]$HoldUpn,[switch]$Strict)
+    $h=$Hold
     $Row.CloudMailbox=[bool](Get-PraValue $h 'Found' $false)
     if ([bool](Get-PraValue $h 'EarlierAccount' $false)) {
-        $note=('{0}: not this object''s mailbox. Exchange Online has an inactive mailbox with this UPN, but it belongs to an earlier account (another ExternalDirectoryObjectId than the account confirmed for this object, or another mailbox GUID than the one recorded for it), so its retention does not count for this object. To see it, run: Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''{1}''" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted | Format-List Name,ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted' -f $holdUpn, $holdUpn.Replace("'","''"))
+        $note=('{0}: not this object''s mailbox. Exchange Online has an inactive mailbox with this UPN, but it belongs to an earlier account (another ExternalDirectoryObjectId than the account confirmed for this object, or another mailbox GUID than the one recorded for it), so its retention does not count for this object. To see it, run: Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''{1}''" -Properties ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted | Format-List Name,ExternalDirectoryObjectId,ExchangeGuid,WhenSoftDeleted' -f $HoldUpn, $HoldUpn.Replace("'","''"))
         Write-PraItem -Context $Context -Status Warn -Text $note
         $Row.Warnings=([string](Get-PraValue $Row 'Warnings' '') + '; ' + $note).Trim(' ',';')
         throw (Get-PraRetentionVerdictError -Kind NoMailbox -Message 'Not covered by the policy: the only inactive mailbox with this UPN is not this object''s mailbox (it belongs to an earlier account). Retention: Found=False; EarlierAccount=True')
     }
     if ([bool](Get-PraValue $h 'IdentityByUpn' $false)) {
-        $note=('{0}: the inactive mailbox is found by its UPN only: its account is deleted, so it cannot be confirmed against Active Directory. Check that it is the mailbox of this object.' -f $holdUpn)
+        $note=('{0}: the inactive mailbox is found by its UPN only: its account is deleted, so it cannot be confirmed against Active Directory. Check that it is the mailbox of this object.' -f $HoldUpn)
         Write-PraItem -Context $Context -Status Warn -Text $note
         $Row.Warnings=([string](Get-PraValue $Row 'Warnings' '') + '; ' + $note).Trim(' ',';')
     }
@@ -1948,6 +2020,24 @@ function Test-PraRetentionRow {
     $Row.CloudDetail+=' | COVERED (GUID='+$Guid+')'
     $null=Write-PraLog -Context $Context -Message $Row.CloudDetail -Level $(if ($Strict) { 'Detail' } else { 'Success' })
     return 'Covered'
+}
+
+function Test-PraRetentionRow {
+    <# Reads the mailbox of one row in Exchange Online and tells whether the retention policy $Guid holds it: 'Covered' (the row is a success, its detail says so) or 'Failed' (an identity check failed and was recorded as an error). Any other answer is thrown: a verdict (Get-PraRetentionVerdictError) or the failure of a call. -Strict: a failed identity check is thrown instead of recorded. -Hold: the answer of a read already made (a bulk read), used instead of a read. -IdentityDone: the account of the row was already confirmed. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)]$Row,[AllowNull()][string]$Guid,[switch]$Strict,$Hold=$null,[switch]$IdentityDone)
+    $holdUpn=[string](Get-PraValue $Row 'UserPrincipalName' '')
+    # An inactive mailbox has no account in Microsoft Entra ID any more: it is found by UPN only. An account that exists must be the synchronised one.
+    if (-not $IdentityDone -and (Test-PraIdentityCheck $Context)) {
+        $identity=Confirm-PraCloudIdentity -Context $Context -State @{ Row=$Row; Upn=$holdUpn; Requests=@(); PlainText='' } -Throw:$Strict
+        if (Test-PraOrdinalEqual $identity 'Failed') { return 'Failed' }
+    }
+    $h=$Hold
+    if ($null -eq $h) {
+        $holdSource=Get-PraValue $Row 'BackupRec' $null; if ($null -eq $holdSource) { $holdSource=$Row }
+        $h=Invoke-PraExo -Context $Context -Operation 'Hold' -Params @{ Upn=$holdUpn; MailboxGuids=[string[]]@(Get-PraRecordedMailboxGuid $holdSource); GuidKept=(Test-PraMailboxGuidKept $holdSource); AbsenceConfirms=$true }
+    }
+    return (Get-PraRetentionHoldDecision -Context $Context -Row $Row -Hold $h -Guid $Guid -HoldUpn $holdUpn -Strict:$Strict)
 }
 
 function Invoke-PraRetentionCheck {
@@ -2030,26 +2120,33 @@ function Get-PraRetentionFailureReason {
 function Test-PraRetentionCoverage {
     <#
     .SYNOPSIS
-        Before a Recover removes the cloud mailboxes: for each row, tells whether the retention policy holds the mailbox (read only: one read of Exchange Online per row, within the retry budgets of the run).
+        Before a Recover removes the cloud mailboxes: for each row, tells whether the retention policy holds the mailbox (read only, within the retry budgets of this check).
     .DESCRIPTION
         Never records an error of the run. A mailbox that the policy does not hold is in NotCovered; a mailbox that could not be read, or whose policy is not named, is in Unverified (the rest are Unverified too once a
-        failure would stop every other read). A row without a mailbox in Exchange Online has nothing to retain (NoMailbox). The rows of the caller are not changed.
+        failure would stop every other read). A row without a mailbox in Exchange Online has nothing to retain (NoMailbox, listed in NoMailboxList). The rows of the caller are not changed.
+        With 20 rows or more, the mailboxes that carry the retention tag are read in bulk (one search of the active and one of the inactive mailboxes per tag, whatever the number of rows) and each row is matched in memory
+        with the rules of the read of one mailbox; a row that the bulk read does not settle is read on its own. Microsoft Entra ID accounts are confirmed one by one (kept for the cloud part that follows).
+        The check has its own retry budget: what it spends is not taken from the budget of the cloud part.
         -CloseSession signs out of the sessions that this check opened; without it the session stays open for the cloud part that follows.
     .OUTPUTS
-        Checked, Covered, NoMailbox, NotCovered and Unverified (each entry: ObjectGuid, Upn, Reason), StopReason and PolicyGuid.
+        Checked, Covered, NoMailbox, NoMailboxList, NotCovered and Unverified (each entry: ObjectGuid, Upn, Reason), StopReason, CouldNotAsk (nothing could be answered because Exchange Online could not be reached or asked: no
+        sign-in, no answer, throttling, the policy not named), PolicyGuid, BulkCalls, BulkResolved and SingleReads.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,[switch]$CloseSession)
-    $result=[pscustomobject]@{ Checked=0; Covered=0; NoMailbox=0; NotCovered=(New-Object 'Collections.Generic.List[object]'); Unverified=(New-Object 'Collections.Generic.List[object]'); StopReason=''; PolicyGuid='' }
+    $result=[pscustomobject]@{ Checked=0; Covered=0; NoMailbox=0; NoMailboxList=(New-Object 'Collections.Generic.List[object]'); NotCovered=(New-Object 'Collections.Generic.List[object]'); Unverified=(New-Object 'Collections.Generic.List[object]'); StopReason=''; CouldNotAsk=$false; PolicyGuid=''; BulkCalls=0; BulkResolved=0; SingleReads=0 }
     $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=''
     $addEntry={ param($List,$Row,[string]$Reason) $List.Add([pscustomobject]@{ ObjectGuid=[string](Get-PraValue $Row 'ObjectGuid' ''); Upn=[string](Get-PraValue $Row 'UserPrincipalName' ''); Reason=$Reason }) }
-    $finish={ $result.NotCovered=[object[]]$result.NotCovered.ToArray(); $result.Unverified=[object[]]$result.Unverified.ToArray(); $result }
+    $finish={ $result.NotCovered=[object[]]$result.NotCovered.ToArray(); $result.Unverified=[object[]]$result.Unverified.ToArray(); $result.NoMailboxList=[object[]]$result.NoMailboxList.ToArray(); $result }
+    $hadRetry=$Context.ContainsKey('_PraRetry'); $savedRetry=$null
+    if ($hadRetry) { $savedRetry=$Context['_PraRetry']; [void]$Context.Remove('_PraRetry') }
     try {
         if ($Rows.Count -eq 0) { return (& $finish) }
         $cfg=Get-PraValue $Context.Config 'Retention' @{}; $cloud=Get-PraValue $Context.Config 'Cloud' @{}
         $named=[bool][string](Get-PraValue $cfg 'PolicyGuid' '') -or ([bool][string](Get-PraValue $cfg 'PolicyName' '') -and [bool](Get-PraValue $cfg 'UseComplianceSession' $false) -and -not [string](Get-PraValue $cloud 'AppId' ''))
         if (-not $named) {
             $result.StopReason='Retention.PolicyGuid is not set in the configuration file (and the policy cannot be found from its name), so the retention policy of the mailboxes cannot be told.'
+            $result.CouldNotAsk=$true
             foreach ($row in $Rows) { & $addEntry $result.Unverified $row $result.StopReason }
             return (& $finish)
         }
@@ -2058,11 +2155,30 @@ function Test-PraRetentionCoverage {
         catch {
             $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $_
             if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
-            $result.StopReason=$failed.Reason
+            $result.StopReason=$failed.Reason; $result.CouldNotAsk=[bool]$failed.Stops
             foreach ($row in $Rows) { & $addEntry $result.Unverified $row $result.StopReason }
             return (& $finish)
         }
         $result.PolicyGuid=[string]$guid
+        # What a failed read says: a verdict about the mailbox, or a failure that concerns the one mailbox, or one that stops every other read.
+        $classify={
+            param($Failure,$Row,[string]$Upn)
+            $kind=[string]$Failure.Exception.Data['PraRetention']
+            if (Test-PraOrdinalEqual $kind 'NoMailbox') {
+                $result.NoMailbox++; $result.NoMailboxList.Add([pscustomobject]@{ ObjectGuid=[string](Get-PraValue $Row 'ObjectGuid' ''); Upn=$Upn; Reason=[string]$Failure.Exception.Message })
+                $null=Write-PraLog -Context $Context -Message ('{0}: no mailbox to retain in Exchange Online: {1}' -f $Upn, $Failure.Exception.Message) -Level Detail
+            }
+            elseif (Test-PraOrdinalEqual $kind 'NotCovered') { & $addEntry $result.NotCovered $Row $Failure.Exception.Message }
+            elseif (Test-PraOrdinalEqual $kind 'PolicyUnknown') { & $addEntry $result.Unverified $Row $Failure.Exception.Message }
+            else {
+                $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $Failure -Upn $Upn
+                if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
+                & $addEntry $result.Unverified $Row $failed.Reason
+                if ($failed.Stops) { $result.StopReason=$failed.Reason; $result.CouldNotAsk=$true }
+            }
+        }
+        $identityOn=Test-PraIdentityCheck $Context
+        $work=New-Object 'Collections.Generic.List[object]'
         foreach ($row in $Rows) {
             if ($result.StopReason) { & $addEntry $result.Unverified $row $result.StopReason; continue }
             $objectGuid=[string](Get-PraValue $row 'ObjectGuid' ''); $upn=[string](Get-PraValue $row 'UserPrincipalName' '')
@@ -2070,24 +2186,62 @@ function Test-PraRetentionCoverage {
             $source=Get-PraValue $row 'BackupRec' $null; if ($null -eq $source) { $source=$row }
             $shadow=[pscustomobject]@{ ObjectGuid=$objectGuid; UserPrincipalName=$upn; BackupRec=$source; CloudMailbox=$null; CloudLicense=$null; CloudStatus='Pending'; CloudDetail=''; FinalStatus='Planned'; Warnings=''; Detail='' }
             $result.Checked++
-            try { $null=Test-PraRetentionRow -Context $Context -Row $shadow -Guid $guid -Strict; $result.Covered++ }
-            catch {
-                $failure=$_
-                $kind=[string]$failure.Exception.Data['PraRetention']
-                if (Test-PraOrdinalEqual $kind 'NoMailbox') { $result.NoMailbox++; $null=Write-PraLog -Context $Context -Message ('{0}: no mailbox to retain in Exchange Online: {1}' -f $upn, $failure.Exception.Message) -Level Detail }
-                elseif (Test-PraOrdinalEqual $kind 'NotCovered') { & $addEntry $result.NotCovered $row $failure.Exception.Message }
-                elseif (Test-PraOrdinalEqual $kind 'PolicyUnknown') { & $addEntry $result.Unverified $row $failure.Exception.Message }
-                else {
-                    $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $failure -Upn $upn
+            if ($identityOn) {
+                try { $null=Confirm-PraCloudIdentity -Context $Context -State @{ Row=$shadow; Upn=$upn; Requests=@(); PlainText='' } -Throw }
+                catch { & $classify $_ $row $upn; continue }
+            }
+            $work.Add([pscustomobject]@{ Row=$row; Shadow=$shadow; Upn=$upn; Source=$source; Hold=$null })
+        }
+        $byKey=$null
+        if ($work.Count -ge $script:PraRetentionBulkMinimum) {
+            $filters=New-Object 'Collections.Generic.List[object]'; $knownFilters=New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+            $verified=if ($identityOn) { (Get-PraCloudSession $Context).Verified } else { @{} }
+            $requests=New-Object 'Collections.Generic.List[object]'
+            for ($index=0; $index -lt $work.Count; $index++) {
+                $entry=$work[$index]
+                $tag=Get-PraValue $entry.Source 'Retention' $null
+                $attribute=[string](Get-PraValue $tag 'Attribute' ''); $value=[string](Get-PraValue $tag 'Value' '')
+                if ($attribute -match '\AextensionAttribute(?<n>[1-9]|1[0-5])\z' -and $value) {
+                    $custom='CustomAttribute'+$Matches.n
+                    if ($knownFilters.Add($custom+'='+$value)) { $filters.Add(@{ Attribute=$custom; Value=$value }) }
+                }
+                $confirmed=''; if ($identityOn -and $verified.ContainsKey($entry.Upn)) { $confirmed=[string]$verified[$entry.Upn] }
+                $requests.Add(@{ Key=[string]$index; Upn=$entry.Upn; ById=$confirmed; MailboxGuids=[string[]]@(Get-PraRecordedMailboxGuid $entry.Source); GuidKept=(Test-PraMailboxGuidKept $entry.Source) })
+            }
+            if ($filters.Count) {
+                $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=''
+                try {
+                    $bulk=Invoke-PraExo -Context $Context -Operation 'HoldBulk' -Params @{ Rows=$requests.ToArray(); Filters=$filters.ToArray() }
+                    $result.BulkCalls++
+                    $byKey=New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::Ordinal)
+                    $answers=Get-PraValue $bulk 'Results' @()
+                    foreach ($answered in @($answers)) { $byKey[[string](Get-PraValue $answered 'Key' '')]=$answered }
+                    $null=Write-PraLog -Context $Context -Message ('Retention read in bulk: {0} active and {1} inactive mailbox(es) carry the retention tag; {2} of the {3} object(s) settled by them' -f (Get-PraValue $bulk 'ActiveCount' 0), (Get-PraValue $bulk 'InactiveCount' 0), $byKey.Count, $work.Count) -Level Detail
+                }
+                catch {
+                    $failure=$_
+                    $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $failure
                     if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
-                    & $addEntry $result.Unverified $row $failed.Reason
-                    if ($failed.Stops) { $result.StopReason=$failed.Reason }
+                    $null=Write-PraLog -Context $Context -Message ('The bulk read of the mailboxes that carry the retention tag failed ({0}): they are read one by one' -f ($failed.Reason -replace '\s+',' ')) -Level Detail
+                    if ($failed.Stops) { $result.StopReason=$failed.Reason; $result.CouldNotAsk=$true }
+                    $byKey=$null
                 }
             }
+        }
+        for ($index=0; $index -lt $work.Count; $index++) {
+            $entry=$work[$index]
+            $answered=$null
+            if ($null -ne $byKey -and $byKey.TryGetValue([string]$index,[ref]$answered)) { $entry.Hold=$answered }
+            elseif ($result.StopReason) { & $addEntry $result.Unverified $entry.Row $result.StopReason; continue }
+            $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=[string]$entry.Shadow.ObjectGuid
+            if ($null -ne $entry.Hold) { $result.BulkResolved++ } else { $result.SingleReads++ }
+            try { $null=Test-PraRetentionRow -Context $Context -Row $entry.Shadow -Guid $guid -Strict -IdentityDone -Hold $entry.Hold; $result.Covered++ }
+            catch { & $classify $_ $entry.Row $entry.Upn }
         }
         return (& $finish)
     } finally {
         $Context.CurrentIdentity=''
+        if ($hadRetry) { $Context['_PraRetry']=$savedRetry } else { [void]$Context.Remove('_PraRetry') }
         if ($CloseSession) {
             try { Close-PraCloudSession $Context }
             catch { Write-PraSignOutWarning -Context $Context -Message ([string]$_.Exception.Message) }

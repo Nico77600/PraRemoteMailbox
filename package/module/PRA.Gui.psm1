@@ -253,13 +253,17 @@ function Get-PraGuiBatchCore {
         if (-not (Test-GuiOrdinalIn $core.Operation @('Convert','Recover','RecoverFinalize'))) { throw 'Not a Convert, Recover or RecoverFinalize package.' }
         if (Test-GuiOrdinal (Get-PraGuiValue $data 'Kind' '') 'ADVerified' -IgnoreCase) { throw 'State/proof is not a batch.' }
         $records = @(if (Test-GuiOrdinal $core.Operation 'RecoverFinalize') { Get-PraGuiValue $data 'Items' @() } else { Get-PraGuiValue $data 'Records' @() })
-        $shared = 0
-        foreach ($record in $records) { if ($null -ne $record -and [bool](Get-PraGuiValue $record 'IsShared' $false)) { $shared++ } }
+        $shared = 0; $tagged = New-Object 'Collections.Generic.List[object]'
+        foreach ($record in $records) {
+            if ($null -eq $record) { continue }
+            if ([bool](Get-PraGuiValue $record 'IsShared' $false)) { $shared++ }
+            if ([bool](Get-PraGuiValue (Get-PraGuiValue $record 'Retention' $null) 'Enabled' $false) -and -not [bool](Get-PraGuiValue $record 'PreserveCloudMailbox' $false)) { $tagged.Add([pscustomobject]@{ ObjectGuid=[string](Get-PraGuiValue $record 'ObjectGuid' ''); UserPrincipalName=[string](Get-PraGuiValue $record 'UserPrincipalName' '') }) }
+        }
         $schema = Get-PraGuiValue $data 'SchemaVersion' 1
         $core.Data = [pscustomobject]@{
             Operation=$core.Operation; BatchId=(Get-PraGuiValue $data 'BatchId' $null); Kind=[string](Get-PraGuiValue $data 'Kind' ''); Environment=[string](Get-PraGuiValue $data 'Environment' '')
             SchemaVersion=$schema; RunId=[string](Get-PraGuiValue $data 'RunId' ''); CreatedUtc=[string](Get-PraGuiValue $data 'CreatedUtc' ''); SourceBackupHash=[string](Get-PraGuiValue $data 'SourceBackupHash' '')
-            RecordCount=$records.Count; FirstRecordMissing=($records.Count -eq 0 -or $null -eq $records[0]); SharedCount=$shared }
+            RecordCount=$records.Count; FirstRecordMissing=($records.Count -eq 0 -or $null -eq $records[0]); SharedCount=$shared; TaggedRows=$tagged.ToArray() }
     } catch { $core.Error = $_.Exception.Message }
     $script:PraGuiBatchCache[$Path] = $core
     return $core
@@ -286,29 +290,35 @@ function Get-PraGuiBatchCoreProblem {
     return $problem
 }
 
-function Test-PraGuiBatchSideFile {
-    <# True for the files that share a batch folder with the batch file and are not batches: the proof (State-), the journal, the data of the global report (PhaseData-, PhaseEvents-). #>
-    param([string]$Name)
-    foreach ($prefix in @('State-', 'Journal-', 'PhaseData-', 'PhaseEvents-', 'RetentionProof-')) { if ($Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
-    return $false
-}
-
 $script:PraGuiProofCache = @{}
 
 function Get-PraGuiRetentionProofText {
-    <# What the window says about the retention proof of the selected Convert batch (the AD part of a Recover on a server that cannot ask Exchange Online): found and how old, or why none is usable. '' when nothing is selected. #>
+    <# What the window says about the retention proof of the selected Convert batch, for the objects that the Recover would check: whether this server needs it (it cannot sign in to Exchange Online), or reads it only when Exchange Online cannot be reached (certificate sign-in), and found and how old, or why none is usable. '' when nothing is selected. #>
     $g=$script:Gui
     $row=$g.SelectedBatch
     $config=$g.State.Config
     if ($null -eq $row -or -not $config -or -not [string](Get-PraGuiValue $row 'BatchId' '') -or -not [string](Get-PraGuiValue $row 'Path' '')) { return '' }
     $backup=[string]$config.Storage.BackupFolder
+    $certificate=[bool][string](Get-PraGuiValue (Get-PraGuiValue $config 'Cloud' $null) 'AppId' '')
+    $folders=@((Join-Path $backup 'Inbox'),(Join-Path $backup 'Outbox'),(Split-Path ([string]$row.Path) -Parent))
     try {
-        $proof=Get-PraRetentionProof -Folder @((Join-Path $backup 'Inbox'),(Join-Path $backup 'Outbox'),(Split-Path ([string]$row.Path) -Parent)) -BatchId ([string]$row.BatchId) -Environment ([string]$config.Environment) -MaxAgeHours ([int]$config.Retention.ProofMaxAgeHours) -Cache $script:PraGuiProofCache
-    } catch { return ('The retention proof cannot be looked for: ' + $_.Exception.Message) }
+        $tagged=@(Get-PraGuiValue (Get-PraGuiValue $row 'Data' $null) 'TaggedRows' @())
+        if (-not $tagged.Count) { return 'No object of this batch carries the retention tag: the Recover has no retention to check, and no retention proof is needed.' }
+        $proof=Get-PraRetentionProof -Folder $folders -BatchId ([string]$row.BatchId) -Environment ([string]$config.Environment) -MaxAgeHours ([int]$config.Retention.ProofMaxAgeHours) -Row $tagged -Cache $script:PraGuiProofCache -SourceBackupHash (Get-PraGuiStampedHash ([string]$row.Path)) -PolicyGuid ([string](Get-PraGuiValue (Get-PraGuiValue $config 'Retention' $null) 'PolicyGuid' ''))
+    } catch { return ('The retention proof cannot be looked for: {0}. To see what these folders hold, run: Get-ChildItem -LiteralPath {1} -Filter ''RetentionProof-*''. Then choose Refresh in the window.' -f ($_.Exception.Message -replace '\s+',' '),(ConvertTo-PraGuiPowerShellLiteral $folders[0])) }
     $age=$proof.AgeHours.ToString('0.#',[Globalization.CultureInfo]::InvariantCulture)
-    if ($proof.Found -and $proof.Complete) { return ('A valid retention proof was found: {0} hours old, {1} of {2} mailbox(es) covered. This server can use it, because it cannot ask Exchange Online.' -f $age,$proof.CoveredCount,$proof.ObjectCount) }
-    if ($proof.Found) { return ('A retention proof was found ({0} hours old) but it does not cover every mailbox: {1}.' -f $age,$proof.Reason) }
-    return ('No valid retention proof for this batch ({0}). Run Check with Expected state Retained on the cloud server, then copy the proof files to the Inbox folder of this server.' -f $proof.Reason)
+    $without=@($proof.NoMailbox).Count
+    $withoutText=if ($without) { ', {0} without a mailbox in Exchange Online (nothing to retain; the run warns about them)' -f $without } else { '' }
+    if ($proof.Found -and $proof.Complete) {
+        $use=if ($certificate) { 'This server asks Exchange Online itself (certificate sign-in): the run reads this proof only when Exchange Online cannot be reached.' } else { 'This server cannot sign in to Exchange Online without a person: the run uses this proof.' }
+        return ('A valid retention proof was found: {0} hours old, {1} of {2} mailbox(es) covered{3}. {4}' -f $age,$proof.CoveredCount,$proof.ObjectCount,$withoutText,$use)
+    }
+    if ($proof.Found) {
+        $use=if ($certificate) { 'It matters only if Exchange Online cannot be reached.' } else { 'The run cannot use it.' }
+        return ('A retention proof was found ({0} hours old) but it does not cover every mailbox: {1}. {2}' -f $age,$proof.Reason,$use)
+    }
+    if ($certificate) { return ('No valid retention proof for this batch ({0}). This server asks Exchange Online itself (certificate sign-in), so a proof matters only if Exchange Online cannot be reached: then run Check with Expected state Retained on the cloud server and copy the two proof files to the folder {1}.' -f $proof.Reason,$folders[0]) }
+    return ('No valid retention proof for this batch ({0}). This server cannot sign in to Exchange Online without a person, so the run needs one: run Check with Expected state Retained on the cloud server, then copy the two proof files (RetentionProof-...json and its .sha256 file) to the folder {1}.' -f $proof.Reason,$folders[0])
 }
 
 function Read-PraGuiState {
@@ -320,7 +330,7 @@ function Read-PraGuiState {
     if (-not (Test-Path -LiteralPath $folder)) { $state.BatchError='Backup folder not present yet: '+$folder; return $state }
     try {
         $state.Batches = @(Get-ChildItem -LiteralPath $folder -Recurse -File -Filter '*.json' -ErrorAction Stop |
-            Where-Object { -not (Test-PraGuiBatchSideFile $_.Name) -and (Split-Path $_.DirectoryName -Leaf) -match '^(Batch|Finalize)-' } |
+            Where-Object { -not (Test-PraBatchSideFile $_.Name) -and (Split-Path $_.DirectoryName -Leaf) -match '^(Batch|Finalize)-' } |
             ForEach-Object { Read-PraGuiBatch -Path $_.FullName -Environment $state.Config.Environment })
         # A batch of another environment is not an error of the folder: it is listed apart (a run can switch to its environment).
         $state.OtherEnvironment = @($state.Batches | Where-Object { $_.EnvMismatch } | ForEach-Object { Read-PraGuiBatch -Path $_.Path -Environment $state.Config.Environment -AnyEnvironment } | Where-Object { $_.Valid })
@@ -354,7 +364,7 @@ function Resolve-PraGuiBatch {
         if (-not [IO.Path]::IsPathRooted($path)) { $path=Join-Path $State.Root $path }
         $entry = Get-Item -LiteralPath $path -ErrorAction Stop
         $found = @(if ($entry.PSIsContainer) {
-            @(Get-ChildItem -LiteralPath $entry.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not (Test-PraGuiBatchSideFile $_.Name) } |
+            @(Get-ChildItem -LiteralPath $entry.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not (Test-PraBatchSideFile $_.Name) } |
                 ForEach-Object { Read-PraGuiBatch $_.FullName $State.Config.Environment } | Where-Object { Test-GuiOrdinal $_.Operation $Operation })
         } else { Read-PraGuiBatch $entry.FullName $State.Config.Environment })
     }
@@ -1962,7 +1972,7 @@ function Update-PraGuiTaskView {
     $c.RetentionProofText.Visibility=Get-PraGuiVisibility ([bool]$proofText)
     if (-not $retentionCheck -and $c.F_AcceptRetention.IsChecked) { $g.Updating++; try { $c.F_AcceptRetention.IsChecked=$false } finally { $g.Updating-- } }
     $c.RetentionHint.Text=if ($g.State.Config -and -not [bool]$g.State.Config.Retention.CheckBeforeRecover) { 'The retention check is turned off in the configuration file (Retention.CheckBeforeRecover): the run only says so in a warning.' }
-        else { 'Before the mailboxes are removed from Exchange Online, the run checks that the retention policy holds them, and stops when it does not (the Preview tells which). Tick this to go on anyway: it applies to the next Preview or Apply only, and the run lists what was accepted in its warnings.' }
+        else { 'Before the mailboxes are removed from Exchange Online, the run checks that the retention policy holds them, and stops when it does not (the Preview tells which). Tick this to go on anyway: it stays ticked for Previews and is cleared once an Apply has run, so it covers one Apply only; the run lists what was accepted in its warnings.' }
 }
 
 function Test-PraGuiConfirmed {
