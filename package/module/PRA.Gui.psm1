@@ -7,7 +7,7 @@
     Local metadata is indicative; the engine remains the authority for all backup/proof checks.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.4
+    Version : 3.2.0
 #>
 #Requires -Version 7.5
 Set-StrictMode -Version Latest
@@ -323,7 +323,8 @@ function Get-PraGuiRetentionProofText {
         return ('A retention proof was found ({0} hours old) but it does not cover every mailbox: {1}. {2} Only the newest proof counts, and an older one never completes it: run Check with Expected state Retained again on the cloud server ({3}), then copy the two proof files to the folder {4}. The run leaves out the objects that are already rolled back or were not converted, which only the run can tell: this is an estimate.' -f $age,$proof.Reason,$use,$check,$folders[0])
     }
     if ($proof.PolicyGuidInvalid) { return ('No retention proof can be used: {0}. Correct Retention.PolicyGuid in the settings of the window or in the configuration file; read the GUID of the policy with: {1}' -f $proof.Reason,$lookup) }
-    if (Test-GuiOrdinal $proof.Refusal 'CopyAgain') { return ('The newest retention proof cannot be used ({0}). Copy both files, RetentionProof-...json and its .sha256 file, again from the Backups\Outbox folder of the cloud server to the folder {1}, together and after the copy has ended. An older proof never stands in for it.' -f $proof.Reason,$folders[0]) }
+    if (Test-GuiOrdinal $proof.Refusal 'CopyAgain') { return ('The newest retention proof cannot be used ({0}). Copy both files, RetentionProof-...json and its .sha256 file, again from the Backups\Outbox folder of the cloud server to the folder {1}, together and after the copy has ended. An older proof never stands in for it.{2}' -f $proof.Reason,$folders[0],$(if ([string]$proof.RefusedPath) { ' Delete the damaged copy at ' + [string]$proof.RefusedPath + ' (and its .sha256 file) so that it is not read again.' } else { '' })) }
+    if (Test-GuiOrdinal $proof.Refusal 'PolicyMismatch') { return ('The newest retention proof cannot be used ({0}). It is of another retention policy: put the same Retention.PolicyGuid in the configuration file of the cloud server and of this server (read the GUID with: {1}), then run Check with Expected state Retained again on the cloud server ({2}).' -f $proof.Reason,$lookup,$check) }
     if (Test-GuiOrdinal $proof.Refusal 'Clock') { return ('The newest retention proof cannot be used ({0}). Compare the clocks of the two servers (Get-Date on each, or w32tm /stripchart /computer:<cloud server> /samples:3 /dataonly), then run Check with Expected state Retained again on the cloud server ({1}).' -f $proof.Reason,$check) }
     if ($certificate) { return ('No valid retention proof for this batch ({0}). This server asks Exchange Online itself (certificate sign-in), so a proof matters only if Exchange Online cannot be reached: then run Check with Expected state Retained on the cloud server ({1}) and copy the two proof files to the folder {2}.' -f $proof.Reason,$check,$folders[0]) }
     return ('No valid retention proof for this batch ({0}). This server cannot sign in to Exchange Online without a person, so the run needs one: run Check with Expected state Retained on the cloud server ({1}), then copy the two proof files (RetentionProof-...json and its .sha256 file) to the folder {2}.' -f $proof.Reason,$check,$folders[0])

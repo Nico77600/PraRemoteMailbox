@@ -14,7 +14,7 @@
     claimed to be equivalent.
 .NOTES
     Author : Nicolas Fabert
-    Version: 3.1.4
+    Version: 3.2.0
 #>
 #Requires -Version 7.5
 

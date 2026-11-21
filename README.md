@@ -21,7 +21,7 @@
 </p>
 
 > [!TIP]
-> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/PraRemoteMailbox/releases/latest) and download **`PraRemoteMailbox-3.1.4.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the signed tool, with the HTML guides. Do not use the **Source code** archives or the green **Code** button: they are a copy of the repository, not the release package.
+> **Download the latest release.** Open the [latest release](https://github.com/Nico77600/PraRemoteMailbox/releases/latest) and download **`PraRemoteMailbox-3.2.0.zip`** under *Assets* (its SHA-256 is in the release notes). That ZIP is the signed tool, with the HTML guides. Do not use the **Source code** archives or the green **Code** button: they are a copy of the repository, not the release package.
 
 > [!IMPORTANT]
 > Files downloaded from the Internet may be blocked by Windows and fail to run. Before using this project, unblock every file in the downloaded folder:
@@ -48,10 +48,10 @@ In a hybrid organisation, a mailbox hosted on-premises is only a *mail user* for
 
 Done by hand, this means rewriting about ten Exchange attributes per object in Active Directory, for hundreds of objects, under stress — and keeping every original value to come back later: a wrong or lost value cannot be repaired without a backup. This tool does the conversion in a planned, verified and **reversible** way.
 
-**Author:** Nicolas Fabert · **Version:** 3.1.4, 2026-11-13 ([changelog](CHANGELOG.md)).
+**Author:** Nicolas Fabert · **Version:** 3.2.0, 2026-11-21 ([changelog](CHANGELOG.md)).
 
 > [!CAUTION]
-> Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (reference guide, chapter 6).
+> Convert creates **new, empty** mailboxes in Exchange Online: the content of the on-premises mailboxes is not moved. A Recover deprovisions the cloud mailboxes: export first what was received in the cloud during the disaster, or protect it with a retention policy (reference guide, chapter 6). Before it removes anything, a Recover checks that the retention policy holds the mailboxes and stops when it does not (`-AcceptRetentionRisk` accepts the risk for one run).
 
 ## Get started
 
@@ -68,7 +68,7 @@ One path for everyone. Set the tool up once (**1 to 4**), then take branch **A**
 # 1 · Get your rights. Give the table "Requirements" below to your administrator (minimum rights, derived from the code).
 
 # 2 · On the server, in PowerShell 7.5+ as administrator: put the tool in its folder and unblock it.
-#     Download PraRemoteMailbox-3.1.4.zip from the latest release (under Assets, not Source code) and extract it to D:\PRA\PraRemoteMailbox
+#     Download PraRemoteMailbox-3.2.0.zip from the latest release (under Assets, not Source code) and extract it to D:\PRA\PraRemoteMailbox
 Get-ChildItem D:\PRA\PraRemoteMailbox -Recurse -File -Force | Unblock-File
 Install-Module ExchangeOnlineManagement -MinimumVersion 3.10.1 -Scope AllUsers -Force
 Install-Module Microsoft.Graph.Authentication -MinimumVersion 2.41.1 -Scope AllUsers -Force     # one command per module: PowerShellGet refuses -MinimumVersion with several names
@@ -204,7 +204,7 @@ Exchange on-premises is down, so the tool reads the permissions where Exchange k
 
 Open the console with `pwsh -STA -File .\package\Invoke-PraRemoteMailbox.ps1 -Gui` (native Fluent theme, PowerShell 7.5+, English). It starts no operation by itself; every operation runs the existing engine in a separate **PowerShell 7.5+** process (the same `pwsh.exe`).
 
-The console is a guided path of five pages: **Setup** (the environment, what this server can run, the prerequisite lights from real detection, one line of run settings), **Task** (move mailboxes, roll back, complete a rollback, check a mailbox, on what: one identity to test first, the configured scope, an OU or a CSV, or a batch or package to continue), **Verify** (the Preview in plain words, then the confirmation word in any letter case), **Run** (the steps announced by the engine, with their waits and warnings in plain words; click a step or an object) and **Next steps**. Run settings changed in the window apply to that run only, through a guarded effective copy of the configuration: the file is never rewritten. See the [reference guide, chapter 8](package/docs/PraRemoteMailbox-Guide.md#8-everyday-use).
+The console is a guided path of five pages: **Setup** (the environment, what this server can run, the prerequisite lights from real detection, one line of run settings), **Task** (move mailboxes, roll back, complete a rollback, check a mailbox, on what: one identity to test first, the configured scope, an OU or a CSV, or a batch or package to continue), **Verify** (the Preview in plain words, then the confirmation word in any letter case), **Run** (the steps announced by the engine, with their waits and warnings in plain words; click a step or an object) and **Next steps**. The batch lists show what is **To do** and what is **Finished**. Run settings changed in the window apply to that run only, through a guarded effective copy of the configuration: the file is never rewritten. See the [reference guide, chapter 8](package/docs/PraRemoteMailbox-Guide.md#8-everyday-use).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="package/docs/images/console-run-finished-dark.png">
@@ -221,7 +221,7 @@ Every run writes a log, a PowerShell transcript, a CSV and an HTML report. Exit 
     <td width="50%" valign="top"><a href="package/docs/images/report-phase-warning-light.png"><img alt="The HTML report of a run with a warning on a shared mailbox, and the list of warnings below the table" src="package/docs/images/report-phase-warning-light.png"></a><br><sub><b>Warnings</b> &middot; something was left aside on purpose: shown in the console, the log, the CSV and the report</sub></td>
   </tr>
   <tr>
-    <td width="50%" valign="top"><a href="package/docs/images/report-global-light.png"><img alt="The global report of a Convert across two servers: the times of the AD server and of the cloud server, then every person from end to end" src="package/docs/images/report-global-light.png"></a><br><sub><b>Global report</b> &middot; on two servers, the last server writes one report that follows each object from the first server to the last</sub></td>
+    <td width="50%" valign="top"><a href="package/docs/images/report-global-light.png"><img alt="The global report of a Convert across two servers: the times of the AD server and of the cloud server, then every person from end to end" src="package/docs/images/report-global-light.png"></a><br><sub><b>Global report</b> &middot; on two servers, the last server writes one report that follows each object from the first server to the last, with every object in full CSV files and a light HTML page</sub></td>
     <td width="50%" valign="top"><a href="package/docs/images/report-global-recover-light.png"><img alt="The global report of a rollback across three phases: Recover on the AD server, Recover on the cloud server, Finalize" src="package/docs/images/report-global-recover-light.png"></a><br><sub><b>Rollback</b> &middot; Recover on the AD server, Recover on the cloud server, then Finalize, in one report</sub></td>
   </tr>
 </table>

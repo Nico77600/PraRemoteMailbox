@@ -9,7 +9,7 @@
     No legacy Assert-MockCalled: counters are mutable objects.
 .NOTES
     Author : Nicolas Fabert
-    Version: 3.1.4
+    Version: 3.2.0
     Run it through tests\Invoke-TestGate.ps1 (evidence, PSScriptAnalyzer, mandatory tests).
 #>
 #Requires -Version 7.5
@@ -4747,7 +4747,7 @@ Describe 'Release 2.3.0 - Confirm-PraApply, command line quoting and the single 
         $version | Should -Match '^\d+\.\d+\.\d+$'
         # External anchors: the version is not only compared with the files that quote it. It must be the release that this tree is
         # (update this literal with the release) and the newest heading of the change log.
-        $version | Should -BeExactly '3.1.4'
+        $version | Should -BeExactly '3.2.0'
         $heading=[regex]::Match([IO.File]::ReadAllText((Join-Path $global:PraGate.Release 'CHANGELOG.md')),'(?m)^## (\d+\.\d+\.\d+)\b')
         $heading.Success | Should -BeTrue
         $heading.Groups[1].Value | Should -BeExactly $version -Because 'the first "## x.y.z" heading of CHANGELOG.md is the version of the tree'
@@ -8890,7 +8890,7 @@ Describe 'Release 3.1.3 - every stop ends with a next step, and the Error block 
         Assert-Next313e $run 'Fix the problem named above, then run the same command again:' '^\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -ConfigPath '
     }
     It 'a failed run whose own next steps are hidden still ends with the fallback, and one that set its own keeps them' {
-        $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.4'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
+        $ctx = @{ Root = $global:PraGate.Package; Version = '3.2.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
             CurrentPhase = 'Start'; CurrentOperation = ''; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
             Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $true; ReportFolder = (Join-Path $global:PraGate.Root 'reports-313e'); NoReport = $true; BatchId = 'abcd1234'; LogFile = ''; TranscriptStarted = $false
             NextSteps = @('Copy these two files to the cloud server.'); ExitCode = 1; CloudConnectFailed = $false; ResultStatus = ''; FallbackNext = @('Fix the problem named above, then run the same command again:', '.\Invoke-PraRemoteMailbox.ps1 -Action Convert -Phase AD -Mode Apply') }
@@ -9431,7 +9431,7 @@ Describe 'Release 3.1.3 - the stop names the object that failed, a cancel is not
     It 'a run cancelled by the operator is reported as cancelled: no error, RESULT: CANCELLED, exit code 1, and the command to run it again' {
         $log = Join-Path $global:PraGate.Root 'cancel-313i.log'
         [IO.File]::WriteAllText($log, 'log' + [Environment]::NewLine)
-        $ctx = @{ Root = $global:PraGate.Package; Version = '3.1.4'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
+        $ctx = @{ Root = $global:PraGate.Package; Version = '3.2.0'; RunId = ((Get-Date -Format 'yyyyMMdd_HHmmss') + '-' + [guid]::NewGuid().ToString('N')); StartTime = Get-Date; Action = 'Convert'; Mode = 'Apply'; Phase = 'AD'
             CurrentPhase = 'Start'; CurrentOperation = 'Confirm-Apply'; CurrentIdentity = ''; StepIndex = 0; Warnings = 0; Issues = (New-Object 'Collections.Generic.List[object]'); Rows = (New-Object 'Collections.Generic.List[object]')
             Server = ''; Config = @{ Environment = 'GATE' }; AllowMutation = $false; ReportFolder = (Join-Path $global:PraGate.Root 'reports-313i'); NoReport = $true; BatchId = ''; LogFile = $log; TranscriptPath = $log; _PraTranscriptCreated = $true; TranscriptStarted = $false
             NextSteps = @(); ExitCode = 1; CloudConnectFailed = $false; ResultStatus = ''; Cancelled = $true
@@ -12391,7 +12391,7 @@ Export-ModuleMember -Function Get-EXORecipient, Get-EXOMailbox, Get-Mailbox, Get
         $row.Warnings | Should -Match ([regex]::Escape('Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''user1@gate.invalid''"'))
         $context.Warnings | Should -Be 1
         $context.Issues.Count | Should -Be 1
-        [string]$context.Issues[0].Message | Should -Match 'Not covered by the policy: the only inactive mailbox with this UPN is not this object''s mailbox'
+        [string]$context.Issues[0].Message | Should -Match 'No mailbox of this object to retain: the only inactive mailbox with this UPN is not this object''s mailbox'
     }
     It 'a failure that ends the cloud phase half way keeps the rows that finished and makes an error only of the others' {
         $global:PraGate.R10Rows = New-R10Rows 3
@@ -15427,6 +15427,61 @@ Describe 'Release 3.2.0 - the newest retention proof decides: an older proof nev
         $answer.Reason | Should -BeExactly 'Retention.PolicyGuid of this configuration (not-a-guid) is not a GUID, so no proof can be matched to the policy'
         (Find-H320Proof $folder 1 -Policy '00000000-0000-0000-0000-000000000000').PolicyGuidInvalid | Should -BeTrue
     }
+    It 'a name that carries a time that does not exist is a renamed file, kept as a candidate so that it still blocks, with no raw error' -ForEach @(
+        @{ NameTime = '20261399000000000' }
+        @{ NameTime = '99999999999999999' }
+        @{ NameTime = '20260230120000000' }) {
+        $folder = New-H320Folder
+        $null = New-H320Proof $folder @('Covered', 'Covered') -AgeHours 3
+        $renamed = New-H320Proof $folder @('Covered', 'Covered') -AgeHours 1 -NameTime $NameTime
+        $answer = Find-H320Proof $folder 2
+        $answer.Found | Should -BeFalse
+        $answer.Complete | Should -BeFalse
+        $answer.Refusal | Should -BeExactly 'RunCheck'
+        $answer.Candidates | Should -Be 2
+        $answer.Reason | Should -Match 'its name carries a time that does not exist \(' -Because $NameTime
+        $answer.Reason | Should -Match 'the file was renamed'
+        $answer.RefusedPath | Should -BeExactly ([IO.Path]::GetFullPath($renamed))
+        $answer.Reason | Should -Match ([regex]::Escape([IO.Path]::GetFullPath($renamed)))
+    }
+    It 'the same name in two folders with different content is settled the same way whatever the order of the folders: the valid copy that is named after its content first, then the full path, and the reason gives the full path' {
+        $good = New-H320Folder; $bad = New-H320Folder
+        $a = New-H320Proof $good @('Covered', 'Covered') -AgeHours 1
+        Copy-Item -LiteralPath $a, ($a + '.sha256') -Destination $bad
+        $damaged = Join-Path $bad (Split-Path $a -Leaf)
+        [IO.File]::AppendAllText($damaged, ' ')
+        foreach ($order in @(@($good, $bad), @($bad, $good))) {
+            $answer = Find-H320Proof $order 2
+            $answer.Found | Should -BeTrue
+            $answer.Complete | Should -BeTrue
+            $answer.Path | Should -BeExactly ([IO.Path]::GetFullPath($a))
+        }
+        $first = New-H320Folder; $second = New-H320Folder
+        $b = New-H320Proof $first @('Covered', 'Covered') -AgeHours 1
+        Copy-Item -LiteralPath $b, ($b + '.sha256') -Destination $second
+        $other = Join-Path $second (Split-Path $b -Leaf)
+        [IO.File]::AppendAllText($b, ' '); [IO.File]::AppendAllText($other, '  ')
+        $pair = @([IO.Path]::GetFullPath($b), [IO.Path]::GetFullPath($other))
+        $expected = if ([string]::CompareOrdinal($pair[0].ToLowerInvariant(), $pair[1].ToLowerInvariant()) -le 0) { $pair[0] } else { $pair[1] }
+        foreach ($order in @(@($first, $second), @($second, $first))) {
+            $answer = Find-H320Proof $order 2
+            $answer.Found | Should -BeFalse
+            $answer.Refusal | Should -BeExactly 'CopyAgain'
+            $answer.RefusedPath | Should -BeExactly $expected
+            $answer.Reason | Should -Match ([regex]::Escape($expected))
+        }
+    }
+    It 'a newest proof of another policy refuses with its own Refusal, PolicyMismatch, and tells both GUIDs' {
+        $folder = New-H320Folder
+        $null = New-H320Proof $folder @('Covered') -AgeHours 1
+        $answer = Find-H320Proof $folder 1 -Policy '50000000-0000-0000-0000-000000000005'
+        $answer.Found | Should -BeFalse
+        $answer.Refusal | Should -BeExactly 'PolicyMismatch'
+        @($answer.PolicyGuid) | Should -BeExactly @('40000000000000000000000000000004')
+        $answer.Reason | Should -Match '40000000000000000000000000000004'
+        $answer.Reason | Should -Match '50000000-0000-0000-0000-000000000005'
+        (Find-H320Proof $folder 1 -Policy '40000000-0000-0000-0000-000000000004').Complete | Should -BeTrue
+    }
     It 'the console and the run use one rule for the objects whose retention a Recover checks: tagged, and not kept on purpose' {
         $tagged = [pscustomobject]@{ Retention = [pscustomobject]@{ Enabled = $true } }
         Test-PraRetentionCheckRecord -Record $tagged | Should -BeTrue
@@ -15463,6 +15518,25 @@ Export-ModuleMember -Function Get-EXOMailbox, Get-ConnectionInformation
         $global:PraGate.H320Binding = @{ TenantId = '20000000-0000-0000-0000-000000000002'; ConnectionId = '30000000-0000-0000-0000-000000000003'; ModuleLocation = $global:PraGate.H320Path; ModulePath = $global:PraGate.H320Path }
         $global:PraGate.H320Runtime = New-GateRuntime -Name 'retention-parity-320h'
         $global:PraGate.H320Mine = '5b0d1c7e-1111-4222-8333-944455556666'
+        # The failures that a read of Exchange Online can end with, as an error record: by kind.
+        function global:New-H320Failure {
+            param([string]$Kind)
+            $details = ''
+            if ($Kind -ceq 'network') { $ex = [System.Net.Http.HttpRequestException]::new('SYNTHETIC: no answer', [InvalidOperationException]::new('SYNTHETIC: wrapper', [System.Net.Sockets.SocketException]::new(10060))) }
+            elseif ($Kind -ceq 'french') { $ex = [InvalidOperationException]::new('SYNTHETIC: Une tentative de connexion a ' + [char]0xE9 + 'chou' + [char]0xE9 + ' car le parti connect' + [char]0xE9 + ' n''a pas r' + [char]0xE9 + 'pondu convenablement au-del' + [char]0xE0 + ' d''une certaine dur' + [char]0xE9 + 'e 20.1.2.3:443') }
+            elseif ($Kind -ceq 'wrapped403') { $ex = [AggregateException]::new([System.Net.Http.HttpRequestException]::new('SYNTHETIC: Response status code does not indicate success: 403 (Forbidden).', $null, [System.Net.HttpStatusCode]::Forbidden)) }
+            elseif ($Kind -ceq 'status429') { $ex = [System.Net.Http.HttpRequestException]::new('SYNTHETIC: failed', $null, [System.Net.HttpStatusCode]::TooManyRequests) }
+            elseif ($Kind -ceq 'text503') { $ex = [InvalidOperationException]::new('SYNTHETIC: HttpStatusCode=503 ServiceUnavailable') }
+            elseif ($Kind -ceq 'timeout') { $ex = [InvalidOperationException]::new('SYNTHETIC: the operation timed out') }
+            elseif ($Kind -ceq 'details') { $ex = [InvalidOperationException]::new('SYNTHETIC: the call failed'); $details = 'SYNTHETIC: HttpStatusCode=503 ServiceUnavailable' }
+            elseif ($Kind -ceq 'privileges') { $ex = [InvalidOperationException]::new('SYNTHETIC: Insufficient privileges to complete the operation.') }
+            elseif ($Kind -ceq 'webexception') { $ex = [System.Net.WebException]::new('SYNTHETIC: the underlying connection was closed', [System.Net.WebExceptionStatus]::ConnectionClosed) }
+            elseif ($Kind -ceq 'status400') { $ex = [System.Net.Http.HttpRequestException]::new('SYNTHETIC: bad request', $null, [System.Net.HttpStatusCode]::BadRequest) }
+            else { $ex = [InvalidOperationException]::new('SYNTHETIC: the filter of this search is not accepted.') }
+            $record = [Management.Automation.ErrorRecord]::new($ex, 'SYNTHETIC', [Management.Automation.ErrorCategory]::NotSpecified, $null)
+            if ($details) { $record.ErrorDetails = [Management.Automation.ErrorDetails]::new($details) }
+            return $record
+        }
         function global:New-H320Mailbox {
             param([int]$Index, [string]$Upn = '', [string]$Id = '', [bool]$Inactive = $false, [string]$Guid = '', [string]$Tag = 'Converted', [string]$Hold = 'mbx40000000000000000000000000000004')
             if (-not $Upn) { $Upn = "user$Index@gate.invalid" }
@@ -15519,7 +15593,7 @@ Export-ModuleMember -Function Get-EXOMailbox, Get-ConnectionInformation
         $global:PraGate.H320Store = @()
     }
     AfterAll {
-        Remove-Item -LiteralPath 'Function:\New-H320Mailbox', 'Function:\Invoke-H320Search', 'Function:\New-H320Row', 'Function:\Invoke-H320Coverage' -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath 'Function:\New-H320Failure', 'Function:\New-H320Mailbox', 'Function:\Invoke-H320Search', 'Function:\New-H320Row', 'Function:\Invoke-H320Coverage' -ErrorAction SilentlyContinue
         Remove-Module PRA.Cloud, PraGateH320Network -Force -ErrorAction SilentlyContinue
         foreach ($key in 'H320Path', 'H320Binding', 'H320Runtime', 'H320Context', 'H320Searches', 'H320Store', 'H320Rows', 'H320Minimum', 'H320Mine', 'H320Mode', 'H320Count', 'H320Fail') { $global:PraGate.Remove($key) }
     }
@@ -15671,7 +15745,7 @@ Export-ModuleMember -Function Get-EXOMailbox, Get-ConnectionInformation
         $answer.CouldNotAsk | Should -BeTrue
         $answer.SignInFailed | Should -BeFalse
     }
-    It 'the Check writes Unverified for a failure of one mailbox (not unique), NotCovered, Covered, and NotChecked only for the run-level stop (no answer)' {
+    It 'the Check writes Unverified for a failure of one mailbox (not unique, no answer), NotCovered and Covered' {
         $global:PraGate.H320Rows = @(1..5 | ForEach-Object { New-H320Row $_ })
         $rows = $global:PraGate.H320Rows
         $null = InModuleScope PRA.Cloud {
@@ -15687,7 +15761,7 @@ Export-ModuleMember -Function Get-EXOMailbox, Get-ConnectionInformation
             }
             Invoke-PraRetentionCheck -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
         }
-        @($rows | ForEach-Object { [string]$_.RetentionVerdict }) | Should -BeExactly @('Unverified', 'NotCovered', 'Covered', 'NotChecked', 'Covered') -Because 'the row that got no answer is not checked; the next row is read on its own'
+        @($rows | ForEach-Object { [string]$_.RetentionVerdict }) | Should -BeExactly @('Unverified', 'NotCovered', 'Covered', 'Unverified', 'Covered') -Because 'a row that was read and got no answer is Unverified, and the loop goes on with the next row'
     }
     It 'a bulk search that fails for a reason of its own leaves the objects of that search to the read of one mailbox, and the others are still read in bulk' {
         $global:PraGate.H320Store = @(1..120 | ForEach-Object { New-H320Mailbox $_ })
@@ -15727,6 +15801,112 @@ Export-ModuleMember -Function Get-EXOMailbox, Get-ConnectionInformation
         $answer.CouldNotAsk | Should -BeTrue
         $answer.StopReason | Should -Match 'did not answer'
         $answer.Covered | Should -Be 0
+    }
+    It 'the bulk search stops the bulk read for a failure that every read would meet, as Get-PraNetworkFailure, Get-PraCloudFailureInfo and Get-PraGraphRefusal tell it, and goes on for a failure of one search: <Name>' -ForEach @(
+        @{ Name = 'a network failure wrapped twice'; Kind = 'network'; Stops = $true }
+        @{ Name = 'a French message of a failed connection'; Kind = 'french'; Stops = $true }
+        @{ Name = 'a refusal (403) inside an AggregateException'; Kind = 'wrapped403'; Stops = $true }
+        @{ Name = 'a 429 status of the response'; Kind = 'status429'; Stops = $true }
+        @{ Name = 'a 503 told by the text only'; Kind = 'text503'; Stops = $true }
+        @{ Name = 'a timeout told by the text only'; Kind = 'timeout'; Stops = $true }
+        @{ Name = 'a 503 told by the error details only'; Kind = 'details'; Stops = $true }
+        @{ Name = 'insufficient privileges'; Kind = 'privileges'; Stops = $true }
+        @{ Name = 'a web exception that lost the connection'; Kind = 'webexception'; Stops = $true }
+        @{ Name = 'a bad request (400)'; Kind = 'status400'; Stops = $false }
+        @{ Name = 'a filter that this search does not accept'; Kind = 'filter'; Stops = $false }) {
+        $global:PraGate.H320Mode = $Kind
+        $answer = InModuleScope PRA.Cloud {
+            Mock Get-EXOMailbox { throw (New-H320Failure $global:PraGate.H320Mode) }
+            $workerThrew = $false
+            try { $null = & $script:PraExoWorker 'HoldBulk' @{ Groups = @(@{ Attribute = 'CustomAttribute1'; Value = 'Converted'; Rows = @(@{ Key = '0'; Upn = 'user1@gate.invalid'; ById = '' }) }) } $null $global:PraGate.H320Binding $null $null } catch { $workerThrew = $true }
+            $record = New-H320Failure $global:PraGate.H320Mode
+            $refusal = (Get-PraCloudFailureInfo $record).Status -in @(401, 403) -or ([string]$record.Exception.Message -match '(?i)Insufficient privileges|Authorization_RequestDenied|Forbidden')
+            $module = ($null -ne (Get-PraNetworkFailure $record)) -or (Get-PraCloudFailureInfo $record).Transient -or $refusal
+            @{ Worker = $workerThrew; Module = [bool]$module }
+        }
+        $answer.Worker | Should -Be $Stops -Because $Name
+        $answer.Module | Should -Be $Stops -Because ('the module says the same: ' + $Name)
+    }
+    It 'a bulk read stops after two searches in a row that failed for a reason of their own: the rest is read one mailbox at a time, and every object is still answered' {
+        $global:PraGate.H320Store = @(1..130 | ForEach-Object { New-H320Mailbox $_ })
+        $global:PraGate.H320Rows = @(1..130 | ForEach-Object { New-H320Row $_ })
+        $global:PraGate.H320Count = 0
+        $answer = InModuleScope PRA.Cloud {
+            $script:PraRetentionBulkMinimum = 20
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Get-EXOMailbox {
+                if ([string]$Filter -like '(CustomAttribute*') { $global:PraGate.H320Count++; throw 'SYNTHETIC: the filter of this search is not accepted.' }
+                Invoke-H320Search -Identity $Identity -ExternalDirectoryObjectId $ExternalDirectoryObjectId -Filter $Filter -Properties $Properties -ResultSize $ResultSize -InactiveMailboxOnly $InactiveMailboxOnly
+            }
+            Mock Invoke-PraExo { & $script:PraExoWorker $Operation $Params $null $global:PraGate.H320Binding $null $null }
+            Test-PraRetentionCoverage -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        $global:PraGate.H320Count | Should -Be 2 -Because 'the third search is not made'
+        $answer.BulkResolved | Should -Be 0
+        $answer.SingleReads | Should -Be 130
+        $answer.Covered | Should -Be 130
+        $answer.CouldNotAsk | Should -BeFalse
+        (Get-Content -LiteralPath $global:PraGate.H320Context.LogFile -Raw) | Should -Match 'the bulk read stopped after two searches in a row failed'
+    }
+    It 'a read that got no answer while the Check goes on with the next mailbox is Unverified; only the rows that the loop did not reach are NotChecked' {
+        $global:PraGate.H320Rows = @(1..5 | ForEach-Object { New-H320Row $_ })
+        $rows = $global:PraGate.H320Rows
+        $null = InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Invoke-PraExo {
+                if ([string]$Params.Upn -ceq 'user2@gate.invalid') { throw [System.Net.Http.HttpRequestException]::new('SYNTHETIC: no answer', [System.Net.Sockets.SocketException]::new(10060)) }
+                @{ Found = $true; Type = 'UserMailbox'; Holds = @('mbx40000000000000000000000000000004') }
+            }
+            Invoke-PraRetentionCheck -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        @($rows | ForEach-Object { [string]$_.RetentionVerdict }) | Should -BeExactly @('Covered', 'Unverified', 'Covered', 'Covered', 'Covered')
+        $rows2 = @(1..5 | ForEach-Object { New-H320Row $_ })
+        $global:PraGate.H320Rows = $rows2
+        $null = InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Test-PraRetentionRow {
+                if ([string]$Row.UserPrincipalName -ceq 'user2@gate.invalid') { $Context.GraphRefused = $true; return 'Failed' }
+                return 'Ok'
+            }
+            Invoke-PraRetentionCheck -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        @($rows2 | ForEach-Object { [string]$_.RetentionVerdict }) | Should -BeExactly @('Covered', 'Unverified', 'NotChecked', 'NotChecked', 'NotChecked')
+    }
+    It 'an inactive mailbox that belongs to an earlier account is no mailbox of this object: NoMailbox in the coverage and in the Check, with a visible warning, never NotCovered or Unverified' {
+        $global:PraGate.H320Rows = @(1..2 | ForEach-Object { New-H320Row $_ })
+        $answer = InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Invoke-PraExo {
+                if ([string]$Params.Upn -ceq 'user1@gate.invalid') { return @{ Found = $false; Type = $null; Holds = @(); IsInactive = $false; Litigation = $false; RetentionHold = $false; EarlierAccount = $true } }
+                @{ Found = $true; Type = 'UserMailbox'; Holds = @('mbx40000000000000000000000000000004') }
+            }
+            Test-PraRetentionCoverage -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        $answer.NoMailbox | Should -Be 1
+        @($answer.NoMailboxList).Count | Should -Be 1
+        $answer.NoMailboxList[0].Upn | Should -BeExactly 'user1@gate.invalid'
+        $answer.NoMailboxList[0].Reason | Should -Match '^No mailbox of this object to retain: the only inactive mailbox with this UPN is not this object''s mailbox \(it belongs to an earlier account\)'
+        @($answer.NotCovered).Count | Should -Be 0
+        @($answer.Unverified).Count | Should -Be 0
+        $answer.Covered | Should -Be 1
+        $global:PraGate.H320Context.Warnings | Should -BeGreaterThan 0
+        $rows = @(1..2 | ForEach-Object { New-H320Row $_ })
+        $global:PraGate.H320Rows = $rows
+        $null = InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Invoke-PraExo {
+                if ([string]$Params.Upn -ceq 'user1@gate.invalid') { return @{ Found = $false; Type = $null; Holds = @(); IsInactive = $false; Litigation = $false; RetentionHold = $false; EarlierAccount = $true } }
+                @{ Found = $true; Type = 'UserMailbox'; Holds = @('mbx40000000000000000000000000000004') }
+            }
+            Invoke-PraRetentionCheck -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        @($rows | ForEach-Object { [string]$_.RetentionVerdict }) | Should -BeExactly @('NoMailbox', 'Covered')
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'docs\PraRemoteMailbox-Guide.md')) | Should -Match 'the object is reported as having \*\*no mailbox\*\* to retain'
     }
 }
 
@@ -15891,6 +16071,41 @@ Describe 'Release 3.2.0 - the gate end to end: a failed sign-in of a person fall
         $run = Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
         $run.ExitCode | Should -Be 1
         (@($run.MainResult.NextSteps) -join "`n") | Should -Match ([regex]::Escape('Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid'))
+    }
+    It 'a Preview names what blocks the Apply from the refusal of the newest proof, like the Apply steps: damaged (copy again, delete the damaged copy), future-dated (clocks), another policy (align Retention.PolicyGuid, both GUIDs, the lookup), and the Apply says the same' {
+        $preview = @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $apply = @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $null = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours 3
+        $bad = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours 1 -Tamper
+        $run = Invoke-GateProcess $runtime $preview
+        $run.ExitCode | Should -Be 0
+        $next = @($run.MainResult.NextSteps) -join "`n"
+        $next | Should -Match 'The Apply would be refused as things stand\. First copy both files of the newest retention proof again from the Backups\\Outbox folder of the cloud server to '
+        $next | Should -Match ('and delete the damaged copy at ' + [regex]::Escape($bad))
+        $next | Should -Not -Match 'First make the retention policy hold the mailboxes named above'
+        $applied = Invoke-GateProcess $runtime $apply
+        (@($applied.MainResult.NextSteps) -join "`n") | Should -Match ('Before that, delete the damaged copy at ' + [regex]::Escape($bad))
+        Remove-Item -LiteralPath $bad, ($bad + '.sha256') -Force
+        $future = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours -2
+        $clock = Invoke-GateProcess $runtime $preview
+        (@($clock.MainResult.NextSteps) -join "`n") | Should -Match 'The Apply would be refused as things stand\. First compare the clocks of the two servers'
+        Remove-Item -LiteralPath $future, ($future + '.sha256') -Force
+        Set-GateConfigText $runtime { param($text) $text.Replace('Retention=@{Enabled=$true;Tag=', 'Retention=@{Enabled=$true;PolicyName='''';PolicyGuid=''50000000-0000-0000-0000-000000000005'';Tag=') }
+        $null = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours 1
+        $other = Invoke-GateProcess $runtime $preview
+        $otherNext = @($other.MainResult.NextSteps) -join "`n"
+        $otherNext | Should -Match 'The Apply would be refused as things stand\. First align Retention\.PolicyGuid on the two servers'
+        $otherNext | Should -Match '40000000000000000000000000000004'
+        $otherNext | Should -Match '50000000-0000-0000-0000-000000000005'
+        $otherNext | Should -Match ([regex]::Escape('Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid'))
+        $blocked = Invoke-GateProcess $runtime $apply
+        $blocked.ExitCode | Should -Be 1
+        $steps = @($blocked.MainResult.NextSteps) -join "`n"
+        $steps | Should -Match 'is of another retention policy: it names 40000000000000000000000000000004, and Retention\.PolicyGuid in the configuration file of this server is 50000000-0000-0000-0000-000000000005'
+        $steps | Should -Match 'on the cloud server and on this server'
+        $steps | Should -Match ([regex]::Escape('Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid'))
+        $steps | Should -Match '-Action Check -Batch [0-9a-f]{8} -Expect Retained'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
     }
     It 'a Retention.PolicyGuid that is not a GUID refuses the proof, and the Next steps say to correct the setting, with the command that reads the GUID' {
         Set-GateConfigText $runtime { param($text) $text.Replace('Retention=@{Enabled=$true;Tag=', 'Retention=@{Enabled=$true;PolicyGuid=''not-a-guid'';Tag=') }

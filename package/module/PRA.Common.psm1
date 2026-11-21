@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.4
+    Version : 3.2.0
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -49,7 +49,7 @@ $ErrorActionPreference = 'Stop'
 # window, run context, report, audit). The literal comments "Version : x.y.z" of the file headers cannot be
 # computed (the signature and the manifest hash the exact bytes): they are listed in the guide, annex D, and
 # checked against this value by the tests. tools\New-PraPackage.ps1 reads the version from this line.
-$script:ToolVersion = '3.1.4'
+$script:ToolVersion = '3.2.0'
 $script:TranscriptOwner = $null
 $script:PraNativePath = $null
 $script:PraNativeProcess = $null
@@ -804,7 +804,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v3.1.4 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v3.2.0 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)
@@ -2529,7 +2529,7 @@ function Get-PraRetentionProof {
     .DESCRIPTION
         Read only. Only one proof decides: the newest, by the time in its name (ties by name), after the copies of one proof (the same SHA-256, in the Inbox and in the batch folder) are counted once. If that newest proof is
         not usable (unreadable or still being copied, damaged, without its .sha256 file, dated in the future, too old, of another batch, Environment, copy of the batch file or policy, or its name does not say the time of its content) nothing is accepted and
-        Refusal says what to do: CopyAgain, Clock or RunCheck. An older proof never stands in. -Row (objects with ObjectGuid and UserPrincipalName): the objects of the Recover. Complete is true when the newest proof says Covered (or
+        Refusal says what to do: CopyAgain, Clock, PolicyMismatch or RunCheck, and RefusedPath names the file. The same name in two folders with different content is settled the same way every time: the copy that is valid and named after its content first, then the full path. An older proof never stands in. -Row (objects with ObjectGuid and UserPrincipalName): the objects of the Recover. Complete is true when the newest proof says Covered (or
         NoMailbox: nothing to retain) for every one of them; Missing lists the others (UPN, else ObjectGuid) and Blocked says why (NotCovered, Unverified, NotChecked, or NotListed). Without -Row, Complete says that every object of the proof is covered.
         An object is found by its ObjectGuid; its UPN counts only for a proof entry that has no ObjectGuid. -SourceBackupHash (the hash of the Convert batch file) and -PolicyGuid (Retention.PolicyGuid, when the configuration
         sets one) must agree with the proof; a -PolicyGuid that is not a GUID refuses it (PolicyGuidInvalid).
@@ -2540,7 +2540,7 @@ function Get-PraRetentionProof {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Folder, [Parameter(Mandatory)][string]$BatchId, [Parameter(Mandatory)][string]$Environment,
         [ValidateRange(1, 720)][int]$MaxAgeHours = 24, [AllowEmptyCollection()][object[]]$Row, [hashtable]$Cache, [string]$SourceBackupHash = '', [string]$PolicyGuid = '')
-    $result = [pscustomobject][ordered]@{ Found = $false; Complete = $false; Refusal = ''; Reason = ''; Path = ''; Sha256 = ''; CreatedUtc = [datetime]::MinValue; AgeHours = [double]0; ObjectCount = 0; CoveredCount = 0; NoMailbox = @(); Missing = [string[]]@(); Blocked = @(); PolicyGuid = [string[]]@(); Proofs = @(); FutureDated = $false; PolicyGuidInvalid = $false; Candidates = 0; Duplicates = 0 }
+    $result = [pscustomobject][ordered]@{ Found = $false; Complete = $false; Refusal = ''; Reason = ''; Path = ''; Sha256 = ''; CreatedUtc = [datetime]::MinValue; AgeHours = [double]0; ObjectCount = 0; CoveredCount = 0; NoMailbox = @(); Missing = [string[]]@(); Blocked = @(); PolicyGuid = [string[]]@(); Proofs = @(); FutureDated = $false; PolicyGuidInvalid = $false; RefusedPath = ''; Candidates = 0; Duplicates = 0 }
     $wantedPolicy = [guid]::Empty
     if ($PolicyGuid -and (-not [guid]::TryParse($PolicyGuid, [ref]$wantedPolicy) -or $wantedPolicy -eq [guid]::Empty)) {
         $result.PolicyGuidInvalid = $true; $result.Refusal = 'PolicyGuid'
@@ -2555,7 +2555,11 @@ function Get-PraRetentionProof {
         if (-not $directory -or -not [IO.Directory]::Exists($directory)) { continue }
         foreach ($file in [IO.Directory]::GetFiles($directory, 'RetentionProof-' + $id + '-*.json')) {
             $leaf = [IO.Path]::GetFileName($file); $match = [regex]::Match($leaf, $namePattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($match.Success -and $seen.Add([IO.Path]::GetFullPath($file))) { $files.Add([pscustomobject]@{ Path = $file; Name = $leaf; NameTime = $match.Groups['time'].Value }) }
+            if ($match.Success -and $seen.Add([IO.Path]::GetFullPath($file))) {
+                $nameDate = [datetime]::MinValue
+                $nameValid = [datetime]::TryParseExact($match.Groups['time'].Value, 'yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$nameDate)
+                $files.Add([pscustomobject]@{ Path = [IO.Path]::GetFullPath($file); Name = $leaf; NameTime = $match.Groups['time'].Value; NameValid = $nameValid })
+            }
         }
     }
     $result.Candidates = $files.Count
@@ -2571,8 +2575,8 @@ function Get-PraRetentionProof {
         }
         $content = $null
         if ($stamp -and $Cache.ContainsKey($stamp)) { $content = $Cache[$stamp] } else { $content = Read-PraRetentionProofFile -Path $candidate.Path; if ($stamp -and -not $content.Transient) { $Cache[$stamp] = $content } }
-        $nameMatches = $content.Valid -and (Test-PraOrdinalEqual $content.CreatedUtc.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture) $candidate.NameTime)
-        $read.Add([pscustomobject]@{ File = $candidate; Read = $content; NameMatches = $nameMatches; SortKey = ($candidate.NameTime + '|' + $candidate.Name) })
+        $nameMatches = $content.Valid -and $candidate.NameValid -and (Test-PraOrdinalEqual $content.CreatedUtc.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture) $candidate.NameTime)
+        $read.Add([pscustomobject]@{ File = $candidate; Read = $content; NameMatches = $nameMatches; SortKey = ($(if ($candidate.NameValid) { '0' } else { '1' }) + '|' + $candidate.NameTime + '|' + $candidate.Name.ToLowerInvariant()); TieKey = ($(if ($content.Valid -and $nameMatches) { '0' } else { '1' }) + '|' + $candidate.Path.ToLowerInvariant()) })
     }
     # The copies of one proof (the same SHA-256) count once; the copy that is valid and named after its content is kept.
     $kept = New-Object 'Collections.Generic.List[object]'
@@ -2588,19 +2592,26 @@ function Get-PraRetentionProof {
         if ($sha) { $bySha[$sha] = $kept.Count }
         $kept.Add($item)
     }
+    # The newest is the greatest time in the name, then the name (a name that carries a time that does not exist counts as newer than any other, so that it always blocks); the same name in two folders with different content is settled the same way every time: the copy that is valid and named after its content, then the full path.
     $ordered = @($kept | Get-PraOrdinalSorted -Property SortKey -Descending)
     $newest = $ordered[0]
+    $tied = @($ordered | Where-Object { [string]::Equals([string]$_.SortKey, [string]$newest.SortKey, [StringComparison]::Ordinal) })
+    if ($tied.Count -gt 1) { $newest = @($tied | Get-PraOrdinalSorted -Property TieKey)[0] }
     $why = ''; $action = 'RunCheck'
     $proof = $newest.Read
     if (-not $proof.Valid) { $why = $proof.Reason; $action = $proof.Refusal }
-    elseif (-not $newest.NameMatches) { $why = ('its name says it was made at {0} UTC but its content says {1} UTC (the file was renamed)' -f [datetime]::ParseExact($newest.File.NameTime, 'yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $proof.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)) }
+    elseif (-not $newest.NameMatches) {
+        $nameDate = [datetime]::MinValue
+        $says = if ([datetime]::TryParseExact($newest.File.NameTime, 'yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$nameDate)) { 'its name says it was made at {0} UTC' -f $nameDate.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) } else { 'its name carries a time that does not exist ({0})' -f $newest.File.NameTime }
+        $why = ('{0} but its content says {1} UTC (the file was renamed)' -f $says, $proof.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture))
+    }
     elseif (-not (Test-PraOrdinalIgnoreCaseEqual $proof.BatchId $id)) { $why = 'it was made for another batch' }
     elseif (-not (Test-PraOrdinalIgnoreCaseEqual $proof.Environment $Environment)) { $why = ('it was made for the Environment {0}, this configuration is {1}' -f $proof.Environment, $Environment) }
     elseif ($SourceBackupHash -and -not (Test-PraOrdinalIgnoreCaseEqual $proof.SourceBackupHash $SourceBackupHash)) { $why = 'it was made from another copy of the Convert batch file (its SourceBackupHash is not the hash of this batch file)' }
-    elseif ($PolicyGuid -and -not (@($proof.PolicyGuid | Where-Object { $parsed = [guid]::Empty; [guid]::TryParse([string]$_, [ref]$parsed) -and $parsed.Equals($wantedPolicy) }).Count)) { $why = 'it was made for another retention policy (its PolicyGuid is not Retention.PolicyGuid of this configuration)' }
+    elseif ($PolicyGuid -and -not (@($proof.PolicyGuid | Where-Object { $parsed = [guid]::Empty; [guid]::TryParse([string]$_, [ref]$parsed) -and $parsed.Equals($wantedPolicy) }).Count)) { $why = ('it was made for another retention policy (its PolicyGuid {0} is not Retention.PolicyGuid {1} of this configuration)' -f $(if (@($proof.PolicyGuid).Count) { @($proof.PolicyGuid) -join ', ' } else { 'none recorded' }), $PolicyGuid); $action = 'PolicyMismatch'; $result.PolicyGuid = $proof.PolicyGuid }
     elseif ($proof.CreatedUtc -gt $now.AddMinutes(5)) { $why = 'its time is in the future (the clocks of the two servers differ by more than 5 minutes)'; $action = 'Clock'; $result.FutureDated = $true }
     elseif (($now - $proof.CreatedUtc).TotalHours -gt $MaxAgeHours) { $why = ('it is {0} hours old, the limit is {1} (Retention.ProofMaxAgeHours)' -f ($now - $proof.CreatedUtc).TotalHours.ToString('0.#', [Globalization.CultureInfo]::InvariantCulture), $MaxAgeHours) }
-    if ($why) { $result.Reason = ('{0}: {1}' -f $newest.File.Name, $why); $result.Refusal = $action; return $result }
+    if ($why) { $result.Reason = ('{0}: {1}' -f $newest.File.Path, $why); $result.Refusal = $action; $result.RefusedPath = [string]$newest.File.Path; return $result }
     $result.Found = $true; $result.Path = $proof.Path; $result.Sha256 = $proof.Sha256; $result.CreatedUtc = $proof.CreatedUtc; $result.AgeHours = [Math]::Max(0.0, ($now - $proof.CreatedUtc).TotalHours)
     $result.ObjectCount = $proof.ObjectCount; $result.CoveredCount = $proof.CoveredCount; $result.PolicyGuid = $proof.PolicyGuid
     $result.Proofs = @([pscustomobject]@{ Path = [string]$proof.Path; Sha256 = [string]$proof.Sha256; CreatedUtc = $proof.CreatedUtc; PolicyGuid = [string[]]@($proof.PolicyGuid); ObjectCount = [int]$proof.ObjectCount })

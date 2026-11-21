@@ -2846,7 +2846,7 @@ Describe 'Release 3.2.0 - the console shows whether the retention proof of the s
         (Get-G320GuiText $case) | Should -Match '^A retention proof was found \(\d+(\.\d)? hours old\) but it does not cover every mailbox: 1 of the 1 object\(s\) of this Recover are not covered in it\. The run cannot use it\. Only the newest proof counts, and an older one never completes it: run Check with Expected state Retained again'
         [IO.File]::AppendAllText($newest.Path, ' ')
         & (Get-Module PRA.Gui) { $script:PraGuiProofCache.Clear() }
-        (Get-G320GuiText $case) | Should -Match '^The newest retention proof cannot be used \(RetentionProof-.*its SHA-256 does not match its \.sha256 file.*\)\. Copy both files, RetentionProof-\.\.\.json and its \.sha256 file, again from the Backups\\Outbox folder of the cloud server to the folder .*Inbox, together and after the copy has ended\. An older proof never stands in for it\.$'
+        (Get-G320GuiText $case) | Should -Match '^The newest retention proof cannot be used \(.*RetentionProof-.*its SHA-256 does not match its \.sha256 file.*\)\. Copy both files, RetentionProof-\.\.\.json and its \.sha256 file, again from the Backups\\Outbox folder of the cloud server to the folder .*Inbox, together and after the copy has ended\. An older proof never stands in for it\. Delete the damaged copy at .*RetentionProof-.* \(and its \.sha256 file\) so that it is not read again\.$'
     }
     It 'a Retention.PolicyGuid that is not a GUID gives the command that reads the GUID, with the policy name when there is one and the list of policies when there is none' {
         $runtime = New-GuiTestRoot

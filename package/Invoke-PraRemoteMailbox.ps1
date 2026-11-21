@@ -155,7 +155,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 3.1.4
+    Version    : 3.2.0
     Requires   : PowerShell 7.5 or later (pwsh.exe; Windows PowerShell 5.1 is refused), RSAT ActiveDirectory,
                  ExchangeOnlineManagement 3.10.1+, Microsoft.Graph.Authentication and Microsoft.Graph.Users 2.41.1+ in one same
                  version (cloud part), ADSync (sync; through the Windows PowerShell compatibility layer when local).
@@ -997,14 +997,25 @@ function Invoke-PraRetentionGate {
     $typedBatch = if ($script:PreviewPackage) { $script:PreviewPackage } elseif ($script:PackageArgument) { $script:PackageArgument } else { $Batch }
     $again = Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -ModeName 'Preview' -BatchId $typedBatch -KeepFilters
     $anyway = (Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -ModeName 'Apply' -BatchId $typedBatch -KeepFilters) + ' -AcceptRetentionRisk'
+    $refusal = if ($script:RetentionProofRoute -and $null -ne $script:RetentionProof) { [string]$script:RetentionProof.Refusal } else { '' }
+    $proofRoute = [bool]($script:RetentionProofRoute -and $null -ne $script:RetentionProof)
+    $proofPolicy = if ($proofRoute) { (@($script:RetentionProof.PolicyGuid) -join ', ') } else { '' }
+    if (-not $proofPolicy) { $proofPolicy = 'none recorded' }
+    $damagedPath = if ($proofRoute) { [string](Get-PraValue $script:RetentionProof 'RefusedPath' '') } else { '' }
+    $inboxFolder = Join-Path $context.BackupFolder 'Inbox'
+    $policyName = [string]$context.Config.Retention.PolicyName
+    $lookup = if ($policyName) { 'Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity {0}).Guid' -f (ConvertTo-PraLiteral $policyName) } else { 'Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid' }
     if (-not $context.AllowMutation) {
         Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}. The Apply will be refused as things stand.' -f $summary)
-        $context.ApplyBlockers = @(Get-PraList $context 'ApplyBlockers') + ('make the retention policy hold the mailboxes named above (see them with: {0}{1}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $check, $(if ($script:RetentionProofRoute) { ', on the cloud server' } else { '' }))
+        $blocker = if ($proofRoute -and (Test-PraOrdinalEqual $refusal 'CopyAgain')) { 'copy both files of the newest retention proof again from the Backups\Outbox folder of the cloud server to {0}{1} ({2}); an older proof never stands in for it, and run the Check again on the cloud server if the files are damaged at the source ({3}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $inboxFolder, $(if ($damagedPath) { ', and delete the damaged copy at ' + $damagedPath } else { '' }), $script:RetentionProofReason, $check }
+            elseif ($proofRoute -and (Test-PraOrdinalEqual $refusal 'Clock')) { 'compare the clocks of the two servers (Get-Date on each: the newest retention proof is dated in the future), then run the Check again on the cloud server ({0}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $check }
+            elseif ($proofRoute -and (Test-PraOrdinalEqual $refusal 'PolicyMismatch')) { 'align Retention.PolicyGuid on the two servers (the newest retention proof names the policy {0}, this server has {1}; read the GUID with: {2}), then run the full Check again on the cloud server ({3}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $proofPolicy, [string]$context.Config.Retention.PolicyGuid, $lookup, $check }
+            elseif ($proofRoute -and (Test-PraOrdinalEqual $refusal 'PolicyGuid')) { 'correct Retention.PolicyGuid in the configuration file (it is not a GUID; read the GUID with: {0}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $lookup }
+            else { 'make the retention policy hold the mailboxes named above (see them with: {0}{1}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $check, $(if ($script:RetentionProofRoute) { ', on the cloud server' } else { '' }) }
+        $context.ApplyBlockers = @(Get-PraList $context 'ApplyBlockers') + $blocker
         return
     }
     $steps = @()
-    $policyName = [string]$context.Config.Retention.PolicyName
-    $lookup = if ($policyName) { 'Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity {0}).Guid' -f (ConvertTo-PraLiteral $policyName) } else { 'Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid' }
     if (-not [string]$context.Config.Retention.PolicyGuid) {
         $steps += 'The retention policy is not named in the configuration file. Read its GUID in a Security and Compliance session, then put it in Retention.PolicyGuid:'
         $steps += $lookup
@@ -1014,11 +1025,18 @@ function Invoke-PraRetentionGate {
         $steps += ('Retention.PolicyGuid in the configuration file ({0}) is not a GUID. Read the GUID of the retention policy, then put it in Retention.PolicyGuid:' -f $configuredGuid)
         $steps += $lookup
     }
-    $refusal = if ($script:RetentionProofRoute -and $null -ne $script:RetentionProof) { [string]$script:RetentionProof.Refusal } else { '' }
-    if ($script:RetentionProofRoute -and (Test-PraOrdinalEqual $refusal 'CopyAgain')) {
-        $steps += ('The newest retention proof cannot be used: {0}. Copy both files again, RetentionProof-...json and its .sha256 file, from the Backups\Outbox folder of the cloud server to the folder {1} of this server (together, and wait for the copy to end), then run the Preview of the Recover again. An older proof never stands in for it.' -f $script:RetentionProofReason, (Join-Path $context.BackupFolder 'Inbox'))
+    if ($proofRoute -and (Test-PraOrdinalEqual $refusal 'CopyAgain')) {
+        $steps += ('The newest retention proof cannot be used: {0}. Copy both files again, RetentionProof-...json and its .sha256 file, from the Backups\Outbox folder of the cloud server to the folder {1} of this server (together, and wait for the copy to end), then run the Preview of the Recover again. An older proof never stands in for it.' -f $script:RetentionProofReason, $inboxFolder)
+        if ($damagedPath) { $steps += ('Before that, delete the damaged copy at {0} (and its .sha256 file), so that it is not read again.' -f $damagedPath) }
         $steps += 'If the files are damaged at the source, run the Check again on the cloud server; it writes a new proof:'
         $steps += $check
+    }
+    elseif ($proofRoute -and (Test-PraOrdinalEqual $refusal 'PolicyMismatch')) {
+        $steps += ('The newest retention proof, {0}, is of another retention policy: it names {1}, and Retention.PolicyGuid in the configuration file of this server is {2}. Make the two servers name the same policy: put the GUID of the policy that holds the mailboxes in Retention.PolicyGuid of the configuration file on the cloud server and on this server (read the GUID with the command below), then run the full Check again on the cloud server. An older proof never stands in for it.' -f [IO.Path]::GetFileName($damagedPath), $proofPolicy, [string]$context.Config.Retention.PolicyGuid)
+        $steps += $lookup
+        $steps += 'Then, on the cloud server, run the Check (read only); it writes a new proof:'
+        $steps += $check
+        $steps += ('Copy those two files to the folder {0} of this server, then run the Preview of the Recover again.' -f $inboxFolder)
     }
     elseif ($script:RetentionProofRoute) {
         $steps += 'This server could not ask Exchange Online, and no retention proof stands in for it. On the cloud server, with the batch folder there, make the retention policy hold the mailboxes named above (an adaptive scope can take several days), then run the Check (read only). It writes a retention proof, RetentionProof-...json and its .sha256 file, in the Backups\Outbox folder of that server:'
