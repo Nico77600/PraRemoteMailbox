@@ -326,10 +326,20 @@ $script:PraExoWorker = {
     # The retention check of many mailboxes: the ACTIVE mailboxes that carry the retention tag and one of the UPNs of the rows (about 50 at a time) are read with a server-side filter,
     # then each row is matched in memory: by the confirmed Entra id when there is one, else by UPN, exactly one mailbox. A row that this cannot settle (no tagged active mailbox, several, an inactive mailbox)
     # is left out of the answer: the caller reads it with Mailbox, whose rules decide.
+    # A failure that would stop every other read too (no answer, throttling, a refusal): the bulk read stops with it; any other failure concerns the chunk only.
+    function StopClass {
+        param([System.Management.Automation.ErrorRecord]$Record)
+        $exception = $Record.Exception
+        while ($null -ne $exception) {
+            if (InSet $exception.GetType().FullName @('System.Net.Http.HttpRequestException','System.Net.Sockets.SocketException','System.Threading.Tasks.TaskCanceledException','System.TimeoutException','System.OperationCanceledException')) { return $true }
+            $exception = $exception.InnerException
+        }
+        return ([string]$Record.Exception.Message -match '(?i)HttpStatusCode=(401|403|408|429|50[234])|\b(429|503|504|408)\b|throttl|timed out|timeout|unauthori[sz]ed|forbidden|insufficient privileges|Authorization_RequestDenied')
+    }
     function HoldBulk {
         $properties = @('RecipientTypeDetails','ExternalDirectoryObjectId','UserPrincipalName','IsInactiveMailbox','InPlaceHolds','LitigationHoldEnabled','RetentionHoldEnabled','ExchangeGuid')
         $results = New-Object 'System.Collections.Generic.List[object]'
-        $activeCount = 0; $searches = 0
+        $activeCount = 0; $searches = 0; $chunkFailures = 0
         $add = {
             param($Index,[string]$Key,$Item)
             $list = $null
@@ -357,7 +367,10 @@ $script:PraExoWorker = {
                 $byUpn = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
                 $byId = New-Object 'System.Collections.Generic.Dictionary[string,System.Collections.Generic.List[object]]' ([StringComparer]::OrdinalIgnoreCase)
                 $searches++
-                foreach ($mailbox in @(Get-EXOMailbox -Filter $filter -Properties $properties -ResultSize Unlimited -ErrorAction Stop)) {
+                $found = $null
+                try { $found = @(Get-EXOMailbox -Filter $filter -Properties $properties -ResultSize Unlimited -ErrorAction Stop) }
+                catch { if (StopClass $_) { throw }; $chunkFailures++; continue }
+                foreach ($mailbox in $found) {
                     $activeCount++
                     & $add $byUpn ([string](V $mailbox 'UserPrincipalName' '')) $mailbox
                     & $add $byId ([string](V $mailbox 'ExternalDirectoryObjectId' '')) $mailbox
@@ -373,7 +386,7 @@ $script:PraExoWorker = {
                 }
             }
         }
-        return @{ Found=$true; Results=$results.ToArray(); ActiveCount=[int]$activeCount; Searches=[int]$searches }
+        return @{ Found=$true; Results=$results.ToArray(); ActiveCount=[int]$activeCount; Searches=[int]$searches; ChunkFailures=[int]$chunkFailures }
     }
     function NormalizeAcl {
         param([object[]]$Entries,[string]$Right,$Target)
@@ -2060,13 +2073,17 @@ function Invoke-PraRetentionCheck {
             try {
                 if (Test-PraOrdinalEqual (Test-PraRetentionRow -Context $Context -Row $row -Guid $guid) 'Failed') {
                     if ([bool](Get-PraValue $Context 'GraphRefused' $false)) { $graphStop=$true; break }
+                    $row.RetentionVerdict='Unverified'
                     continue
                 }
                 $row.RetentionVerdict='Covered'
             } catch {
                 $failure=$_
                 $verdictKind=[string]$failure.Exception.Data['PraRetention']
+                # What the object itself says is its verdict (a failure of its own is Unverified); NotChecked stays for the failures that stop the run (no answer, throttling, the retry time, a refusal of Microsoft Graph).
                 if (Test-PraOrdinalIn $verdictKind @('NoMailbox','NotCovered')) { $row.RetentionVerdict=$verdictKind }
+                elseif (Test-PraOrdinalEqual $verdictKind 'PolicyUnknown') { $row.RetentionVerdict='Unverified' }
+                elseif (-not ((Get-PraRetryState $Context).RunExhausted -or ($failure.Exception.Data['PraGraph'] -eq $true -and $null -ne (Get-PraGraphRefusal -ErrorRecord $failure)) -or $null -ne (Get-PraNetworkFailure $failure) -or (Get-PraCloudFailureInfo $failure).Transient)) { $row.RetentionVerdict='Unverified' }
                 # The retry time of the run is used up: ONE error for the run, the rows not checked stay Pending (never one error per row).
                 if ((Get-PraRetryState $Context).RunExhausted) { $stopRun=$failure; break }
                 if ($failure.Exception.Data['PraGraph'] -eq $true) {
@@ -2129,14 +2146,15 @@ function Test-PraRetentionCoverage {
         The check has its own retry budget: what it spends is not taken from the budget of the cloud part.
         -CloseSession signs out of the sessions that this check opened; without it the session stays open for the cloud part that follows.
     .OUTPUTS
-        Checked, Covered, NoMailbox, NoMailboxList, NotCovered and Unverified (each entry: ObjectGuid, Upn, Reason), StopReason, PolicyGuid, BulkCalls, Searches (bulk searches of Exchange Online), BulkResolved, SingleReads and
+        Checked, Covered, NoMailbox, NoMailboxList, NotCovered and Unverified (each entry: ObjectGuid, Upn, Reason), StopReason, SignInFailed and SignInMessage (the sign-in failed: told by the caller, never left as the failure of the run), PolicyGuid, BulkCalls, Searches (bulk searches of Exchange Online), BulkResolved, SingleReads and
         CouldNotAsk: true only when Exchange Online could not be reached or asked (the sign-in failed, no answer, throttling, the policy not named) and every row that is not covered is Unverified with that one reason of the run;
         any answer about one object (a mailbox not held, another account, not unique, an ambiguity) leaves it false.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context,[Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows,[switch]$CloseSession)
-    $result=[pscustomobject]@{ Checked=0; Covered=0; NoMailbox=0; NoMailboxList=(New-Object 'Collections.Generic.List[object]'); NotCovered=(New-Object 'Collections.Generic.List[object]'); Unverified=(New-Object 'Collections.Generic.List[object]'); StopReason=''; CouldNotAsk=$false; PolicyGuid=''; BulkCalls=0; Searches=0; BulkResolved=0; SingleReads=0 }
+    $result=[pscustomobject]@{ Checked=0; Covered=0; NoMailbox=0; NoMailboxList=(New-Object 'Collections.Generic.List[object]'); NotCovered=(New-Object 'Collections.Generic.List[object]'); Unverified=(New-Object 'Collections.Generic.List[object]'); StopReason=''; CouldNotAsk=$false; SignInFailed=$false; SignInMessage=''; PolicyGuid=''; BulkCalls=0; Searches=0; BulkResolved=0; SingleReads=0 }
     $flags=@{ Reach=$false }
+    $connectFailedBefore=[bool](Get-PraValue $Context 'CloudConnectFailed' $false)
     $Context.CurrentOperation='VerifyRetention'; $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$false
     $addEntry={ param($List,$Row,[string]$Reason) $List.Add([pscustomobject]@{ ObjectGuid=[string](Get-PraValue $Row 'ObjectGuid' ''); Upn=[string](Get-PraValue $Row 'UserPrincipalName' ''); Reason=$Reason }) }
     $finish={
@@ -2162,7 +2180,8 @@ function Test-PraRetentionCoverage {
         catch {
             $failed=Get-PraRetentionFailureReason -Context $Context -ErrorRecord $_
             if ($failed.Technical) { $null=Write-PraLog -Context $Context -Message ('Technical detail: {0}' -f $failed.Technical) -Level Detail }
-            $result.StopReason=$failed.Reason; $flags.Reach=([bool]$failed.Stops -or [bool](Get-PraValue $Context 'CloudConnectFailed' $false))
+            $result.StopReason=$failed.Reason; $result.SignInFailed=[bool](Get-PraValue $Context 'CloudConnectFailed' $false); if ($result.SignInFailed) { $result.SignInMessage=$failed.Reason }
+            $flags.Reach=([bool]$failed.Stops -or $result.SignInFailed)
             foreach ($row in $Rows) { & $addEntry $result.Unverified $row $result.StopReason }
             return (& $finish)
         }
@@ -2223,7 +2242,7 @@ function Test-PraRetentionCoverage {
                     $byKey=New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::Ordinal)
                     $answers=Get-PraValue $bulk 'Results' @()
                     foreach ($answered in @($answers)) { $byKey[[string](Get-PraValue $answered 'Key' '')]=$answered }
-                    $null=Write-PraLog -Context $Context -Message ('Retention read in bulk: {0} tagged active mailbox(es) found in {1} search(es); {2} of the {3} object(s) settled by them' -f (Get-PraValue $bulk 'ActiveCount' 0), $result.Searches, $byKey.Count, $work.Count) -Level Detail
+                    $null=Write-PraLog -Context $Context -Message ('Retention read in bulk: {0} tagged active mailbox(es) found in {1} search(es); {2} of the {3} object(s) settled by them{4}' -f (Get-PraValue $bulk 'ActiveCount' 0), $result.Searches, $byKey.Count, $work.Count, $(if ([int](Get-PraValue $bulk 'ChunkFailures' 0)) { '; ' + (Get-PraValue $bulk 'ChunkFailures' 0) + ' search(es) failed and their objects are read one by one' } else { '' })) -Level Detail
                 }
                 catch {
                     $failure=$_
@@ -2247,7 +2266,7 @@ function Test-PraRetentionCoverage {
         }
         return (& $finish)
     } finally {
-        $Context.CurrentIdentity=''
+        $Context.CurrentIdentity=''; $Context.CloudConnectFailed=$connectFailedBefore
         if ($hadRetry) { $Context['_PraRetry']=$savedRetry } else { [void]$Context.Remove('_PraRetry') }
         if ($CloseSession) {
             try { Close-PraCloudSession $Context }

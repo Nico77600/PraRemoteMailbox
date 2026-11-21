@@ -553,7 +553,7 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         }
     }
     function global:New-GateRuntime {
-        param([string]$Name='case',[string]$Case='Normal',[switch]$Preexisting,[switch]$Shared13,[ValidateRange(3,500)][int]$TrusteeCount=8,[ValidateRange(100,120)][int]$AclCount=100,[ValidateRange(2,13)][int]$UserCount=2,[hashtable]$Extra=@{})
+        param([string]$Name='case',[string]$Case='Normal',[switch]$Preexisting,[switch]$Shared13,[ValidateRange(3,500)][int]$TrusteeCount=8,[ValidateRange(100,120)][int]$AclCount=100,[ValidateRange(2,13)][int]$UserCount=2,[hashtable]$Extra=@{},[switch]$RealCloud)
         $caseName=$Name
         $root=Join-Path $global:PraGate.Root ([guid]::NewGuid().ToString('N').Substring(0,6))
         $modules=Join-Path $root 'modules'; $package=Join-Path $root 'package'
@@ -566,7 +566,8 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         [IO.File]::WriteAllText((Join-Path $modules 'ActiveDirectory\ActiveDirectory.psm1'),$global:PraGate.AdSource,(New-Object Text.UTF8Encoding($true)))
         [IO.File]::WriteAllText((Join-Path $modules 'ADSync\ADSync.psm1'),$global:PraGate.SyncSource,(New-Object Text.UTF8Encoding($true)))
         Copy-Item -Path (Join-Path $global:PraGate.Package '*') -Destination $package -Recurse -Force
-        [IO.File]::WriteAllText((Join-Path $package 'module\PRA.Cloud.psm1'),$global:PraGate.CloudSource,(New-Object Text.UTF8Encoding($true)))
+        # -RealCloud keeps the production PRA.Cloud module of the package (its sign-in and its retention check run); otherwise the cloud barrier takes its place.
+        if (-not $RealCloud) { [IO.File]::WriteAllText((Join-Path $package 'module\PRA.Cloud.psm1'),$global:PraGate.CloudSource,(New-Object Text.UTF8Encoding($true))) }
         Set-PraFixtureHash -Root $package -Relative 'module\PRA.Cloud.psm1'
         $users=@(1..$UserCount | ForEach-Object { New-GateUser $_ })
         if ($Shared13) {
@@ -655,12 +656,15 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
         [IO.File]::WriteAllText($path,($record | ConvertTo-Json -Depth 25),(New-Object Text.UTF8Encoding($true)))
     }
     function global:Invoke-GateProcess {
-        param($Runtime,[hashtable]$Arguments,[switch]$Desktop,[switch]$ExplicitArguments,[ValidateRange(10,240)][int]$TimeoutSeconds=60,[ValidateRange(256,512)][int]$MemoryLimitMB=512,[switch]$Certificate,[switch]$SignInPossible)
+        param($Runtime,[hashtable]$Arguments,[switch]$Desktop,[switch]$ExplicitArguments,[ValidateRange(10,240)][int]$TimeoutSeconds=60,[ValidateRange(256,512)][int]$MemoryLimitMB=512,[switch]$Certificate,[switch]$SignInPossible,[switch]$ExoSignInFails)
         # -Certificate: the AD server of the run has a certificate sign-in (a Cloud section is added to a copy of the configuration file, in a folder of its own: the file of the runtime is never changed).
         # -SignInPossible: a person could answer a sign-in in this run (Test-PraRunCanSignIn answers true).
-        if ($Certificate -and $Arguments.ContainsKey('ConfigPath') -and [IO.File]::Exists([string]$Arguments.ConfigPath)) {
+        # -ExoSignInFails: the sign-in to Exchange Online of the production Cloud module fails with an error of the identity provider (AADSTS50126); nothing leaves the process.
+        if ($Certificate) {
+            if (-not $Arguments.ContainsKey('ConfigPath') -or -not [IO.File]::Exists([string]$Arguments.ConfigPath)) { throw 'Synthetic harness: -Certificate needs a ConfigPath that exists.' }
             $configText=[IO.File]::ReadAllText([string]$Arguments.ConfigPath)
-            if ($configText -notmatch 'Cloud\s*=\s*@\{' -and $configText.Contains("Execution=@{Phase='Both'}")) {
+            if ($configText -notmatch 'Cloud\s*=\s*@\{' -and -not $configText.Contains("Execution=@{Phase='Both'}")) { throw 'Synthetic harness: -Certificate cannot be applied, the configuration has no Execution=@{Phase=''Both''} line to add the Cloud section after.' }
+            if ($configText -notmatch 'Cloud\s*=\s*@\{') {
                 $copyFolder=Join-Path $Runtime.Root ('config-'+[guid]::NewGuid().ToString('N').Substring(0,8))
                 $null=New-Item -ItemType Directory -Path $copyFolder -Force
                 $copyPath=Join-Path $copyFolder ([IO.Path]::GetFileName([string]$Arguments.ConfigPath))
@@ -668,6 +672,13 @@ Export-ModuleMember -Function Get-ADSyncScheduler,Start-ADSyncSyncCycle
                 $Arguments=$Arguments.Clone(); $Arguments.ConfigPath=$copyPath
             }
         }
+        $exoSetup=if ($ExoSignInFails) {
+            @'
+function global:Get-ConnectionInformation { [CmdletBinding()]param() @() }
+function global:Disconnect-ExchangeOnline { [CmdletBinding()]param($ConnectionId,[switch]$Confirm) }
+function global:Connect-ExchangeOnline { [CmdletBinding()]param($AppId,$CertificateThumbprint,$Organization,$UserPrincipalName,[switch]$ShowBanner,[switch]$DisableWAM) throw 'SYNTHETIC: AADSTS50126: Error validating credentials due to invalid username or password.' }
+'@
+        } else { '' }
         $signInSetup=if ($SignInPossible) { "function global:Invoke-GateSignInPossible { `$true }`r`nSet-Alias -Name Test-PraRunCanSignIn -Value Invoke-GateSignInPossible -Scope Global" } else { '' }
         $paramsPath=Join-Path $Runtime.Root ('args-'+[guid]::NewGuid().ToString('N')+'.clixml')
         [IO.File]::WriteAllText($paramsPath,[Management.Automation.PSSerializer]::Serialize($Arguments,10))
@@ -719,6 +730,7 @@ function global:Receive-Job { [CmdletBinding()] param(`$Job,[switch]`$Keep)
     if (`$Job.IsCycle) { [pscustomobject]@{ Result='Success'; Seconds=1; Computer=`$Job.Computer } } else { [pscustomobject]@{ Computer=`$Job.Computer; CycleEnabled=`$true } } }
 function global:Connect-ExchangeOnline { throw 'SYNTHETIC BLOCK: EXO' }
 function global:Connect-MgGraph { throw 'SYNTHETIC BLOCK: Graph' }
+$exoSetup
 $signInSetup
 Import-Module ActiveDirectory -Force -Global -ErrorAction Stop
 if ((Get-Command Get-ADUser).Module.Path -notlike '$($Runtime.Modules.Replace("'","''"))*') { throw 'Non-synthetic AD module refused.' }
@@ -13621,7 +13633,8 @@ Describe 'Release 3.2.0 - the retention check before a Recover: one read per mai
         $answer.StopReason | Should -Match 'Microsoft 365 did not answer \(network\)'
         $global:PraGate.E320Calls.Count | Should -Be 0
         $global:PraGate.E320Context.Issues.Count | Should -Be 0
-        $global:PraGate.E320Context.CloudConnectFailed | Should -BeTrue
+        $answer.SignInFailed | Should -BeTrue
+        $global:PraGate.E320Context.CloudConnectFailed | Should -BeFalse -Because 'the failed sign-in is told in the answer, it is not the failure of the run'
     }
     It 'a read that gets no answer, or is throttled, stops the reads: the next mailboxes are not asked, they are not checked, with the same reason' -ForEach @(
         @{ Name = 'no answer'; Failure = 'network'; Reason = 'Microsoft 365 did not answer \(network\)' }
@@ -14307,9 +14320,15 @@ Describe 'Release 3.2.0 - the retention proof in the entry script: the Check on 
         @(Get-GateWrites $runtime).Count | Should -Be 0
         $next = @($run.MainResult.NextSteps)
         ($next | Where-Object { $_ -match '-Action Check -Batch [0-9a-f]{8}.* -Expect Retained$' }).Count | Should -Be 1
-        ($next -join "`n") | Should -Match 'On the cloud server, with the batch folder there, make the retention policy hold the mailboxes named above'
-        ($next -join "`n") | Should -Match ('Copy those two files to the folder ' + [regex]::Escape((Join-Path $runtime.State.BackupFolder 'Inbox')) + ' of this server')
-        ($next -join "`n") | Should -Match 'as many hours as its own Retention\.ProofMaxAgeHours says \(24\)'
+        if ($Why -ceq 'tampered') {
+            ($next -join "`n") | Should -Match ('Copy both files again, RetentionProof-\.\.\.json and its \.sha256 file, from the Backups\\Outbox folder of the cloud server to the folder ' + [regex]::Escape((Join-Path $runtime.State.BackupFolder 'Inbox')) + ' of this server')
+            ($next -join "`n") | Should -Match 'An older proof never stands in for it'
+        }
+        else {
+            ($next -join "`n") | Should -Match 'On the cloud server, with the batch folder there, make the retention policy hold the mailboxes named above'
+            ($next -join "`n") | Should -Match ('Copy those two files to the folder ' + [regex]::Escape((Join-Path $runtime.State.BackupFolder 'Inbox')) + ' of this server')
+            ($next -join "`n") | Should -Match 'as many hours as its own Retention\.ProofMaxAgeHours says \(24\)'
+        }
         @($next | Where-Object { $_ -match '-Action Check -Batch [0-9a-f]{8}.* -Expect Retained$' })[0] | Should -Not -Match '-ConfigPath' -Because 'the command is for the cloud server, which has its own configuration file'
         $next[-1] | Should -Match '-Action Recover -Phase AD -Mode Apply -Batch .* -AcceptRetentionRisk$' -Because 'the override is the last line'
     }
@@ -15162,7 +15181,7 @@ Describe 'Release 3.2.0 - the guide, the settings and the messages say what the 
         $guide = $global:PraGate.G320Guide
         $guide | Should -Match 'The `\.sha256` file is an integrity check, not a proof of origin\.'
         $guide | Should -Match 'give write access to them only to the operators of the tool'
-        $guide | Should -Match 'newest usable proof .* that lists it with a definitive verdict'
+        $guide | Should -Match 'The newest proof decides\.'
         $guide | Should -Match '`SourceBackupHash`'
         $guide | Should -Match 'the same UPN with another ObjectGuid is \*\*not\*\* covered'
         $guide | Should -Match 'at most 64 MB and is read once'
@@ -15214,27 +15233,30 @@ Describe 'Release 3.2.0 - the guide, the settings and the messages say what the 
     }
 }
 
-Describe 'Release 3.2.0 - a retention proof says a verdict for each object: the newest proof that lists an object with a definitive verdict decides, NotChecked leaves it to an older proof, a proof of an earlier build or an invalid Retention.PolicyGuid is refused (production Common module, synthetic files)' -Tag 'Release320h' {
+Describe 'Release 3.2.0 - the newest retention proof decides: an older proof never stands in or completes it, copies count once, a renamed or damaged newest proof refuses (production Common module, synthetic files)' -Tag 'Release320h', 'Release320i' {
     BeforeAll {
         Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global
         $global:PraGate.H320Batch = 'ABCDEF0123456789ABCDEF0123456789'
         function global:New-H320Folder { $path = Join-Path $global:PraGate.Root ('proof-h-' + [guid]::NewGuid().ToString('N').Substring(0, 8)); $null = New-Item -ItemType Directory -Path $path -Force; return $path }
         # A proof written by hand: the verdict of each object by its number (1 to n), as text.
         function global:New-H320Proof {
-            param([string]$Folder, [string[]]$Verdicts, [double]$AgeHours = 1)
+            param([string]$Folder, [string[]]$Verdicts, [double]$AgeHours = 1, [string]$NameTime = '', [switch]$NoSidecar, [switch]$Tamper, [string]$SourceHash = 'ff00', [string]$Environment = 'PROD', [int]$Skip = 0)
             $created = [DateTime]::UtcNow.AddHours(-$AgeHours)
-            $entries = @(for ($i = 0; $i -lt $Verdicts.Count; $i++) { [ordered]@{ ObjectGuid = ('00000000-0000-0000-0000-{0:000000000000}' -f ($i + 1)); Upn = ('User{0}@Contoso.Invalid' -f ($i + 1)); Verdict = $Verdicts[$i]; Covered = ($Verdicts[$i] -ceq 'Covered'); NoMailbox = ($Verdicts[$i] -ceq 'NoMailbox') } })
-            $record = [ordered]@{ SchemaVersion = 1; Kind = 'RetentionProof'; BatchId = $global:PraGate.H320Batch.ToLowerInvariant(); SourceBackupHash = 'ff00'; Environment = 'PROD'; CreatedUtc = $created.ToString('o'); PolicyGuid = @('40000000000000000000000000000004'); ObjectCount = $entries.Count; CoveredCount = @($entries | Where-Object { $_.Covered }).Count; Objects = $entries }
-            $path = Join-Path $Folder ('RetentionProof-{0}-{1}.json' -f $global:PraGate.H320Batch.ToLowerInvariant(), $created.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture))
+            $entries = @(for ($i = $Skip; $i -lt $Verdicts.Count; $i++) { [ordered]@{ ObjectGuid = ('00000000-0000-0000-0000-{0:000000000000}' -f ($i + 1)); Upn = ('User{0}@Contoso.Invalid' -f ($i + 1)); Verdict = $Verdicts[$i]; Covered = ($Verdicts[$i] -ceq 'Covered'); NoMailbox = ($Verdicts[$i] -ceq 'NoMailbox') } })
+            $record = [ordered]@{ SchemaVersion = 1; Kind = 'RetentionProof'; BatchId = $global:PraGate.H320Batch.ToLowerInvariant(); SourceBackupHash = $SourceHash; Environment = $Environment; CreatedUtc = $created.ToString('o'); PolicyGuid = @('40000000000000000000000000000004'); ObjectCount = $entries.Count; CoveredCount = @($entries | Where-Object { $_.Covered }).Count; Objects = $entries }
+            if (-not $NameTime) { $NameTime = $created.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture) }
+            $path = Join-Path $Folder ('RetentionProof-{0}-{1}.json' -f $global:PraGate.H320Batch.ToLowerInvariant(), $NameTime)
             [IO.File]::WriteAllText($path, ($record | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
-            [IO.File]::WriteAllText($path + '.sha256', (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false)))
+            if (-not $NoSidecar) { [IO.File]::WriteAllText($path + '.sha256', (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false))) }
+            if ($Tamper) { [IO.File]::AppendAllText($path, ' ') }
             return $path
         }
         function global:Find-H320Proof {
-            param([string]$Folder, [int]$Rows, [string]$Policy = '')
+            param([string[]]$Folder, [int]$Rows, [string]$Policy = '', [string]$SourceHash = '')
             $row = @(1..$Rows | ForEach-Object { [pscustomobject]@{ ObjectGuid = ('00000000-0000-0000-0000-{0:000000000000}' -f $_); UserPrincipalName = "user$_@contoso.invalid" } })
-            $arguments = @{ Folder = @($Folder); BatchId = $global:PraGate.H320Batch; Environment = 'prod'; MaxAgeHours = 24; Row = $row }
+            $arguments = @{ Folder = $Folder; BatchId = $global:PraGate.H320Batch; Environment = 'prod'; MaxAgeHours = 24; Row = $row }
             if ($Policy) { $arguments.PolicyGuid = $Policy }
+            if ($SourceHash) { $arguments.SourceBackupHash = $SourceHash }
             return (Get-PraRetentionProof @arguments)
         }
     }
@@ -15242,9 +15264,9 @@ Describe 'Release 3.2.0 - a retention proof says a verdict for each object: the 
         Remove-Item -LiteralPath 'Function:\New-H320Folder', 'Function:\New-H320Proof', 'Function:\Find-H320Proof' -ErrorAction SilentlyContinue
         $global:PraGate.Remove('H320Batch')
     }
-    It 'T0 says every object is covered, T1 (newer) says one is not: the object is blocked by T1, which the answer names, and the change is told' {
+    It 'an older proof that is complete does not stand in for a newest proof that says an object is NotCovered: the newest blocks and names the object and the proof' {
         $folder = New-H320Folder
-        $t0 = New-H320Proof $folder @('Covered', 'Covered', 'Covered') -AgeHours 3
+        $null = New-H320Proof $folder @('Covered', 'Covered', 'Covered') -AgeHours 3
         $t1 = New-H320Proof $folder @('Covered', 'NotCovered', 'Covered') -AgeHours 1
         $answer = Find-H320Proof $folder 3
         $answer.Found | Should -BeTrue
@@ -15252,70 +15274,147 @@ Describe 'Release 3.2.0 - a retention proof says a verdict for each object: the 
         @($answer.Missing) | Should -BeExactly @('user2@contoso.invalid')
         @($answer.Blocked).Count | Should -Be 1
         $answer.Blocked[0].Upn | Should -BeExactly 'user2@contoso.invalid'
+        $answer.Blocked[0].Verdict | Should -BeExactly 'NotCovered'
         $answer.Blocked[0].Proof | Should -BeExactly (Split-Path $t1 -Leaf)
-        @($answer.Notes) | Should -BeExactly @(('The newer retention proof {0} gives another answer than {1} for 1 object(s) of this Recover: the newer one decides.' -f (Split-Path $t1 -Leaf), (Split-Path $t0 -Leaf)))
+        @($answer.Proofs).Count | Should -Be 1
+        $answer.Proofs[0].Path | Should -BeExactly $t1
         $answer.Reason | Should -Match '1 of the 3 object\(s\) of this Recover are not covered in it'
+        $answer.Refusal | Should -BeExactly 'RunCheck'
     }
-    It 'an older proof that says NotCovered does not block an object that the newer proof says is covered, and the change is told' {
+    It 'an older proof that says NotCovered does not block when the newest says everything is covered' {
         $folder = New-H320Folder
-        $t0 = New-H320Proof $folder @('NotCovered', 'Covered') -AgeHours 3
+        $null = New-H320Proof $folder @('NotCovered', 'Covered') -AgeHours 3
         $t1 = New-H320Proof $folder @('Covered', 'Covered') -AgeHours 1
         $answer = Find-H320Proof $folder 2
         $answer.Complete | Should -BeTrue
         @($answer.Blocked).Count | Should -Be 0
         @($answer.Proofs).Count | Should -Be 1
         $answer.Proofs[0].Path | Should -BeExactly $t1
-        @($answer.Notes).Count | Should -Be 1
-        $answer.Notes[0] | Should -Match 'gives another answer than'
     }
-    It 'NotChecked in a newer proof leaves the object to the older proof, which is then recorded as used, with a note; an object that the newest proof does not list is decided by the older one' {
+    It 'an incomplete newest proof is never completed by an older complete one: the objects it does not list or did not check block' {
         $folder = New-H320Folder
-        $t0 = New-H320Proof $folder @('Covered', 'Covered', 'Covered') -AgeHours 3
-        $t1 = New-H320Proof $folder @('NotChecked', 'Covered') -AgeHours 1
-        $answer = Find-H320Proof $folder 3
-        $answer.Complete | Should -BeTrue
-        @($answer.Proofs | ForEach-Object { Split-Path $_.Path -Leaf }) | Should -BeExactly @((Split-Path $t1 -Leaf), (Split-Path $t0 -Leaf))
-        @($answer.Notes).Count | Should -Be 1
-        $answer.Notes[0] | Should -BeExactly ('The retention proof {0} did not check 1 object(s) of this Recover: the answer of {1} is used for them.' -f (Split-Path $t1 -Leaf), (Split-Path $t0 -Leaf))
-    }
-    It 'an object that no proof says anything definite about is missing, whatever the number of proofs' {
-        $folder = New-H320Folder
-        $null = New-H320Proof $folder @('NotChecked', 'Covered') -AgeHours 3
-        $null = New-H320Proof $folder @('NotChecked', 'NotChecked') -AgeHours 1
-        $answer = Find-H320Proof $folder 2
+        $null = New-H320Proof $folder @('Covered', 'Covered', 'Covered', 'Covered') -AgeHours 3
+        $t1 = New-H320Proof $folder @('NotChecked', 'Unverified', 'Covered', 'Covered') -AgeHours 1 -Skip 0
+        $answer = Find-H320Proof $folder 4
+        $answer.Found | Should -BeTrue
         $answer.Complete | Should -BeFalse
-        @($answer.Missing) | Should -BeExactly @('user1@contoso.invalid')
-        @($answer.Blocked).Count | Should -Be 0
+        @($answer.Missing) | Should -BeExactly @('user1@contoso.invalid', 'user2@contoso.invalid')
+        @($answer.Blocked | ForEach-Object { $_.Verdict }) | Should -BeExactly @('NotChecked', 'Unverified')
+        $folder2 = New-H320Folder
+        $null = New-H320Proof $folder2 @('Covered', 'Covered', 'Covered') -AgeHours 3
+        $null = New-H320Proof $folder2 @('Covered', 'Covered', 'Covered') -AgeHours 1 -Skip 1
+        $answer2 = Find-H320Proof $folder2 3
+        $answer2.Complete | Should -BeFalse
+        @($answer2.Blocked | ForEach-Object { $_.Verdict }) | Should -BeExactly @('NotListed')
+        $answer2.Blocked[0].Upn | Should -BeExactly 'user1@contoso.invalid'
     }
-    It 'an object without a mailbox in the newest proof counts as covered and is listed; a proof that is too old is not one of the proofs' {
+    It 'a newest proof that is damaged, without its .sha256 file, or still being copied refuses with the step to copy again, even when an older proof is valid' {
+        foreach ($case in @('Tamper', 'NoSidecar')) {
+            $folder = New-H320Folder
+            $null = New-H320Proof $folder @('Covered', 'Covered') -AgeHours 3
+            $bad = if ($case -eq 'Tamper') { New-H320Proof $folder @('Covered', 'Covered') -AgeHours 1 -Tamper } else { New-H320Proof $folder @('Covered', 'Covered') -AgeHours 1 -NoSidecar }
+            $answer = Find-H320Proof $folder 2
+            $answer.Found | Should -BeFalse -Because $case
+            $answer.Complete | Should -BeFalse -Because $case
+            $answer.Refusal | Should -BeExactly 'CopyAgain' -Because $case
+            $answer.Reason | Should -Match ([regex]::Escape((Split-Path $bad -Leaf))) -Because $case
+        }
+        $folder = New-H320Folder
+        $null = New-H320Proof $folder @('Covered') -AgeHours 3
+        $held = New-H320Proof $folder @('Covered') -AgeHours 1
+        $stream = [IO.File]::Open($held, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try {
+            $answer = Find-H320Proof $folder 1
+            $answer.Found | Should -BeFalse
+            $answer.Refusal | Should -BeExactly 'CopyAgain'
+        }
+        finally { $stream.Dispose() }
+    }
+    It 'a newest proof dated in the future, of another Environment or of another copy of the batch file refuses even when an older proof is valid, and the step differs' {
+        $folder = New-H320Folder
+        $null = New-H320Proof $folder @('Covered') -AgeHours 3
+        $null = New-H320Proof $folder @('Covered') -AgeHours -2
+        $future = Find-H320Proof $folder 1
+        $future.Found | Should -BeFalse
+        $future.FutureDated | Should -BeTrue
+        $future.Refusal | Should -BeExactly 'Clock'
+        $folder = New-H320Folder
+        $null = New-H320Proof $folder @('Covered') -AgeHours 3
+        $null = New-H320Proof $folder @('Covered') -AgeHours 1 -Environment 'LAB'
+        $other = Find-H320Proof $folder 1
+        $other.Found | Should -BeFalse
+        $other.Refusal | Should -BeExactly 'RunCheck'
+        $other.Reason | Should -Match 'Environment'
+        $folder = New-H320Folder
+        $null = New-H320Proof $folder @('Covered') -AgeHours 3 -SourceHash 'aa11'
+        $null = New-H320Proof $folder @('Covered') -AgeHours 1 -SourceHash 'bb22'
+        $hash = Find-H320Proof $folder 1 -SourceHash 'aa11'
+        $hash.Found | Should -BeFalse
+        $hash.Reason | Should -Match 'SourceBackupHash'
+        $old = Find-H320Proof (New-H320Folder) 1
+        $old.Found | Should -BeFalse
+        $old.Refusal | Should -BeExactly 'RunCheck'
+    }
+    It 'a renamed file is refused: the time in its name must be the time inside it, and an older valid proof does not stand in' {
+        $folder = New-H320Folder
+        $null = New-H320Proof $folder @('Covered', 'Covered') -AgeHours 3
+        $renamed = New-H320Proof $folder @('Covered', 'Covered') -AgeHours 1 -NameTime ([DateTime]::UtcNow.AddMinutes(-1).ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture))
+        $answer = Find-H320Proof $folder 2
+        $answer.Found | Should -BeFalse
+        $answer.Refusal | Should -BeExactly 'RunCheck'
+        $answer.Reason | Should -Match 'renamed'
+        $answer.Reason | Should -Match ([regex]::Escape((Split-Path $renamed -Leaf)))
+    }
+    It 'copies of one proof in the Inbox and in the batch folder count once; a copy that is damaged does not hide the intact one' {
+        $inbox = New-H320Folder; $batch = New-H320Folder
+        $a = New-H320Proof $inbox @('Covered', 'Covered') -AgeHours 1
+        Copy-Item -LiteralPath $a -Destination $batch; Copy-Item -LiteralPath ($a + '.sha256') -Destination $batch
+        $answer = Find-H320Proof @($inbox, $batch) 2
+        $answer.Found | Should -BeTrue
+        $answer.Complete | Should -BeTrue
+        $answer.Candidates | Should -Be 2
+        $answer.Duplicates | Should -Be 1
+        @($answer.Proofs).Count | Should -Be 1
+        Remove-Item -LiteralPath ($batch + '\' + (Split-Path $a -Leaf) + '.sha256')
+        $again = Find-H320Proof @($inbox, $batch) 2
+        $again.Found | Should -BeTrue
+        $again.Complete | Should -BeTrue
+        $again.Duplicates | Should -Be 1
+    }
+    It 'an object without a mailbox in the newest proof counts as covered and is listed; a proof that is too old is refused' {
         $folder = New-H320Folder
         $null = New-H320Proof $folder @('NoMailbox', 'Covered') -AgeHours 1
-        $null = New-H320Proof $folder @('NotCovered', 'NotCovered') -AgeHours 30
         $answer = Find-H320Proof $folder 2
         $answer.Complete | Should -BeTrue
         @($answer.NoMailbox).Count | Should -Be 1
         $answer.NoMailbox[0].Upn | Should -BeExactly 'user1@contoso.invalid'
-        @($answer.Notes).Count | Should -Be 0
+        $stale = New-H320Folder
+        $null = New-H320Proof $stale @('Covered', 'Covered') -AgeHours 30
+        $tooOld = Find-H320Proof $stale 2
+        $tooOld.Found | Should -BeFalse
+        $tooOld.Reason | Should -Match 'hours old'
     }
-    It 'a proof of an earlier build (no Verdict) is not accepted, and says why' {
+    It 'a proof without a Verdict is not accepted, and the reason says to run the Check again' {
         $folder = New-H320Folder
-        $record = [ordered]@{ SchemaVersion = 1; Kind = 'RetentionProof'; BatchId = $global:PraGate.H320Batch.ToLowerInvariant(); SourceBackupHash = 'ff00'; Environment = 'PROD'; CreatedUtc = [DateTime]::UtcNow.ToString('o'); PolicyGuid = @('40000000000000000000000000000004'); ObjectCount = 1; CoveredCount = 1
+        $created = [DateTime]::UtcNow
+        $record = [ordered]@{ SchemaVersion = 1; Kind = 'RetentionProof'; BatchId = $global:PraGate.H320Batch.ToLowerInvariant(); SourceBackupHash = 'ff00'; Environment = 'PROD'; CreatedUtc = $created.ToString('o'); PolicyGuid = @('40000000000000000000000000000004'); ObjectCount = 1; CoveredCount = 1
             Objects = @([ordered]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'User1@Contoso.Invalid'; Covered = $true; NoMailbox = $false }) }
-        $path = Join-Path $folder ('RetentionProof-{0}-{1}.json' -f $global:PraGate.H320Batch.ToLowerInvariant(), '20261120120000000')
+        $path = Join-Path $folder ('RetentionProof-{0}-{1}.json' -f $global:PraGate.H320Batch.ToLowerInvariant(), $created.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture))
         [IO.File]::WriteAllText($path, ($record | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
         [IO.File]::WriteAllText($path + '.sha256', (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant())
         $answer = Find-H320Proof $folder 1
         $answer.Found | Should -BeFalse
-        $answer.Reason | Should -Match 'entry 1 has no Verdict \(a proof written by an earlier build is not accepted\)'
+        $answer.Reason | Should -Match 'entry 1 has no Verdict: the Check of this version writes one for every object'
+        $answer.Reason | Should -Not -Match 'earlier build|development'
     }
-    It 'the writer and the reader agree on the four verdicts, and the booleans follow them' {
+    It 'the writer and the reader agree on the five verdicts, and the booleans follow them' {
         $folder = New-H320Folder
-        $objects = @('Covered', 'NotCovered', 'NotChecked', 'NoMailbox', 'covered', 'nonsense') | ForEach-Object -Begin { $n = 0 } -Process { $n++; [pscustomobject]@{ ObjectGuid = ('00000000-0000-0000-0000-{0:000000000000}' -f $n); Upn = "u$n@contoso.invalid"; Verdict = $_ } }
+        $objects = @('Covered', 'NotCovered', 'NotChecked', 'NoMailbox', 'covered', 'unverified', 'nonsense') | ForEach-Object -Begin { $n = 0 } -Process { $n++; [pscustomobject]@{ ObjectGuid = ('00000000-0000-0000-0000-{0:000000000000}' -f $n); Upn = "u$n@contoso.invalid"; Verdict = $_ } }
         $written = Write-PraRetentionProof -Folder $folder -BatchId $global:PraGate.H320Batch -Environment 'PROD' -Object $objects
         $read = & (Get-Module PRA.Common) { param($p) Read-PraRetentionProofFile -Path $p } $written.Path
         $read.Valid | Should -BeTrue
-        @($read.Objects | ForEach-Object { $_.Verdict }) | Should -BeExactly @('Covered', 'NotCovered', 'NotChecked', 'NoMailbox', 'Covered', 'NotChecked')
-        @($read.Objects | ForEach-Object { [string]$_.Covered + [string]$_.NoMailbox }) | Should -BeExactly @('TrueFalse', 'FalseFalse', 'FalseFalse', 'FalseTrue', 'TrueFalse', 'FalseFalse')
+        @($read.Objects | ForEach-Object { $_.Verdict }) | Should -BeExactly @('Covered', 'NotCovered', 'NotChecked', 'NoMailbox', 'Covered', 'Unverified', 'NotChecked')
+        @($read.Objects | ForEach-Object { [string]$_.Covered + [string]$_.NoMailbox }) | Should -BeExactly @('TrueFalse', 'FalseFalse', 'FalseFalse', 'FalseTrue', 'TrueFalse', 'FalseFalse', 'FalseFalse')
     }
     It 'a Retention.PolicyGuid that is not a GUID refuses every proof, even a valid one, and says to correct the setting' {
         $folder = New-H320Folder
@@ -15338,9 +15437,17 @@ Describe 'Release 3.2.0 - a retention proof says a verdict for each object: the 
         $text | Should -Match 'Test-PraRetentionCheckRecord -Record \$plan\.Row\.BackupRec -PreserveCloudMailbox \(\[bool\]\$plan\.Row\.PreserveCloudMailbox\)'
         [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Gui.psm1')) | Should -Match 'Test-PraRetentionCheckRecord -Record \$_ -PreserveCloudMailbox'
     }
+    It 'a shared mailbox kept on purpose is one rule for the plan of the run, the gate and the console' {
+        Test-PraCloudMailboxKept -IsShared $true -Operation 'recover' -KeepCloudShared $true | Should -BeTrue
+        Test-PraCloudMailboxKept -IsShared $true -Operation 'Convert' -KeepCloudShared $true | Should -BeFalse
+        Test-PraCloudMailboxKept -IsShared $false -Operation 'Recover' -KeepCloudShared $true | Should -BeFalse
+        Test-PraCloudMailboxKept -IsShared $true -Operation 'Recover' -KeepCloudShared $false | Should -BeFalse
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Directory.psm1')) | Should -Match 'Test-PraCloudMailboxKept -IsShared'
+        [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'module\PRA.Gui.psm1')) | Should -Match 'Test-PraCloudMailboxKept -IsShared'
+    }
 }
 
-Describe 'Release 3.2.0 - the retention check reads like one mailbox at a time, whatever the way: an untagged active mailbox beside a tagged inactive one, an ambiguity, a failed sign-in, the stop of the reads (production Cloud module, the worker over a mocked Exchange Online, no network)' -Tag 'Release320h' {
+Describe 'Release 3.2.0 - the retention check reads like one mailbox at a time, whatever the way: an untagged active mailbox beside a tagged inactive one, an ambiguity, a failed sign-in, the stop of the reads (production Cloud module, the worker over a mocked Exchange Online, no network)' -Tag 'Release320h', 'Release320i' {
     BeforeAll {
         $global:PraGate.H320Path = Join-Path $global:PraGate.Root 'PraGateH320Network.psm1'
         $networkSource = @'
@@ -15414,9 +15521,9 @@ Export-ModuleMember -Function Get-EXOMailbox, Get-ConnectionInformation
     AfterAll {
         Remove-Item -LiteralPath 'Function:\New-H320Mailbox', 'Function:\Invoke-H320Search', 'Function:\New-H320Row', 'Function:\Invoke-H320Coverage' -ErrorAction SilentlyContinue
         Remove-Module PRA.Cloud, PraGateH320Network -Force -ErrorAction SilentlyContinue
-        foreach ($key in 'H320Path', 'H320Binding', 'H320Runtime', 'H320Context', 'H320Searches', 'H320Store', 'H320Rows', 'H320Minimum', 'H320Mine', 'H320Mode', 'H320Count') { $global:PraGate.Remove($key) }
+        foreach ($key in 'H320Path', 'H320Binding', 'H320Runtime', 'H320Context', 'H320Searches', 'H320Store', 'H320Rows', 'H320Minimum', 'H320Mine', 'H320Mode', 'H320Count', 'H320Fail') { $global:PraGate.Remove($key) }
     }
-    It 'gives the same answer in bulk and one mailbox at a time, for the cases that decided wrongly in bulk: an untagged active mailbox beside a tagged inactive one of the same account and GUID (not covered both ways), and an untagged inactive mailbox beside a tagged one with the same UPN and GUID (ambiguous both ways)' {
+    It 'gives the same answer in bulk and one mailbox at a time, for the cases that a search by tag cannot settle alone: an untagged active mailbox beside a tagged inactive one of the same account and GUID (not covered both ways), and an untagged inactive mailbox beside a tagged one with the same UPN and GUID (ambiguous both ways)' {
         $mine = $global:PraGate.H320Mine
         $store = New-Object 'Collections.Generic.List[object]'
         foreach ($index in 1..20) { $store.Add((New-H320Mailbox $index)) }
@@ -15537,9 +15644,93 @@ Export-ModuleMember -Function Get-EXOMailbox, Get-ConnectionInformation
         $answer.CouldNotAsk | Should -BeTrue
         $answer.Covered | Should -Be 0
     }
+    It 'a failed sign-in is kept in the answer (SignInFailed and its message) and the flag CloudConnectFailed of the run is what it was before the check, whatever its value' -ForEach @(
+        @{ Before = $false }
+        @{ Before = $true }) {
+        $global:PraGate.H320Rows = @(1..3 | ForEach-Object { New-H320Row $_ })
+        $global:PraGate.H320Context.CloudConnectFailed = $Before
+        $answer = InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { throw 'SYNTHETIC: AADSTS50126: Error validating credentials due to invalid username or password.' }
+            Mock Close-PraCloudSession { }
+            Test-PraRetentionCoverage -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        $answer.CouldNotAsk | Should -BeTrue
+        $answer.SignInFailed | Should -BeTrue
+        $answer.SignInMessage | Should -Match 'AADSTS50126'
+        $global:PraGate.H320Context.CloudConnectFailed | Should -Be $Before
+        $global:PraGate.H320Context.Issues.Count | Should -Be 0
+    }
+    It 'a failure that is not the sign-in leaves SignInFailed false' {
+        $global:PraGate.H320Rows = @(1..3 | ForEach-Object { New-H320Row $_ })
+        $answer = InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Invoke-PraExo { throw [System.Net.Http.HttpRequestException]::new('SYNTHETIC: no answer', [System.Net.Sockets.SocketException]::new(10060)) }
+            Test-PraRetentionCoverage -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        $answer.CouldNotAsk | Should -BeTrue
+        $answer.SignInFailed | Should -BeFalse
+    }
+    It 'the Check writes Unverified for a failure of one mailbox (not unique), NotCovered, Covered, and NotChecked only for the run-level stop (no answer)' {
+        $global:PraGate.H320Rows = @(1..5 | ForEach-Object { New-H320Row $_ })
+        $rows = $global:PraGate.H320Rows
+        $null = InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Invoke-PraExo {
+                switch ([string]$Params.Upn) {
+                    'user1@gate.invalid' { throw 'Exchange Online mailbox not unique: user1@gate.invalid' }
+                    'user2@gate.invalid' { return @{ Found = $true; Type = 'UserMailbox'; Holds = @() } }
+                    'user4@gate.invalid' { throw [System.Net.Http.HttpRequestException]::new('SYNTHETIC: no answer', [System.Net.Sockets.SocketException]::new(10060)) }
+                    default { return @{ Found = $true; Type = 'UserMailbox'; Holds = @('mbx40000000000000000000000000000004') } }
+                }
+            }
+            Invoke-PraRetentionCheck -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        @($rows | ForEach-Object { [string]$_.RetentionVerdict }) | Should -BeExactly @('Unverified', 'NotCovered', 'Covered', 'NotChecked', 'Covered') -Because 'the row that got no answer is not checked; the next row is read on its own'
+    }
+    It 'a bulk search that fails for a reason of its own leaves the objects of that search to the read of one mailbox, and the others are still read in bulk' {
+        $global:PraGate.H320Store = @(1..120 | ForEach-Object { New-H320Mailbox $_ })
+        $global:PraGate.H320Rows = @(1..120 | ForEach-Object { New-H320Row $_ })
+        $global:PraGate.H320Fail = 'user7@gate.invalid'
+        $global:PraGate.H320Searches.Clear()
+        $answer = InModuleScope PRA.Cloud {
+            $script:PraRetentionBulkMinimum = 20
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Get-EXOMailbox {
+                if ([string]$Filter -like '(CustomAttribute*' -and ([string]$Filter).Contains($global:PraGate.H320Fail)) { throw 'SYNTHETIC: the filter of this search is not accepted.' }
+                Invoke-H320Search -Identity $Identity -ExternalDirectoryObjectId $ExternalDirectoryObjectId -Filter $Filter -Properties $Properties -ResultSize $ResultSize -InactiveMailboxOnly $InactiveMailboxOnly
+            }
+            Mock Invoke-PraExo { & $script:PraExoWorker $Operation $Params $null $global:PraGate.H320Binding $null $null }
+            Test-PraRetentionCoverage -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        $answer.Covered | Should -Be 120
+        @($answer.Unverified).Count | Should -Be 0
+        $answer.CouldNotAsk | Should -BeFalse
+        $answer.BulkResolved | Should -BeLessThan 120
+        $answer.BulkResolved | Should -BeGreaterThan 0
+        $answer.SingleReads | Should -BeGreaterThan 0
+        $global:PraGate.Remove('H320Fail')
+    }
+    It 'a bulk search that fails like every other read would (throttling) stops the bulk read: the failure is not taken for a problem of one search' {
+        $global:PraGate.H320Store = @(1..60 | ForEach-Object { New-H320Mailbox $_ })
+        $global:PraGate.H320Rows = @(1..60 | ForEach-Object { New-H320Row $_ })
+        $answer = InModuleScope PRA.Cloud {
+            $script:PraRetentionBulkMinimum = 20
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Get-EXOMailbox { throw [System.Net.Http.HttpRequestException]::new('SYNTHETIC: no answer', [System.Net.Sockets.SocketException]::new(10060)) }
+            Mock Invoke-PraExo { & $script:PraExoWorker $Operation $Params $null $global:PraGate.H320Binding $null $null }
+            Test-PraRetentionCoverage -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        $answer.CouldNotAsk | Should -BeTrue
+        $answer.StopReason | Should -Match 'did not answer'
+        $answer.Covered | Should -Be 0
+    }
 }
 
-Describe 'Release 3.2.0 - the gate end to end: a failed sign-in of a person falls to the proof, the newest definite verdict of each object decides, an invalid Retention.PolicyGuid refuses the proof, the harness leaves the configuration of the runtime alone (real main, production Directory module, synthetic AD and cloud barrier)' -Tag 'Release320h' {
+Describe 'Release 3.2.0 - the gate end to end: a failed sign-in of a person falls to the proof, the newest proof decides, an invalid Retention.PolicyGuid refuses the proof, the harness leaves the configuration of the runtime alone (real main, production Directory module, synthetic AD and cloud barrier)' -Tag 'Release320h', 'Release320i' {
     BeforeAll {
         function global:Set-H320Converted {
             param($Runtime, $Bundles)
@@ -15553,17 +15744,20 @@ Describe 'Release 3.2.0 - the gate end to end: a failed sign-in of a person fall
         }
         function global:Save-H320State { param($Runtime) [IO.File]::WriteAllText($Runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($Runtime.State, 35)) }
         function global:New-H320MainProof {
-            param($Runtime, $Bundles, [string]$Verdict = 'Covered', [double]$AgeHours = 1)
-            $folder = Join-Path $Runtime.State.BackupFolder 'Inbox'
+            param($Runtime, $Bundles, [string]$Verdict = 'Covered', [double]$AgeHours = 1, [string]$NameTime = '', [switch]$Tamper, [string]$Folder = '')
+            if (-not $Folder) { $Folder = Join-Path $Runtime.State.BackupFolder 'Inbox' }
+            $folder = $Folder
             $null = New-Item -ItemType Directory -Path $folder -Force
             $source = Get-Content -LiteralPath $Bundles.Source -Raw | ConvertFrom-Json
             $hash = (Get-FileHash -LiteralPath $Bundles.Source -Algorithm SHA256).Hash.ToLowerInvariant()
             $created = [DateTime]::UtcNow.AddHours(-$AgeHours)
             $entries = @($source.Records | ForEach-Object { [ordered]@{ ObjectGuid = [string]$_.ObjectGuid; Upn = ([string]$_.UserPrincipalName).ToUpperInvariant(); Verdict = $Verdict; Covered = ($Verdict -eq 'Covered'); NoMailbox = ($Verdict -eq 'NoMailbox') } })
             $record = [ordered]@{ SchemaVersion = 1; Kind = 'RetentionProof'; BatchId = [string]$source.BatchId; SourceBackupHash = $hash; Environment = 'SYNTHETIC_GATE'; CreatedUtc = $created.ToString('o'); PolicyGuid = @('40000000000000000000000000000004'); ObjectCount = $entries.Count; CoveredCount = @($entries | Where-Object { $_.Covered }).Count; Objects = $entries }
-            $path = Join-Path $folder ('RetentionProof-{0}-{1}.json' -f ([string]$source.BatchId).ToLowerInvariant(), $created.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture))
+            if (-not $NameTime) { $NameTime = $created.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture) }
+            $path = Join-Path $folder ('RetentionProof-{0}-{1}.json' -f ([string]$source.BatchId).ToLowerInvariant(), $NameTime)
             [IO.File]::WriteAllText($path, ($record | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
             [IO.File]::WriteAllText($path + '.sha256', (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false)))
+            if ($Tamper) { [IO.File]::AppendAllText($path, ' ') }
             return $path
         }
     }
@@ -15618,24 +15812,85 @@ Describe 'Release 3.2.0 - the gate end to end: a failed sign-in of a person fall
         $noSignIn = Invoke-GateProcess $runtime @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
         @($noSignIn.Events | Where-Object Operation -eq 'RetentionGate-SyntheticBarrier').Count | Should -Be 0 -Because 'without a person to sign in, nothing is asked'
     }
-    It 'T0 says covered and T1 (newer) says not covered: the Apply stops, the run names T1 and says that the newer proof decides; a NotChecked T1 leaves it to T0, which is told' {
-        $t0 = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours 3
+    It 'the newest proof decides: an older complete proof does not stand in for a newest proof that says NotCovered, Unverified or NotChecked; the Apply stops and the step is the full Check again' {
+        $apply = @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $inbox = Join-Path $runtime.State.BackupFolder 'Inbox'
+        $null = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours 3
         $t1 = New-H320MainProof $runtime $bundles -Verdict 'NotCovered' -AgeHours 1
+        $run = Invoke-GateProcess $runtime $apply
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Match ('the newest retention proof ' + [regex]::Escape((Split-Path $t1 -Leaf)) + ' says that the retention policy does not hold this mailbox')
+        $run.Output | Should -Match 'Only the newest retention proof counts: an older proof never completes it'
+        $run.Output | Should -Not -Match 'Retention: accepted from'
+        $next = @($run.MainResult.NextSteps) -join "`n"
+        $next | Should -Match ('The newest retention proof, ' + [regex]::Escape((Split-Path $t1 -Leaf)) + ', does not cover 2 object\(s\) of this Recover')
+        $next | Should -Match 'run the full Check again on the cloud server'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        $previous = $t1
+        foreach ($verdict in @('NotChecked', 'Unverified')) {
+            Remove-Item -LiteralPath $previous, ($previous + '.sha256') -Force
+            Start-Sleep -Milliseconds 20
+            $newest = New-H320MainProof $runtime $bundles -Verdict $verdict -AgeHours 1
+            $previous = $newest
+            $again = Invoke-GateProcess $runtime $apply
+            $again.ExitCode | Should -Be 1 -Because $verdict
+            $again.Output | Should -Not -Match 'Retention: accepted from' -Because $verdict
+            $again.Output | Should -Match ('the newest retention proof ' + [regex]::Escape((Split-Path $newest -Leaf)) + ' says that ') -Because $verdict
+        }
+    }
+    It 'a damaged, future-dated or renamed newest proof refuses even with an older valid proof, and the step differs: copy both files again, compare the clocks, run the Check again' {
+        $apply = @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $null = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours 3
+        $bad = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours 1 -Tamper
+        $run = Invoke-GateProcess $runtime $apply
+        $run.ExitCode | Should -Be 1
+        $run.Output | Should -Not -Match 'Retention: accepted from'
+        $run.Output | Should -Match ([regex]::Escape((Split-Path $bad -Leaf)) + ': its SHA-256 does not match its \.sha256 file')
+        $next = @($run.MainResult.NextSteps) -join "`n"
+        $next | Should -Match 'Copy both files again, RetentionProof-\.\.\.json and its \.sha256 file'
+        $next | Should -Match 'An older proof never stands in for it'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+        Remove-Item -LiteralPath $bad, ($bad + '.sha256') -Force
+        $future = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours -2
+        $clock = Invoke-GateProcess $runtime $apply
+        $clock.ExitCode | Should -Be 1
+        $clock.Output | Should -Not -Match 'Retention: accepted from'
+        (@($clock.MainResult.NextSteps) -join "`n") | Should -Match 'the clocks of the two servers differ'
+        Remove-Item -LiteralPath $future, ($future + '.sha256') -Force
+        $null = New-H320MainProof $runtime $bundles -Verdict 'Covered' -AgeHours 1 -NameTime ([DateTime]::UtcNow.AddMinutes(-1).ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture))
+        $rename = Invoke-GateProcess $runtime $apply
+        $rename.ExitCode | Should -Be 1
+        $rename.Output | Should -Match 'the file was renamed'
+        $rename.Output | Should -Not -Match 'Retention: accepted from'
+        (@($rename.MainResult.NextSteps) -join "`n") | Should -Match '-Action Check -Batch [0-9a-f]{8} -Expect Retained'
+    }
+    It 'copies of one proof in the Inbox and in the Outbox count once and the accepted proof is recorded once; without Retention.PolicyGuid the OK line prints the policy the proof names' {
+        $apply = @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $proof = New-H320MainProof $runtime $bundles
+        $outbox = (New-Item -ItemType Directory -Path (Join-Path $runtime.State.BackupFolder 'Outbox') -Force).FullName
+        Copy-Item -LiteralPath $proof, ($proof + '.sha256') -Destination $outbox
+        $run = Invoke-GateProcess $runtime $apply
+        $run.ExitCode | Should -BeIn @(0, 2)
+        $run.Output | Should -Match 'Retention: accepted from the retention proof RetentionProof-[0-9a-f]{32}-\d{17}\.json'
+        $run.Output | Should -Match '\(policy 40000000000000000000000000000004, as the proof names it: Retention\.PolicyGuid is not set on this server\)'
+        $log = Get-Content -LiteralPath $run.MainResult.LogFile -Raw
+        ([regex]::Matches($log, 'Retention proof accepted: ')).Count | Should -Be 1
+        $log | Should -Match '1 copy\(ies\) of the retention proof were found in the folders and counted once'
+    }
+    It 'with Retention.PolicyGuid set the OK line does not print the policy of the proof; with a PolicyGuid that is not a GUID and no PolicyName the Next steps give the command that lists the policies' {
+        Set-GateConfigText $runtime { param($text) $text.Replace('Retention=@{Enabled=$true;Tag=', 'Retention=@{Enabled=$true;PolicyGuid=''40000000-0000-0000-0000-000000000004'';Tag=') }
+        $null = New-H320MainProof $runtime $bundles
+        $configured = Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $configured.ExitCode | Should -BeIn @(0, 2)
+        $configured.Output | Should -Match 'Retention: accepted from the retention proof '
+        $configured.Output | Should -Not -Match 'as the proof names it'
+    }
+    It 'when Retention.PolicyName is empty the Next steps give Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid' {
+        Set-GateConfigText $runtime { param($text) $text.Replace('Retention=@{Enabled=$true;Tag=', 'Retention=@{Enabled=$true;PolicyName='''';PolicyGuid=''not-a-guid'';Tag=') }
+        $null = New-H320MainProof $runtime $bundles
         $run = Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
         $run.ExitCode | Should -Be 1
-        $run.Output | Should -Match ('the retention proof ' + [regex]::Escape((Split-Path $t1 -Leaf)) + ' says that the retention policy does not hold this mailbox')
-        $run.Output | Should -Match 'The newer retention proof RetentionProof-[0-9a-f]{32}-\d{17}\.json gives another answer than RetentionProof-[0-9a-f]{32}-\d{17}\.json for 2 object\(s\) of this Recover: the newer one decides\.'
-        $run.Output | Should -Not -Match 'Retention: accepted from'
-        @(Get-GateWrites $runtime).Count | Should -Be 0
-        Remove-Item -LiteralPath $t1, ($t1 + '.sha256') -Force
-        $t2 = New-H320MainProof $runtime $bundles -Verdict 'NotChecked' -AgeHours 1
-        $again = Invoke-GateProcess $runtime @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
-        $again.ExitCode | Should -BeIn @(0, 2)
-        $again.Output | Should -Match 'Retention: accepted from the retention proof ' -Because 'T0 decides: the newer proof checked nothing'
-        $again.Output | Should -Match 'did not check 2 object\(s\) of this Recover: the answer of RetentionProof-'
-        @($again.MainResult.Warnings | Where-Object { [string]$_.Message -match 'did not check 2 object' }).Count | Should -Be 1
-        $settings = Get-Content -LiteralPath $again.MainResult.LogFile -Raw
-        ([regex]::Matches($settings, 'Retention proof accepted: ')).Count | Should -Be 1
+        (@($run.MainResult.NextSteps) -join "`n") | Should -Match ([regex]::Escape('Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid'))
     }
     It 'a Retention.PolicyGuid that is not a GUID refuses the proof, and the Next steps say to correct the setting, with the command that reads the GUID' {
         Set-GateConfigText $runtime { param($text) $text.Replace('Retention=@{Enabled=$true;Tag=', 'Retention=@{Enabled=$true;PolicyGuid=''not-a-guid'';Tag=') }
@@ -15674,9 +15929,90 @@ Describe 'Release 3.2.0 - the gate end to end: a failed sign-in of a person fall
         $guide | Should -Match 'A \*\*scheduled run\*\* has no person to sign in: start it with `-NonInteractive` or `-Force`'
         $guide | Should -Match 'a sign-in that fails for any reason'
         $guide | Should -Match 'every\*\* object that is not covered is unverified for that one reason'
-        $guide | Should -Match 'the newest usable proof .* that lists it with a definitive verdict .* decides; a `NotChecked` verdict leaves it to an older proof'
+        $guide | Should -Match '\*\*The newest proof decides\.\*\*'
+        $guide | Should -Match 'An incomplete newest proof is never completed by an older one'
         $guide | Should -Match 'so 100 searches for 5,000 objects instead of 5,000 reads'
         $guide | Should -Match 'a `Retention\.PolicyGuid` that is not a GUID refuses every proof'
-        $guide | Should -Match 'A proof without `Verdict` \(written by a development build\) is not accepted'
+        $guide | Should -Match 'A proof without `Verdict` is not accepted: run the Check again'
+        $guide | Should -Not -Match 'development build|earlier build'
+    }
+}
+
+Describe 'Release 3.2.0 - a failed sign-in on the AD part that a proof stands in for is a warning, not the failure of the run: exit 0 or 2, never 1 (real main, production Directory and Cloud modules, synthetic AD, the Exchange Online sign-in fails with AADSTS50126)' -Tag 'Release320i' {
+    BeforeAll {
+        function global:Set-I320Converted {
+            param($Runtime, $Bundles)
+            $module = Get-Module PRA.Directory
+            foreach ($plan in $Bundles.Plans) {
+                $user = @($Runtime.State.Users | Where-Object ObjectGUID -eq $plan.Record.ObjectGuid)[0]
+                foreach ($key in $plan.Kinds.Keys) { $user.$key = & $module { param($state) ConvertFrom-PraStoredValue $state } $plan.Desired[$key] }
+                $user.uSNChanged = [long]101
+            }
+            $Runtime.State.Group.member = @($Runtime.State.Users | ForEach-Object DistinguishedName)
+        }
+        function global:Save-I320State { param($Runtime) [IO.File]::WriteAllText($Runtime.StatePath, [Management.Automation.PSSerializer]::Serialize($Runtime.State, 35)) }
+        function global:New-I320Proof {
+            param($Runtime, $Bundles, [string]$Verdict = 'Covered')
+            $folder = Join-Path $Runtime.State.BackupFolder 'Inbox'
+            $null = New-Item -ItemType Directory -Path $folder -Force
+            $source = Get-Content -LiteralPath $Bundles.Source -Raw | ConvertFrom-Json
+            $hash = (Get-FileHash -LiteralPath $Bundles.Source -Algorithm SHA256).Hash.ToLowerInvariant()
+            $created = [DateTime]::UtcNow.AddHours(-1)
+            $entries = @($source.Records | ForEach-Object { [ordered]@{ ObjectGuid = [string]$_.ObjectGuid; Upn = ([string]$_.UserPrincipalName).ToUpperInvariant(); Verdict = $Verdict; Covered = ($Verdict -eq 'Covered'); NoMailbox = $false } })
+            $record = [ordered]@{ SchemaVersion = 1; Kind = 'RetentionProof'; BatchId = [string]$source.BatchId; SourceBackupHash = $hash; Environment = 'SYNTHETIC_GATE'; CreatedUtc = $created.ToString('o'); PolicyGuid = @('40000000000000000000000000000004'); ObjectCount = $entries.Count; CoveredCount = @($entries | Where-Object { $_.Covered }).Count; Objects = $entries }
+            $path = Join-Path $folder ('RetentionProof-{0}-{1}.json' -f ([string]$source.BatchId).ToLowerInvariant(), $created.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture))
+            [IO.File]::WriteAllText($path, ($record | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText($path + '.sha256', (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false)))
+            return $path
+        }
+    }
+    BeforeEach {
+        $runtime = New-GateRuntime -Name 'gate-320i' -RealCloud
+        $env:PRA_GATE_STATE = $runtime.StatePath
+        $env:PSModulePath = $runtime.Modules + ';' + (Join-Path $PSHOME 'Modules')
+        Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+        Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+        Import-Module (Join-Path $runtime.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+        Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+        $context = New-GateContext $runtime
+        $context.BackupFolder = $runtime.State.BackupFolder
+        $bundles = New-GateSourceBundles $context
+        Remove-Item -LiteralPath $runtime.EventPath -Force -ErrorAction SilentlyContinue
+        Set-I320Converted $runtime $bundles; Save-I320State $runtime
+        Set-GateConfigText $runtime { param($text) $text.Replace('Retention=@{Enabled=$true;Tag=', 'Retention=@{Enabled=$true;PolicyGuid=''40000000-0000-0000-0000-000000000004'';Tag=').Replace("Execution=@{Phase='Both'}", "Execution=@{Phase='Both'}`r`n Cloud=@{TenantId='11111111-2222-3333-4444-555555555555';Organization='contoso.onmicrosoft.com';AppId='app';CertificateThumbprint='ABCDEF';IdentityCheck='Off'}") }
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\Set-I320Converted', 'Function:\Save-I320State', 'Function:\New-I320Proof' -ErrorAction SilentlyContinue }
+    It 'the Apply goes on with the proof, ends 0 or 2 and not 1, has no "Failure reported by the run" issue, and warns with the reason of the failed sign-in' {
+        $null = New-I320Proof $runtime $bundles
+        $run = Invoke-GateProcess $runtime -Certificate -ExoSignInFails @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $run.ExitCode | Should -BeIn @(0, 2)
+        $run.Output | Should -Match 'Retention: accepted from the retention proof RetentionProof-'
+        $run.Output | Should -Match 'Exchange Online could not be asked by this run: .*AADSTS50126'
+        $run.Output | Should -Not -Match 'Failure reported by the run'
+        $log = Get-Content -LiteralPath $run.MainResult.LogFile -Raw
+        $log | Should -Not -Match 'Failure reported by the run'
+        @(Get-GateWrites $runtime).Count | Should -BeGreaterThan 0
+        $warning = @($run.MainResult.Warnings | Where-Object { [string]$_.Message -match 'AADSTS50126' })
+        $warning.Count | Should -BeGreaterThan 0
+    }
+    It 'the Preview ends 0 and says the same, and without a proof the Apply stops with the steps for the cloud server (exit 1 is that stop, not the sign-in)' {
+        $null = New-I320Proof $runtime $bundles
+        $preview = Invoke-GateProcess $runtime -Certificate -ExoSignInFails @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $preview.ExitCode | Should -Be 0
+        $preview.Output | Should -Match 'Retention: accepted from the retention proof RetentionProof-'
+        $preview.Output | Should -Match 'Exchange Online could not be asked by this run: .*AADSTS50126'
+        $preview.Output | Should -Not -Match 'Failure reported by the run'
+        Get-ChildItem -LiteralPath (Join-Path $runtime.State.BackupFolder 'Inbox') -Filter 'RetentionProof-*' | Remove-Item -Force
+        $blocked = Invoke-GateProcess $runtime -Certificate -ExoSignInFails @{Action='Recover';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $blocked.ExitCode | Should -Be 1
+        $blocked.Output | Should -Match 'AADSTS50126'
+        (@($blocked.MainResult.NextSteps) -join "`n") | Should -Match '-Action Check -Batch [0-9a-f]{8} -Expect Retained'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
+    It 'the harness refuses a -Certificate that it cannot apply, instead of leaving the run without a sign-in' {
+        { Invoke-GateProcess $runtime -Certificate @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=(Join-Path $runtime.Root 'missing.psd1')} } | Should -Throw '*-Certificate needs a ConfigPath that exists*'
+        $plain = New-GateRuntime -Name 'gate-320i-plain'
+        Set-GateConfigText $plain { param($text) $text.Replace("Execution=@{Phase='Both'}", "Execution=@{Phase='AD'}") }
+        { Invoke-GateProcess $plain -Certificate @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$plain.ConfigPath} } | Should -Throw '*-Certificate cannot be applied*'
     }
 }

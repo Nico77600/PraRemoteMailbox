@@ -2792,7 +2792,7 @@ try {
     }
 }
 
-Describe 'Release 3.2.0 - the console shows whether the retention proof of the selected batch is found, and how old it is (synthetic, no engine)' -Tag 'Release320e' {
+Describe 'Release 3.2.0 - the console shows whether the retention proof of the selected batch is found, and how old it is (synthetic, no engine)' -Tag 'Release320e', 'Release320i' {
     BeforeAll {
         function global:Get-G320GuiText {
             param($Case)
@@ -2800,7 +2800,7 @@ Describe 'Release 3.2.0 - the console shows whether the retention proof of the s
             try {
                 & (Get-Module PRA.Gui) {
                     $case = $global:PraGuiProofCase
-                    $config = [pscustomobject]@{ Environment = 'GUISYNTHETIC'; Storage = [pscustomobject]@{ BackupFolder = $case.Backup }; Retention = [pscustomobject]@{ ProofMaxAgeHours = $case.Hours; PolicyGuid = '' }; Cloud = [pscustomobject]@{ AppId = $(if ($case.Certificate) { 'app' } else { '' }) }; SharedMailbox = [pscustomobject]@{ KeepCloudSharedOnRecover = $(if ($case.ContainsKey('KeepShared')) { [bool]$case.KeepShared } else { $false }) } }
+                    $config = [pscustomobject]@{ Environment = 'GUISYNTHETIC'; Storage = [pscustomobject]@{ BackupFolder = $case.Backup }; Retention = [pscustomobject]@{ ProofMaxAgeHours = $case.Hours; PolicyGuid = $(if ($case.ContainsKey('PolicyGuid')) { [string]$case.PolicyGuid } else { '' }); PolicyName = $(if ($case.ContainsKey('PolicyName')) { [string]$case.PolicyName } else { '' }) }; Cloud = [pscustomobject]@{ AppId = $(if ($case.Certificate) { 'app' } else { '' }) }; SharedMailbox = [pscustomobject]@{ KeepCloudSharedOnRecover = $(if ($case.ContainsKey('KeepShared')) { [bool]$case.KeepShared } else { $false }) } }
                     $script:Gui = @{ SelectedBatch = [pscustomobject]@{ BatchId = $case.Batch.Id; Path = $case.Batch.Path; Data = [pscustomobject]@{ TaggedRows = $case.Tagged } }; State = [pscustomobject]@{ Config = $config } }
                     try { Get-PraGuiRetentionProofText } finally { $script:Gui = $null }
                 }
@@ -2815,13 +2815,13 @@ Describe 'Release 3.2.0 - the console shows whether the retention proof of the s
         $hash = (Get-FileHash -LiteralPath $batch.Path -Algorithm SHA256).Hash.ToLowerInvariant()
         $tagged = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'a@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } }, [pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000002'; UserPrincipalName = 'b@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } })
         $case = @{ Batch = $batch; Backup = (Join-Path $runtime.Root 'Backups'); Inbox = $inbox; Hours = 24; Certificate = $false; Tagged = $tagged }
-        (Get-G320GuiText $case) | Should -Match '^No valid retention proof for this batch \(no retention proof of this batch was found\)\. This server cannot sign in to Exchange Online without a person, so the run needs one: run Check with Expected state Retained on the cloud server, then copy the two proof files \(RetentionProof-\.\.\.json and its \.sha256 file\) to the folder '
+        (Get-G320GuiText $case) | Should -Match '^No valid retention proof for this batch \(no retention proof of this batch was found\)\. This server cannot sign in to Exchange Online without a person, so the run needs one: run Check with Expected state Retained on the cloud server \(\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Batch [0-9a-f]{8} -Expect Retained\), then copy the two proof files \(RetentionProof-\.\.\.json and its \.sha256 file\) to the folder '
         $certificate = @{} + $case; $certificate.Certificate = $true
         (Get-G320GuiText $certificate) | Should -Match '^No valid retention proof for this batch \(no retention proof of this batch was found\)\. This server asks Exchange Online itself \(certificate sign-in\), so a proof matters only if Exchange Online cannot be reached: then run Check'
         $objects = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'Covered' }, [pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000002'; Upn = 'b@example.invalid'; Verdict = 'NotCovered' })
         $null = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash $hash -Environment 'guisynthetic' -Object $objects
-        (Get-G320GuiText $case) | Should -Match '^A retention proof was found \(\d+(\.\d)? hours old\) but it does not cover every mailbox: 1 of the 2 object\(s\) of this Recover are not covered in it\. The run cannot use it\. The run leaves out the objects that are already rolled back or were not converted, which only the run can tell: this is an estimate\.$'
-        (Get-G320GuiText $certificate) | Should -Match 'It matters only if Exchange Online cannot be reached\. The run leaves out the objects that are already rolled back or were not converted, which only the run can tell: this is an estimate\.$'
+        (Get-G320GuiText $case) | Should -Match '^A retention proof was found \(\d+(\.\d)? hours old\) but it does not cover every mailbox: 1 of the 2 object\(s\) of this Recover are not covered in it\. The run cannot use it\. Only the newest proof counts, and an older one never completes it: run Check with Expected state Retained again on the cloud server \(\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Batch [0-9a-f]{8} -Expect Retained\), then copy the two proof files to the folder .+ The run leaves out the objects that are already rolled back or were not converted, which only the run can tell: this is an estimate\.$'
+        (Get-G320GuiText $certificate) | Should -Match 'It matters only if Exchange Online cannot be reached\. Only the newest proof counts, and an older one never completes it: .* The run leaves out the objects that are already rolled back or were not converted, which only the run can tell: this is an estimate\.$'
         Start-Sleep -Milliseconds 30
         $withoutMailbox = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'Covered' }, [pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000002'; Upn = 'b@example.invalid'; Verdict = 'NoMailbox' })
         $null = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash $hash -Environment 'GuiSynthetic' -Object $withoutMailbox
@@ -2831,6 +2831,31 @@ Describe 'Release 3.2.0 - the console shows whether the retention proof of the s
         (Get-G320GuiText $other) | Should -Match 'does not cover every mailbox: 1 of the 1 object\(s\) of this Recover are not covered in it' -Because 'the same objects as the engine judges, found by ObjectGuid'
         $untagged = @{} + $case; $untagged.Tagged = @()
         (Get-G320GuiText $untagged) | Should -Match '^No object of this batch carries the retention tag'
+    }
+    It 'the newest proof decides in the console too: an older complete proof does not complete a newer one that says NotCovered, and a damaged newest proof says to copy both files again with the folder' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $inbox = Join-Path $runtime.Root 'Backups\Inbox'
+        $hash = (Get-FileHash -LiteralPath $batch.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $tagged = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'a@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } })
+        $case = @{ Batch = $batch; Backup = (Join-Path $runtime.Root 'Backups'); Inbox = $inbox; Hours = 24; Certificate = $false; Tagged = $tagged }
+        $null = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash $hash -Environment 'GuiSynthetic' -Object @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'Covered' })
+        (Get-G320GuiText $case) | Should -Match '^A valid retention proof was found'
+        Start-Sleep -Milliseconds 30
+        $newest = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash $hash -Environment 'GuiSynthetic' -Object @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'NotCovered' })
+        (Get-G320GuiText $case) | Should -Match '^A retention proof was found \(\d+(\.\d)? hours old\) but it does not cover every mailbox: 1 of the 1 object\(s\) of this Recover are not covered in it\. The run cannot use it\. Only the newest proof counts, and an older one never completes it: run Check with Expected state Retained again'
+        [IO.File]::AppendAllText($newest.Path, ' ')
+        & (Get-Module PRA.Gui) { $script:PraGuiProofCache.Clear() }
+        (Get-G320GuiText $case) | Should -Match '^The newest retention proof cannot be used \(RetentionProof-.*its SHA-256 does not match its \.sha256 file.*\)\. Copy both files, RetentionProof-\.\.\.json and its \.sha256 file, again from the Backups\\Outbox folder of the cloud server to the folder .*Inbox, together and after the copy has ended\. An older proof never stands in for it\.$'
+    }
+    It 'a Retention.PolicyGuid that is not a GUID gives the command that reads the GUID, with the policy name when there is one and the list of policies when there is none' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $tagged = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'a@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } })
+        $case = @{ Batch = $batch; Backup = (Join-Path $runtime.Root 'Backups'); Hours = 24; Certificate = $false; Tagged = $tagged; PolicyGuid = 'not-a-guid'; PolicyName = '' }
+        (Get-G320GuiText $case) | Should -Match ([regex]::Escape('Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid'))
+        $named = @{} + $case; $named.PolicyName = 'Policy-Synthetic'
+        (Get-G320GuiText $named) | Should -Match ([regex]::Escape('Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity ''Policy-Synthetic'').Guid'))
     }
     It 'a proof made from another copy of the batch file is not valid for the console either, a lock does not stay in the cache, and a proof that cannot be looked for gets a command to see the folder' {
         $runtime = New-GuiTestRoot

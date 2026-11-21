@@ -1895,7 +1895,7 @@ function New-PraPlan {
         $desired[$tagAttr] = $original
     }
     $sourceLicensing = Get-PraValue $SourceRecord 'Licensing' $null
-    $preserveMailbox = $shared -and (Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover') -and [bool](Get-PraValue $Context 'KeepCloudShared' $false)
+    $preserveMailbox = Test-PraCloudMailboxKept -IsShared ([bool]$shared) -Operation $Operation -KeepCloudShared ([bool](Get-PraValue $Context 'KeepCloudShared' $false))
     $preserveLicense = ((Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover')) -and [bool](Get-PraValue $sourceLicensing 'Enabled' $false) -and [bool](Get-PraValue $sourceLicensing 'WasMember' $false)
     $trusteeAnchors = [ordered]@{}
     $knownAnchors = Get-PraValue $Context '_PraTrusteeAnchors' $null

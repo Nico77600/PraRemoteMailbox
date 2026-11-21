@@ -903,7 +903,7 @@ function Invoke-PraRetentionGate {
     $isAd = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')
     $certificate = [bool][string]$context.Config.Cloud.AppId
     $canAsk = $modulesOk -and ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -or $certificate -or ($isAd -and (Test-PraRunCanSignIn)))
-    $script:RetentionProofReason = ''; $script:RetentionProofRoute = $false; $script:RetentionProof = $null
+    $script:RetentionProofReason = ''; $script:RetentionProofRoute = $false; $script:RetentionProof = $null; $script:RetentionProofMissing = @()
     if ($canAsk) {
         Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
         $keepSession = $context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')
@@ -923,34 +923,34 @@ function Invoke-PraRetentionGate {
         $proof = Get-PraRetentionProof -Folder (Get-PraRetentionProofFolder) -BatchId ([string]$context.Source.Data.BatchId) -Environment ([string]$context.Config.Environment) -MaxAgeHours ([int]$context.Config.Retention.ProofMaxAgeHours) -Row $rows.ToArray() -SourceBackupHash ([string]$context.Source.Hash) -PolicyGuid ([string]$context.Config.Retention.PolicyGuid)
         $script:RetentionProof = $proof
         if ($proof.Found -and $proof.Complete) {
-            $proofs = @($proof.Proofs)
-            $accepted = @($proofs | ForEach-Object { [pscustomobject]@{ Path = [string]$_.Path; Sha256 = [string]$_.Sha256; CreatedUtc = $_.CreatedUtc; PolicyGuid = [string[]]@($_.PolicyGuid); ObjectCount = [int]$_.ObjectCount } })
-            $names = (@($proofs | ForEach-Object { [IO.Path]::GetFileName([string]$_.Path) }) -join ', ')
-            if ($proofs.Count -eq 1) {
-                $hours = ([DateTime]::UtcNow - $proofs[0].CreatedUtc).TotalHours.ToString('0.#', [Globalization.CultureInfo]::InvariantCulture)
-                Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: accepted from the retention proof {0} ({1} hours old, written by a Check on the cloud server): the {2} object(s) that carry the retention tag are covered' -f $names, $hours, $rows.Count)
-            }
-            else { Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: accepted from {0} retention proofs written by Checks on the cloud server ({1}; for each object the newest proof that says anything definite about it decides): the {2} object(s) that carry the retention tag are covered' -f $proofs.Count, $names, $rows.Count) }
-            $detail = (@($accepted | ForEach-Object { 'SHA-256 {0}, created {1} UTC, policy {2}, {3} object(s)' -f $_.Sha256, $_.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $(if (@($_.PolicyGuid).Count) { @($_.PolicyGuid) -join ', ' } else { '(none recorded)' }), $_.ObjectCount }) -join ' | ')
-            Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('Exchange Online could not be asked by this run: {0} The proof: {1}.' -f ([string]$answer.StopReason).Trim(), $detail)
-            $context.RetentionProofAccepted = [object[]]$accepted
-            foreach ($item in $accepted) { Write-PraLog -Context $context -Message ('Retention proof accepted: {0} | SHA-256 {1} | created {2} UTC | policy {3} | {4} object(s) | live check: {5}' -f $item.Path, $item.Sha256, $item.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), (@($item.PolicyGuid) -join ','), $item.ObjectCount, ([string]$answer.StopReason -replace '\s+', ' ')) -Level Detail }
-            foreach ($note in @($proof.Notes)) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text $note }
+            $item = $proof.Proofs[0]
+            $accepted = [pscustomobject]@{ Path = [string]$item.Path; Sha256 = [string]$item.Sha256; CreatedUtc = $item.CreatedUtc; PolicyGuid = [string[]]@($item.PolicyGuid); ObjectCount = [int]$item.ObjectCount }
+            $hours = ([DateTime]::UtcNow - $item.CreatedUtc).TotalHours.ToString('0.#', [Globalization.CultureInfo]::InvariantCulture)
+            $policyNamed = if ([string]$context.Config.Retention.PolicyGuid) { '' } else { ' (policy {0}, as the proof names it: Retention.PolicyGuid is not set on this server)' -f $(if (@($accepted.PolicyGuid).Count) { @($accepted.PolicyGuid) -join ', ' } else { 'none recorded' }) }
+            Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: accepted from the retention proof {0} ({1} hours old, written by a Check on the cloud server): the {2} object(s) that carry the retention tag are covered{3}' -f [IO.Path]::GetFileName($accepted.Path), $hours, $rows.Count, $policyNamed)
+            $detail = 'SHA-256 {0}, created {1} UTC, policy {2}, {3} object(s)' -f $accepted.Sha256, $accepted.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $(if (@($accepted.PolicyGuid).Count) { @($accepted.PolicyGuid) -join ', ' } else { '(none recorded)' }), $accepted.ObjectCount
+            $signInFailed = [bool](Get-PraValue $answer 'SignInFailed' $false)
+            Write-PraItem -Context $context -Status $(if ($signInFailed) { 'Warn' } else { 'Info' }) -Icon Cloud -Text ('Exchange Online could not be asked by this run: {0} The proof: {1}.' -f ([string]$answer.StopReason).Trim(), $detail)
+            $context.RetentionProofAccepted = [object[]]@($accepted)
+            Write-PraLog -Context $context -Message ('Retention proof accepted: {0} | SHA-256 {1} | created {2} UTC | policy {3} | {4} object(s) | live check: {5}' -f $accepted.Path, $accepted.Sha256, $accepted.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), (@($accepted.PolicyGuid) -join ','), $accepted.ObjectCount, ([string]$answer.StopReason -replace '\s+', ' ')) -Level Detail
+            if ($proof.Duplicates) { Write-PraLog -Context $context -Message ('{0} copy(ies) of the retention proof were found in the folders and counted once' -f $proof.Duplicates) -Level Detail }
             if ($AcceptRetentionRisk) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text '-AcceptRetentionRisk was given and is not needed: the retention proof covers every mailbox.' }
             Write-PraRetentionNoMailbox -Entry @($proof.NoMailbox)
             return
         }
-        foreach ($note in @($proof.Notes)) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text $note }
         $shownBlocked = 0
+        $says = @{ NotCovered = 'says that the retention policy does not hold this mailbox'; Unverified = 'says that the retention of this mailbox could not be checked when the proof was written'; NotChecked = 'says that this mailbox was not checked when the proof was written (the Check stopped before it)'; NotListed = 'does not list this mailbox' }
         foreach ($entry in @($proof.Blocked)) {
-            if ($shownBlocked -ge 10) { Write-PraLog -Context $context -Message ('{0}: the retention proof {1} says this mailbox is not held' -f $entry.Upn, $entry.Proof) -Level Detail; continue }
+            if ($shownBlocked -ge 10) { Write-PraLog -Context $context -Message ('{0}: the newest retention proof {1} {2}' -f $entry.Upn, $entry.Proof, $says[[string]$entry.Verdict]) -Level Detail; continue }
             $context.CurrentIdentity = [string]$entry.ObjectGuid
-            Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the retention proof {1} says that the retention policy does not hold this mailbox. It is the newest proof that says anything definite about it, so older proofs do not count.' -f $entry.Upn, $entry.Proof)
+            Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the newest retention proof {1} {2}.' -f $entry.Upn, $entry.Proof, $says[[string]$entry.Verdict])
             $shownBlocked++
         }
         $context.CurrentIdentity = ''
+        if (@($proof.Blocked).Count) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text 'Only the newest retention proof counts: an older proof never completes it.' }
         $script:RetentionProofReason = if ($proof.Reason) { [string]$proof.Reason } else { 'no usable retention proof' }
         if ($proof.Missing.Count) { Write-PraLog -Context $context -Message ('Retention proof {0}: not covered or not in it: {1}' -f [IO.Path]::GetFileName($proof.Path), ($proof.Missing -join ', ')) -Level Detail }
+        $script:RetentionProofMissing = @($proof.Blocked)
     }
     $withoutMailbox = Get-PraValue $answer 'NoMailboxList' @()
     Write-PraRetentionNoMailbox -Entry @($withoutMailbox)
@@ -1004,17 +1004,25 @@ function Invoke-PraRetentionGate {
     }
     $steps = @()
     $policyName = [string]$context.Config.Retention.PolicyName
+    $lookup = if ($policyName) { 'Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity {0}).Guid' -f (ConvertTo-PraLiteral $policyName) } else { 'Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid' }
     if (-not [string]$context.Config.Retention.PolicyGuid) {
         $steps += 'The retention policy is not named in the configuration file. Read its GUID in a Security and Compliance session, then put it in Retention.PolicyGuid:'
-        $steps += ('Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity {0}).Guid' -f (ConvertTo-PraLiteral $policyName))
+        $steps += $lookup
     }
     $configuredGuid = [string]$context.Config.Retention.PolicyGuid; $parsedGuid = [guid]::Empty
     if ($configuredGuid -and (-not [guid]::TryParse($configuredGuid, [ref]$parsedGuid) -or $parsedGuid -eq [guid]::Empty)) {
         $steps += ('Retention.PolicyGuid in the configuration file ({0}) is not a GUID. Read the GUID of the retention policy, then put it in Retention.PolicyGuid:' -f $configuredGuid)
-        $steps += ('Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity {0}).Guid' -f (ConvertTo-PraLiteral $policyName))
+        $steps += $lookup
     }
-    if ($script:RetentionProofRoute) {
+    $refusal = if ($script:RetentionProofRoute -and $null -ne $script:RetentionProof) { [string]$script:RetentionProof.Refusal } else { '' }
+    if ($script:RetentionProofRoute -and (Test-PraOrdinalEqual $refusal 'CopyAgain')) {
+        $steps += ('The newest retention proof cannot be used: {0}. Copy both files again, RetentionProof-...json and its .sha256 file, from the Backups\Outbox folder of the cloud server to the folder {1} of this server (together, and wait for the copy to end), then run the Preview of the Recover again. An older proof never stands in for it.' -f $script:RetentionProofReason, (Join-Path $context.BackupFolder 'Inbox'))
+        $steps += 'If the files are damaged at the source, run the Check again on the cloud server; it writes a new proof:'
+        $steps += $check
+    }
+    elseif ($script:RetentionProofRoute) {
         $steps += 'This server could not ask Exchange Online, and no retention proof stands in for it. On the cloud server, with the batch folder there, make the retention policy hold the mailboxes named above (an adaptive scope can take several days), then run the Check (read only). It writes a retention proof, RetentionProof-...json and its .sha256 file, in the Backups\Outbox folder of that server:'
+        if (@($script:RetentionProofMissing).Count) { $steps += ('The newest retention proof, {0}, does not cover {1} object(s) of this Recover (for example {2}). Only the newest proof counts: run the full Check again on the cloud server, after the policy holds those mailboxes; it writes a new proof for every object.' -f $script:RetentionProofMissing[0].Proof, @($script:RetentionProofMissing).Count, ((@($script:RetentionProofMissing | Select-Object -First 3 | ForEach-Object { [string]$_.Upn }) -join ', '))) }
         $steps += $check
         $steps += ('Copy those two files to the folder {0} of this server, then run the Preview of the Recover again. This server accepts a proof for as many hours as its own Retention.ProofMaxAgeHours says ({1}).' -f (Join-Path $context.BackupFolder 'Inbox'), $context.Config.Retention.ProofMaxAgeHours)
         $steps += ('Why no proof was accepted: {0}.' -f $script:RetentionProofReason)
@@ -1826,7 +1834,7 @@ try {
                 $row = New-PraRow $context $record
                 $originalLicensing = Get-PraValue $record 'Licensing' $null
                 $row.PreserveLicense = ((Test-PraOrdinalIgnoreCaseEqual $cloudAction 'Recover')) -and [bool](Get-PraValue $originalLicensing 'Enabled' $false) -and [bool](Get-PraValue $originalLicensing 'WasMember' $false)
-                $row.PreserveCloudMailbox = ((Test-PraOrdinalIgnoreCaseEqual $cloudAction 'Recover')) -and $row.IsShared -and $context.KeepCloudShared
+                $row.PreserveCloudMailbox = Test-PraCloudMailboxKept -IsShared ([bool]$row.IsShared) -Operation $cloudAction -KeepCloudShared ([bool]$context.KeepCloudShared)
                 $holders = Get-PraValue $record 'SharedPermissions' $null
                 $row.SharedFullAccess = Get-PraValue $holders 'FullAccess' @(); $row.SharedSendAs = Get-PraValue $holders 'SendAs' @(); $row.SharedSendOnBehalf = Get-PraValue $holders 'SendOnBehalf' @()
                 if ($null -ne $context.Proof) {

@@ -183,7 +183,9 @@
     #                  and Environment, not older than this many hours (1 to 720), and covers every object of the Recover. Where Exchange Online
     #                  can be asked (phase Both, a certificate sign-in, or an interactive console) its answer decides and the proof is read only
     #                  when Exchange Online cannot be reached. The hours are the setting of the server that reads the proof (the AD server).
-    #                  The proof must also be of the same Convert batch file and, when PolicyGuid is set here, of that policy.
+    #                  The proof must also be of the same Convert batch file and, when PolicyGuid is set here, of that policy. Only the NEWEST
+    #                  proof of the batch counts; an older proof never completes it. Without PolicyGuid here the proof is accepted and the run prints
+    #                  the policy GUID the proof names.
     # ---------------------------------------------------------------------
     Retention = @{
         Enabled              = $true
