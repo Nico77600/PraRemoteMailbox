@@ -4,7 +4,7 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
-## 3.2.0 — 2026-11-21
+## 3.2.0 — 2026-11-22
 
 ### Added
 - Batches of thousands of objects: planned, measured and documented for 5,000 objects per batch.
