@@ -412,9 +412,19 @@ function Get-PraFallbackNext {
         }
         $mayBe = @(Get-PraList $context 'MayBeChanged')
         if (($written -gt 0 -or $mayBe.Count) -and $batchId -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert')) {
-            return @(('Active Directory {0} for {1} object(s) before the stop (see the journal and the backup named above) and none of them is verified. Do not run the Apply again before reading what is left. To put them back as they were, roll the batch back (run the Preview first, then the same command with -Mode Apply):' -f $(if ($written -gt 0) { 'was changed' } else { 'may have been changed' }), [Math]::Max($written, $mayBe.Count)),
+            $changed = [Math]::Max($written, $mayBe.Count)
+            $verified = @($context.Rows | Where-Object { (Get-PraValue $_ 'ADVerified' $false) -eq $true }).Count
+            $stateFolder = [string](Get-PraValue $context 'PhaseWriteFolder' '')
+            $stateWritten = [bool]($stateFolder -and (Test-Path -LiteralPath $stateFolder -PathType Container) -and @(Get-ChildItem -LiteralPath $stateFolder -File -Filter ('State-' + $batchId + '*.json') -ErrorAction SilentlyContinue).Count)
+            $rollback = @('To put them back as they were, roll the batch back (run the Preview first, then the same command with -Mode Apply):',
                 (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $batchId),
                 'To see first what the batch holds in Exchange Online, run the Check:', (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $batchId))
+            if ($verified -ge $changed -and $verified -gt 0 -and $stateWritten) {
+                return @(('Active Directory was changed for {0} object(s) before the stop (see the journal and the backup named above) and all {1} were verified: the stop came after the verification. To go on with this batch (the verified objects are not changed again: it runs the Entra Connect synchronisation and writes the transfer package), run:' -f $changed, $verified),
+                    (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -BatchId $batchId)) + $rollback
+            }
+            $state = if ($verified -gt 0) { ('{0} of them {1} verified, the others are not' -f $verified, $(if ($verified -eq 1) { 'is' } else { 'are' })) } else { 'none of them is verified' }
+            return @(('Active Directory {0} for {1} object(s) before the stop (see the journal and the backup named above) and {2}. Do not run the Apply again before reading what is left. {3}' -f $(if ($written -gt 0) { 'was changed' } else { 'may have been changed' }), $changed, $state, $rollback[0])) + @($rollback | Select-Object -Skip 1)
         }
         if ($written -gt 0) {
             return @(('Active Directory was changed for {0} object(s) before the stop (see the journal and the backup named above). Do not run the Apply again before reading what is left: run the Preview of the same command:' -f $written),
@@ -828,11 +838,13 @@ function Save-PraRetentionProof {
     }
     if (-not $checked) { return }
     $context.CurrentOperation = 'Write-RetentionProof'; $context.CurrentIdentity = ''
-    $outbox = Join-Path $context.BackupFolder 'Outbox'
+    # The proof is for the other server: it goes to the Outbox of the backup folder of this server, also when the batch was read from a package in a temporary preview folder.
+    $outbox = Join-Path ([string]$context.Config.Storage.BackupFolder) 'Outbox'
     try {
         $guids = @([string](Get-PraValue $context 'RetentionPolicyGuid' ''))
         $written = Write-PraRetentionProof -Folder $outbox -BatchId ([string]$context.Source.Data.BatchId) -SourceBackupHash ([string]$context.Source.Hash) -Environment ([string]$context.Config.Environment) -PolicyGuid $guids -Object $objects.ToArray()
-        Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Retention proof written: {0} of {1} object(s) covered ({2})' -f $written.CoveredCount, $written.ObjectCount, $written.Path) -Detail $written.Path
+        $withoutMailbox = @($objects | Where-Object { Test-PraOrdinalEqual $_.Verdict 'NoMailbox' }).Count
+        Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Retention proof written: {0} of {1} object(s) covered{2} ({3})' -f $written.CoveredCount, $written.ObjectCount, $(if ($withoutMailbox) { ', {0} without a mailbox in Exchange Online (nothing to retain)' -f $withoutMailbox } else { '' }), $written.Path) -Detail $written.Path
         $next = Get-PraCommandLine -ActionName 'Recover' -PhaseName 'AD' -ModeName 'Preview' -BatchId (Get-PraShortId ([string]$context.Source.Data.BatchId)) -OtherServer
         $context.NextSteps = @(Get-PraList $context 'NextSteps') + @(('For the Recover on the AD server, copy these two files to its Backups\Inbox folder: {0} and {1}. The AD server accepts a proof for as many hours as its own Retention.ProofMaxAgeHours says (24 by default), so copy them soon. Then run there:' -f $written.Path, $written.Sidecar), $next)
     }
@@ -897,6 +909,14 @@ function Invoke-PraRetentionGate {
         Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('Retention: none of the {0} object(s) carries the retention tag, so there is no retention to check before the mailboxes are removed.' -f $Plans.Count)
         return
     }
+    $cloudNotDone = @()
+    try {
+        $doneInfo = Get-PraConvertCloudDone -Folder (Split-Path ([string]$context.Source.Path) -Parent) -BatchId ([string]$context.Source.Data.BatchId) -Environment ([string]$context.Config.Environment)
+        if ($null -ne $doneInfo -and $doneInfo.Known) { $cloudNotDone = @($rows | Where-Object { -not $doneInfo.Done.Contains([string]$_.ObjectGuid) }) }
+    } catch { $cloudNotDone = @() }
+    if ($cloudNotDone.Count) {
+        Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('Retention: the Exchange Online part of the Convert is not recorded as complete for {0} of the {1} object(s) that carry the retention tag. They are checked like the others, on purpose: the licence group that the Convert adds gives a mailbox as soon as Entra Connect has synchronised, with or without that part, and the Recover removes the licence again. When Exchange Online has no mailbox for an object, the check says so (no mailbox, nothing to retain) and the Recover goes on.' -f $cloudNotDone.Count, $rows.Count)
+    }
     $needGraph = -not (Test-PraOrdinalIgnoreCaseEqual ([string]$context.Config.Cloud.IdentityCheck) 'Off')
     $report = Get-PraCloudModuleReport -MinExo ([string]$context.Config.Exo.MinModuleVersion)
     $modulesOk = $report.Exo.Ok -and ($report.Graph.Ok -or -not $needGraph)
@@ -918,6 +938,7 @@ function Invoke-PraRetentionGate {
     $context.CurrentOperation = 'Check-Retention'; $context.CurrentIdentity = ''
     $notCovered = @($answer.NotCovered); $unverified = @($answer.Unverified)
     $couldNotAsk = [bool](Get-PraValue $answer 'CouldNotAsk' $false)
+    $viaProof = $false; $coveredCount = [int](Get-PraValue $answer 'Covered' 0); $noMailboxCount = [int](Get-PraValue $answer 'NoMailbox' 0); $proofKinds = @{ Unverified = 0; NotChecked = 0; NotListed = 0 }
     if ($isAd -and $couldNotAsk -and -not $notCovered.Count) {
         $script:RetentionProofRoute = $true
         $proof = Get-PraRetentionProof -Folder (Get-PraRetentionProofFolder) -BatchId ([string]$context.Source.Data.BatchId) -Environment ([string]$context.Config.Environment) -MaxAgeHours ([int]$context.Config.Retention.ProofMaxAgeHours) -Row $rows.ToArray() -SourceBackupHash ([string]$context.Source.Hash) -PolicyGuid ([string]$context.Config.Retention.PolicyGuid)
@@ -951,13 +972,22 @@ function Invoke-PraRetentionGate {
         $script:RetentionProofReason = if ($proof.Reason) { [string]$proof.Reason } else { 'no usable retention proof' }
         if ($proof.Missing.Count) { Write-PraLog -Context $context -Message ('Retention proof {0}: not covered or not in it: {1}' -f [IO.Path]::GetFileName($proof.Path), ($proof.Missing -join ', ')) -Level Detail }
         $script:RetentionProofMissing = @($proof.Blocked)
+        if ($proof.Found) {
+            # A proof that was read and does not cover every object is the answer: its verdicts are the counts and the words.
+            $viaProof = $true
+            $notCovered = @(@($proof.Blocked) | Where-Object { Test-PraOrdinalEqual ([string]$_.Verdict) 'NotCovered' } | ForEach-Object { [pscustomobject]@{ ObjectGuid = [string]$_.ObjectGuid; Upn = [string]$_.Upn; Reason = ('the newest retention proof {0} {1}' -f $_.Proof, $says['NotCovered']) } })
+            $unverified = @(@($proof.Blocked) | Where-Object { -not (Test-PraOrdinalEqual ([string]$_.Verdict) 'NotCovered') } | ForEach-Object { [pscustomobject]@{ ObjectGuid = [string]$_.ObjectGuid; Upn = [string]$_.Upn; Reason = ('the newest retention proof {0} {1}' -f $_.Proof, $says[[string]$_.Verdict]) } })
+            foreach ($kind in @('Unverified', 'NotChecked', 'NotListed')) { $proofKinds[$kind] = @(@($proof.Blocked) | Where-Object { Test-PraOrdinalEqual ([string]$_.Verdict) $kind }).Count }
+            $noMailboxCount = @($proof.NoMailbox).Count
+            $coveredCount = [Math]::Max(0, $rows.Count - @($proof.Blocked).Count - $noMailboxCount)
+        }
     }
-    $withoutMailbox = Get-PraValue $answer 'NoMailboxList' @()
+    $withoutMailbox = if ($viaProof) { @($proof.NoMailbox) } else { Get-PraValue $answer 'NoMailboxList' @() }
     Write-PraRetentionNoMailbox -Entry @($withoutMailbox)
     $bad = $notCovered.Count + $unverified.Count
-    $without = if ($answer.NoMailbox) { ' ({0} without a mailbox in Exchange Online: nothing to retain, see the warnings above)' -f $answer.NoMailbox } else { '' }
+    $without = if ($noMailboxCount) { ' ({0} without a mailbox in Exchange Online: nothing to retain, see the warnings above)' -f $noMailboxCount } else { '' }
     if (-not $bad) {
-        Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: the retention policy holds the {0} mailbox(es) that carry the retention tag{1}' -f $answer.Covered, $without)
+        Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: the retention policy holds the {0} mailbox(es) that carry the retention tag{1}' -f $coveredCount, $without)
         if ($AcceptRetentionRisk) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text '-AcceptRetentionRisk was given and is not needed: every mailbox is held.' }
         return
     }
@@ -967,14 +997,24 @@ function Invoke-PraRetentionGate {
     Write-PraLog -Context $context -Lines $lines.ToArray() -Level Detail
     $shorten = { param([string]$Text) if ($Text.Length -gt 300) { $Text.Substring(0, 300) + '...' } else { $Text } }
     $limit = 10; $shown = 0
-    foreach ($entry in $notCovered) {
-        if ($shown -ge $limit) { break }
-        $context.CurrentIdentity = [string]$entry.ObjectGuid
-        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the retention policy does not hold this mailbox. {1}' -f $entry.Upn, (& $shorten ([string]$entry.Reason)))
-        $shown++
+    # The mailboxes concerned are named in the warning: the first ten, then how many more (the full list is in the log).
+    $namesOf = { param($Items) $names = @(@($Items) | ForEach-Object { [string]$_.Upn }); $text = (@($names | Select-Object -First 10) -join ', '); if ($names.Count -gt 10) { $text += (' and {0} more (the full list is in the log)' -f ($names.Count - 10)) }; $text }
+    if (-not $viaProof) {
+        foreach ($entry in $notCovered) {
+            if ($shown -ge $limit) { break }
+            $context.CurrentIdentity = [string]$entry.ObjectGuid
+            Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the retention policy does not hold this mailbox. {1}' -f $entry.Upn, (& $shorten ([string]$entry.Reason)))
+            $shown++
+        }
     }
     $context.CurrentIdentity = ''
-    if ([string]$answer.StopReason) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('The retention of {0} mailbox(es) could not be checked: {1}' -f $unverified.Count, (& $shorten ([string]$answer.StopReason))) }
+    if ($viaProof) {
+        if ([string]$answer.StopReason) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('Exchange Online could not be asked by this run ({0}), so the newest retention proof was read.' -f (& $shorten (([string]$answer.StopReason).Trim().TrimEnd('.')))) }
+    }
+    elseif ([string]$answer.StopReason) {
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('The retention of {0} mailbox(es) could not be checked: {1}' -f $unverified.Count, (& $shorten ([string]$answer.StopReason)))
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('Mailboxes concerned ({0}): {1}.' -f $unverified.Count, (& $namesOf $unverified))
+    }
     else {
         foreach ($entry in $unverified) {
             if ($shown -ge $limit) { break }
@@ -984,8 +1024,15 @@ function Invoke-PraRetentionGate {
         }
         $context.CurrentIdentity = ''
     }
-    if ($bad -gt $shown -and -not [string]$answer.StopReason) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('{0} more mailbox(es) are listed in the log.' -f ($bad - $shown)) }
-    $summary = '{0} mailbox(es) held, {1} not held by the retention policy, {2} not checked{3}' -f $answer.Covered, $notCovered.Count, $unverified.Count, $without
+    if ($bad -gt $shown -and -not $viaProof -and -not [string]$answer.StopReason) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('{0} more mailbox(es) are listed in the log.' -f ($bad - $shown)) }
+    if ($viaProof) {
+        $kinds = ''
+        if ($proofKinds.Unverified) { $kinds += (', {0} unverified (the Check could not check them)' -f $proofKinds.Unverified) }
+        if ($proofKinds.NotChecked) { $kinds += (', {0} not checked (the Check stopped before them)' -f $proofKinds.NotChecked) }
+        if ($proofKinds.NotListed) { $kinds += (', {0} not in the proof' -f $proofKinds.NotListed) }
+        $summary = '{0} mailbox(es) held, {1} not held by the retention policy{2}{3}' -f $coveredCount, $notCovered.Count, $kinds, $without
+    }
+    else { $summary = '{0} mailbox(es) held, {1} not held by the retention policy, {2} not checked{3}' -f $coveredCount, $notCovered.Count, $unverified.Count, $without }
     if ($script:RetentionProofRoute) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('No retention proof stands in for the check: {0}.' -f $script:RetentionProofReason) }
     if ($AcceptRetentionRisk) {
         Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('Retention risk accepted for this run (-AcceptRetentionRisk). {0}. The {1} mailbox(es) that are not held or not checked are removed from Exchange Online without a retention hold of the policy.' -f $summary, $bad)
@@ -1500,7 +1547,7 @@ try {
         if (-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) { $script:PreviewPackage = [string]$Batch }
         $imported = Import-PraTransferPackage -Path $packagePath -BackupFolder $importRoot -Environment $config.Environment -ExpectedKind $expectedKind
         Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Transfer package {0} verified (checksums, Environment, names): {1} folder(s) extracted, {2} already present and identical' -f $imported.Name, $imported.Created.Count, $imported.Existing.Count)
-        if ((-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply'))) { Write-PraItem -Context $context -Status Info -Text 'Preview: the package was verified and read from a private temporary folder, deleted at the end. Nothing was written to the backup folder.' }
+        if ((-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply'))) { Write-PraItem -Context $context -Status Info -Text ('Preview: the package was verified and read from a private temporary folder, deleted at the end. Nothing was written to the backup folder' + $(if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { ' except the retention proof, which is written to the Outbox folder of the backup folder.' } else { '.' })) }
         $script:ImportedFolders = @($imported.Created)
         if ((Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) {
             # The console tells an imported batch from one converted here by this file (outside the batch folder, which travels with the package).
@@ -1676,6 +1723,16 @@ try {
         if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { Test-PraCloudModuleAvailable }
         $context.Source = Import-PraBackup $context (Get-PraBatchFile -Value $Batch -Operations @('Convert'))
         if (-not (Test-PraOrdinalEqual $context.Source.Data.Operation 'Convert')) { throw 'Recover needs the original Convert batch.' }
+        $applyState = Get-PraBatchApplyState -Folder (Split-Path $context.Source.Path -Parent) -BatchId ([string]$context.Source.Data.BatchId) -SchemaVersion ([int](Get-PraValue $context.Source.Data 'SchemaVersion' 2))
+        if (Test-PraOrdinalEqual $applyState 'NotApplied') {
+            $leftover = Split-Path $context.Source.Path -Parent
+            $short = Get-PraShortId ([string]$context.Source.Data.BatchId)
+            $context.NextSteps = @(('Batch {0} did not change Active Directory: its folder {1} holds the backup only (no AD proof, no journal line of a write), because the run that made it stopped before its first write. You can delete that folder, or keep it as evidence. It is not a batch to roll back.' -f $short, $leftover),
+                'To convert the objects, run the Convert again with the same selection (-Group, -SearchBase, -CsvPath or -Identity), the Preview first:',
+                (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -ModeName 'Preview'))
+            $context.NextOnFailure = $true; $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+            throw ('Recover stopped before any change: batch {0} did not change Active Directory (it stopped before its first AD write), so there is nothing to roll back.' -f $short)
+        }
         $context.SourceBackupHash = $context.Source.Hash
         $records = @(Select-PraSourceRecord $context.Source)
         $context.PhaseFolders = @(Split-Path $context.Source.Path -Parent)
@@ -1931,8 +1988,21 @@ try {
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and $notExpected -and -not $runErrors -and -not $context.CloudConnectFailed) {
             Write-PraItem -Context $context -Status Fail -Text ('Check finished: {0} object(s) not in the expected state. Nothing was changed.' -f $notExpected)
             $context.CheckFinished = $true
-            $context.NextSteps = @('If the Entra Connect sync has not run since the Active Directory changes, run it first (Start-ADSyncSyncCycle -PolicyType Delta on the Entra Connect server, or wait for the next automatic cycle, about 30 minutes), then run the Check again:',
-                (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $Batch }) -KeepFilters))
+            $rerunCheck = Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $Batch }) -KeepFilters
+            if (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained') {
+                $checkedGuid = [string](Get-PraValue $context 'RetentionPolicyGuid' '')
+                $policyLabel = if ($checkedGuid) { ' (' + $checkedGuid + ')' } else { '' }
+                $policyName = [string]$context.Config.Retention.PolicyName
+                $detailCommand = if ($checkedGuid) { 'Connect-IPPSSession; Get-RetentionCompliancePolicy -Identity {0} -DistributionDetail | Format-List Name,Guid,Enabled,Mode,DistributionStatus,*Location*' -f (ConvertTo-PraLiteral $checkedGuid) }
+                    elseif ($policyName) { 'Connect-IPPSSession; Get-RetentionCompliancePolicy -Identity {0} -DistributionDetail | Format-List Name,Guid,Enabled,Mode,DistributionStatus,*Location*' -f (ConvertTo-PraLiteral $policyName) }
+                    else { 'Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid' }
+                $keepProof = @(Get-PraList $context 'NextSteps')
+                $context.NextSteps = @(('The retention policy{0} does not hold, or could not be checked for, {1} mailbox(es) of this batch (named above). Look at what the policy covers: the mailbox must be in its scope and not excluded, and an adaptive scope can take several days to catch up. Read the policy with:' -f $policyLabel, $notExpected),
+                    $detailCommand, 'Make the policy hold those mailboxes, then run the Check again (it writes a new retention proof):', $rerunCheck) + $keepProof
+            }
+            else {
+                $context.NextSteps = @('If the Entra Connect sync has not run since the Active Directory changes, run it first (Start-ADSyncSyncCycle -PolicyType Delta on the Entra Connect server, or wait for the next automatic cycle, about 30 minutes), then run the Check again:', $rerunCheck)
+            }
             $context.NextOnFailure = $true
         }
         elseif ($context.Issues.Count -or $cloudErrors.Count) {

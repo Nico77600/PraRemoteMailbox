@@ -674,7 +674,7 @@ function Write-PraCloudError {
 
 function Write-PraCloudFailure {
     <# A cloud call that threw. A network failure is said in plain words with the raw text in the technical detail only; any other failure keeps its message. -Expectation: the message of another failure may be a result of the check itself (not a run error). #>
-    param([hashtable]$Context,$Row,[Parameter(Mandatory)]$ErrorRecord,[string]$Upn='',[string]$Extra='',[switch]$Expectation)
+    param([hashtable]$Context,$Row,[Parameter(Mandatory)]$ErrorRecord,[string]$Upn='',[string]$Extra='',[switch]$Expectation,[switch]$NamedMessage)
     $raw=[string]$ErrorRecord.Exception.Message
     $network=Get-PraNetworkFailure $ErrorRecord
     if ($null -ne $network) {
@@ -692,6 +692,7 @@ function Write-PraCloudFailure {
         return
     }
     $message=$(if ($Extra) { $raw + ' | ' + $Extra } else { $raw })
+    if ($NamedMessage -and $Upn -and $message.IndexOf($Upn,[StringComparison]::OrdinalIgnoreCase) -lt 0) { $message='{0}: {1}' -f $Upn,$message }
     if ($Expectation) { Write-PraCloudError -Context $Context -Row $Row -Message $message } else { Write-PraCloudError -Context $Context -Row $Row -Message $message -RunError }
 }
 
@@ -908,6 +909,8 @@ function Resolve-PraCloudIdentity {
     $result = { param($Status, $ObjectId, $Message, $Technical, $Account = $null) [pscustomobject]@{ Status = $Status; ObjectId = $ObjectId; Message = $Message; Technical = $Technical; Account = $Account } }
     $older = if ($Recorded) { '' } else { ' The record was written by an older version: it holds only the objectGUID, not the ms-DS-ConsistencyGuid.' }
     $accounts = @(Get-PraEntraAccount -Context $Context -Upn $Upn -Property $Property)
+    $selected = [string[]]@(@('id', 'userPrincipalName', 'onPremisesImmutableId', 'onPremisesSyncEnabled') + @($Property) | Get-PraOrdinalUnique -IgnoreCase)
+    foreach ($read in $accounts) { try { Add-Member -InputObject $read -NotePropertyName PraSelectedProperty -NotePropertyValue $selected -Force } catch { $null = $_ } }
     if ($accounts.Count -gt 1) {
         return (& $result 'Ambiguous' '' ('{0}: Microsoft Entra ID returned {1} accounts for this UPN, so the right one cannot be chosen. Nothing was changed on it. Remove the duplicate account in Microsoft Entra ID, then run the same command again.' -f $Upn, $accounts.Count) ('accounts=' + (@($accounts | ForEach-Object { [string](Get-PraValue $_ 'Id' '') }) -join ',')))
     }
@@ -1560,7 +1563,11 @@ function Get-PraGraphFact {
     $confirmed=if ($verified.ContainsKey($Upn) -and [string]$verified[$Upn]) { [string]$verified[$Upn] } else { '' }
     $lookup=if ($confirmed) { $confirmed } else { $Upn }
     $sentinel=New-Object object
-    $prefetched=($null -ne $Account -and -not @($props | Where-Object { [object]::ReferenceEquals((Get-PraValue $Account $_ $sentinel),$sentinel) }).Count)
+    # The account of the identity check is the answer only when it was READ with every property asked here: a user read with the minimal select (for instance as the trustee of
+    # another object) still has assignedLicenses, assignedPlans and provisionedPlans as properties, but empty, and would say "no licence, no mailbox".
+    $selectedWith=Get-PraValue $Account 'PraSelectedProperty' $null
+    $coversProps=($null -eq $selectedWith -or -not @($props | Where-Object { -not (Test-PraOrdinalIgnoreCaseIn $_ @($selectedWith)) }).Count)
+    $prefetched=($null -ne $Account -and $coversProps -and -not @($props | Where-Object { [object]::ReferenceEquals((Get-PraValue $Account $_ $sentinel),$sentinel) }).Count)
     if ($prefetched) { $users=@($Account) }
     else {
         $readUser={ param($UserId,$Property) Get-MgUser -UserId $UserId -Property $Property -ErrorAction Stop }
@@ -2127,6 +2134,14 @@ function Invoke-PraRetentionCheck {
                 # with the next row; NotChecked is only for the rows that the loop did not reach because it stopped (the retry time of the run, a refusal of Microsoft Graph).
                 if (Test-PraOrdinalIn $verdictKind @('NoMailbox','NotCovered')) { $row.RetentionVerdict=$verdictKind }
                 else { $row.RetentionVerdict='Unverified' }
+                # An object that has no mailbox in Exchange Online has nothing to retain: that is a pass, not a failure of the Check.
+                if (Test-PraOrdinalEqual $verdictKind 'NoMailbox') {
+                    $noMailboxUpn=[string](Get-PraValue $row 'UserPrincipalName' '')
+                    $row.CloudMailbox=$false; $row.CloudStatus='Success'; $row.FinalStatus='Success'
+                    $row.CloudDetail=('no mailbox in Exchange Online (active or inactive): nothing to retain | '+[string]$failure.Exception.Message).Trim(' ','|')
+                    Write-PraItem -Context $Context -Status Ok -Text ('{0}: no mailbox in Exchange Online (active or inactive): nothing to retain for this object.' -f $noMailboxUpn)
+                    continue
+                }
                 # The retry time of the run is used up: ONE error for the run, the rows not checked stay Pending (never one error per row).
                 if ((Get-PraRetryState $Context).RunExhausted) { $stopRun=$failure; break }
                 if ($failure.Exception.Data['PraGraph'] -eq $true) {
@@ -2136,7 +2151,7 @@ function Invoke-PraRetentionCheck {
                         $Context.GraphRefused=$true; $graphStop=$true; break
                     }
                 }
-                Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $failure -Upn ([string](Get-PraValue $row 'UserPrincipalName' '')) -Expectation
+                Write-PraCloudFailure -Context $Context -Row $row -ErrorRecord $failure -Upn ([string](Get-PraValue $row 'UserPrincipalName' '')) -Expectation -NamedMessage
             }
         }
         if ($graphStop) {

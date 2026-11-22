@@ -1727,7 +1727,7 @@ try {
  if($packaged.State -cne 'AD part done, cloud part to do' -or $packaged.Finish){throw ('Packaged row: '+$packaged.State)}
  if($c.BatchHelp.Text -cnotmatch 'finish it here'){throw 'The list help does not explain "finish it here"'}
  $orphanRow=RowOf $g $OrphanId
- if(-not $orphanRow -or $orphanRow.Selectable -or $orphanRow.Finish -or $orphanRow.State -cne 'Nothing was written to AD: not a batch to continue' -or $orphanRow.Level -cne 'Warn'){throw ('A folder marked not applied is not a batch to continue: '+$orphanRow.State)}
+ if(-not $orphanRow -or $orphanRow.Selectable -or $orphanRow.Finish -or $orphanRow.State -cne 'Nothing was written to AD: nothing to roll back, not a batch to continue' -or $orphanRow.Level -cne 'Warn'){throw ('A folder marked not applied is not a batch to continue: '+$orphanRow.State)}
  $c.BatchList.SelectedItem=$failed; Pump 80
  if($c.PhasePillText.Text -cne 'Phase: AD'){throw ('Finish phase pill: '+$c.PhasePillText.Text)}
  if($c.PhaseText.Text -cnotmatch 'Active Directory is NOT changed again.*Entra Connect synchronisation again.*ONE transfer package'){throw ('Finish phase text: '+$c.PhaseText.Text)}
@@ -2420,6 +2420,21 @@ Describe 'Release 3.2.0 - the console tells a finished batch from one that is st
         foreach ($done in @($finished, $both)) { foreach ($other in @($todo, $pending, $stopped, $partial, $adOnly, $garbage)) { (& $position $done) | Should -BeGreaterThan (& $position $other) -Because 'finished batches are last' } }
     }
 
+    It 'a Convert batch that never wrote to AD (a killed run left the backup only) is not offered as a batch to roll back, in the console as in the command line' -Tag 'Release320j' {
+        $runtime = New-GuiTestRoot
+        $leftover = New-GuiTestBatch -Runtime $runtime
+        Remove-Item -LiteralPath $leftover.Proof, ($leftover.Proof + '.sha256') -Force -ErrorAction SilentlyContinue
+        $journalOnly = New-GuiTestBatch -Runtime $runtime
+        Remove-Item -LiteralPath $journalOnly.Proof, ($journalOnly.Proof + '.sha256') -Force -ErrorAction SilentlyContinue
+        Write-GuiTestFile (Join-Path $journalOnly.Folder ('Journal-' + $journalOnly.Id + '.jsonl')) ('{"RunId":"r","Utc":"u","Target":"00000000-0000-0000-0000-000000000001","Operation":"Set-ADUser","Status":"Started","Detail":""}' + "`r`n")
+        $applied = New-GuiTestBatch -Runtime $runtime
+        $rows = Get-GuiBatchRows $runtime 'Recover' 'New'
+        $r = Get-GuiRowOf $rows $leftover.Id
+        $r.State | Should -BeExactly 'Nothing was written to AD: nothing to roll back, not a batch to continue'
+        $r.Selectable | Should -BeFalse; $r.Group | Should -BeExactly 'Other'; $r.Level | Should -BeExactly 'Warn'
+        (Get-GuiRowOf $rows $journalOnly.Id).State | Should -BeExactly 'Can be rolled back'
+        (Get-GuiRowOf $rows $applied.Id).State | Should -BeExactly 'Can be rolled back'
+    }
     It 'labels the batches of a rollback: a finished conversion is still a batch to roll back, and says it is finished; a Recover whose cloud part is done says so and cannot be continued' {
         $runtime = New-GuiTestRoot
         $todo = New-GuiTestBatch -Runtime $runtime

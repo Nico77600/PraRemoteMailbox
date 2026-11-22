@@ -1640,7 +1640,7 @@ function Get-PraGuiBatchEntry {
         $proofPath=Join-Path $item.Folder ('State-'+$item.BatchId+'.json')
         $hasProof=Test-Path -LiteralPath $proofPath -PathType Leaf
         $state_='Ready'; $level='Ok'; $selectable=$true; $finish=$false; $group='To do'; $mark=''
-        $notApplied=Test-Path -LiteralPath (Join-Path $item.Folder 'NOT-APPLIED.txt') -PathType Leaf
+        $notApplied=(Test-Path -LiteralPath (Join-Path $item.Folder 'NOT-APPLIED.txt') -PathType Leaf) -or ((Test-GuiOrdinal $item.Operation 'Convert') -and (Test-GuiOrdinal (Get-PraBatchApplyState -Folder ([string]$item.Folder) -BatchId ([string]$item.BatchId) -SchemaVersion ([int](Get-PraGuiValue $item.Data 'SchemaVersion' 2))) 'NotApplied'))
         $progress=if ($hasProof -or (Test-GuiOrdinal $item.Operation 'RecoverFinalize' -IgnoreCase)) { Get-PraGuiBatchProgress $item.Folder ([string]$item.Operation) ([string]$item.Environment) } else { [pscustomobject]@{ Kind='None'; Pending=0 } }
         switch ($item.Operation) {
             'Convert' {
@@ -1678,7 +1678,7 @@ function Get-PraGuiBatchEntry {
                 else { $state_='Ready to finalize'; $level='Todo' }
             }
         }
-        if ($notApplied -and (Test-GuiOrdinalIn $item.Operation @('Convert','Recover'))) { $state_='Nothing was written to AD: not a batch to continue'; $level='Warn'; $selectable=$false; $finish=$false; $group='Other'; $mark=$markWarn }
+        if ($notApplied -and (Test-GuiOrdinalIn $item.Operation @('Convert','Recover'))) { $state_='Nothing was written to AD: nothing to roll back, not a batch to continue'; $level='Warn'; $selectable=$false; $finish=$false; $group='Other'; $mark=$markWarn }
         $glyph=switch ($item.Operation) { 'Convert' { [string][char]0xE753 } 'Recover' { [string][char]0xE7A7 } default { [string][char]0xE930 } }
         $label=if (Test-GuiOrdinal $item.Operation 'RecoverFinalize') { 'Finalize' } else { [string]$item.Operation }
         $sub='{0}, {1} shared · environment {2} · {3}' -f (ConvertTo-PraGuiPlural $recordCount 'mailbox' 'mailboxes'),$shared,$item.Environment,(Split-Path $item.Folder -Leaf)

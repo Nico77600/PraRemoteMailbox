@@ -1978,7 +1978,7 @@ function Complete-PraRun {
     $issueLines = @($issueLines | ForEach-Object { if ($_.Length -gt 240) { $_.Substring(0, 237) + '...' } else { $_ } })
     if ($issueLines.Count) {
         # The same count as the Result line: an object that failed and the stop that follows its error are one error, not two.
-        if ($Context.Issues.Count -gt 2) { $issueLines = @(('{0} error(s) in total, see the log and the report' -f $(if ($isCheckRun) { $c.RunError } else { $c.Error }))) + $issueLines }
+        if ($Context.Issues.Count -gt 2) { $issueLines = @($(if ($isCheckRun) { '{0} error(s) in total ({1} not as expected), see the log and the report' -f $c.Error, ($c.Error - $c.RunError) } else { '{0} error(s) in total, see the log and the report' -f $c.Error })) + $issueLines }
         $values['Error'] = @('Fail', $issueLines)
     }
     $warningList = @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
@@ -2507,6 +2507,31 @@ function Test-PraCloudMailboxKept {
     [CmdletBinding()]
     param([bool]$IsShared, [string]$Operation, [bool]$KeepCloudShared)
     return ($IsShared -and (Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover') -and $KeepCloudShared)
+}
+
+function Get-PraBatchApplyState {
+    <#
+    .SYNOPSIS
+        Whether a Convert batch folder shows that Active Directory was written by the batch: Applied, NotApplied (nothing was written) or Unknown (a batch of the first schema: it has no AD proof to tell).
+    .DESCRIPTION
+        NotApplied: the folder is marked NOT-APPLIED, or it has no State file (AD proof) and its journal, if any, has no line of a write (Set-ADUser, Add-ADGroupMember or Remove-ADGroupMember that was started
+        or applied). That is what a run that was stopped (a hard kill, a closed window) before its first AD write leaves behind: the backup only. Read only; never throws.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$BatchId, [int]$SchemaVersion = 2)
+    try {
+        if ([IO.File]::Exists((Join-Path $Folder 'NOT-APPLIED.txt'))) { return 'NotApplied' }
+        if ($SchemaVersion -lt 2) { return 'Unknown' }
+        if ([IO.File]::Exists((Join-Path $Folder ('State-' + $BatchId + '.json')))) { return 'Applied' }
+        $journal = Join-Path $Folder ('Journal-' + $BatchId + '.jsonl')
+        if ([IO.File]::Exists($journal)) {
+            foreach ($line in [IO.File]::ReadLines($journal)) {
+                if (($line.Contains('"Status":"Started"') -or $line.Contains('"Status":"Applied"')) -and ($line.Contains('"Operation":"Set-ADUser"') -or $line.Contains('"Operation":"Add-ADGroupMember"') -or $line.Contains('"Operation":"Remove-ADGroupMember"'))) { return 'Applied' }
+            }
+        }
+        return 'NotApplied'
+    }
+    catch { return 'Unknown' }
 }
 
 function Find-PraRetentionProofEntry {
@@ -3983,7 +4008,7 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-PraImmutableId, Get-PraSourceAnchor, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Copy-PraPhaseFile, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Write-PraGlobalEventsCsv, Write-PraGlobalIssuesCsv, Get-PraGlobalJourney, Test-PraBatchSideFile, Write-PraRetentionProof, Get-PraRetentionProof, Test-PraRetentionCheckRecord, Test-PraCloudMailboxKept, Get-PraConvertCloudDone, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, New-PraRecordIndex, Get-PraRecordIndex, Find-PraRecord, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-PraImmutableId, Get-PraSourceAnchor, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Copy-PraPhaseFile, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Write-PraGlobalEventsCsv, Write-PraGlobalIssuesCsv, Get-PraGlobalJourney, Test-PraBatchSideFile, Write-PraRetentionProof, Get-PraRetentionProof, Test-PraRetentionCheckRecord, Test-PraCloudMailboxKept, Get-PraBatchApplyState, Get-PraConvertCloudDone, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, New-PraRecordIndex, Get-PraRecordIndex, Find-PraRecord, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Test-PraOwnEntryProcess, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block

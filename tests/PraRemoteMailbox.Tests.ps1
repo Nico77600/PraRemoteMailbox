@@ -206,8 +206,10 @@ function Assert-GateBackupBarrier {
 if (-not ('GateSynthetic.ADServerDownException' -as [type])) { Add-Type -TypeDefinition 'namespace GateSynthetic { public class ADServerDownException : System.Exception { public ADServerDownException(string message) : base(message) { } } }' }
 function Get-ADDomainController {
     [CmdletBinding()]
-    param([switch]$Discover,[switch]$Writable,[string]$Identity,[string]$Server)
+    param([switch]$Discover,[switch]$Writable,[string]$Identity,[string]$Server,[string]$Filter)
     if (-not $Discover) { Assert-GateServer $Server }
+    # The list of the domain controllers (the replication step) is read with -Filter: a run stopped there has verified every object already.
+    if ($global:PraGateAd.Case -eq 'InterruptAtReplication' -and $Filter) { Stop-GatePipeline }
     # The domain controller does not answer (the text is in another language than English: the type tells).
     if ($global:PraGateAd.Case -eq 'AdServerDown' -and -not $Discover) { throw [GateSynthetic.ADServerDownException]::new('Impossible de contacter le serveur. Cela peut etre parce que ce serveur n''existe pas.') }
     Write-GateEvent 'Get-ADDomainController' $Identity $Server @{Discover=[bool]$Discover; HostNameType='System.String'}
@@ -794,6 +796,11 @@ exit `$code
         $plans=@(New-PraPlan $Context 'user1' 'Convert'; New-PraPlan $Context 'user2' 'Convert')
         $directory=Get-Module PRA.Directory
         $source=if ($ApplySnapshots) { Invoke-PraAdBatch $Context $plans 'Convert' } else { & $directory { param($c,$p) Save-PraBatch $c $p 'Convert' } $Context $plans }
+        # A batch that was applied has the journal of its writes; a Convert saved without it would be a backup that never changed Active Directory.
+        if (-not $ApplySnapshots) {
+            $firstTarget=[string]@($source.Data.Records)[0].ObjectGuid
+            [IO.File]::WriteAllText((Join-Path (Split-Path $source.Path -Parent) ('Journal-'+$source.Data.BatchId+'.jsonl')),('{"RunId":"gate","Utc":"2026-11-20T00:00:00.0000000Z","Target":"'+$firstTarget+'","Operation":"Set-ADUser","Status":"Applied","Detail":""}'+"`r`n"),(New-Object Text.UTF8Encoding($false)))
+        }
         $Context.SourceBackupHash=$source.Hash; $Context.Source=$source; $Context.Action='Recover'
         $recoverPlans=@(foreach ($record in $source.Data.Records) { New-PraPlan $Context $record.ObjectGuid 'Recover' $record })
         $recover=if ($ApplySnapshots) { Invoke-PraAdBatch $Context $recoverPlans 'Recover' } else { & $directory { param($c,$p) Save-PraBatch $c $p 'Recover' } $Context $recoverPlans }
@@ -9719,6 +9726,21 @@ Describe 'Release 3.2.0 - a run stopped from outside ends FAIL with exit code 1 
         @($proof.Records).Count | Should -Be 1
         (Get-Content -LiteralPath @(Get-ChildItem -LiteralPath (Join-Path $runtime.Root 'logs') -Filter '*.log')[0].FullName -Tail 2) -join "`n" | Should -Match 'RESULT: FAIL'
     }
+    It 'a Convert Apply stopped after every object was verified (the replication step) counts what was verified and gives the continuation and the rollback' -Tag 'Release320j' {
+        $runtime = New-GateRuntime -Name 'interrupt-replication-320j' -Case 'InterruptAtReplication'
+        Set-GateConfigText $runtime { param($text) $text.Replace("Execution=@{Phase='Both'}", "Execution=@{Phase='Both'}`r`n Directory=@{ForceReplication=`$true;ReplicationVerifyAttempts=1;ReplicationVerifyDelaySeconds=1}") }
+        $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='AD';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
+        $run.ExitCode | Should -Be 1 -Because ($run.Output + $run.Error)
+        $run.Output | Should -Match 'the run was interrupted before it finished'
+        $batch = [regex]::Match($run.Output, '(?m)^\s*\S+\s+Batch\s+(?<id>[0-9a-f]{8})\s*$').Groups['id'].Value
+        $batch | Should -Match '^[0-9a-f]{8}$' -Because $run.Output
+        $run.Output | Should -Match 'Active Directory was changed for 2 object\(s\) before the stop \(see the journal and the backup named above\) and all 2 were verified: the stop came after the verification\. To go on with this batch \(the verified objects are not changed again: it runs the Entra Connect synchronisation and writes the transfer package\), run:'
+        $run.Output | Should -Match ('-Action Convert -Phase AD -Mode Apply -Batch ' + $batch + ' -ConfigPath ')
+        $run.Output | Should -Match 'To put them back as they were, roll the batch back \(run the Preview first, then the same command with -Mode Apply\):'
+        $run.Output | Should -Match ('-Action Recover -Batch ' + $batch + ' -ConfigPath ')
+        $run.Output | Should -Match ('-Action Check -Batch ' + $batch + ' -ConfigPath ')
+        $run.Output | Should -Not -Match 'none of them is verified'
+    }
     It 'a Phase Both Apply stopped in the cloud wait: no object is a success, the phase data says Failed, the Exchange Online part is the next step' {
         $runtime = New-GateRuntime -Name 'interrupt-cloud-320a' -Case 'CloudInterrupt'
         $run = Invoke-GateProcess $runtime @{Action='Convert';Phase='Both';Mode='Apply';Force=$true;ConfigPath=$runtime.ConfigPath} -TimeoutSeconds 120
@@ -12386,12 +12408,13 @@ Export-ModuleMember -Function Get-EXORecipient, Get-EXOMailbox, Get-Mailbox, Get
             Invoke-PraRetentionCheck $global:PraGate.R10Context $global:PraGate.R10Rows
         }
         $row = $global:PraGate.R10Rows[0]
-        $row.CloudStatus | Should -BeExactly 'Error'
+        $row.CloudStatus | Should -BeExactly 'Success'
         $row.Warnings | Should -Match 'user1@gate\.invalid: not this object''s mailbox\. Exchange Online has an inactive mailbox with this UPN, but it belongs to an earlier account'
         $row.Warnings | Should -Match ([regex]::Escape('Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''user1@gate.invalid''"'))
         $context.Warnings | Should -Be 1
-        $context.Issues.Count | Should -Be 1
-        [string]$context.Issues[0].Message | Should -Match 'No mailbox of this object to retain: the only inactive mailbox with this UPN is not this object''s mailbox'
+        $context.Issues.Count | Should -Be 0 -Because 'the object has no mailbox to retain: that is a pass, with a warning'
+        $row.RetentionVerdict | Should -BeExactly 'NoMailbox'
+        $row.CloudDetail | Should -Match 'No mailbox of this object to retain: the only inactive mailbox with this UPN is not this object''s mailbox'
     }
     It 'a failure that ends the cloud phase half way keeps the rows that finished and makes an error only of the others' {
         $global:PraGate.R10Rows = New-R10Rows 3
@@ -12577,6 +12600,44 @@ Export-ModuleMember -Function Get-EXORecipient, Get-EXOMailbox, Get-Mailbox, Get
         }
         @($global:PraGate.R10.Accounts) | Should -BeExactly @($true, $false) -Because 'the first read got the account of the identity check, the second was not given a kept one'
         $global:PraGate.R10Rows[0].CloudStatus | Should -BeExactly 'Success'
+    }
+    It 'an account read with the minimal select (as the trustee of another object) is never taken for the facts of the same object: the licences and the plans are read again (<Order>)' -Tag 'Release320j' -ForEach @(@{ Order = 'trustee first' }, @{ Order = 'mailbox first' }) {
+        $context = $global:PraGate.R10Context
+        $context.Config.Cloud = @{ CheckMailbox = $true; CheckLicense = $true; MailboxCheckVia = 'Graph'; RequiredSkuPartNumber = ''; IdentityCheck = 'Anchor'; TenantId = '20000000-0000-0000-0000-000000000002' }
+        $userGuid = 'ab12cd34-0000-4000-8000-0000000000ef'; $sharedGuid = 'ab12cd34-0000-4000-8000-0000000000aa'
+        $global:PraGate.R10Case = @{ UserAnchor = (New-R10Anchor $userGuid); SharedAnchor = (New-R10Anchor $sharedGuid); Reads = (New-Object 'Collections.Generic.List[string]'); Order = $Order }
+        $user = New-R10Row -Upn 'user1@gate.invalid' -Guid $userGuid
+        $sharedRecord = [pscustomobject]@{ ObjectGuid = $sharedGuid; UserPrincipalName = 'shared1@gate.invalid'; SamAccountName = 'shared1'; IsShared = $true; SourceAnchor = [pscustomobject]@{ ObjectGuid = $global:PraGate.R10Case.SharedAnchor; ConsistencyGuid = '' }; SharedTrusteeAnchors = @{ 'user1@gate.invalid' = @($global:PraGate.R10Case.UserAnchor) } }
+        $global:PraGate.R10Case.Pair = @((New-PraRow $context $sharedRecord), $user)
+        $facts = InModuleScope PRA.Cloud {
+            Mock Assert-PraGraphSession { }
+            Mock Get-MgUser {
+                param($UserId, $Filter, $Property)
+                $full = @($Property) -contains 'assignedLicenses'
+                $global:PraGate.R10Case.Reads.Add(('{0}|{1}' -f $UserId, $(if ($full) { 'full' } else { 'minimal' })))
+                $anchor = if ([string]$UserId -like 'shared1*') { $global:PraGate.R10Case.SharedAnchor } else { $global:PraGate.R10Case.UserAnchor }
+                $account = [pscustomobject]@{ Id = 'aaaaaaaa-0000-0000-0000-000000000001'; UserPrincipalName = $UserId; OnPremisesImmutableId = $anchor; OnPremisesSyncEnabled = $true; assignedPlans = $null; provisionedPlans = $null; assignedLicenses = $null }
+                if ($full) {
+                    $account.assignedPlans = @([pscustomobject]@{ Service = 'exchange'; CapabilityStatus = 'Enabled' })
+                    $account.provisionedPlans = @([pscustomobject]@{ Service = 'exchange'; ProvisioningStatus = 'Success' })
+                    $account.assignedLicenses = @([pscustomobject]@{ SkuId = '10000000-0000-0000-0000-000000000000' })
+                }
+                $account
+            }
+            Mock Get-MgUserLicenseDetail { @() }
+            $session = Get-PraCloudSession $global:PraGate.R10Context
+            $session.Graph = $true
+            $props = [string[]]@(Get-PraGraphFactProperty -Mailbox $true -License $true)
+            $states = @{}
+            foreach ($row in $global:PraGate.R10Case.Pair) { $states[[string]$row.UserPrincipalName] = @{ Row = $row; Upn = [string]$row.UserPrincipalName; Requests = $(if ($row.IsShared) { @(@{ Trustee = 'user1@gate.invalid' }) } else { @() }); PlainText = ''; FactProps = $(if ($row.IsShared) { [string[]]@() } else { $props }) } }
+            $sequence = if ($global:PraGate.R10Case.Order -ceq 'trustee first') { @('shared1@gate.invalid', 'user1@gate.invalid') } else { @('user1@gate.invalid', 'shared1@gate.invalid') }
+            foreach ($name in $sequence) { $null = Confirm-PraCloudIdentity -Context $global:PraGate.R10Context -State $states[$name] }
+            Get-PraGraphFact -Context $global:PraGate.R10Context -Upn 'user1@gate.invalid' -Mailbox $true -License $true -Account $states['user1@gate.invalid'].Account
+        }
+        $facts.LicenseCount | Should -Be 1 -Because (($global:PraGate.R10Case.Reads) -join '; ')
+        $facts.Enabled | Should -BeTrue
+        $facts.Provisioned | Should -BeTrue
+        if ($Order -ceq 'trustee first') { @($global:PraGate.R10Case.Reads | Where-Object { $_ -cmatch '\|full$' }).Count | Should -BeGreaterThan 0 -Because 'the minimal account of the trustee read is not the answer' }
     }
     It 'a Graph account other than the confirmed one is refused with a next step that names the account to look at' {
         $global:PraGate.R10Case = @{ Other = 'cccccccc-0000-0000-0000-000000000003' }
@@ -14271,6 +14332,30 @@ Describe 'Release 3.2.0 - the retention proof in the entry script: the Check on 
             $objects = @($source.Records | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ ObjectGuid = [string]$_.ObjectGuid; Upn = ([string]$_.UserPrincipalName).ToUpperInvariant(); Verdict = $(if ($Partial -and $i -eq 2) { 'NotCovered' } else { $Verdict }) } })
             return (New-E320ProofFile -Folder $Folder -BatchId ([string]$source.BatchId) -Environment $Environment -CreatedUtc ([DateTime]::UtcNow.AddHours(-$AgeHours)) -Objects $objects -Tamper:$Tamper -SourceBackupHash ((Get-FileHash -LiteralPath $Bundles.Source -Algorithm SHA256).Hash.ToLowerInvariant()))
         }
+        function global:New-E320Big {
+            param([int]$Count = 13, [string]$Case = 'RetentionUnverified')
+            $big = New-GateRuntime -Name ('proof-320j-' + $Count + '-' + $Case) -UserCount $Count -Case $Case
+            $env:PRA_GATE_STATE = $big.StatePath
+            $env:PSModulePath = $big.Modules + ';' + (Join-Path $PSHOME 'Modules')
+            Remove-Module PRA.Directory -Force -ErrorAction SilentlyContinue
+            Get-Module ActiveDirectory -All | Remove-Module -Force -ErrorAction Stop
+            Import-Module (Join-Path $big.Modules 'ActiveDirectory\ActiveDirectory.psm1') -Force -Global
+            Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Directory.psm1') -Force -Global
+            $bigContext = New-GateContext $big
+            $bigContext.BackupFolder = $big.State.BackupFolder
+            $plans = @(1..$Count | ForEach-Object { New-PraPlan $bigContext ('user' + $_) 'Convert' })
+            $source = & (Get-Module PRA.Directory) { param($c, $p) Save-PraBatch $c $p 'Convert' } $bigContext $plans
+            [IO.File]::WriteAllText((Join-Path (Split-Path $source.Path -Parent) ('Journal-' + $source.Data.BatchId + '.jsonl')), ('{"RunId":"gate","Utc":"2026-11-20T00:00:00.0000000Z","Target":"' + [string]@($source.Data.Records)[0].ObjectGuid + '","Operation":"Set-ADUser","Status":"Applied","Detail":""}' + "`r`n"), (New-Object Text.UTF8Encoding($false)))
+            foreach ($plan in $plans) {
+                $user = @($big.State.Users | Where-Object ObjectGUID -eq $plan.Record.ObjectGuid)[0]
+                foreach ($key in $plan.Kinds.Keys) { $user.$key = & (Get-Module PRA.Directory) { param($state) ConvertFrom-PraStoredValue $state } $plan.Desired[$key] }
+                $user.uSNChanged = [long]101
+            }
+            $big.State.Group.member = @($big.State.Users | ForEach-Object DistinguishedName)
+            Save-E320State2 $big
+            Remove-Item -LiteralPath $big.EventPath -Force -ErrorAction SilentlyContinue
+            return [pscustomobject]@{ Runtime = $big; Source = $source.Path }
+        }
     }
     BeforeEach {
         $runtime = New-GateRuntime -Name 'proof-320e'
@@ -14287,7 +14372,7 @@ Describe 'Release 3.2.0 - the retention proof in the entry script: the Check on 
         $runtime.State.Case = 'RetentionUnverified'
         Set-E320Converted2 $runtime $bundles; Save-E320State2 $runtime
     }
-    AfterAll { Remove-Item -LiteralPath 'Function:\Set-E320Converted2', 'Function:\Save-E320State2', 'Function:\New-E320Proof', 'Function:\New-E320ProofFile' -ErrorAction SilentlyContinue }
+    AfterAll { Remove-Item -LiteralPath 'Function:\Set-E320Converted2', 'Function:\Save-E320State2', 'Function:\New-E320Proof', 'Function:\New-E320ProofFile', 'Function:\New-E320Big' -ErrorAction SilentlyContinue }
     It 'AD part, Exchange Online not reachable: a valid proof of the cloud server is accepted, nothing is asked of Exchange Online, the Recover goes on' {
         $proof = New-E320Proof $runtime $bundles
         Test-Path -LiteralPath $proof | Should -BeTrue
@@ -14393,6 +14478,97 @@ Describe 'Release 3.2.0 - the retention proof in the entry script: the Check on 
         $single = Invoke-GateProcess $runtime @{Action='Check';Mode='Preview';Expect='Retained';Once=$true;ConfigPath=$runtime.ConfigPath;Identity='user1@gate.invalid'}
         $single.Output | Should -Not -Match 'Retention proof written'
         @(Get-ChildItem -LiteralPath $outbox -File -Filter 'RetentionProof-*' -ErrorAction SilentlyContinue).Count | Should -Be 0
+    }
+    It 'with a proof that was read, the wording and the counts follow its verdicts: <Verdict>' -Tag 'Release320j' -ForEach @(
+        @{ Verdict = 'NotCovered'; Counts = '0 mailbox\(es\) held, 2 not held by the retention policy\. The Apply will be refused'; Says = 'says that the retention policy does not hold this mailbox' }
+        @{ Verdict = 'Unverified'; Counts = '0 mailbox\(es\) held, 0 not held by the retention policy, 2 unverified \(the Check could not check them\)\. The Apply will be refused'; Says = 'says that the retention of this mailbox could not be checked when the proof was written' }
+        @{ Verdict = 'NotChecked'; Counts = '0 mailbox\(es\) held, 0 not held by the retention policy, 2 not checked \(the Check stopped before them\)\. The Apply will be refused'; Says = 'says that this mailbox was not checked when the proof was written' }) {
+        $null = New-E320Proof $runtime $bundles -Verdict $Verdict
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $run.ExitCode | Should -Be 0
+        $run.Output | Should -Match $Counts
+        $run.Output | Should -Match $Says
+        $run.Output | Should -Not -Match 'The retention of 2 mailbox\(es\) could not be checked' -Because 'the proof answered'
+        $run.Output | Should -Match 'Exchange Online could not be asked by this run \(This run cannot sign in to Exchange Online by itself.*\), so the newest retention proof was read'
+    }
+    It 'the warning names the mailboxes: the first ten, then how many more, and the log has the full list' -Tag 'Release320j' {
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $run.ExitCode | Should -Be 0
+        $names = @($bundles.Plans | ForEach-Object { [string]$_.Record.UserPrincipalName })
+        $line = @($run.Output -split "`r?`n" | Where-Object { $_ -match 'Mailboxes concerned \(2\): ' })
+        $line.Count | Should -BeGreaterThan 0
+        foreach ($name in $names) { $line[0] | Should -Match ([regex]::Escape($name)) }
+        $world = New-E320Big -Count 13 -Case 'RetentionUnverified'
+        $big = $world.Runtime; $source = $world.Source
+        $many = Invoke-GateProcess $big @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$big.ConfigPath;Batch=$source}
+        $many.ExitCode | Should -Be 0 -Because ($many.Output + $many.Error)
+        $manyLine = @($many.Output -split "`r?`n" | Where-Object { $_ -match 'Mailboxes concerned \(13\): ' })
+        $manyLine.Count | Should -BeGreaterThan 0
+        $manyLine[0] | Should -Match ' and 3 more \(the full list is in the log\)\.'
+        @([regex]::Matches($manyLine[0], '@gate\.invalid')).Count | Should -Be 10
+        $log = Get-Content -LiteralPath $many.MainResult.LogFile -Raw
+        $log | Should -Match 'Retention not checked \| user13@gate\.invalid'
+    }
+    It 'an object whose Exchange Online part of the Convert is not recorded as complete is gated like the others, and the message says why' -Tag 'Release320j' {
+        $folder = Split-Path $bundles.Source -Parent
+        $id = [string](Get-Content -LiteralPath $bundles.Source -Raw | ConvertFrom-Json).BatchId
+        $guids = @($bundles.Plans | ForEach-Object { [string]$_.Record.ObjectGuid })
+        $record = [ordered]@{ SchemaVersion = 2; Kind = 'PhaseData'; Environment = 'SYNTHETIC_GATE'; BatchId = $id.ToLowerInvariant(); Phase = [ordered]@{ RunId = 'r'; Action = 'Convert'; Phase = 'Cloud'; Mode = 'Apply'; StartedUtc = 'x' }
+            Objects = @([ordered]@{ ObjectGuid = $guids[0]; CloudStatus = 'Success' }, [ordered]@{ ObjectGuid = $guids[1]; CloudStatus = 'Pending' }) }
+        $phasePath = Join-Path $folder 'PhaseData-20261120000004-Cloud-dddddddd.json'
+        [IO.File]::WriteAllText($phasePath, ($record | ConvertTo-Json -Depth 6 -Compress), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($phasePath + '.sha256', (Get-FileHash -LiteralPath $phasePath -Algorithm SHA256).Hash.ToLowerInvariant())
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $run.ExitCode | Should -Be 0
+        $run.Output | Should -Match 'Retention: the Exchange Online part of the Convert is not recorded as complete for 1 of the 2 object\(s\) that carry the retention tag\. They are checked like the others, on purpose: the licence group that the Convert adds gives a mailbox as soon as Entra Connect has synchronised, with or without that part'
+        $run.Output | Should -Match 'Mailboxes concerned \(2\): ' -Because 'the object is gated like the other'
+        Remove-Item -LiteralPath $phasePath, ($phasePath + '.sha256') -Force
+        $plain = Invoke-GateProcess $runtime @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $plain.Output | Should -Not -Match 'is not recorded as complete'
+    }
+    It 'a Check started from a package writes its retention proof to the Outbox of the backup folder, not to the temporary preview folder, and prints that path' -Tag 'Release320j' {
+        $runtime.State.Case = 'RetentionVerdictsAll'; Save-E320State2 $runtime
+        $batchFolder = Split-Path $bundles.Source -Parent
+        $id = [string](Get-Content -LiteralPath $bundles.Source -Raw | ConvertFrom-Json).BatchId
+        $outbox = Join-Path $runtime.State.BackupFolder 'Outbox'
+        $made = New-PraTransferPackage -Kind Convert -Environment 'SYNTHETIC_GATE' -BatchId $id -Folders @($batchFolder) -OutboxFolder (Join-Path $runtime.Root 'packages')
+        Get-ChildItem -LiteralPath $outbox -File -Filter 'RetentionProof-*' -ErrorAction SilentlyContinue | Remove-Item -Force
+        $run = Invoke-GateProcess $runtime @{Action='Check';Mode='Preview';Expect='Retained';Once=$true;ConfigPath=$runtime.ConfigPath;Batch=$made.Path}
+        $run.ExitCode | Should -Be 0 -Because ($run.Output + $run.Error)
+        $files = @(Get-ChildItem -LiteralPath $outbox -File | Where-Object { $_.Name -like 'RetentionProof-*' })
+        $files.Count | Should -Be 2
+        $proofPath = @($files | Where-Object Extension -eq '.json')[0].FullName
+        $run.Output | Should -Match ('Retention proof written: 2 of 2 object\(s\) covered \(' + [regex]::Escape($proofPath) + '\)')
+        $run.Output | Should -Match 'Nothing was written to the backup folder except the retention proof, which is written to the Outbox folder of the backup folder\.'
+        @(Get-ChildItem -LiteralPath (Join-Path $runtime.Root 'logs') -Directory -Filter 'preview-*' -ErrorAction SilentlyContinue).Count | Should -Be 0 -Because 'the temporary preview folder is deleted at the end'
+        $found = Get-PraRetentionProof -Folder @($outbox) -BatchId $id -Environment 'synthetic_gate'
+        $found.Found | Should -BeTrue
+    }
+    It 'a Check -Expect Retained that finds mailboxes not held counts them as one error line each, and its Next steps are about the retention policy, not the Entra Connect sync' -Tag 'Release320j' {
+        $world = New-E320Big -Count 4 -Case 'CheckNotExpected'
+        $big = $world.Runtime
+        $run = Invoke-GateProcess $big @{Action='Check';Mode='Preview';Expect='Retained';Once=$true;ConfigPath=$big.ConfigPath;Batch=$world.Source}
+        $run.Output | Should -Match '4 error\(s\) in total \(4 not as expected\), see the log and the report'
+        $run.ExitCode | Should -Be 1
+        $steps = @($run.MainResult.NextSteps) -join "`n"
+        $steps | Should -Match 'The retention policy does not hold, or could not be checked for, 4 mailbox\(es\) of this batch \(named above\)\. Look at what the policy covers'
+        $steps | Should -Match ([regex]::Escape('Connect-IPPSSession; Get-RetentionCompliancePolicy -Identity '))
+        $steps | Should -Match 'Make the policy hold those mailboxes, then run the Check again \(it writes a new retention proof\):'
+        $steps | Should -Match '-Action Check -Batch .* -Expect Retained'
+        $steps | Should -Not -Match 'Entra Connect sync has not run'
+    }
+    It 'a Recover of a Convert batch that never wrote to AD (the backup only) is refused before any change and says there is nothing to roll back' -Tag 'Release320j' {
+        $folder = Split-Path $bundles.Source -Parent
+        Get-ChildItem -LiteralPath $folder -File -Filter 'Journal-*.jsonl' | Remove-Item -Force
+        $run = Invoke-GateProcess $runtime @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $run.ExitCode | Should -Be 1
+        $short = ([string](Get-Content -LiteralPath $bundles.Source -Raw | ConvertFrom-Json).BatchId).Substring(0, 8)
+        ($run.MainResult.Issues.Message -join ' ') | Should -Match ('Recover stopped before any change: batch ' + $short + ' did not change Active Directory \(it stopped before its first AD write\), so there is nothing to roll back\.')
+        $next = @($run.MainResult.NextSteps) -join "`n"
+        $next | Should -Match 'holds the backup only \(no AD proof, no journal line of a write\)'
+        $next | Should -Match 'It is not a batch to roll back\.'
+        $next | Should -Match '-Action Convert -Phase AD'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
     }
 }
 
@@ -15908,6 +16084,27 @@ Export-ModuleMember -Function Get-EXOMailbox, Get-ConnectionInformation
         @($rows | ForEach-Object { [string]$_.RetentionVerdict }) | Should -BeExactly @('NoMailbox', 'Covered')
         [IO.File]::ReadAllText((Join-Path $global:PraGate.Source 'docs\PraRemoteMailbox-Guide.md')) | Should -Match 'the object is reported as having \*\*no mailbox\*\* to retain'
     }
+    It 'the Check passes an object that has no mailbox, names the object on the failure line of one that is not held, and the verdicts agree' -Tag 'Release320j' {
+        $global:PraGate.H320Rows = @(1..3 | ForEach-Object { New-H320Row $_ })
+        $rows = $global:PraGate.H320Rows
+        $null = InModuleScope PRA.Cloud {
+            Mock Connect-PraCloudSession { }
+            Mock Close-PraCloudSession { }
+            Mock Invoke-PraExo {
+                if ([string]$Params.Upn -ceq 'user1@gate.invalid') { return @{ Found = $false; Type = $null; Holds = @(); IsInactive = $false; Litigation = $false; RetentionHold = $false } }
+                if ([string]$Params.Upn -ceq 'user2@gate.invalid') { return @{ Found = $true; Type = 'UserMailbox'; Holds = @() } }
+                @{ Found = $true; Type = 'UserMailbox'; Holds = @('mbx40000000000000000000000000000004') }
+            }
+            Invoke-PraRetentionCheck -Context $global:PraGate.H320Context -Rows $global:PraGate.H320Rows
+        }
+        @($rows | ForEach-Object { [string]$_.RetentionVerdict }) | Should -BeExactly @('NoMailbox', 'NotCovered', 'Covered')
+        @($rows | ForEach-Object { [string]$_.CloudStatus }) | Should -BeExactly @('Success', 'Error', 'Success')
+        $context = $global:PraGate.H320Context
+        $context.Issues.Count | Should -Be 1 -Because 'an object without a mailbox is not an error'
+        [string]$context.Issues[0].Message | Should -Match '^user2@gate\.invalid: Not covered by the policy'
+        $log = Get-Content -LiteralPath $context.LogFile -Raw
+        $log | Should -Match 'user1@gate\.invalid: no mailbox in Exchange Online \(active or inactive\): nothing to retain for this object\.'
+    }
 }
 
 Describe 'Release 3.2.0 - the gate end to end: a failed sign-in of a person falls to the proof, the newest proof decides, an invalid Retention.PolicyGuid refuses the proof, the harness leaves the configuration of the runtime alone (real main, production Directory module, synthetic AD and cloud barrier)' -Tag 'Release320h', 'Release320i' {
@@ -16229,5 +16426,29 @@ Describe 'Release 3.2.0 - a failed sign-in on the AD part that a proof stands in
         $plain = New-GateRuntime -Name 'gate-320i-plain'
         Set-GateConfigText $plain { param($text) $text.Replace("Execution=@{Phase='Both'}", "Execution=@{Phase='AD'}") }
         { Invoke-GateProcess $plain -Certificate @{Action='Recover';Mode='Preview';Phase='AD';ConfigPath=$plain.ConfigPath} } | Should -Throw '*-Certificate cannot be applied*'
+    }
+}
+
+Describe 'Release 3.2.0 - a Convert batch folder shows whether it wrote to Active Directory (production Common module, synthetic folders)' -Tag 'Release320j' {
+    BeforeAll { Import-Module (Join-Path $global:PraGate.Package 'module\PRA.Common.psm1') -Force -Global }
+    It 'a folder with the backup only, or a journal without a write, is NotApplied; a State file or a journal line of a write is Applied; the NOT-APPLIED marker wins; the first schema is Unknown' {
+        $id = [guid]::NewGuid().ToString('N')
+        $folder = Join-Path $global:PraGate.Root ('apply-state-' + $id.Substring(0, 8))
+        $null = New-Item -ItemType Directory -Path $folder -Force
+        [IO.File]::WriteAllText((Join-Path $folder 'Convert-x.json'), '{}')
+        Get-PraBatchApplyState -Folder $folder -BatchId $id | Should -BeExactly 'NotApplied'
+        $journal = Join-Path $folder ('Journal-' + $id + '.jsonl')
+        [IO.File]::WriteAllText($journal, ('{"RunId":"r","Utc":"u","Target":"*","Operation":"Backup","Status":"Verified","Detail":""}' + "`r`n" + '{"RunId":"r","Utc":"u","Target":"*","Operation":"Set-ADUser","Status":"Failed","Detail":""}' + "`r`n"))
+        Get-PraBatchApplyState -Folder $folder -BatchId $id | Should -BeExactly 'NotApplied' -Because 'a failed write is not a write'
+        [IO.File]::AppendAllText($journal, '{"RunId":"r","Utc":"u","Target":"00000000-0000-0000-0000-000000000001","Operation":"Set-ADUser","Status":"Started","Detail":""}' + "`r`n")
+        Get-PraBatchApplyState -Folder $folder -BatchId $id | Should -BeExactly 'Applied'
+        Remove-Item -LiteralPath $journal -Force
+        [IO.File]::WriteAllText((Join-Path $folder ('State-' + $id + '.json')), '{}')
+        Get-PraBatchApplyState -Folder $folder -BatchId $id | Should -BeExactly 'Applied'
+        [IO.File]::WriteAllText((Join-Path $folder 'NOT-APPLIED.txt'), 'x')
+        Get-PraBatchApplyState -Folder $folder -BatchId $id | Should -BeExactly 'NotApplied'
+        Get-PraBatchApplyState -Folder $folder -BatchId $id -SchemaVersion 1 | Should -BeExactly 'NotApplied'
+        Remove-Item -LiteralPath (Join-Path $folder 'NOT-APPLIED.txt'), (Join-Path $folder ('State-' + $id + '.json')) -Force
+        Get-PraBatchApplyState -Folder $folder -BatchId $id -SchemaVersion 1 | Should -BeExactly 'Unknown'
     }
 }
