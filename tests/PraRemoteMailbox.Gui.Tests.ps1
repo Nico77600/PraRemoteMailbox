@@ -2047,6 +2047,7 @@ Describe 'Release 3.2.0 - scale: the console reads a batch file again only when 
         }
         @($third.Batches | Where-Object Path -eq $changed.Path)[0].Data.RecordCount | Should -Be 2
         [IO.File]::WriteAllText($batches[2].Path+'.sha256',('0'*64),$script:GuiEncoding)
+        [IO.File]::SetLastWriteTimeUtc($batches[2].Path+'.sha256',[DateTime]::UtcNow.AddSeconds(5))
         $fourth=Read-PraGuiState $runtime.Root $runtime.Config
         @($fourth.Batches | Where-Object Path -eq $batches[2].Path)[0].Status | Should -Match 'SHA-256 mismatch' -Because 'a changed .sha256 file is a change of the batch'
     }
@@ -2332,6 +2333,7 @@ Describe 'Release 3.2.0 - the console does not keep a checksum that it could not
         (& (Get-Module PRA.Gui) { (Get-PraGuiBatchCore $global:PraGuiLocked).Problem }) | Should -BeNullOrEmpty -Because 'a failure to read is not kept on the cached core'
         (& (Get-Module PRA.Gui) { Get-PraGuiBatchCoreProblem (Get-PraGuiBatchCore $global:PraGuiLocked) $global:PraGuiLocked }) | Should -BeExactly '' -Because 'the lock ended'
         [IO.File]::WriteAllText($batch.Path+'.sha256',('0'*64),$script:GuiEncoding)
+        [IO.File]::SetLastWriteTimeUtc($batch.Path+'.sha256',[DateTime]::UtcNow.AddSeconds(5))
         (& (Get-Module PRA.Gui) { Get-PraGuiBatchCoreProblem (Get-PraGuiBatchCore $global:PraGuiLocked) $global:PraGuiLocked }) | Should -BeExactly 'SHA-256 mismatch.'
         (& (Get-Module PRA.Gui) { (Get-PraGuiBatchCore $global:PraGuiLocked).Problem }) | Should -BeExactly 'SHA-256 mismatch.' -Because 'a real mismatch stays until the stamp changes'
         Remove-Variable PraGuiLocked -Scope Global
