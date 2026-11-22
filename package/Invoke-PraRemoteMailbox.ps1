@@ -1609,7 +1609,17 @@ try {
         if ($context.Source.Legacy) { throw 'This batch was written by an old version and has no AD proof (State file): it cannot be finished from here. Nothing was changed.' }
         $batchFolder = Split-Path $context.Source.Path -Parent
         $proofPath = Join-Path $batchFolder ('State-' + $context.Source.Data.BatchId + '.json')
-        if (-not (Test-Path -LiteralPath $proofPath -PathType Leaf)) { throw 'This batch has no AD proof (State file): its AD changes were not verified, so it cannot be finished from here. Nothing was changed.' }
+        if (-not (Test-Path -LiteralPath $proofPath -PathType Leaf)) {
+            if (Test-PraOrdinalEqual (Get-PraBatchApplyState -Folder $batchFolder -BatchId ([string]$context.Source.Data.BatchId) -SchemaVersion ([int](Get-PraValue $context.Source.Data 'SchemaVersion' 2))) 'NotApplied') {
+                $short = Get-PraShortId ([string]$context.Source.Data.BatchId)
+                $context.NextSteps = @(('Nothing was written to Active Directory by batch {0}: its folder {1} holds the backup only (no AD proof, no journal line of a write), because the run that made it stopped before its first write. You can delete that folder, or keep it as evidence. It is not a batch to finish.' -f $short, $batchFolder),
+                    'To convert the objects, run the Convert again with the same selection (-Group, -SearchBase, -CsvPath or -Identity), the Preview first:',
+                    (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -ModeName 'Preview'))
+                $context.NextOnFailure = $true; $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+                throw ('Batch {0} did not change Active Directory (it stopped before its first AD write), so there is nothing to finish. Nothing was changed.' -f $short)
+            }
+            throw 'This batch has no AD proof (State file): its AD changes were not verified, so it cannot be finished from here. Nothing was changed.'
+        }
         $context.SourceBackupHash = $context.Source.Hash
         $context.Proof = Import-PraProof $context $proofPath $context.Source 'Convert'
         Assert-PraBatchNotRolledBack -ObjectGuid @($context.Proof.Data.Records | ForEach-Object { [string]$_.ObjectGuid })

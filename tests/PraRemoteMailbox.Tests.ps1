@@ -14557,6 +14557,26 @@ Describe 'Release 3.2.0 - the retention proof in the entry script: the Check on 
         $steps | Should -Match '-Action Check -Batch .* -Expect Retained'
         $steps | Should -Not -Match 'Entra Connect sync has not run'
     }
+    It 'a Convert -Phase AD -Batch of a batch that never wrote to AD is refused with the Next of a backup that holds nothing to finish, not with its own command again; a batch with writes but no AD proof keeps the generic refusal' -Tag 'Release320j' {
+        $folder = Split-Path $bundles.Source -Parent
+        $arguments = @{Action='Convert';Mode='Apply';Phase='AD';Force=$true;ConfigPath=$runtime.ConfigPath;Batch=$bundles.Source}
+        $withWrites = Invoke-GateProcess $runtime $arguments
+        $withWrites.ExitCode | Should -Be 1
+        $withWrites.Output | Should -Match 'This batch has no AD proof \(State file\): its AD changes were not verified, so it cannot be finished from here'
+        Get-ChildItem -LiteralPath $folder -File -Filter 'Journal-*.jsonl' | Remove-Item -Force
+        $short = ([string](Get-Content -LiteralPath $bundles.Source -Raw | ConvertFrom-Json).BatchId).Substring(0, 8)
+        $run = Invoke-GateProcess $runtime $arguments
+        $run.ExitCode | Should -Be 1
+        ($run.MainResult.Issues.Message -join ' ') | Should -Match ('Batch ' + $short + ' did not change Active Directory \(it stopped before its first AD write\), so there is nothing to finish\. Nothing was changed\.')
+        $steps = @($run.MainResult.NextSteps)
+        $steps[0] | Should -Match 'holds the backup only \(no AD proof, no journal line of a write\)'
+        $steps[0] | Should -Match 'You can delete that folder, or keep it as evidence\. It is not a batch to finish\.'
+        $steps[1] | Should -Be 'To convert the objects, run the Convert again with the same selection (-Group, -SearchBase, -CsvPath or -Identity), the Preview first:'
+        $steps[2] | Should -Match 'Invoke-PraRemoteMailbox\.ps1 -Action Convert -Phase AD -ConfigPath '
+        $steps[2] | Should -Not -Match '-Batch'
+        ($steps -join "`n") | Should -Not -Match 'Fix the problem named above'
+        @(Get-GateWrites $runtime).Count | Should -Be 0
+    }
     It 'a Recover of a Convert batch that never wrote to AD (the backup only) is refused before any change and says there is nothing to roll back' -Tag 'Release320j' {
         $folder = Split-Path $bundles.Source -Parent
         Get-ChildItem -LiteralPath $folder -File -Filter 'Journal-*.jsonl' | Remove-Item -Force
