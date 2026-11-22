@@ -2505,6 +2505,7 @@ Describe 'Release 3.2.0 - the console tells a finished batch from one that is st
         [IO.File]::WriteAllText($path + '.sha256', ('0' * 64))
         (& $progress $sum.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'the checksum does not match the file'
         [IO.File]::WriteAllText($path + '.sha256', $good.ToUpperInvariant())
+        [IO.File]::SetLastWriteTimeUtc($path + '.sha256', [DateTime]::UtcNow.AddSeconds(5))
         (& $progress $sum.Folder 'GuiSynthetic').Kind | Should -BeExactly 'Finished' -Because 'a checksum file written afterwards is read at the next refresh, in any letter case'
         $busy = New-GuiTestBatch -Runtime $runtime
         $busyPath = Write-GuiPhaseData $busy.Folder 'Convert' 'Cloud' 'Success'
@@ -2920,5 +2921,19 @@ Describe 'Release 3.2.0 - the console shows whether the retention proof of the s
         (& (Get-Module PRA.Common) { Test-PraBatchSideFile 'retentionproof-abcdef01-20261119101010000.json.sha256' }) | Should -BeTrue
         (& (Get-Module PRA.Common) { Test-PraBatchSideFile 'Convert-x.json' }) | Should -BeFalse
         (& (Get-Module PRA.Gui) { $null -eq (Get-Command Test-PraGuiBatchSideFile -ErrorAction SilentlyContinue) }) | Should -BeTrue
+    }
+}
+
+Describe 'Release 3.2.0 - the console does not keep a batch journal open after it read it (synthetic, no engine)' -Tag 'Release320a' {
+    It 'the journal can be opened at once with no sharing after the sync is found completed, although that line is not the last one' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $journal = Join-Path $batch.Folder ('Journal-' + $batch.Id + '.jsonl')
+        Write-GuiTestFile $journal ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Completed`"}`r`n{`"RunId`":`"r`",`"Operation`":`"Backup`",`"Status`":`"Verified`"}`r`n")
+        $global:PraGuiJournalCase = @{ Folder = $batch.Folder; Id = $batch.Id }
+        try { $completed = & (Get-Module PRA.Gui) { Test-PraGuiBatchSyncCompleted $global:PraGuiJournalCase.Folder $global:PraGuiJournalCase.Id } }
+        finally { Remove-Variable PraGuiJournalCase -Scope Global -ErrorAction SilentlyContinue }
+        $completed | Should -BeTrue
+        { [IO.File]::Open($journal, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None).Dispose() } | Should -Not -Throw -Because 'the engine appends to this journal'
     }
 }

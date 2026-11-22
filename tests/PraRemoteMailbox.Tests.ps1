@@ -6571,7 +6571,7 @@ Describe 'Release 3.0.0 - phase data and the global report across the two server
         $page = Read-PraGlobalReportData $report.Html
         @($page.Objects | Where-Object { $_.Name -eq ($evil + '@contoso.com') }).Count | Should -Be 1 -Because 'the data is stored as text, and the page script shows it as text'
         @($page.Issues | Where-Object { $_.Message -eq 'boom <img src=x onerror=alert(1)>' }).Count | Should -Be 1
-        (@(Import-Csv -LiteralPath $report.Csv -Delimiter ';') | Where-Object { $_.Name -like "'=*" }).Count | Should -Be 1
+        @(@(Import-Csv -LiteralPath $report.Csv -Delimiter ';') | Where-Object { $_.Name -like "'=*" }).Count | Should -Be 1
         ($ad.GlobalModel.Objects | Where-Object Name -eq '=cmd@contoso.com').Verdict | Should -BeExactly 'failed'
     }
 
@@ -11819,7 +11819,7 @@ Export-ModuleMember -Function Get-EXOMailbox,Get-EXORecipient,Get-MgUser,Get-MgU
         $result = InModuleScope PRA.Cloud {
             Mock Start-Sleep { }
             $slow = { $global:PraGate.R9Calls++; [Threading.Thread]::Sleep(2100); throw $global:PraGate.R9Failure }
-            try { Invoke-PraCloudCall -Context $global:PraGate.CloudContext -Call 'Microsoft Graph user' -Script $slow; $null } catch { $_.Exception.Message }
+            $null = try { Invoke-PraCloudCall -Context $global:PraGate.CloudContext -Call 'Microsoft Graph user' -Script $slow; $null } catch { $_.Exception.Message }
             @{ Calls = $global:PraGate.R9Calls; Spent = (Get-PraRetryState $global:PraGate.CloudContext).RunSpent }
         }
         $result.Calls | Should -Be 2 -Because '2 s of the call + 1 s of wait = 3 s, then 2 s more of the second call: over the 3 s of the object'
@@ -13853,9 +13853,9 @@ Describe 'Release 3.2.0 - the retention check before a Recover in the entry scri
         @(Get-ChildItem -LiteralPath $runtime.State.BackupFolder -Recurse -File).Count | Should -Be $before
         $next = @($run.MainResult.NextSteps)
         ($next -join "`n") | Should -Match 'Connect-IPPSSession; \(Get-RetentionCompliancePolicy -Identity ''PRA-Converted-Retention''\)\.Guid'
-        ($next | Where-Object { $_ -match '-Action Check -Batch [0-9a-f]{8}.* -Expect Retained$' }).Count | Should -Be 1
-        ($next | Where-Object { $_ -match '-Action Recover -Phase AD -Batch ' -and $_ -notmatch '-Mode Apply' }).Count | Should -Be 1
-        ($next | Where-Object { $_ -match '-Action Recover -Phase AD -Mode Apply -Batch .* -AcceptRetentionRisk$' }).Count | Should -Be 1
+        @($next | Where-Object { $_ -match '-Action Check -Batch [0-9a-f]{8}.* -Expect Retained$' }).Count | Should -Be 1
+        @($next | Where-Object { $_ -match '-Action Recover -Phase AD -Batch ' -and $_ -notmatch '-Mode Apply' }).Count | Should -Be 1
+        @($next | Where-Object { $_ -match '-Action Recover -Phase AD -Mode Apply -Batch .* -AcceptRetentionRisk$' }).Count | Should -Be 1
         ($next -join "`n") | Should -Match 'Retention\.CheckBeforeRecover = \$false'
         @($run.Events | Where-Object Operation -eq 'RetentionGate-SyntheticBarrier').Count | Should -Be 1
     }
@@ -14073,7 +14073,7 @@ Describe 'Release 3.2.0 - shared mailbox permissions: a Deny entry is reported, 
         $plan = New-PraPlan $context 'user1' 'Convert'
         $plan.Row.Warnings | Should -Not -Match 'Deny'
         & (Get-Module PRA.Directory) { param($c, $p) Write-PraAdDelta -Context $c -Plan $p } $context $plan
-        @($context.WarningList | Where-Object { $_.Message -match 'Deny' }).Count | Should -Be 0
+        @(Get-PraList $context 'WarningList' | Where-Object { $_.Message -match 'Deny' }).Count | Should -Be 0
     }
     It 'an account that is a computer or a foreign security principal is ignored with a warning that names its class, the other holders are kept, and the plan is not stopped' {
         $global:PraGateAd.OtherPrincipals = @(
@@ -14404,7 +14404,7 @@ Describe 'Release 3.2.0 - the retention proof in the entry script: the Check on 
         $run.Output | Should -Match ('No retention proof stands in for the check: .*' + $Reason)
         @(Get-GateWrites $runtime).Count | Should -Be 0
         $next = @($run.MainResult.NextSteps)
-        ($next | Where-Object { $_ -match '-Action Check -Batch [0-9a-f]{8}.* -Expect Retained$' }).Count | Should -Be 1
+        @($next | Where-Object { $_ -match '-Action Check -Batch [0-9a-f]{8}.* -Expect Retained$' }).Count | Should -Be 1
         if ($Why -ceq 'tampered') {
             ($next -join "`n") | Should -Match ('Copy both files again, RetentionProof-\.\.\.json and its \.sha256 file, from the Backups\\Outbox folder of the cloud server to the folder ' + [regex]::Escape((Join-Path $runtime.State.BackupFolder 'Inbox')) + ' of this server')
             ($next -join "`n") | Should -Match 'An older proof never stands in for it'
@@ -16470,5 +16470,20 @@ Describe 'Release 3.2.0 - a Convert batch folder shows whether it wrote to Activ
         Get-PraBatchApplyState -Folder $folder -BatchId $id -SchemaVersion 1 | Should -BeExactly 'NotApplied'
         Remove-Item -LiteralPath (Join-Path $folder 'NOT-APPLIED.txt'), (Join-Path $folder ('State-' + $id + '.json')) -Force
         Get-PraBatchApplyState -Folder $folder -BatchId $id -SchemaVersion 1 | Should -BeExactly 'Unknown'
+    }
+    It 'the journal is not held open once the state is told: it can be opened at once with no sharing, although the line of a write is not the last one' {
+        $id = [guid]::NewGuid().ToString('N')
+        $folder = Join-Path $global:PraGate.Root ('apply-state-open-' + $id.Substring(0, 8))
+        $null = New-Item -ItemType Directory -Path $folder -Force
+        $journal = Join-Path $folder ('Journal-' + $id + '.jsonl')
+        $lines = @(
+            '{"RunId":"r","Utc":"u","Target":"*","Operation":"Backup","Status":"Verified","Detail":""}',
+            '{"RunId":"r","Utc":"u","Target":"00000000-0000-0000-0000-000000000001","Operation":"Set-ADUser","Status":"Started","Detail":""}',
+            '{"RunId":"r","Utc":"u","Target":"00000000-0000-0000-0000-000000000001","Operation":"Set-ADUser","Status":"Applied","Detail":""}',
+            '{"RunId":"r","Utc":"u","Target":"*","Operation":"ADSync","Status":"Completed","Detail":""}'
+        )
+        [IO.File]::WriteAllText($journal, (($lines -join "`r`n") + "`r`n"))
+        Get-PraBatchApplyState -Folder $folder -BatchId $id | Should -BeExactly 'Applied'
+        { [IO.File]::Open($journal, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None).Dispose() } | Should -Not -Throw -Because 'the engine appends to this journal'
     }
 }

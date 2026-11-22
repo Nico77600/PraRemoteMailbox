@@ -2525,9 +2525,14 @@ function Get-PraBatchApplyState {
         if ([IO.File]::Exists((Join-Path $Folder ('State-' + $BatchId + '.json')))) { return 'Applied' }
         $journal = Join-Path $Folder ('Journal-' + $BatchId + '.jsonl')
         if ([IO.File]::Exists($journal)) {
-            foreach ($line in [IO.File]::ReadLines($journal)) {
-                if (($line.Contains('"Status":"Started"') -or $line.Contains('"Status":"Applied"')) -and ($line.Contains('"Operation":"Set-ADUser"') -or $line.Contains('"Operation":"Add-ADGroupMember"') -or $line.Contains('"Operation":"Remove-ADGroupMember"'))) { return 'Applied' }
+            $lines = ([IO.File]::ReadLines($journal)).GetEnumerator()
+            try {
+                while ($lines.MoveNext()) {
+                    $line = $lines.Current
+                    if (($line.Contains('"Status":"Started"') -or $line.Contains('"Status":"Applied"')) -and ($line.Contains('"Operation":"Set-ADUser"') -or $line.Contains('"Operation":"Add-ADGroupMember"') -or $line.Contains('"Operation":"Remove-ADGroupMember"'))) { return 'Applied' }
+                }
             }
+            finally { $lines.Dispose() }
         }
         return 'NotApplied'
     }
@@ -4012,10 +4017,10 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-Pra
     Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Test-PraOwnEntryProcess, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
-# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCByrJM6T/pRp3A5
-# tbfg2GN7/UVodhZKdaESO/yurr7PjaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCpZWlsKxedAVYg
+# GhISuy996/WYttpqQ5i33qoBW81REaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -4087,28 +4092,28 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-Pra
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCB2JaHM79/t
-# yMromgHsdhZmWqawcoUx0qZ1vxaSVDLN9zANBgkqhkiG9w0BAQEFAASCAgAx+KbG
-# 0lZXCoeaDwtB3ZIkn8V9iBdKOVpB1zLqAVm6dB9z0hKCf4TyAJM67dmhHUnwC/lC
-# Bo8V+AfcgdsZOKIKAYdPSbvkROqdyktY0Kus0/abOr8QOv63uEKAvDOucRUhkE35
-# LSj3wUiqZFyVBuOwtPLwaiIwYqgi4Sakk0ld91hKekMjN9zu/JrCEITnZYcos0xH
-# GZmmpS6FZl440IOJsDETYtIoZUuDLsiW2z0TpLh962X0VGV9CET3rGItcd6siAW9
-# SBGm7UuwBbZitZpu3WFPOxoJImNv1DZv/UsIIks89P6hbu8lzi9oLWeyhGJASMOb
-# K7JJv4viF9WqaE1a6PMDrEfMwEJNeVF8EMOT5/ESvJeEB3XJR5Xkz5x/dWI8uJ16
-# Atg0NhrCZaUI1pE9xvS0v0+S8IArgCaP/fNrfiQPwV8QcvzKEIStX6ZAdRNhEkPb
-# bOFu7GgY3+6K8QM8mAfkMc5b/6xl7FsopP2Jo8Vj9DbJadqP2aHvCvg5KLjiuSR2
-# rKtZGkm5Cq20XqtXMHPdnsazYodxIk9mDqKVlLrH0OjZ6udPXoaSfc4D8gcgaE1j
-# 5mbsBM9jgdeYYobXa70oiDfAPBZIDLySjQhYRj7qpXXhJS0ejyN4lw6PyHLHgb6L
-# HkzT0kXCWjfhY0YBwFcAgoJayHVviR84sNPCrKGCFM8wghTLBgorBgEEAYI3AwMB
-# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCpvwRaegYY
+# 3wCr/AA8xWfLbHOXPxi5Jf7WpRLRIAuTkzANBgkqhkiG9w0BAQEFAASCAgBcaxgk
+# RAONWQ70LQqvxrwm8Iuj/thWws05G9J8WDm2fMjWIQV+4WBlbswIa9bZRUgBrRIk
+# Rrb3O7Ye1jhuzd6dh5Hj1xTZAbSVR4z+x4H1JcEXEPll1ZelD8YWVz2P3djl+9+Q
+# 7AQrRNu8nzUbmr6o6I1/yVuBVXWh/Fv5dh9kONDK5UoBTuxs2+nhlUDxZve3encA
+# YSyOB6Bll0G0CFX3dTM8dRUlPiWWTm+U7Uj67P14e9ux5E2qIpIFPgiGBBPHdDvf
+# PVpX9qsoVt6bCdmvMBOagd7yquupJkqnwMjxGswcfr7J0hB9POstv8M6wQ7jdcsk
+# /I2mienpCzrCzD1x9oSEeiOQHwAyqdueNfl0ZfnuMt1CrMvQJTSG3h+wmdX3964b
+# mrZ+qrzI3yHHkZFHUuOb18i1zmEF2j+Go+qeiogVgd0Kr8FsQAv+oJzK+/n8yMCl
+# tCIK1ot78qwR7qaDAW8tcnj3XbsYvYn3hp/zqv77yhDNSN7L4buCtFphmgdqkRsU
+# HmBQpmDhS0PAy/osbb2FdKdtc8KR0d311H3K6f4dueTwdHVt3uxc74DWe1NsOB53
+# K3ySSn7IUWUcQBcH0HqEGNCCAjV5NgxmLGCA2hbNmtfp1nxXiQhFwwQ2jjDSPhV4
+# NQI3wYYcbwDounrp1rjI70f3yj7AQa0gx7YWD6GCFM4wghTKBgorBgEEAYI3AwMB
+# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIEb92LrmuCOSBINhZKvAiD1M6g2WHk8yH9deMNxpndJUAghckLyOzFUd
-# rBgPMjAyNjExMjIxMTA5MjNaMAMCAQECEBuGrtnEGynrwzsgrUS+Of+gghGnMIIE
+# BAIBBQAEIJ9pDnqOYkyB+vMDA3LoENRexlKSLnUBtAN357ws2fmZAghPAWcWztwW
+# GBgPMjAyNjExMjIyMTEyMTNaMAMCAQECEC2IG1KkY8h34sS5VnsrEMagghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -4203,17 +4208,17 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-Pra
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjExMDkyM1owKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIOuv
-# MdlVNIIXxYe3e/eLo+FmbHPwcOoOg3crFuMhWjxfMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjIxMTIxM1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIOk0
+# UQqYojpJEKbX4eiuNGrku+94t9BhAixRsA8DsRmcMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIESDBGAiEA3QF23Ep7YpkwKQnoKQWKgyTaXz2zX0Iu18sXJATeoWsCIQDE
-# eXZX6FI9A63YjbGDx5UGI/tkgu4Au22fQAllSMcPFQ==
+# zj0EAwIERzBFAiEAh4IuJPmE9uuryiYZo4WsEZj4JDN3UdHtPD5diByGlr0CIARs
+# GqOviIdh1VQeSJX8lFki30BTFhTrSHvchcRgV2R0
 # SIG # End signature block
