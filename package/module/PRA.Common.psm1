@@ -18,7 +18,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.4
+    Version : 3.2.0
     History : see CHANGELOG.md
 #>
 #Requires -Version 7.5
@@ -49,10 +49,11 @@ $ErrorActionPreference = 'Stop'
 # window, run context, report, audit). The literal comments "Version : x.y.z" of the file headers cannot be
 # computed (the signature and the manifest hash the exact bytes): they are listed in the guide, annex D, and
 # checked against this value by the tests. tools\New-PraPackage.ps1 reads the version from this line.
-$script:ToolVersion = '3.1.4'
+$script:ToolVersion = '3.2.0'
 $script:TranscriptOwner = $null
 $script:PraNativePath = $null
 $script:PraNativeProcess = $null
+$script:PraEventWriteWarned = $false
 # Columns of the CSV report, in this order (also the fields copied from each result row).
 $script:RowFields = @('ObjectGuid','SamAccountName','UserPrincipalName','Action','IsShared','ADApplied','ADVerified',
     'GroupAction','BackupPath','LastOperation','CloudMailbox','CloudLicense','CloudStatus','CloudDetail','PreserveCloudMailbox',
@@ -181,6 +182,48 @@ function Get-PraOrdinalUnique {
     process { if ($null -ne $InputObject -and $seen.Add([string]$InputObject)) { [string]$InputObject } }
 }
 
+$script:PraRecordIndexCache = New-Object 'Runtime.CompilerServices.ConditionalWeakTable[object,object]'
+
+function New-PraRecordIndex {
+    <# The records of a list by ObjectGuid (ordinal, ignoring the case): ByGuid finds one record without scanning the list, Duplicates holds the GUIDs that more than one record carries (the first record is kept). #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][object]$Record)
+    $map = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    $duplicates = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $count = 0
+    foreach ($item in @($Record)) {
+        if ($null -eq $item) { continue }
+        $count++
+        $key = [string]$item.ObjectGuid
+        if ($map.ContainsKey($key)) { [void]$duplicates.Add($key); continue }
+        $map.Add($key, $item)
+    }
+    return [pscustomobject]@{ ByGuid = $map; Duplicates = $duplicates; Count = $count }
+}
+
+function Get-PraRecordIndex {
+    <# New-PraRecordIndex of a records array, built once: the same array (and the same number of records) gives the same index. A value that is not an array is indexed each time. #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyCollection()][object]$Record)
+    if ($Record -is [object[]]) {
+        $cached = $null
+        if ($script:PraRecordIndexCache.TryGetValue($Record, [ref]$cached) -and $cached.Count -eq $Record.Length) { return $cached }
+        $index = New-PraRecordIndex -Record $Record
+        $script:PraRecordIndexCache.AddOrUpdate($Record, $index)
+        return $index
+    }
+    return (New-PraRecordIndex -Record $Record)
+}
+
+function Find-PraRecord {
+    <# The record of an index (New-PraRecordIndex, Get-PraRecordIndex) for a GUID in any letter case; $null when there is none. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Index, [AllowNull()][AllowEmptyString()][string]$Guid)
+    $found = $null
+    if ($Guid -and $Index.ByGuid.TryGetValue($Guid, [ref]$found)) { return $found }
+    return $null
+}
+
 function Compare-PraX500Address {
     <#
     .SYNOPSIS
@@ -226,6 +269,8 @@ function Get-PraCloudModuleReport {
         $Available = @(Get-Module -ListAvailable -Name 'Microsoft.Graph.Authentication', 'Microsoft.Graph.Users', 'ExchangeOnlineManagement' -SkipEditionCheck -ErrorAction SilentlyContinue)
     }
     if (-not $PSBoundParameters.ContainsKey('Loaded')) { $Loaded = @(Get-Module -Name 'Microsoft.Graph.*' -ErrorAction SilentlyContinue) }
+    # The built-in minimum is the floor: a lower value in the configuration does not lower it.
+    if ([version]$MinExo -lt [version]$script:PraMinExoVersion) { $MinExo = $script:PraMinExoVersion }
     $minGraphVersion = [version]$MinGraph; $minExoVersion = [version]$MinExo
     $versionsOf = {
         param([object[]]$Modules, [string]$Name)
@@ -397,6 +442,7 @@ function Get-PraValue {
     param([AllowNull()][object]$Object, [Parameter(Mandatory)][string]$Name, [AllowNull()][object]$Default = $null)
     if ($null -eq $Object) { return ,$Default }
     if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return ,($Object[$Name]) }
         foreach ($entry in $Object.GetEnumerator()) { if ([string]::Equals([string]$entry.Key, $Name, [StringComparison]::OrdinalIgnoreCase)) { return ,($entry.Value) } }
     } else {
         $property = $Object.PSObject.Properties[$Name]
@@ -412,6 +458,53 @@ function Get-PraList {
     $value = Get-PraValue $Object $Name $null
     if ($null -eq $value) { return }
     foreach ($item in $value) { if ($null -ne $item) { $item } }
+}
+
+function ConvertTo-PraImmutableId {
+    <# The onPremisesImmutableId that a GUID gives: the base64 text of its 16 bytes in Active Directory byte order. A GUID (object, text or 16 bytes) only; $null for anything else, the empty GUID included. #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return $null }
+    if ($Value -isnot [guid] -and $Value -isnot [byte[]] -and $Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = @($Value | Where-Object { $null -ne $_ })
+        if ($items.Count -eq 1) { return (ConvertTo-PraImmutableId -Value $items[0]) }
+        if ($items.Count -eq 16 -and -not @($items | Where-Object { $_ -isnot [byte] }).Count) { return (ConvertTo-PraImmutableId -Value ([byte[]]$items)) }
+        return $null
+    }
+    $guid = [guid]::Empty
+    if ($Value -is [guid]) { $guid = $Value }
+    elseif ($Value -is [byte[]]) { if ($Value.Length -ne 16) { return $null }; $guid = [guid]::new([byte[]]$Value) }
+    elseif (-not [guid]::TryParse([string]$Value, [ref]$guid)) { return $null }
+    if ($guid -eq [guid]::Empty) { return $null }
+    return [Convert]::ToBase64String($guid.ToByteArray())
+}
+
+function Get-PraSourceAnchor {
+    <#
+    .SYNOPSIS
+        The source anchors of one Active Directory record, as the onPremisesImmutableId texts the Entra ID account may carry.
+    .DESCRIPTION
+        A record written by this version holds SourceAnchor (ObjectGuid and ConsistencyGuid, both base64); the Entra ID account is the right one when it carries either.
+        A record without it (backup, transfer package or batch of an older version) has only its ObjectGuid: the anchor is derived from it (Recorded = $false).
+        A record without a usable GUID has no anchor (Usable = $false). The texts are base64 and are compared exactly.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object]$Record)
+    $candidates = New-Object 'Collections.Generic.List[string]'
+    $stored = Get-PraValue $Record 'SourceAnchor' $null
+    $recorded = $false
+    if ($null -ne $stored) {
+        foreach ($name in @('ConsistencyGuid', 'ObjectGuid')) {
+            $text = [string](Get-PraValue $stored $name '')
+            if ($text -cmatch '^[A-Za-z0-9+/]{22}==\z' -and -not $candidates.Contains($text)) { $candidates.Add($text); $recorded = $true }
+        }
+    }
+    if (-not $recorded) {
+        $derived = ConvertTo-PraImmutableId -Value (Get-PraValue $Record 'ObjectGuid' $null)
+        if ($derived) { $candidates.Add($derived) }
+    }
+    return [pscustomobject]@{ Candidates = [string[]]$candidates.ToArray(); Recorded = $recorded; Usable = ($candidates.Count -gt 0) }
 }
 
 function Format-PraDuration {
@@ -457,23 +550,68 @@ function Add-PraWarning {
     })
 }
 
+function ConvertTo-PraPlainMessage {
+    <#
+    .SYNOPSIS
+        The text of an error without its stack: the lines "at Namespace.Type.Method(...)", "at <ScriptBlock>, file: line N" and "--- End of ... stack trace ---" are removed.
+        The card, the console and the report show this text; the log keeps the whole detail. The empty parts that Exchange Online puts between its separators ("||You can't use...")
+        are removed too, so that no stray pipe is shown.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return '' }
+    $frame = '^\s*(at\s+(<[^>\r\n]+>|[^\s(,]+\([^\r\n]*|[^\s,]+,\s+[^\r\n]*?\bline\s+\d+[^\r\n]*)|---\s*End of [^\r\n]*---)\s*$'
+    $kept = @([regex]::Split($Text, '\r?\n') | Where-Object { $_ -notmatch $frame })
+    $plain = ($kept -join [Environment]::NewLine).TrimEnd()
+    $plain = [regex]::Replace($plain, '\|(?:[ \t]*\|)+', '|')
+    $plain = [regex]::Replace($plain, '(?m)^[ \t]*\|[ \t]*|(?<=:[ \t]+)\|[ \t]*', '')
+    return ([regex]::Replace($plain, '(?m)[ \t]*\|[ \t]*(?=\r?$)', ''))
+}
+
+function Test-PraOwnEntryProcess {
+    <#
+    .SYNOPSIS
+        True when this PowerShell process was started for one script or one command (pwsh -File, -Command or -EncodedCommand, without -NoExit): the console's child
+        process, a scheduled task, a batch file. False for an interactive session where the operator typed the command: its window must never be closed by the run.
+    .PARAMETER Arguments
+        The command line of the process (the first item is the program); the process's own when not given.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([string[]]$Arguments = [Environment]::GetCommandLineArgs())
+    $own = $false
+    for ($i = 1; $i -lt $Arguments.Count; $i++) {
+        $argument = [string]$Arguments[$i]
+        if ($argument.Length -lt 2 -or -not ($argument.StartsWith('-', [StringComparison]::Ordinal) -or $argument.StartsWith('/', [StringComparison]::Ordinal))) { continue }
+        $name = $argument.TrimStart('-', '/')
+        if (Test-PraOrdinalIn $name @('noexit', 'noe') -IgnoreCase) { return $false }
+        if (Test-PraOrdinalIn $name @('file', 'f', 'command', 'c', 'commandwithargs', 'cwa', 'encodedcommand', 'e', 'ec') -IgnoreCase) { $own = $true }
+    }
+    return $own
+}
+
 function Write-PraEvent {
-    <# Optional JSONL channel to the window; CLI runs without PRA_EVENT_FILE are unchanged. #>
+    <# Optional JSONL channel to the window; CLI runs without PRA_EVENT_FILE are unchanged. A line that cannot be written (another program holds the file) never stops the run: it is tried three times, the first failure of the run is said once on the console. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][ValidateSet('start','step','item','summary','result','plan','progress','count')][string]$Kind, [hashtable]$Data = @{})
     if (-not $env:PRA_EVENT_FILE) { return }
     $record = [ordered]@{ time = [datetime]::UtcNow.ToString('o'); kind = $Kind }
     foreach ($key in $Data.Keys) { $record[$key] = $Data[$key] }
     $line = ($record | ConvertTo-Json -Compress -Depth 8) + "`n"
+    $reason = ''
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         try {
             [IO.File]::AppendAllText($env:PRA_EVENT_FILE, $line, (New-Object Text.UTF8Encoding($false)))
             return
         }
-        catch [IO.IOException] {
-            if ($attempt -eq 3) { throw }
-            Start-Sleep -Milliseconds 50
+        catch {
+            $reason = [string]$_.Exception.Message
+            if ($attempt -lt 3) { Start-Sleep -Milliseconds 50 }
         }
+    }
+    if (-not $script:PraEventWriteWarned) {
+        $script:PraEventWriteWarned = $true
+        try { Write-PraHost @('      ', (Get-PraIcon 'Warn'), ('The progress file of the window cannot be written ({0}): the run goes on, the window may miss some events.' -f $reason)) -Color $script:Theme.Warn } catch { $null = $_ }
     }
 }
 
@@ -519,12 +657,17 @@ function Write-PraProgress {
 }
 
 function Write-PraLogFile {
-    <# Appends one line to the log file. A log that cannot be written stops the run (audit). #>
+    <# Appends one line (or, with -Lines, a block of lines in one write) to the log file. A log that cannot be written stops the run (audit). #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost','',Justification='Last-resort console message when the log is broken.')]
-    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Level, [AllowEmptyString()][string]$Message)
+    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Level, [AllowEmptyString()][string]$Message, [string[]]$Lines)
     if (-not $Context.LogFile) { return }
-    $line = '{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Level, ($Message -replace '[\r\n]+', ' | ')
-    try { [IO.File]::AppendAllText($Context.LogFile, $line + "`r`n", (New-Object Text.UTF8Encoding($false))) }
+    if ($PSBoundParameters.ContainsKey('Lines')) {
+        $block = New-Object Text.StringBuilder
+        foreach ($entry in $Lines) { [void]$block.Append(('{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Level, ($entry -replace '[\r\n]+', ' | '))).Append("`r`n") }
+        $text = $block.ToString()
+    }
+    else { $text = ('{0} [{1,-6}] {2}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'), $Level, ($Message -replace '[\r\n]+', ' | ')) + "`r`n" }
+    try { [IO.File]::AppendAllText($Context.LogFile, $text, (New-Object Text.UTF8Encoding($false))) }
     catch {
         $failure = 'The log file cannot be written: {0}' -f $_.Exception.Message
         Add-PraIssue $Context $failure 'Log'
@@ -546,18 +689,27 @@ function Write-PraLog {
         Detail    log only (full values, technical traces)
         Debug     log only; also on the console with -Verbose
         Step      log only (step headers are drawn by Write-PraStep)
+    .PARAMETER Lines
+        Several Detail lines written to the log in one write (the lines of one object, for example). Detail only.
     .PARAMETER ForegroundColor
         Console colour of the text (presentation only: it never changes the level or the counters).
     #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][AllowEmptyString()][string]$Message,
-        [ValidateSet('Info','Sub','Success','Warning','Error','Debug','Step','Detail')][string]$Level = 'Info',
+    [CmdletBinding(DefaultParameterSetName = 'One')]
+    param([Parameter(Mandatory, Position = 0)][hashtable]$Context, [Parameter(Mandatory, Position = 1, ParameterSetName = 'One')][AllowEmptyString()][string]$Message,
+        [Parameter(Mandatory, ParameterSetName = 'Block')][AllowEmptyString()][string[]]$Lines,
+        [Parameter(Position = 2)][ValidateSet('Info','Sub','Success','Warning','Error','Debug','Step','Detail')][string]$Level = 'Info',
         [ConsoleColor]$ForegroundColor)
+    if ([string]::Equals($PSCmdlet.ParameterSetName, 'Block', [StringComparison]::Ordinal)) {
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $Level 'Detail')) { throw 'Write-PraLog -Lines is for the Detail level only.' }
+        Write-PraLogFile -Context $Context -Level 'DETAIL' -Lines $Lines
+        return
+    }
     $logLevel = @{ Info='INFO'; Sub='INFO'; Success='OK'; Warning='WARN'; Error='ERROR'; Debug='DEBUG'; Step='STEP'; Detail='DETAIL' }[$Level]
     if ((Test-PraOrdinalIgnoreCaseEqual $Level 'Warning')) { $Context.Warnings = [int](Get-PraValue $Context 'Warnings' 0) + 1; Add-PraWarning $Context $Message }
     if ((Test-PraOrdinalIgnoreCaseEqual $Level 'Error')) { Add-PraIssue $Context $Message }
     Write-PraLogFile -Context $Context -Level $logLevel -Message $Message
-    $text = $Message -replace '[\r\n]+', ' | '
+    # The Detail and Step levels go to the log only: their plain text is not needed.
+    $text = if ((Test-PraOrdinalIgnoreCaseEqual $Level 'Detail') -or (Test-PraOrdinalIgnoreCaseEqual $Level 'Step')) { '' } else { (ConvertTo-PraPlainMessage $Message) -replace '[\r\n]+', ' | ' }
     switch ($Level) {
         'Debug' {
             $verbose = [bool](Get-PraValue $Context 'VerboseEnabled' ((Test-PraOrdinalIgnoreCaseEqual $VerbosePreference 'Continue')))
@@ -652,7 +804,7 @@ function Write-PraBanner {
         Title card at the start of an execution:
 
           ╭────────────────────────────────────────────────────────────────────────────╮
-          │  ♦  PRA Remote Mailbox                           v3.1.4 · Nicolas Fabert   │
+          │  ♦  PRA Remote Mailbox                           v3.2.0 · Nicolas Fabert   │
           │     Hybrid Exchange disaster recovery · on-premises mailboxes → Exchange O │
           ╰────────────────────────────────────────────────────────────────────────────╯
                ►  Action     Convert · Preview (nothing is changed)
@@ -909,7 +1061,7 @@ function Get-PraPhysicalPath {
         if (@($full.Split('\') | Select-Object -Skip 3 | Where-Object { [string]::Equals($_, '.', [StringComparison]::Ordinal) -or [string]::Equals($_, '..', [StringComparison]::Ordinal) }).Count) { throw "Path $Path uses a device namespace with relative segments; it cannot be resolved safely." }
     }
     $existing = $full.TrimEnd('\')
-    if ($existing -match '^[A-Za-z]:$' -or $existing -match '^\\\\[?.]\\[A-Za-z]:$') { $existing += '\' }
+    if ($existing -match '^[A-Za-z]:\z' -or $existing -match '^\\\\[?.]\\[A-Za-z]:\z') { $existing += '\' }
     $missing = New-Object Collections.Generic.List[string]
     while (-not ([IO.Directory]::Exists($existing) -or [IO.File]::Exists($existing))) {
         $parent = [IO.Path]::GetDirectoryName($existing)
@@ -1099,10 +1251,11 @@ function Get-PraDefaultConfiguration {
         Cloud = @{
             TenantId=''; Organization=''; AppId=''; CertificateThumbprint=''; UserPrincipalName=''
             CheckMailbox=$true; CheckLicense=$true; MailboxCheckVia='Exo'; RequiredSkuPartNumber=''
+            IdentityCheck='Anchor'; RetryBudgetObjectSeconds=180; RetryBudgetRunMinutes=30
         }
         Exo = @{ MinModuleVersion='3.10.1'; UseSubprocess=$false; DisableWAM=$false; GrantVerifyAttempts=13; GrantVerifyDelaySeconds=10 }
         Polling = @{ IntervalMinutes=1; TimeoutMinutes=60 }
-        Retention = @{ Enabled=$true; PolicyName='PRA-Converted-Retention'; PolicyGuid=''; UseComplianceSession=$false; Tag=@{ Enabled=$true; Attribute='extensionAttribute1'; Value='Converted' } }
+        Retention = @{ Enabled=$true; PolicyName='PRA-Converted-Retention'; PolicyGuid=''; UseComplianceSession=$false; CheckBeforeRecover=$true; ProofMaxAgeHours=24; Tag=@{ Enabled=$true; Attribute='extensionAttribute1'; Value='Converted' } }
         Execution = @{ Phase='Both' }
         Storage = @{ BackupFolder='.\Backups'; ForbiddenBackupRoots=@() }
         Logging = @{ Folder='.\logs' }
@@ -1225,6 +1378,12 @@ function Import-PraConfiguration {
     $badValue = $cloud.MailboxCheckVia
     $cloud.MailboxCheckVia = Resolve-PraOfficialValue $cloud.MailboxCheckVia @('Graph','Exo')
     if ($null -eq $cloud.MailboxCheckVia) { throw (Get-PraConfigurationValueError $file 'Cloud.MailboxCheckVia' 'Exo or Graph' $badValue) }
+    $badValue = $cloud.IdentityCheck
+    $cloud.IdentityCheck = Resolve-PraOfficialValue $cloud.IdentityCheck @('Anchor','Off')
+    if ($null -eq $cloud.IdentityCheck) { throw (Get-PraConfigurationValueError $file 'Cloud.IdentityCheck' 'Anchor or Off' $badValue) }
+    if ($cloud.RetryBudgetObjectSeconds -lt 0 -or $cloud.RetryBudgetObjectSeconds -gt 3600 -or $cloud.RetryBudgetRunMinutes -lt 0 -or $cloud.RetryBudgetRunMinutes -gt 720) {
+        throw 'Configuration: Cloud.RetryBudgetObjectSeconds must be 0..3600 and Cloud.RetryBudgetRunMinutes 0..720 (0 = no retry).'
+    }
     if ([bool]$cloud.AppId -ne [bool]$cloud.CertificateThumbprint) { throw 'Configuration: Cloud.AppId and Cloud.CertificateThumbprint go together (both set = certificate sign-in, both empty = interactive sign-in).' }
     if ($cloud.AppId) {
         # Certificate (app-only) sign-in cannot work without the tenant: refuse it at load, not in the middle of a run.
@@ -1241,6 +1400,7 @@ function Import-PraConfiguration {
     $retention = $config.Retention
     if ($retention.Tag.Attribute -notmatch '^extensionAttribute([1-9]|1[0-5])\z') { throw 'Configuration: Retention.Tag.Attribute must be extensionAttribute1 to extensionAttribute15.' }
     if ($retention.Enabled -and $retention.Tag.Enabled -and -not $retention.Tag.Value) { throw 'Configuration: Retention.Tag.Value is empty.' }
+    if ($retention.ProofMaxAgeHours -lt 1 -or $retention.ProofMaxAgeHours -gt 720) { throw 'Configuration: Retention.ProofMaxAgeHours must be between 1 and 720.' }
     $badValue = $config.Execution.Phase
     $config.Execution.Phase = Resolve-PraOfficialValue $config.Execution.Phase @('Both','AD','Cloud')
     if ($null -eq $config.Execution.Phase) { throw (Get-PraConfigurationValueError $file 'Execution.Phase' 'Both, AD or Cloud' $badValue) }
@@ -1362,6 +1522,9 @@ function Get-PraOutcome {
     $runErrors = 0
     # A run refused before any change (Entra Connect check, cloud modules, domain controller refusing the account) touched no object: only its error is a result row.
     $untouched = [bool](Get-PraValue $Context 'NoChangeMade' $false)
+    # In an Apply whose batch exists (its backup is written), an object still Planned when the run ends is not done: it is Pending, never counted as a success or as skipped.
+    $appliesChanges = (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $Context 'Mode' '')) 'Apply') -and (Test-PraOrdinalIn ([string](Get-PraValue $Context 'Action' '')) @('Convert', 'Recover', 'Finalize') -IgnoreCase) -and
+        ([bool](Get-PraValue $Context 'ChangesStarted' $false) -or -not [string]::IsNullOrEmpty([string](Get-PraValue $Context 'BatchId' '')))
     foreach ($row in $(if ($untouched) { @() } else { $Context.Rows.ToArray() })) {
         $copy = [ordered]@{}
         # Same lookup as Get-PraValue (missing and $null both give $null), inlined: this loop runs 22 times per row on very large runs.
@@ -1374,6 +1537,10 @@ function Get-PraOutcome {
         $copy.PermMissing = $copy.PermMissing -join '; '
         if (-not (Test-PraOrdinalIn $copy.FinalStatus $script:FinalStatuses)) {
             $copy.Detail = 'Final status missing or invalid: {0}. {1}' -f $copy.FinalStatus, $copy.Detail; $copy.FinalStatus = 'Error'
+        }
+        elseif ($appliesChanges -and (Test-PraOrdinalEqual $copy.FinalStatus 'Planned')) {
+            $copy.FinalStatus = 'Pending'
+            if (-not $copy.Detail) { $copy.Detail = 'not finished: the run ended before this object was done; the next steps say how to go on' }
         }
         if (Test-PraOrdinalEqual $copy.FinalStatus 'Error') {
             foreach ($field in @('ObjectGuid','SamAccountName','UserPrincipalName')) { if ($copy[$field]) { $errorIdentities[[string]$copy[$field]] = $true } }
@@ -1522,7 +1689,8 @@ function Write-PraReportChunks {
                 $value = $slice[$i].$name
                 if ($null -eq $value) { continue }
                 if ($value -isnot [string] -and $value -isnot [bool]) { $value = Get-PraReportScalar $value }
-                if ($dictionary.TryGetValue($value, [ref]$k)) { $column[$i] = $k }
+                $k = $dictionary[$value]
+                if ($null -ne $k) { $column[$i] = $k }
                 else {
                     $k = $dictionary.Count + 1
                     $dictionary.Add($value, $k)
@@ -1588,6 +1756,7 @@ function Write-PraReportHtml {
         'Duration' = (Format-PraDuration ((Get-Date) - [datetime]$Context.StartTime).TotalSeconds)
         'Run ID' = [string]$Context.RunId
         'Run settings changed' = ((@(Get-PraList $Context 'ConfigOverrides') | ForEach-Object { [string]$_ }) -join '; ')
+        'Retention proof accepted' = $(if ((Get-PraPhaseSetting -Context $Context).Contains('Retention proof accepted')) { (Get-PraPhaseSetting -Context $Context)['Retention proof accepted'] } else { '' })
     }
     $metaHtml = New-Object Text.StringBuilder
     foreach ($key in $meta.Keys) { if ($meta[$key]) { [void]$metaHtml.AppendFormat('<div><span>{0}</span>{1}</div>', (ConvertTo-PraHtmlText $key), (ConvertTo-PraHtmlText $meta[$key])) } }
@@ -1603,11 +1772,14 @@ function Write-PraReportHtml {
         '{{DATA_NOTICE}}' = ConvertTo-PraHtmlText $notice
         '{{ROWS_TABLE}}' = ''; '{{ISSUES}}' = ''; '{{WARNINGS}}' = ''
     }
-    foreach ($key in $values.Keys) { $template = $template.Replace($key, $values[$key]) }
+    # One pass over the template: a value that holds a marker is written as it is, never replaced again. The place of the data is found before any value is put in.
     $marker = '{{DATA}}'
     $at = $template.LastIndexOf($marker, [StringComparison]::Ordinal)
-    if ($at -lt 0) { $Writer.Write($template); return }
-    $Writer.Write($template.Substring(0, $at))
+    $pattern = New-Object Text.RegularExpressions.Regex('\{\{[A-Z_]+\}\}', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $evaluator = [Text.RegularExpressions.MatchEvaluator]({ param($Match) if ($values.ContainsKey($Match.Value)) { [string]$values[$Match.Value] } else { $Match.Value } }).GetNewClosure()
+    if ($at -lt 0) { $Writer.Write($pattern.Replace($template, $evaluator)); return }
+    $tail = $pattern.Replace($template.Substring($at + $marker.Length), $evaluator)
+    $Writer.Write($pattern.Replace($template.Substring(0, $at), $evaluator))
 
     $issueItems = foreach ($issue in $issueList) {
         [pscustomobject]@{ Timestamp = [string](Get-PraValue $issue 'Timestamp' ''); Phase = [string](Get-PraValue $issue 'Phase' ''); Operation = [string](Get-PraValue $issue 'Operation' '')
@@ -1626,7 +1798,7 @@ function Write-PraReportHtml {
     $json = '{{"format":1,"statuses":[{0}],"rows":{{"count":{1},"fields":[{2}]}},"issues":{{"count":{3},"fields":[{4}],"titles":["Time","Step","Operation","Object","Source","Message"]}},"warnings":{{"count":{5},"fields":[{6}],"titles":["Time","Step","Message"]}},"chunks":{{"rows":{7},"issues":{8},"warnings":{9}}}}}' -f
         $statuses, $rowItems.Count, $fieldsJson, $issueList.Count, (($issueFields | ForEach-Object { ConvertTo-PraJsonString $_ }) -join ','), $warningList.Count, (($warningFields | ForEach-Object { ConvertTo-PraJsonString $_ }) -join ','), $rowChunks, $issueChunks, $warningChunks
     $Writer.Write('<script type="application/json" id="pra-meta">' + $json + "</script>`r`n")
-    $Writer.Write($template.Substring($at + $marker.Length))
+    $Writer.Write($tail)
 }
 
 function Get-PraReportHtml {
@@ -1719,6 +1891,13 @@ function Complete-PraRun {
     if (([int]$Context.ExitCode -ne 0 -or $Context.CloudConnectFailed -or (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $Context 'ResultStatus' '') 'Failed')) -and $Context.Issues.Count -eq 0 -and -not [bool](Get-PraValue $Context 'Cancelled' $false)) {
         Add-PraIssue $Context 'Failure reported by the run (exit code / cloud connection).' 'Run'
     }
+    # No stack line reaches the card, the console or the report: the log holds the whole detail.
+    foreach ($entry in @($Context.Issues.ToArray()) + @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ })) {
+        if ($entry -is [pscustomobject] -and $entry.PSObject.Properties['Message']) {
+            $plain = ConvertTo-PraPlainMessage ([string]$entry.Message)
+            if (-not [string]::Equals($plain, [string]$entry.Message, [StringComparison]::Ordinal)) { $entry.Message = $plain }
+        }
+    }
     foreach ($key in @('LogFile','TranscriptPath','BackupFiles','StateFiles')) {
         $candidates = Get-PraValue $Context $key
         if ((Test-PraOrdinalIn $key @('LogFile','TranscriptPath') -IgnoreCase)) { $candidates = [string]$candidates }
@@ -1750,10 +1929,14 @@ function Complete-PraRun {
         Write-PraReport $Context $reports
     }
     # The run that ends the chain also writes the global report: every object from the first server to the last (see region 9).
-    $globalReport = @{ Html = ''; Csv = '' }
+    $globalReport = @{ Html = ''; Csv = ''; EventsCsv = ''; IssuesCsv = '' }
     if (-not $Context.NoReport -and (Test-PraGlobalReportWanted $Context)) {
         $globalReport = Write-PraGlobalReport -Context $Context
-        if ($globalReport.Html) { $Context.NextSteps = @(('Global report (every object, from the first server to this one): ' + $globalReport.Html)) + @(@(Get-PraValue $Context 'NextSteps' @()) | ForEach-Object { $_ } | Where-Object { $_ }) }
+        if ($globalReport.Html) {
+            $globalLines = @(('Global report (every object, from the first server to this one): ' + $globalReport.Html))
+            if ($globalReport.Csv -and $globalReport.EventsCsv -and $globalReport.IssuesCsv) { $globalLines += ('Global report data, one file per kind (CSV): objects {0}, journey lines {1}, errors and warnings {2}' -f $globalReport.Csv, $globalReport.EventsCsv, $globalReport.IssuesCsv) }
+            $Context.NextSteps = $globalLines + @(@(Get-PraValue $Context 'NextSteps' @()) | ForEach-Object { $_ } | Where-Object { $_ })
+        }
     }
 
     # Summary card.
@@ -1795,7 +1978,7 @@ function Complete-PraRun {
     $issueLines = @($issueLines | ForEach-Object { if ($_.Length -gt 240) { $_.Substring(0, 237) + '...' } else { $_ } })
     if ($issueLines.Count) {
         # The same count as the Result line: an object that failed and the stop that follows its error are one error, not two.
-        if ($Context.Issues.Count -gt 2) { $issueLines = @(('{0} error(s) in total, see the log and the report' -f $(if ($isCheckRun) { $c.RunError } else { $c.Error }))) + $issueLines }
+        if ($Context.Issues.Count -gt 2) { $issueLines = @($(if ($isCheckRun) { '{0} error(s) in total ({1} not as expected), see the log and the report' -f $c.Error, ($c.Error - $c.RunError) } else { '{0} error(s) in total, see the log and the report' -f $c.Error })) + $issueLines }
         $values['Error'] = @('Fail', $issueLines)
     }
     $warningList = @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
@@ -1868,7 +2051,7 @@ function Complete-PraRun {
         HtmlReport = $(if (-not $reports.HtmlFailed) { $reports.Html } else { '' }); Issues = [object[]]$Context.Issues.ToArray()
         WarningCount = @(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ }).Count
         Warnings = [object[]]@(@(Get-PraValue $Context 'WarningList' @()) | ForEach-Object { $_ } | Where-Object { $null -ne $_ })
-        GlobalHtmlReport = [string]$globalReport.Html; GlobalCsvReport = [string]$globalReport.Csv
+        GlobalHtmlReport = [string]$globalReport.Html; GlobalCsvReport = [string]$globalReport.Csv; GlobalEventsCsvReport = [string]$globalReport.EventsCsv; GlobalIssuesCsvReport = [string]$globalReport.IssuesCsv
         TransferPackage = [string](Get-PraValue $Context 'TransferPackage' ''); TransferPackageKind = [string](Get-PraValue $Context 'TransferPackageKind' '')
         ConfigOverrides = [string[]]@(@(Get-PraValue $Context 'ConfigOverrides' @()) | ForEach-Object { $_ } | Where-Object { $_ })
     }
@@ -1877,7 +2060,7 @@ function Complete-PraRun {
         success = $result.SuccessCount; error = $result.ErrorCount; pending = $result.PendingCount
         skipped = $result.SkippedCount; planned = $result.PlannedCount; total = $result.TotalCount
         seconds = [int]$result.Duration.TotalSeconds; batchId = $result.BatchId; nextSteps = @($result.NextSteps)
-        logFile = $result.LogFile; csvReport = $result.CsvReport; htmlReport = $result.HtmlReport; globalReport = $result.GlobalHtmlReport; globalCsvReport = $result.GlobalCsvReport
+        logFile = $result.LogFile; csvReport = $result.CsvReport; htmlReport = $result.HtmlReport; globalReport = $result.GlobalHtmlReport; globalCsvReport = $result.GlobalCsvReport; globalEventsCsvReport = $result.GlobalEventsCsvReport; globalIssuesCsvReport = $result.GlobalIssuesCsvReport
         warnings = $result.WarningCount; backupFiles = @($result.BackupFiles); stateFiles = @($result.StateFiles)
         issues = @($result.Issues | ForEach-Object { [string](Get-PraValue $_ 'Message' ([string]$_)) })
         transferPackage = $result.TransferPackage; transferPackageKind = $result.TransferPackageKind; configOverrides = @($result.ConfigOverrides) }
@@ -1896,7 +2079,7 @@ $script:PraTransferKinds = @{
     Recover  = @{ Direction = 'ToCloud'; Target = 'Cloud'; Prefix = 'Batch-' }
     Finalize = @{ Direction = 'ToAD'; Target = 'AD'; Prefix = 'Finalize-' }
 }
-$script:PraTransferLimits = @{ MaxEntries = [int]2000; MaxEntryBytes = [long]268435456; MaxTotalBytes = [long]536870912; MaxManifestBytes = [long]1048576 }
+$script:PraTransferLimits = @{ MaxEntries = [int]2000; MaxEntryBytes = [long]2147483648; MaxTotalBytes = [long]4294967296; MaxManifestBytes = [long]1048576 }
 
 function Remove-PraStaleStaging {
     <# Sweeps the staging folders ('.importing-*') that a killed import left in the backup folder (older than 15 minutes: never an import in progress). #>
@@ -2106,8 +2289,11 @@ function Invoke-PraTransferPackage {
             $directory = New-Object IO.DirectoryInfo $target
             if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw ("Transfer package: the folder {0} is a reparse point." -f $folder) }
             $inFolder = @($files | Where-Object { ([string]$_.FullName).StartsWith($folder + '/', [StringComparison]::Ordinal) })
-            $onDisk = @([IO.Directory]::GetFiles($target))
-            if ([IO.Directory]::GetDirectories($target).Length -or $onDisk.Count -ne $inFolder.Count) {
+            # The folder may hold more than the package: the side files that a later run writes there (proof, journal, global report data) are kept as they are.
+            $listedNames = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in $inFolder) { [void]$listedNames.Add(([string]$entry.FullName).Substring($folder.Length + 1)) }
+            $unlisted = @([IO.Directory]::GetFiles($target) | Where-Object { $leaf = [IO.Path]::GetFileName($_); -not $listedNames.Contains($leaf) -and (-not (Test-PraBatchSideFile $leaf) -or ([IO.File]::GetAttributes($_) -band [IO.FileAttributes]::ReparsePoint)) })
+            if ([IO.Directory]::GetDirectories($target).Length -or $unlisted.Count) {
                 throw ("Transfer package: the folder {0} already exists and is different from the package: refused (nothing was changed)." -f $folder)
             }
             foreach ($entry in $inFolder) {
@@ -2184,6 +2370,351 @@ function Invoke-PraTransferPackage {
     }
 }
 
+function Test-PraBatchSideFile {
+    <# True for the files of a batch folder that are not a batch file, by name: the proof (State-), the journal, the data of the global report (PhaseData-, PhaseEvents-) and any checksum file. #>
+    param([Parameter(Mandatory)][string]$Name)
+    if ($Name.EndsWith('.sha256', [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    foreach ($prefix in @('State-', 'Journal-', 'PhaseData-', 'PhaseEvents-', 'RetentionProof-')) { if ($Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}
+
+function Get-PraRetentionProofName {
+    <# RetentionProof-<batch ID>-<UTC time>.json: the retention proof that a Check -Expect Retained writes for a Convert batch (the batch ID is the full ID of that batch). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$BatchId, [Parameter(Mandatory)][datetime]$CreatedUtc)
+    if ($BatchId -notmatch '\A[0-9a-fA-F]{8,32}\z') { throw 'Retention proof: the batch ID must be 8 to 32 hexadecimal characters.' }
+    return 'RetentionProof-{0}-{1}.json' -f $BatchId.ToLowerInvariant(), $CreatedUtc.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture)
+}
+
+$script:PraRetentionVerdicts = New-Object 'Collections.Generic.Dictionary[string,string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+foreach ($name in @('Covered', 'NotCovered', 'NoMailbox', 'Unverified', 'NotChecked')) { $script:PraRetentionVerdicts[$name] = $name }
+
+function Write-PraRetentionProof {
+    <#
+    .SYNOPSIS
+        Writes the retention proof of a Convert batch in a folder (with its .sha256 file): what the retention check found, per object, at this time.
+    .DESCRIPTION
+        -Object: ObjectGuid, Upn and Verdict: Covered, NotCovered, NoMailbox, Unverified (the object itself could not be checked: not unique, ambiguous, another account, policy unknown) or NotChecked (the run stopped before it);
+        anything else is NotChecked. Each entry says its Verdict, and Covered and NoMailbox as booleans that agree with it (Covered true only for Covered, NoMailbox true only for NoMailbox).
+        The file is never replaced: its name carries the time.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$BatchId, [string]$SourceBackupHash = '', [Parameter(Mandatory)][string]$Environment,
+        [string[]]$PolicyGuid = @(), [AllowEmptyCollection()][object[]]$Object = @())
+    $created = [DateTime]::UtcNow
+    $entries = New-Object 'Collections.Generic.List[object]'
+    $coveredCount = 0
+    foreach ($item in $Object) {
+        $known = $null
+        if (-not $script:PraRetentionVerdicts.TryGetValue([string]$item.Verdict, [ref]$known)) { $known = 'NotChecked' }
+        $covered = Test-PraOrdinalEqual $known 'Covered'
+        if ($covered) { $coveredCount++ }
+        $entries.Add([ordered]@{ ObjectGuid = [string]$item.ObjectGuid; Upn = [string]$item.Upn; Verdict = $known; Covered = $covered; NoMailbox = (Test-PraOrdinalEqual $known 'NoMailbox') })
+    }
+    $record = [ordered]@{
+        SchemaVersion = 1; Kind = 'RetentionProof'; BatchId = $BatchId.ToLowerInvariant(); SourceBackupHash = $SourceBackupHash; Environment = $Environment
+        CreatedUtc = $created.ToString('o'); PolicyGuid = [string[]]@($PolicyGuid | Where-Object { $_ }); ObjectCount = $entries.Count; CoveredCount = $coveredCount; Objects = $entries.ToArray()
+    }
+    Initialize-PraPrivateFolder -Path $Folder
+    $path = Join-Path ([IO.Path]::GetFullPath($Folder)) (Get-PraRetentionProofName -BatchId $BatchId -CreatedUtc $created)
+    $stream = New-Object IO.FileStream($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($record | ConvertTo-Json -Depth 6)); $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    $hash = Write-PraFileChecksum -Path $path
+    return [pscustomobject][ordered]@{ Path = $path; Sidecar = ($path + '.sha256'); Sha256 = $hash; ObjectCount = $entries.Count; CoveredCount = $coveredCount; CreatedUtc = $created }
+}
+
+function Read-PraRetentionProofFile {
+    <#
+    .SYNOPSIS
+        Reads one retention proof file: its checksum file must be there and match, and the content must be a retention proof of the right shape. Never throws.
+    .DESCRIPTION
+        The file is read once (at most 64 MB); the SHA-256 and the content are those same bytes. Every entry must have a Verdict (Covered, NotCovered, Unverified, NotChecked or NoMailbox), a boolean Covered and a boolean NoMailbox that agree with it, an ObjectGuid that is
+        a GUID when it has one, and no entry may repeat an object (by ObjectGuid, or by UPN): otherwise the proof is not valid and Reason says which entry. Refusal tells what to do about a proof that is not valid: CopyAgain (the file or
+        its .sha256 file is missing, still being copied, damaged or unreadable) or RunCheck (the content is not a proof that this version accepts).
+    .OUTPUTS
+        Valid, Transient (the file could not be read: not a statement about its content), Refusal, Reason, Path, Sha256 (of the bytes read, whenever they were read), BatchId, Environment, CreatedUtc (UTC), SourceBackupHash, PolicyGuid, ObjectCount,
+        CoveredCount, NoMailboxCount and Objects (Guid, HasGuid, Upn, Verdict, Covered, NoMailbox).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $result = [pscustomobject][ordered]@{ Valid = $false; Transient = $false; Refusal = ''; Reason = ''; Path = $Path; Sha256 = ''; BatchId = ''; Environment = ''; CreatedUtc = [datetime]::MinValue; SourceBackupHash = ''; PolicyGuid = [string[]]@(); ObjectCount = 0; CoveredCount = 0; NoMailboxCount = 0; Objects = @() }
+    $refuse = { param([string]$Why, [string]$Action) $result.Reason = $Why; $result.Refusal = $Action; $result }
+    try {
+        $limit = 64MB
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try {
+            $length = $stream.Length
+            if ($length -lt 2 -or $length -gt $limit) { return (& $refuse 'its size is not acceptable (a retention proof is at most 64 MB)' 'CopyAgain') }
+            $bytes = New-Object byte[] ([int]$length)
+            $got = 0
+            while ($got -lt $bytes.Length) { $count = $stream.Read($bytes, $got, $bytes.Length - $got); if ($count -le 0) { break }; $got += $count }
+            if ($got -ne $bytes.Length) { $result.Transient = $true; return (& $refuse 'it changed while it was being read' 'CopyAgain') }
+        }
+        finally { $stream.Dispose() }
+        $actual = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        $result.Sha256 = $actual
+        $sidecar = $Path + '.sha256'
+        if (-not [IO.File]::Exists($sidecar)) { return (& $refuse 'its .sha256 file is missing (the copy may not be finished)' 'CopyAgain') }
+        $token = ([IO.File]::ReadAllText($sidecar).Trim() -split '\s+')[0]
+        if ($token -notmatch '\A[0-9a-fA-F]{64}\z' -or -not (Test-PraOrdinalIgnoreCaseEqual $token $actual)) { return (& $refuse 'its SHA-256 does not match its .sha256 file (the file was changed or damaged)' 'CopyAgain') }
+        $content = (New-Object Text.UTF8Encoding($false)).GetString($bytes).TrimStart([char]0xFEFF)
+        $data = $content | ConvertFrom-PraJson
+        if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $data 'Kind' '')) 'RetentionProof') -or [int](Get-PraValue $data 'SchemaVersion' 0) -ne 1) { return (& $refuse 'it is not a retention proof of this version' 'RunCheck') }
+        $created = [datetime]::MinValue
+        if (-not [datetime]::TryParse([string](Get-PraValue $data 'CreatedUtc' ''), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$created)) { return (& $refuse 'its time is not readable' 'RunCheck') }
+        $objects = @($(if ($null -ne $data.PSObject.Properties['Objects']) { $data.Objects }) | Where-Object { $null -ne $_ })
+        $entries = New-Object 'Collections.Generic.List[object]'
+        $seenGuid = New-Object 'Collections.Generic.HashSet[guid]'
+        $seenUpn = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        $covered = 0; $noMailbox = 0; $position = 0
+        foreach ($entry in $objects) {
+            $position++
+            $guidText = [string](Get-PraValue $entry 'ObjectGuid' ''); $upn = [string](Get-PraValue $entry 'Upn' '')
+            $guid = [guid]::Empty
+            if ($guidText -and (-not [guid]::TryParse($guidText, [ref]$guid) -or $guid -eq [guid]::Empty)) { return (& $refuse ('entry {0} has an ObjectGuid that is not a GUID' -f $position) 'RunCheck') }
+            if (-not $guidText -and -not $upn) { return (& $refuse ('entry {0} names no object (no ObjectGuid and no Upn)' -f $position) 'RunCheck') }
+            $isCovered = Get-PraValue $entry 'Covered' $null; $isNoMailbox = Get-PraValue $entry 'NoMailbox' $null
+            if ($isCovered -isnot [bool] -or $isNoMailbox -isnot [bool]) { return (& $refuse ('entry {0} does not say true or false for Covered and NoMailbox' -f $position) 'RunCheck') }
+            if ($isCovered -and $isNoMailbox) { return (& $refuse ('entry {0} says both Covered and NoMailbox' -f $position) 'RunCheck') }
+            $verdict = [string](Get-PraValue $entry 'Verdict' '')
+            if (-not $verdict) { return (& $refuse ('entry {0} has no Verdict: the Check of this version writes one for every object' -f $position) 'RunCheck') }
+            if (-not (Test-PraOrdinalIn $verdict @('Covered', 'NotCovered', 'Unverified', 'NotChecked', 'NoMailbox'))) { return (& $refuse ('entry {0} has an unknown Verdict' -f $position) 'RunCheck') }
+            if (((Test-PraOrdinalEqual $verdict 'Covered') -xor $isCovered) -or ((Test-PraOrdinalEqual $verdict 'NoMailbox') -xor $isNoMailbox)) { return (& $refuse ('entry {0}: its Verdict {1} does not agree with its Covered and NoMailbox' -f $position, $verdict) 'RunCheck') }
+            if ($guidText -and -not $seenGuid.Add($guid)) { return (& $refuse ('the object {0} is in the proof more than once (entry {1})' -f $guid, $position) 'RunCheck') }
+            if ($upn -and -not $seenUpn.Add($upn)) { return (& $refuse ('the UPN {0} is in the proof more than once (entry {1})' -f $upn, $position) 'RunCheck') }
+            if ($isCovered) { $covered++ }
+            if ($isNoMailbox) { $noMailbox++ }
+            $entries.Add([pscustomobject]@{ Guid = $guid; HasGuid = [bool]$guidText; Upn = $upn; Verdict = $verdict; Covered = [bool]$isCovered; NoMailbox = [bool]$isNoMailbox })
+        }
+        $result.BatchId = [string](Get-PraValue $data 'BatchId' ''); $result.Environment = [string](Get-PraValue $data 'Environment' ''); $result.SourceBackupHash = [string](Get-PraValue $data 'SourceBackupHash' '')
+        $result.CreatedUtc = $created.ToUniversalTime(); $result.PolicyGuid = [string[]]@(if ($null -ne $data.PSObject.Properties['PolicyGuid']) { $data.PolicyGuid })
+        $result.Objects = $entries.ToArray(); $result.ObjectCount = $entries.Count; $result.CoveredCount = $covered; $result.NoMailboxCount = $noMailbox
+        $result.Valid = $true
+    }
+    catch { $result.Transient = $true; $result.Reason = 'it cannot be read (' + (([string]$_.Exception.Message) -replace '\s+', ' ') + ')'; $result.Refusal = 'CopyAgain' }
+    return $result
+}
+
+function Test-PraRetentionCheckRecord {
+    <# True when a Recover checks the retention of the object of this record: the record carries the retention tag and the cloud mailbox is not kept on purpose (-PreserveCloudMailbox). The gate of the run and the console use this one rule. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Record, [bool]$PreserveCloudMailbox = $false)
+    return ((-not $PreserveCloudMailbox) -and [bool](Get-PraValue (Get-PraValue $Record 'Retention' $null) 'Enabled' $false))
+}
+
+function Test-PraCloudMailboxKept {
+    <# True when a Recover leaves the cloud mailbox of the object on purpose: a shared mailbox, in a Recover, when SharedMailbox.KeepCloudSharedOnRecover is on. The plan of the run and the console use this one rule. #>
+    [CmdletBinding()]
+    param([bool]$IsShared, [string]$Operation, [bool]$KeepCloudShared)
+    return ($IsShared -and (Test-PraOrdinalIgnoreCaseEqual $Operation 'Recover') -and $KeepCloudShared)
+}
+
+function Get-PraBatchApplyState {
+    <#
+    .SYNOPSIS
+        Whether a Convert batch folder shows that Active Directory was written by the batch: Applied, NotApplied (nothing was written) or Unknown (a batch of the first schema: it has no AD proof to tell).
+    .DESCRIPTION
+        NotApplied: the folder is marked NOT-APPLIED, or it has no State file (AD proof) and its journal, if any, has no line of a write (Set-ADUser, Add-ADGroupMember or Remove-ADGroupMember that was started
+        or applied). That is what a run that was stopped (a hard kill, a closed window) before its first AD write leaves behind: the backup only. Read only; never throws.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$BatchId, [int]$SchemaVersion = 2)
+    try {
+        if ([IO.File]::Exists((Join-Path $Folder 'NOT-APPLIED.txt'))) { return 'NotApplied' }
+        if ($SchemaVersion -lt 2) { return 'Unknown' }
+        if ([IO.File]::Exists((Join-Path $Folder ('State-' + $BatchId + '.json')))) { return 'Applied' }
+        $journal = Join-Path $Folder ('Journal-' + $BatchId + '.jsonl')
+        if ([IO.File]::Exists($journal)) {
+            $lines = ([IO.File]::ReadLines($journal)).GetEnumerator()
+            try {
+                while ($lines.MoveNext()) {
+                    $line = $lines.Current
+                    if (($line.Contains('"Status":"Started"') -or $line.Contains('"Status":"Applied"')) -and ($line.Contains('"Operation":"Set-ADUser"') -or $line.Contains('"Operation":"Add-ADGroupMember"') -or $line.Contains('"Operation":"Remove-ADGroupMember"'))) { return 'Applied' }
+                }
+            }
+            finally { $lines.Dispose() }
+        }
+        return 'NotApplied'
+    }
+    catch { return 'Unknown' }
+}
+
+function Find-PraRetentionProofEntry {
+    <# The entry of a proof for an object of a Recover: by ObjectGuid; the UPN counts only for an entry that has no ObjectGuid (a row without ObjectGuid is found by its UPN). $null when the proof does not list the object. #>
+    param([Parameter(Mandatory)]$Index, [Parameter(Mandatory)]$Item)
+    $entry = $null
+    $itemUpn = [string](Get-PraValue $Item 'UserPrincipalName' ''); $itemGuidText = [string](Get-PraValue $Item 'ObjectGuid' '')
+    $itemGuid = [guid]::Empty
+    if ($itemGuidText -and [guid]::TryParse($itemGuidText, [ref]$itemGuid) -and $itemGuid -ne [guid]::Empty) {
+        if (-not $Index.ByGuid.TryGetValue($itemGuid, [ref]$entry)) { $entry = $null; if ($itemUpn) { [void]$Index.ByUpnWithoutGuid.TryGetValue($itemUpn, [ref]$entry) } }
+    }
+    elseif ($itemUpn) { [void]$Index.ByUpn.TryGetValue($itemUpn, [ref]$entry) }
+    return $entry
+}
+
+function Get-PraRetentionProof {
+    <#
+    .SYNOPSIS
+        The retention proof that lets a Recover go on when Exchange Online cannot be asked: the NEWEST proof of the Convert batch in these folders, and what it says about each object.
+    .DESCRIPTION
+        Read only. Only one proof decides: the newest, by the time in its name (ties by name), after the copies of one proof (the same SHA-256, in the Inbox and in the batch folder) are counted once. If that newest proof is
+        not usable (unreadable or still being copied, damaged, without its .sha256 file, dated in the future, too old, of another batch, Environment, copy of the batch file or policy, or its name does not say the time of its content) nothing is accepted and
+        Refusal says what to do: CopyAgain, Clock, PolicyMismatch or RunCheck, and RefusedPath names the file. The same name in two folders with different content is settled the same way every time: the copy that is valid and named after its content first, then the full path. An older proof never stands in. -Row (objects with ObjectGuid and UserPrincipalName): the objects of the Recover. Complete is true when the newest proof says Covered (or
+        NoMailbox: nothing to retain) for every one of them; Missing lists the others (UPN, else ObjectGuid) and Blocked says why (NotCovered, Unverified, NotChecked, or NotListed). Without -Row, Complete says that every object of the proof is covered.
+        An object is found by its ObjectGuid; its UPN counts only for a proof entry that has no ObjectGuid. -SourceBackupHash (the hash of the Convert batch file) and -PolicyGuid (Retention.PolicyGuid, when the configuration
+        sets one) must agree with the proof; a -PolicyGuid that is not a GUID refuses it (PolicyGuidInvalid).
+    .OUTPUTS
+        Found (the newest proof is usable), Complete, Refusal, Reason, Path, Sha256, CreatedUtc, AgeHours, ObjectCount, CoveredCount, NoMailbox (objects that the proof says have no mailbox), Missing, Blocked (Upn, ObjectGuid, Verdict, Proof),
+        PolicyGuid, Proofs (the proof that decided: Path, Sha256, CreatedUtc, PolicyGuid, ObjectCount), FutureDated, PolicyGuidInvalid, Candidates (files looked at, copies included) and Duplicates (copies counted once).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Folder, [Parameter(Mandatory)][string]$BatchId, [Parameter(Mandatory)][string]$Environment,
+        [ValidateRange(1, 720)][int]$MaxAgeHours = 24, [AllowEmptyCollection()][object[]]$Row, [hashtable]$Cache, [string]$SourceBackupHash = '', [string]$PolicyGuid = '')
+    $result = [pscustomobject][ordered]@{ Found = $false; Complete = $false; Refusal = ''; Reason = ''; Path = ''; Sha256 = ''; CreatedUtc = [datetime]::MinValue; AgeHours = [double]0; ObjectCount = 0; CoveredCount = 0; NoMailbox = @(); Missing = [string[]]@(); Blocked = @(); PolicyGuid = [string[]]@(); Proofs = @(); FutureDated = $false; PolicyGuidInvalid = $false; RefusedPath = ''; Candidates = 0; Duplicates = 0 }
+    $wantedPolicy = [guid]::Empty
+    if ($PolicyGuid -and (-not [guid]::TryParse($PolicyGuid, [ref]$wantedPolicy) -or $wantedPolicy -eq [guid]::Empty)) {
+        $result.PolicyGuidInvalid = $true; $result.Refusal = 'PolicyGuid'
+        $result.Reason = 'Retention.PolicyGuid of this configuration ({0}) is not a GUID, so no proof can be matched to the policy' -f $PolicyGuid
+        return $result
+    }
+    $id = $BatchId.ToLowerInvariant()
+    $namePattern = '\ARetentionProof-' + [regex]::Escape($id) + '-(?<time>[0-9]{17})\.json\z'
+    $files = New-Object 'Collections.Generic.List[object]'
+    $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($directory in $Folder) {
+        if (-not $directory -or -not [IO.Directory]::Exists($directory)) { continue }
+        foreach ($file in [IO.Directory]::GetFiles($directory, 'RetentionProof-' + $id + '-*.json')) {
+            $leaf = [IO.Path]::GetFileName($file); $match = [regex]::Match($leaf, $namePattern, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($match.Success -and $seen.Add([IO.Path]::GetFullPath($file))) {
+                $nameDate = [datetime]::MinValue
+                $nameValid = [datetime]::TryParseExact($match.Groups['time'].Value, 'yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$nameDate)
+                $files.Add([pscustomobject]@{ Path = [IO.Path]::GetFullPath($file); Name = $leaf; NameTime = $match.Groups['time'].Value; NameValid = $nameValid })
+            }
+        }
+    }
+    $result.Candidates = $files.Count
+    if (-not $files.Count) { $result.Refusal = 'RunCheck'; $result.Reason = 'no retention proof of this batch was found'; return $result }
+    $now = [DateTime]::UtcNow
+    $read = New-Object 'Collections.Generic.List[object]'
+    foreach ($candidate in $files) {
+        $stamp = ''
+        if ($null -ne $Cache) {
+            $info = New-Object IO.FileInfo $candidate.Path; $sidecarText = ''
+            try { $sidecarText = [IO.File]::ReadAllText($candidate.Path + '.sha256').Trim() } catch { $sidecarText = '' }
+            $stamp = '{0}|{1}|{2}|{3}|{4}' -f $candidate.Path, $info.Length, $info.LastWriteTimeUtc.Ticks, (New-Object IO.FileInfo ($candidate.Path + '.sha256')).LastWriteTimeUtc.Ticks, $sidecarText
+        }
+        $content = $null
+        if ($stamp -and $Cache.ContainsKey($stamp)) { $content = $Cache[$stamp] } else { $content = Read-PraRetentionProofFile -Path $candidate.Path; if ($stamp -and -not $content.Transient) { $Cache[$stamp] = $content } }
+        $nameMatches = $content.Valid -and $candidate.NameValid -and (Test-PraOrdinalEqual $content.CreatedUtc.ToString('yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture) $candidate.NameTime)
+        $read.Add([pscustomobject]@{ File = $candidate; Read = $content; NameMatches = $nameMatches; SortKey = ($(if ($candidate.NameValid) { '0' } else { '1' }) + '|' + $candidate.NameTime + '|' + $candidate.Name.ToLowerInvariant()); TieKey = ($(if ($content.Valid -and $nameMatches) { '0' } else { '1' }) + '|' + $candidate.Path.ToLowerInvariant()) })
+    }
+    # The copies of one proof (the same SHA-256) count once; the copy that is valid and named after its content is kept.
+    $kept = New-Object 'Collections.Generic.List[object]'
+    $bySha = New-Object 'Collections.Generic.Dictionary[string,int]' -ArgumentList ([StringComparer]::Ordinal)
+    foreach ($item in $read) {
+        $sha = [string]$item.Read.Sha256
+        if ($sha -and $bySha.ContainsKey($sha)) {
+            $result.Duplicates++
+            $at = $bySha[$sha]; $current = $kept[$at]
+            if ((($item.Read.Valid -and $item.NameMatches) -and -not ($current.Read.Valid -and $current.NameMatches)) -or ($item.Read.Valid -and -not $current.Read.Valid)) { $kept[$at] = $item }
+            continue
+        }
+        if ($sha) { $bySha[$sha] = $kept.Count }
+        $kept.Add($item)
+    }
+    # The newest is the greatest time in the name, then the name (a name that carries a time that does not exist counts as newer than any other, so that it always blocks); the same name in two folders with different content is settled the same way every time: the copy that is valid and named after its content, then the full path.
+    $ordered = @($kept | Get-PraOrdinalSorted -Property SortKey -Descending)
+    $newest = $ordered[0]
+    $tied = @($ordered | Where-Object { [string]::Equals([string]$_.SortKey, [string]$newest.SortKey, [StringComparison]::Ordinal) })
+    if ($tied.Count -gt 1) { $newest = @($tied | Get-PraOrdinalSorted -Property TieKey)[0] }
+    $why = ''; $action = 'RunCheck'
+    $proof = $newest.Read
+    if (-not $proof.Valid) { $why = $proof.Reason; $action = $proof.Refusal }
+    elseif (-not $newest.NameMatches) {
+        $nameDate = [datetime]::MinValue
+        $says = if ([datetime]::TryParseExact($newest.File.NameTime, 'yyyyMMddHHmmssfff', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$nameDate)) { 'its name says it was made at {0} UTC' -f $nameDate.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) } else { 'its name carries a time that does not exist ({0})' -f $newest.File.NameTime }
+        $why = ('{0} but its content says {1} UTC (the file was renamed)' -f $says, $proof.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture))
+    }
+    elseif (-not (Test-PraOrdinalIgnoreCaseEqual $proof.BatchId $id)) { $why = 'it was made for another batch' }
+    elseif (-not (Test-PraOrdinalIgnoreCaseEqual $proof.Environment $Environment)) { $why = ('it was made for the Environment {0}, this configuration is {1}' -f $proof.Environment, $Environment) }
+    elseif ($SourceBackupHash -and -not (Test-PraOrdinalIgnoreCaseEqual $proof.SourceBackupHash $SourceBackupHash)) { $why = 'it was made from another copy of the Convert batch file (its SourceBackupHash is not the hash of this batch file)' }
+    elseif ($PolicyGuid -and -not (@($proof.PolicyGuid | Where-Object { $parsed = [guid]::Empty; [guid]::TryParse([string]$_, [ref]$parsed) -and $parsed.Equals($wantedPolicy) }).Count)) { $why = ('it was made for another retention policy (its PolicyGuid {0} is not Retention.PolicyGuid {1} of this configuration)' -f $(if (@($proof.PolicyGuid).Count) { @($proof.PolicyGuid) -join ', ' } else { 'none recorded' }), $PolicyGuid); $action = 'PolicyMismatch'; $result.PolicyGuid = $proof.PolicyGuid }
+    elseif ($proof.CreatedUtc -gt $now.AddMinutes(5)) { $why = 'its time is in the future (the clocks of the two servers differ by more than 5 minutes)'; $action = 'Clock'; $result.FutureDated = $true }
+    elseif (($now - $proof.CreatedUtc).TotalHours -gt $MaxAgeHours) { $why = ('it is {0} hours old, the limit is {1} (Retention.ProofMaxAgeHours)' -f ($now - $proof.CreatedUtc).TotalHours.ToString('0.#', [Globalization.CultureInfo]::InvariantCulture), $MaxAgeHours) }
+    if ($why) { $result.Reason = ('{0}: {1}' -f $newest.File.Path, $why); $result.Refusal = $action; $result.RefusedPath = [string]$newest.File.Path; return $result }
+    $result.Found = $true; $result.Path = $proof.Path; $result.Sha256 = $proof.Sha256; $result.CreatedUtc = $proof.CreatedUtc; $result.AgeHours = [Math]::Max(0.0, ($now - $proof.CreatedUtc).TotalHours)
+    $result.ObjectCount = $proof.ObjectCount; $result.CoveredCount = $proof.CoveredCount; $result.PolicyGuid = $proof.PolicyGuid
+    $result.Proofs = @([pscustomobject]@{ Path = [string]$proof.Path; Sha256 = [string]$proof.Sha256; CreatedUtc = $proof.CreatedUtc; PolicyGuid = [string[]]@($proof.PolicyGuid); ObjectCount = [int]$proof.ObjectCount })
+    $withRows = $PSBoundParameters.ContainsKey('Row') -and $null -ne $Row
+    if (-not $withRows) {
+        $open = @($proof.Objects | Where-Object { -not ($_.Covered -or $_.NoMailbox) })
+        $result.Complete = ($proof.ObjectCount -gt 0 -and $open.Count -eq 0)
+        if (-not $result.Complete) { $result.Refusal = 'RunCheck'; $result.Reason = '{0} of the {1} object(s) of the proof are not covered' -f ($proof.ObjectCount - $proof.CoveredCount - $proof.NoMailboxCount), $proof.ObjectCount }
+        $result.NoMailbox = @($proof.Objects | Where-Object { $_.NoMailbox } | ForEach-Object { [pscustomobject]@{ ObjectGuid = $(if ($_.HasGuid) { $_.Guid.ToString() } else { '' }); Upn = $_.Upn } })
+        return $result
+    }
+    $index = [pscustomobject]@{ ByGuid = (New-Object 'Collections.Generic.Dictionary[guid,object]'); ByUpnWithoutGuid = (New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)); ByUpn = (New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)) }
+    foreach ($entry in $proof.Objects) {
+        if ($entry.HasGuid) { $index.ByGuid[$entry.Guid] = $entry } elseif ($entry.Upn) { $index.ByUpnWithoutGuid[$entry.Upn] = $entry }
+        if ($entry.Upn) { $index.ByUpn[$entry.Upn] = $entry }
+    }
+    $missing = New-Object 'Collections.Generic.List[string]'; $blocked = New-Object 'Collections.Generic.List[object]'; $without = New-Object 'Collections.Generic.List[object]'
+    $proofName = [IO.Path]::GetFileName([string]$proof.Path)
+    foreach ($item in $Row) {
+        $itemUpn = [string](Get-PraValue $item 'UserPrincipalName' ''); $itemGuidText = [string](Get-PraValue $item 'ObjectGuid' '')
+        $entry = Find-PraRetentionProofEntry -Index $index -Item $item
+        if ($null -ne $entry -and ($entry.Covered -or $entry.NoMailbox)) {
+            if ($entry.NoMailbox) { $without.Add([pscustomobject]@{ ObjectGuid = $itemGuidText; Upn = $itemUpn }) }
+            continue
+        }
+        $missing.Add($(if ($itemUpn) { $itemUpn } else { $itemGuidText }))
+        $blocked.Add([pscustomobject]@{ Upn = $itemUpn; ObjectGuid = $itemGuidText; Verdict = $(if ($null -eq $entry) { 'NotListed' } else { [string]$entry.Verdict }); Proof = $proofName })
+    }
+    $result.Missing = [string[]]$missing.ToArray(); $result.Blocked = $blocked.ToArray(); $result.NoMailbox = $without.ToArray(); $result.Complete = ($missing.Count -eq 0)
+    if (-not $result.Complete) { $result.Refusal = 'RunCheck'; $result.Reason = '{0} of the {1} object(s) of this Recover are not covered in it' -f $missing.Count, @($Row).Count }
+    return $result
+}
+
+function Get-PraConvertCloudDone {
+    <#
+    .SYNOPSIS
+        The objects whose cloud part of the Convert is recorded as complete: from the PhaseData files of the Convert batch folder (checksum, Kind, Environment and batch are checked; a file that fails is ignored).
+    .OUTPUTS
+        Known (at least one cloud phase of the Convert was read) and Done (a set of ObjectGuid, any letter case).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Folder, [Parameter(Mandatory)][string]$BatchId, [string]$Environment = '')
+    $done = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+    $known = $false
+    if ($Folder -and [IO.Directory]::Exists($Folder)) {
+        $files = [string[]][IO.Directory]::GetFiles($Folder, $script:PraPhaseFilter)
+        [Array]::Sort([Array]$files, [Collections.IComparer][StringComparer]::Ordinal)
+        if ($files.Length -gt $script:PraPhaseLimits.MaxFiles) { $files = [string[]]@($files[($files.Length - $script:PraPhaseLimits.MaxFiles)..($files.Length - 1)]) }
+        foreach ($file in $files) {
+            try {
+                $length = ([IO.FileInfo]$file).Length
+                if ($length -lt 2 -or $length -gt $script:PraPhaseLimits.MaxBytes -or -not [IO.File]::Exists($file + '.sha256')) { continue }
+                $bytes = [IO.File]::ReadAllBytes($file)
+                $digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+                $token = ([IO.File]::ReadAllText($file + '.sha256').Trim() -split '\s+')[0]
+                if ($token -notmatch '\A[0-9a-fA-F]{64}\z' -or -not (Test-PraOrdinalIgnoreCaseEqual $token $digest)) { continue }
+                $record = (New-Object Text.UTF8Encoding($false)).GetString($bytes) | ConvertFrom-PraJson
+                if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $record 'Kind' '')) 'PhaseData')) { continue }
+                if ($Environment -and -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $record 'Environment' '')) $Environment)) { continue }
+                if (-not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $record 'BatchId' '')) $BatchId)) { continue }
+                $phase = Get-PraValue $record 'Phase' $null
+                if (-not (Test-PraOrdinalEqual ([string](Get-PraValue $phase 'Action' '')) 'Convert') -or -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $phase 'Mode' '')) 'Apply') -or
+                    -not (Test-PraOrdinalIn ([string](Get-PraValue $phase 'Phase' '')) @('Cloud', 'Both') -IgnoreCase)) { continue }
+                $known = $true
+                $listed = Get-PraValue $record 'Objects' @()
+                foreach ($object in @($listed)) { if (Test-PraOrdinalEqual ([string](Get-PraValue $object 'CloudStatus' '')) 'Success') { [void]$done.Add([string](Get-PraValue $object 'ObjectGuid' '')) } }
+            }
+            catch { $null = $_ }
+        }
+    }
+    return [pscustomobject]@{ Known = $known; Done = $done }
+}
+
 function Get-PraTransferPackage {
     <#
     .SYNOPSIS
@@ -2211,7 +2742,8 @@ function Import-PraTransferPackage {
     .SYNOPSIS
         Verifies a transfer package and extracts its folders, as private folders with their original names, under the backup folder.
     .DESCRIPTION
-        Throws when anything is wrong. A folder that already exists with identical content is accepted (Existing); a different one is refused
+        Throws when anything is wrong. A folder that already exists is accepted (Existing) when every file of the package is in it unchanged and
+        the only other files are side files (Test-PraBatchSideFile: proof, journal, global report data, checksums), which are never replaced; any other difference is refused
         and nothing is written. Returns Kind, BatchId, Folders (full paths), Created, Existing.
     #>
     [CmdletBinding()]
@@ -2347,14 +2879,14 @@ function Get-PraConfigurationFlat {
 }
 
 function Get-PraConfigurationDifference {
-    <# What the run changes compared with the configuration file: one object (Key, Base, Effective, Text = 'Key: base -> effective') per setting whose value differs. #>
+    <# What the run changes compared with the configuration file: one object (Key, Base, Effective, Text = 'Key: base -> effective') per setting whose value differs (the letter case is not a difference). #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][Collections.IDictionary]$Base, [Parameter(Mandatory)][Collections.IDictionary]$Effective)
     $baseFlat = @{}
     foreach ($row in @(Get-PraConfigurationFlat -Configuration $Base)) { $baseFlat[$row.Key] = $row.Value }
     foreach ($row in @(Get-PraConfigurationFlat -Configuration $Effective)) {
         $before = if ($baseFlat.ContainsKey($row.Key)) { [string]$baseFlat[$row.Key] } else { '' }
-        if (-not (Test-PraOrdinalEqual $before $row.Value)) {
+        if (-not (Test-PraOrdinalIgnoreCaseEqual $before $row.Value)) {
             $beforeText = if ($before) { $before } else { '(empty)' }; $afterText = if ($row.Value) { $row.Value } else { '(empty)' }
             [pscustomobject][ordered]@{ Key = $row.Key; Base = $before; Effective = $row.Value; Text = ('{0}: {1} -> {2}' -f $row.Key, $beforeText, $afterText) }
         }
@@ -2435,20 +2967,27 @@ function New-PraEffectiveConfiguration {
 # small machine-readable file (PhaseData-*.json + .sha256) in the batch folder it creates; the file travels in the transfer package with the batch
 # (listed in transfer.json with its SHA-256 like every entry, so a changed file is refused at import). It is DATA FOR A REPORT: nothing in the engine
 # decides anything from it. It is read as untrusted input (size, schema, checksum, Environment) and every value is HTML-encoded when it is shown.
-$script:PraPhaseLimits = @{ MaxBytes = [long]67108864; MaxText = 2000; MaxStepText = 300; MaxStepsPerObject = 40; MaxJourney = 200000; MaxObjects = 200000; MaxFiles = 24; MaxIssues = 500; DetailedObjects = 2000 }
+# The journey lines, errors and warnings of a phase are not in that file: they are written one JSON object per line to PhaseEvents-<same stem>.jsonl (+ .sha256) next to it, whose
+# SHA-256 the PhaseData header carries, so the PhaseData file holds the header and one entry per object whatever the number of events. Nothing is cut silently: what a limit leaves
+# out is counted in the header (Omitted) and the global report says so.
+# MaxFileBytes: the largest PhaseData file the writer writes; MaxBytes: the largest PhaseData file the reader accepts, and all the files read for one report together;
+# MaxEventsBytes: the largest events file and all the events files read for one report together; MaxLineChars: the longest line the reader accepts; MaxFiles: the newest PhaseData files read.
+$script:PraPhaseLimits = @{ MaxBytes = [long]268435456; MaxFileBytes = [long]67108864; MaxEventsBytes = [long]100663296; MaxLineChars = 65536; MaxText = 2000; MaxStepText = 300; MaxJourney = 1000000; MaxObjects = 200000; MaxFiles = 200 }
 $script:PraPhaseFilter = 'PhaseData-*.json'
+$script:PraEventsPrefix = 'PhaseEvents-'
+$script:PraTextCut = [long]0
 $script:PraNotAvailable = 'not available (folder from an older version or copied manually)'
 # Display only: a Pending phase (or stage) that a later phase of the same report took over is shown as handed over; the verdict logic reads the raw status.
 $script:PraHandedOver = 'Handed over'
 
 function Limit-PraText {
-    <# A text for a report: control characters replaced by a space, at most $Max characters. #>
+    <# A text for a report: control characters replaced by a space, at most $Max characters (a longer text ends with '...' and is counted in $script:PraTextCut). #>
     [CmdletBinding()]
     [OutputType([string])]
     param([AllowNull()][object]$Value, [int]$Max = 2000)
     if ($null -eq $Value) { return '' }
     $text = [regex]::Replace([string]$Value, '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ' ')
-    if ($text.Length -gt $Max) { return $text.Substring(0, [Math]::Max(0, $Max - 3)) + '...' }
+    if ($text.Length -gt $Max) { $script:PraTextCut++; return $text.Substring(0, [Math]::Max(0, $Max - 3)) + '...' }
     return $text
 }
 
@@ -2456,7 +2995,7 @@ function Add-PraJourney {
     <#
     .SYNOPSIS
         Remembers one line of the journey of an object (time, step, status, text) when the current identity is a known object.
-        Memory only; bounded; used by the phase data and the global report.
+        Memory only. A line above MaxJourney is not kept and a text cut to MaxStepText is not complete: both are counted in the context (JourneyDropped, JourneyTextCut) and the phase data says so.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Status, [AllowEmptyString()][string]$Text)
@@ -2466,9 +3005,11 @@ function Add-PraJourney {
     if (-not $name) { return }
     if (-not $Context.ContainsKey('Journey')) { $Context['Journey'] = New-Object 'Collections.Generic.List[object]' }
     $list = $Context['Journey']
-    if ($list.Count -ge $script:PraPhaseLimits.MaxJourney) { return }
+    if ($list.Count -ge $script:PraPhaseLimits.MaxJourney) { $Context['JourneyDropped'] = [long](Get-PraValue $Context 'JourneyDropped' 0) + 1; return }
+    $cut = $script:PraTextCut
     [void]$list.Add([pscustomobject]@{ Time = [datetime]::UtcNow.ToString('o'); Name = $name; Step = (Limit-PraText (Get-PraValue $Context 'CurrentPhase' '') 200)
             Status = $Status; Text = (Limit-PraText $Text $script:PraPhaseLimits.MaxStepText) })
+    if ($script:PraTextCut -gt $cut) { $Context['JourneyTextCut'] = [long](Get-PraValue $Context 'JourneyTextCut' 0) + 1 }
 }
 
 function Get-PraPhaseSetting {
@@ -2485,48 +3026,56 @@ function Get-PraPhaseSetting {
     $settings['Entra Connect sync'] = [string]([bool](Get-PraValue (Get-PraValue $config 'EntraConnect' @{}) 'Sync' $false))
     $settings['Entra Connect policy'] = [string](Get-PraValue (Get-PraValue $config 'EntraConnect' @{}) 'PolicyType' '')
     $settings['AD replication before the sync'] = [string]([bool](Get-PraValue (Get-PraValue $config 'Directory' @{}) 'ForceReplication' $false))
+    $settings['Retention check before Recover'] = [string]([bool](Get-PraValue (Get-PraValue $config 'Retention' @{}) 'CheckBeforeRecover' $true))
+    $accepted = Get-PraValue $Context 'RetentionProofAccepted' $null
+    if ($null -ne $accepted -and @($accepted).Count) {
+        $settings['Retention proof accepted'] = (@($accepted | ForEach-Object { '{0} (SHA-256 {1}, created {2} UTC, policy {3}, {4} object(s))' -f [IO.Path]::GetFileName([string]$_.Path), $_.Sha256, ([datetime]$_.CreatedUtc).ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $(if (@($_.PolicyGuid).Count) { @($_.PolicyGuid) -join ', ' } else { '(none recorded)' }), $_.ObjectCount }) -join '; ')
+    }
     return $settings
 }
 
 function New-PraPhaseRecord {
     <#
     .SYNOPSIS
-        What this run did, as data: the run (server, operator, times, mode, tool version, run settings changed, steps), one entry per object (identity,
-        type, final status, steps with status, time and message, warnings, backup) and the errors and warnings. Memory only.
+        What this run did, as data: the run (server, operator, times, mode, tool version, run settings changed, steps, log file), one entry per object (identity, type, final
+        status, steps with status, time and message, warnings, backup), the errors and the warnings, the journey lines that name no object, and what a limit left out (Omitted).
+        Memory only: Save-PraPhaseData writes the steps, the errors, the warnings and the other lines to the events file.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions','',Justification='In-memory constructor of report data, no change to any target or file.')]
     [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$Context, [string]$HandOff = '', [switch]$NoSteps)
+    param([Parameter(Mandatory)][hashtable]$Context, [string]$HandOff = '')
     $limits = $script:PraPhaseLimits
+    $cutBefore = $script:PraTextCut
     $outcome = Get-PraOutcome $Context
     $byName = New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
-    if (-not $NoSteps) {
-        foreach ($entry in @(Get-PraList $Context 'Journey')) {
+    if ($Context.ContainsKey('Journey') -and $null -ne $Context['Journey']) {
+        foreach ($entry in $Context['Journey']) {
             if ($null -eq $entry) { continue }
-            if (-not $byName.ContainsKey($entry.Name)) { $byName[$entry.Name] = New-Object 'Collections.Generic.List[object]' }
-            if ($byName[$entry.Name].Count -lt $limits.MaxStepsPerObject) { [void]$byName[$entry.Name].Add($entry) }
+            $list = $byName[[string]$entry.Name]
+            if ($null -eq $list) { $list = New-Object 'Collections.Generic.List[object]'; $byName[[string]$entry.Name] = $list }
+            [void]$list.Add($entry)
         }
     }
+    $used = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
     $objects = New-Object 'Collections.Generic.List[object]'
+    $omittedObjects = 0
     foreach ($row in $Context.Rows.ToArray()) {
-        if ($objects.Count -ge $limits.MaxObjects) { break }
+        if ($objects.Count -ge $limits.MaxObjects) { $omittedObjects++; continue }
         $guid = [string](Get-PraValue $row 'ObjectGuid' ''); $upn = [string](Get-PraValue $row 'UserPrincipalName' ''); $sam = [string](Get-PraValue $row 'SamAccountName' '')
         $name = if ($upn) { $upn } elseif ($sam) { $sam } else { $guid }
         $steps = New-Object 'Collections.Generic.List[object]'
-        if (-not $NoSteps) {
-            $found = $null
-            if ($byName.TryGetValue($name, [ref]$found)) { foreach ($entry in $found) { [void]$steps.Add([ordered]@{ Time = $entry.Time; Step = $entry.Step; Status = $entry.Status; Text = $entry.Text }) } }
-            if (-not $steps.Count) {
-                # No event named this object: the steps are read from its result row.
-                $now = [datetime]::UtcNow.ToString('o')
-                if ([string](Get-PraValue $row 'BackupPath' '')) { [void]$steps.Add([ordered]@{ Time = $now; Step = 'Backup'; Status = 'Ok'; Text = 'Backup written' }) }
-                if ((Get-PraValue $row 'ADApplied' $null) -eq $true) { [void]$steps.Add([ordered]@{ Time = $now; Step = 'Active Directory'; Status = 'Ok'; Text = 'Attributes changed' }) }
-                if ((Get-PraValue $row 'ADVerified' $null) -eq $true) { [void]$steps.Add([ordered]@{ Time = $now; Step = 'Active Directory'; Status = 'Ok'; Text = 'Read back and verified' }) }
-                $cloud = [string](Get-PraValue $row 'CloudStatus' '')
-                if ($cloud -and -not (Test-PraOrdinalEqual $cloud 'N/A')) {
-                    $cloudState = if (Test-PraOrdinalEqual $cloud 'Success') { 'Ok' } elseif (Test-PraOrdinalEqual $cloud 'Error') { 'Fail' } elseif (Test-PraOrdinalEqual $cloud 'Pending') { 'Warn' } else { 'Info' }
-                    [void]$steps.Add([ordered]@{ Time = $now; Step = 'Exchange Online'; Status = $cloudState; Text = (Limit-PraText (('{0} {1}' -f $cloud, (Get-PraValue $row 'CloudDetail' '')).Trim()) $limits.MaxStepText) })
-                }
+        $found = $byName[$name]
+        if ($null -ne $found) { [void]$used.Add($name); $steps.AddRange($found) }
+        if (-not $steps.Count) {
+            # No event named this object: the steps are read from its result row.
+            $now = [datetime]::UtcNow.ToString('o')
+            if ([string](Get-PraValue $row 'BackupPath' '')) { [void]$steps.Add([ordered]@{ Time = $now; Step = 'Backup'; Status = 'Ok'; Text = 'Backup written' }) }
+            if ((Get-PraValue $row 'ADApplied' $null) -eq $true) { [void]$steps.Add([ordered]@{ Time = $now; Step = 'Active Directory'; Status = 'Ok'; Text = 'Attributes changed' }) }
+            if ((Get-PraValue $row 'ADVerified' $null) -eq $true) { [void]$steps.Add([ordered]@{ Time = $now; Step = 'Active Directory'; Status = 'Ok'; Text = 'Read back and verified' }) }
+            $cloud = [string](Get-PraValue $row 'CloudStatus' '')
+            if ($cloud -and -not (Test-PraOrdinalEqual $cloud 'N/A')) {
+                $cloudState = if (Test-PraOrdinalEqual $cloud 'Success') { 'Ok' } elseif (Test-PraOrdinalEqual $cloud 'Error') { 'Fail' } elseif (Test-PraOrdinalEqual $cloud 'Pending') { 'Warn' } else { 'Info' }
+                [void]$steps.Add([ordered]@{ Time = $now; Step = 'Exchange Online'; Status = $cloudState; Text = (Limit-PraText (('{0} {1}' -f $cloud, (Get-PraValue $row 'CloudDetail' '')).Trim()) $limits.MaxStepText) })
             }
         }
         [void]$objects.Add([ordered]@{
@@ -2538,106 +3087,369 @@ function New-PraPhaseRecord {
                 Steps = $steps.ToArray()
             })
     }
+    $unattached = New-Object 'Collections.Generic.List[object]'
+    foreach ($pair in $byName.GetEnumerator()) { if (-not $used.Contains([string]$pair.Key)) { $unattached.AddRange($pair.Value) } }
     $stepLog = @(@(Get-PraList $Context 'StepLog') | ForEach-Object { if ($null -ne $_) { [ordered]@{ Index = [int]$_.Index; Title = (Limit-PraText $_.Title 200); State = [string]$_.State; StartedUtc = [string]$_.StartedUtc; EndedUtc = [string]$_.EndedUtc } } })
-    $issues = @($Context.Issues.ToArray() | Select-Object -First $limits.MaxIssues | ForEach-Object {
+    $issues = @($Context.Issues.ToArray() | ForEach-Object {
             [ordered]@{ Timestamp = [string](Get-PraValue $_ 'Timestamp' ''); Phase = (Limit-PraText (Get-PraValue $_ 'Phase' '') 200); Operation = (Limit-PraText (Get-PraValue $_ 'Operation' '') 200)
                 Identity = (Limit-PraText (Get-PraValue $_ 'Identity' '') 300); Source = (Limit-PraText (Get-PraValue $_ 'Source' '') 100); Message = (Limit-PraText (Get-PraValue $_ 'Message' ([string]$_)) 1000) } })
-    $warnings = @(@(Get-PraList $Context 'WarningList') | Select-Object -First $limits.MaxIssues | ForEach-Object {
+    $warnings = @(@(Get-PraList $Context 'WarningList') | ForEach-Object {
             [ordered]@{ Timestamp = [string](Get-PraValue $_ 'Timestamp' ''); Phase = (Limit-PraText (Get-PraValue $_ 'Phase' '') 200); Message = (Limit-PraText (Get-PraValue $_ 'Message' ([string]$_)) 1000) } })
     $counts = $outcome.Counts
     $overrides = @(@(Get-PraList $Context 'ConfigOverrides') | ForEach-Object { if ($_) { Limit-PraText $_ 500 } })
     $runId = [string](Get-PraValue $Context 'RunId' '')
+    $omitted = [ordered]@{ Objects = [long]$omittedObjects; ObjectsBySize = [long]0; JourneyLines = [long](Get-PraValue $Context 'JourneyDropped' 0); Texts = ([long](Get-PraValue $Context 'JourneyTextCut' 0) + ($script:PraTextCut - $cutBefore)); EventLines = [long]0 }
     return [ordered]@{
-        SchemaVersion = 1; Kind = 'PhaseData'; Environment = [string](Get-PraValue (Get-PraValue $Context 'Config' @{}) 'Environment' ''); BatchId = [string](Get-PraValue $Context 'BatchId' '')
-        ToolVersion = [string](Get-PraValue $Context 'Version' ''); Truncated = [bool]$NoSteps
+        SchemaVersion = 2; Kind = 'PhaseData'; Environment = [string](Get-PraValue (Get-PraValue $Context 'Config' @{}) 'Environment' ''); BatchId = [string](Get-PraValue $Context 'BatchId' '')
+        ToolVersion = [string](Get-PraValue $Context 'Version' ''); Truncated = [bool]($omitted.Objects -or $omitted.JourneyLines -or $omitted.Texts)
         Phase = [ordered]@{
             RunId = $runId; Action = [string](Get-PraValue $Context 'Action' ''); Phase = [string](Get-PraValue $Context 'Phase' ''); Mode = [string](Get-PraValue $Context 'Mode' '')
             Computer = [string]$env:COMPUTERNAME; Account = ('{0}\{1}' -f $env:USERDOMAIN, $env:USERNAME); Server = [string](Get-PraValue $Context 'Server' '')
+            LogFile = (Limit-PraText ([IO.Path]::GetFileName([string](Get-PraValue $Context 'LogFile' ''))) 200)
             StartedUtc = ([datetime](Get-PraValue $Context 'StartTime' ([datetime]::Now))).ToUniversalTime().ToString('o'); EndedUtc = [datetime]::UtcNow.ToString('o')
             Status = [string]$outcome.Status; ExitCode = [int]$outcome.ExitCode; HandOff = $HandOff; Overrides = $overrides; Settings = (Get-PraPhaseSetting $Context); Steps = $stepLog
             Counts = [ordered]@{ Success = [int]$counts.Success; Error = [int]$counts.Error; Pending = [int]$counts.Pending; Skipped = [int]$counts.Skipped; Planned = [int]$counts.Planned }
         }
-        Objects = $objects.ToArray(); Issues = $issues; Warnings = $warnings
+        Omitted = $omitted
+        Limits = [ordered]@{ MaxObjects = [long]$limits.MaxObjects; MaxFileBytes = [long]$limits.MaxFileBytes; MaxJourney = [long]$limits.MaxJourney; MaxStepText = [long]$limits.MaxStepText; MaxText = [long]$limits.MaxText; MaxEventsBytes = [long]$limits.MaxEventsBytes }
+        Objects = $objects.ToArray(); Issues = $issues; Warnings = $warnings; Unattached = $unattached.ToArray()
     }
+}
+
+function Write-PraPhaseEventFile {
+    <#
+    .SYNOPSIS
+        Writes the steps of every object, the journey lines that name no object, the errors and the warnings of a phase record to a JSON-lines file (one object per line, UTF-8
+        without a byte order mark). A line that would take the file above MaxEventsBytes is not written and is counted.
+    .OUTPUTS
+        Count (lines written), Bytes and Dropped (lines left out).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Record, [Parameter(Mandatory)][string]$Path)
+    $limits = $script:PraPhaseLimits
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $escape = $script:JsonEscape; $evaluator = $script:JsonEscapeEvaluator
+    $quote = { param([string]$Text) if ($escape.IsMatch($Text)) { '"' + $escape.Replace($Text, $evaluator) + '"' } else { '"' + $Text + '"' } }
+    $state = @{ Count = 0; Bytes = [long]0; Dropped = [long]0 }
+    $stream = New-Object IO.FileStream($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $writer = New-Object IO.StreamWriter($stream, $utf8, 1048576)
+    try {
+        $emit = {
+            param([string]$Line)
+            $size = $utf8.GetByteCount($Line) + 1
+            if ($state.Bytes + $size -gt $limits.MaxEventsBytes) { $state.Dropped++; return }
+            $writer.Write($Line); $writer.Write("`n"); $state.Bytes += $size; $state.Count++
+        }
+        # The steps of an object carry its place in the list of objects (I): two objects can have no GUID or the same one, the place always tells them apart.
+        $place = 0
+        foreach ($object in @($Record.Objects)) {
+            $key = (& $quote ([string]$object.ObjectGuid)) + ',"I":' + $place
+            $place++
+            foreach ($step in @($object.Steps)) {
+                $time = [string]$step.Time; $name = [string]$step.Step; $status = [string]$step.Status; $text = [string]$step.Text
+                if ($escape.IsMatch($time + $name + $status + $text)) { & $emit ('{"K":"E","G":' + $key + ',"Time":' + (& $quote $time) + ',"Step":' + (& $quote $name) + ',"Status":' + (& $quote $status) + ',"Text":' + (& $quote $text) + '}') }
+                else { & $emit ('{"K":"E","G":' + $key + ',"Time":"' + $time + '","Step":"' + $name + '","Status":"' + $status + '","Text":"' + $text + '"}') }
+            }
+        }
+        foreach ($step in @($Record.Unattached)) {
+            & $emit ('{"K":"E","G":"","Name":' + (& $quote ([string]$step.Name)) + ',"Time":' + (& $quote ([string]$step.Time)) + ',"Step":' + (& $quote ([string]$step.Step)) + ',"Status":' + (& $quote ([string]$step.Status)) + ',"Text":' + (& $quote ([string]$step.Text)) + '}')
+        }
+        foreach ($issue in @($Record.Issues)) {
+            & $emit ('{"K":"I","Timestamp":' + (& $quote ([string]$issue.Timestamp)) + ',"Phase":' + (& $quote ([string]$issue.Phase)) + ',"Operation":' + (& $quote ([string]$issue.Operation)) + ',"Identity":' + (& $quote ([string]$issue.Identity)) +
+                ',"Source":' + (& $quote ([string]$issue.Source)) + ',"Message":' + (& $quote ([string]$issue.Message)) + '}')
+        }
+        foreach ($warning in @($Record.Warnings)) {
+            & $emit ('{"K":"W","Timestamp":' + (& $quote ([string]$warning.Timestamp)) + ',"Phase":' + (& $quote ([string]$warning.Phase)) + ',"Message":' + (& $quote ([string]$warning.Message)) + '}')
+        }
+        $writer.Flush(); $stream.Flush($true)
+    }
+    finally { $writer.Dispose() }
+    return [pscustomobject]@{ Count = [int]$state.Count; Bytes = [long]$state.Bytes; Dropped = [long]$state.Dropped }
+}
+
+function Write-PraFileChecksum {
+    <# Writes <Path>.sha256 (the SHA-256 of the file, lower case hexadecimal, no line break) and returns the hash. Never overwrites. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $hash = New-Object IO.FileStream($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try { $digest = Get-PraStreamSha256 $hash } finally { $hash.Dispose() }
+    $sidecar = New-Object IO.FileStream(($Path + '.sha256'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $text = (New-Object Text.UTF8Encoding($false)).GetBytes($digest); $sidecar.Write($text, 0, $text.Length); $sidecar.Flush($true) } finally { $sidecar.Dispose() }
+    return $digest
+}
+
+function Limit-PraPhaseObject {
+    <#
+    .SYNOPSIS
+        Keeps the PhaseData file of a record within MaxFileBytes: the objects that would not fit are left out, from the end, and counted in Omitted.Objects. Their steps stay in the
+        events file as lines that name the object. A record that fits is not changed.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Record, [Parameter(Mandatory)][string]$EventsName)
+    $objects = @($Record.Objects)
+    if (-not $objects.Count) { return }
+    $utf8 = New-Object Text.UTF8Encoding($false)
+    $flat = @(foreach ($object in $objects) { $copy = [ordered]@{}; foreach ($key in $object.Keys) { if (-not (Test-PraOrdinalEqual $key 'Steps')) { $copy[$key] = $object[$key] } }; $copy })
+    $shell = [ordered]@{}
+    foreach ($key in $Record.Keys) { if (-not (Test-PraOrdinalIn $key @('Objects', 'Issues', 'Warnings', 'Unattached'))) { $shell[$key] = $Record[$key] } }
+    $shell['Events'] = [ordered]@{ File = $EventsName; Count = [int]::MaxValue; Bytes = [long]::MaxValue; Sha256 = ('0' * 64) }
+    $shell['Issues'] = @(); $shell['Warnings'] = @()
+    $budget = [long]$script:PraPhaseLimits.MaxFileBytes - 4096 - $utf8.GetByteCount(($shell | ConvertTo-Json -Depth 8 -Compress))
+    $size = $utf8.GetByteCount((ConvertTo-Json -InputObject $flat -Depth 8 -Compress))
+    $keep = $flat.Count
+    while ($size -gt $budget -and $keep -gt 0) {
+        $keep = [Math]::Max(0, [Math]::Min($keep - 1, [int][Math]::Floor($keep * ([Math]::Max(0, $budget) / [double]$size) * 0.98)))
+        $size = if ($keep) { $utf8.GetByteCount((ConvertTo-Json -InputObject @($flat[0..($keep - 1)]) -Depth 8 -Compress)) } else { 2 }
+    }
+    if ($keep -ge $flat.Count) { return }
+    $lines = New-Object 'Collections.Generic.List[object]'
+    foreach ($line in @($Record.Unattached)) { $lines.Add($line) }
+    for ($place = $keep; $place -lt $objects.Count; $place++) {
+        foreach ($step in @($objects[$place].Steps)) { $lines.Add([ordered]@{ Name = [string]$objects[$place].Name; Time = [string]$step.Time; Step = [string]$step.Step; Status = [string]$step.Status; Text = [string]$step.Text }) }
+    }
+    $Record['Unattached'] = $lines.ToArray()
+    $Record['Objects'] = if ($keep) { [object[]]@($objects[0..($keep - 1)]) } else { [object[]]@() }
+    $Record.Omitted.Objects = [long]$Record.Omitted.Objects + ($objects.Count - $keep)
+    $Record.Omitted.ObjectsBySize = [long]$Record.Omitted.ObjectsBySize + ($objects.Count - $keep)
 }
 
 function Save-PraPhaseData {
     <#
     .SYNOPSIS
-        Writes what this run did, as PhaseData-<time>-<phase>-<run>.json and its .sha256, in a batch folder this run created (private folder: the files inherit
-        its ACL). Never overwrites. The file is dropped to the steps-less form when it would be larger than the limit.
+        Writes what this run did in a batch folder this run created (private folder: the files inherit its ACL): PhaseEvents-<time>-<phase>-<run>.jsonl (the steps of every object,
+        the errors and the warnings) and its .sha256, then PhaseData-<time>-<phase>-<run>.json (the header and one entry per object, with the SHA-256 of the events file) and its
+        .sha256. Never overwrites. What a limit leaves out is counted in the header (Omitted).
     .OUTPUTS
-        The path of the file.
+        The path of the PhaseData file.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context, [Parameter(Mandatory)][string]$Folder, [string]$HandOff = '')
     if (-not [IO.Directory]::Exists($Folder)) { throw "Phase data: folder not found: $Folder" }
-    $json = (New-PraPhaseRecord -Context $Context -HandOff $HandOff) | ConvertTo-Json -Depth 8 -Compress
-    if ($json.Length -gt $script:PraPhaseLimits.MaxBytes / 4) { $json = (New-PraPhaseRecord -Context $Context -HandOff $HandOff -NoSteps) | ConvertTo-Json -Depth 8 -Compress }
-    $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes($json)
-    if ($bytes.LongLength -gt $script:PraPhaseLimits.MaxBytes) { throw 'Phase data: the file would be larger than the limit.' }
+    $record = New-PraPhaseRecord -Context $Context -HandOff $HandOff
     $runId = [string](Get-PraValue $Context 'RunId' '')
     $short = ($runId -replace '\A[^-]*-', '' -replace '[^0-9A-Za-z]', '')
     if ($short.Length -gt 8) { $short = $short.Substring(0, 8) }
     if (-not $short) { $short = [guid]::NewGuid().ToString('N').Substring(0, 8) }
     $side = ([string](Get-PraValue $Context 'Phase' '') -replace '[^0-9A-Za-z]', '')
     if (-not $side) { $side = 'Run' }
-    $path = Join-Path $Folder ('PhaseData-{0}-{1}-{2}.json' -f [datetime]::UtcNow.ToString('yyyyMMddHHmmss', [Globalization.CultureInfo]::InvariantCulture), $side, $short)
-    $stream = New-Object IO.FileStream($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
-    $hash = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    try { $digest = Get-PraStreamSha256 $hash } finally { $hash.Dispose() }
-    $sidecar = New-Object IO.FileStream(($path + '.sha256'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-    try { $text = (New-Object Text.UTF8Encoding($false)).GetBytes($digest); $sidecar.Write($text, 0, $text.Length); $sidecar.Flush($true) } finally { $sidecar.Dispose() }
+    # The time in the name orders the files: a second save in the same second takes the next second, so that its files never meet the first ones.
+    $moment = [datetime]::UtcNow
+    $path = ''; $eventsPath = ''
+    for ($attempt = 0; $attempt -lt 1000; $attempt++) {
+        $stem = '{0}-{1}-{2}' -f $moment.AddSeconds($attempt).ToString('yyyyMMddHHmmss', [Globalization.CultureInfo]::InvariantCulture), $side, $short
+        $path = Join-Path $Folder ('PhaseData-' + $stem + '.json')
+        $eventsPath = Join-Path $Folder ($script:PraEventsPrefix + $stem + '.jsonl')
+        if (-not ([IO.File]::Exists($path) -or [IO.File]::Exists($path + '.sha256') -or [IO.File]::Exists($eventsPath) -or [IO.File]::Exists($eventsPath + '.sha256'))) { break }
+    }
+    if ([IO.File]::Exists($path) -or [IO.File]::Exists($eventsPath)) { throw "Phase data: no free file name in $Folder." }
+    try {
+        Limit-PraPhaseObject -Record $record -EventsName ([IO.Path]::GetFileName($eventsPath))
+        $events = Write-PraPhaseEventFile -Record $record -Path $eventsPath
+        $digest = Write-PraFileChecksum -Path $eventsPath
+        foreach ($object in $record.Objects) { $object.Remove('Steps') }
+        $record.Remove('Unattached')
+        $record.Issues = @(); $record.Warnings = @()
+        $record.Omitted.EventLines = [long]$events.Dropped
+        $record.Truncated = [bool]($record.Omitted.Objects -or $record.Omitted.JourneyLines -or $record.Omitted.Texts -or $record.Omitted.EventLines)
+        $record['Events'] = [ordered]@{ File = [IO.Path]::GetFileName($eventsPath); Count = [int]$events.Count; Bytes = [long]$events.Bytes; Sha256 = $digest }
+        $bytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($record | ConvertTo-Json -Depth 8 -Compress))
+        if ($bytes.LongLength -gt $script:PraPhaseLimits.MaxFileBytes) { throw 'Phase data: the file would be larger than the limit.' }
+        $stream = New-Object IO.FileStream($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+        $null = Write-PraFileChecksum -Path $path
+    }
+    catch {
+        $failure = $_
+        foreach ($leftover in @($eventsPath, ($eventsPath + '.sha256'), $path, ($path + '.sha256'))) { try { [IO.File]::Delete($leftover) } catch { $null = $_ } }
+        throw $failure
+    }
     return $path
 }
 
+function Copy-PraPhaseFile {
+    <# Copies one PhaseData file with its events file and their .sha256 files into a folder. A file already there is left alone. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Destination)
+    $leaf = [IO.Path]::GetFileName($Path)
+    $events = Join-Path ([IO.Path]::GetDirectoryName($Path)) ($script:PraEventsPrefix + $leaf.Substring(10, $leaf.Length - 15) + '.jsonl')
+    foreach ($candidate in @($Path, ($Path + '.sha256'), $events, ($events + '.sha256'))) {
+        if (-not [IO.File]::Exists($candidate)) { continue }
+        $target = Join-Path $Destination ([IO.Path]::GetFileName($candidate))
+        if ([IO.File]::Exists($target)) { continue }
+        [IO.File]::Copy($candidate, $target, $false)
+    }
+}
+
 function Copy-PraPhaseData {
-    <# Copies the PhaseData files (and their .sha256) of the source folders into a folder this run created, so that they travel with it. A file already there is left alone. #>
+    <# Copies the PhaseData files and the events file of each (and their .sha256) of the source folders into a folder this run created, so that they travel with it. A file already there is left alone. Returns the number of phases found. #>
     [CmdletBinding()]
     param([string[]]$SourceFolder = @(), [Parameter(Mandatory)][string]$Destination)
     $copied = 0
     foreach ($source in @($SourceFolder | Where-Object { $_ } | Get-PraOrdinalUnique -IgnoreCase)) {
         if (-not [IO.Directory]::Exists($source)) { continue }
         foreach ($file in [IO.Directory]::GetFiles($source, $script:PraPhaseFilter)) {
-            foreach ($candidate in @($file, ($file + '.sha256'))) {
-                if (-not [IO.File]::Exists($candidate)) { continue }
-                $target = Join-Path $Destination ([IO.Path]::GetFileName($candidate))
-                if ([IO.File]::Exists($target)) { continue }
-                [IO.File]::Copy($candidate, $target, $false)
-            }
+            Copy-PraPhaseFile -Path $file -Destination $Destination
             $copied++
         }
     }
     return $copied
 }
 
+function Read-PraEventLine {
+    <# The objects of a JSON-lines file, read in batches of lines (one JSON array per batch; line by line when a batch cannot be read). Skipped counts the lines that are longer than MaxLineChars or are not a JSON object. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    $maxChars = $script:PraPhaseLimits.MaxLineChars
+    $items = New-Object 'Collections.Generic.List[object]'
+    $batch = New-Object 'Collections.Generic.List[string]'
+    $state = @{ Skipped = 0 }
+    $flush = {
+        $parsed = $null
+        try { $parsed = @(('[' + [string]::Join(',', $batch) + ']') | ConvertFrom-PraJson); if ($parsed.Count -ne $batch.Count) { $parsed = $null } } catch { $parsed = $null }
+        if ($null -eq $parsed) {
+            $parsed = New-Object 'Collections.Generic.List[object]'
+            foreach ($single in $batch) {
+                try { $one = @($single | ConvertFrom-PraJson); if ($one.Count -eq 1) { $parsed.Add($one[0]) } else { $state.Skipped++ } } catch { $state.Skipped++ }
+            }
+        }
+        foreach ($item in $parsed) { if ($item -is [pscustomobject]) { $items.Add($item) } else { $state.Skipped++ } }
+        $batch.Clear()
+    }
+    foreach ($line in [IO.File]::ReadLines($Path, [Text.Encoding]::UTF8)) {
+        if (-not $line) { continue }
+        if ($line.Length -gt $maxChars -or $line[0] -ne [char]'{' -or $line[$line.Length - 1] -ne [char]'}') { $state.Skipped++; continue }
+        $batch.Add($line)
+        if ($batch.Count -ge 2000) { & $flush }
+    }
+    if ($batch.Count) { & $flush }
+    return [pscustomobject]@{ Items = $items; Skipped = [int]$state.Skipped }
+}
+
+function Add-PraPhaseEvent {
+    <#
+    .SYNOPSIS
+        Reads the events file of a validated PhaseData record (size, .sha256, the SHA-256 in the header, then the lines) and puts the steps on the objects of the record and the errors
+        and the warnings on the record. The lines that name no object are kept in Unattached.
+    .OUTPUTS
+        '' when the file was used (lines that could not be read are counted in EventLinesSkipped), otherwise why it cannot be used: the record then has no steps, errors or warnings.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Record, [Parameter(Mandatory)][string]$DataFile, [Parameter(Mandatory)][hashtable]$Budget)
+    $limits = $script:PraPhaseLimits
+    $leaf = [IO.Path]::GetFileName($DataFile)
+    $path = Join-Path ([IO.Path]::GetDirectoryName($DataFile)) ($script:PraEventsPrefix + $leaf.Substring(10, $leaf.Length - 15) + '.jsonl')
+    try {
+        if (-not [IO.File]::Exists($path)) { throw 'the events file is missing' }
+        $length = ([IO.FileInfo]$path).Length
+        if ($length -gt $limits.MaxEventsBytes) { throw ('the events file is larger than {0} MB' -f [long]($limits.MaxEventsBytes / 1MB)) }
+        if (($Budget.Bytes + $length) -gt $limits.MaxEventsBytes) { throw ('the events files read before it already use {0} MB of the {1} MB allowed for one report' -f [long]($Budget.Bytes / 1MB), [long]($limits.MaxEventsBytes / 1MB)) }
+        $Budget.Bytes += $length
+        $sidecar = $path + '.sha256'
+        if (-not [IO.File]::Exists($sidecar)) { throw 'the .sha256 file of the events file is missing' }
+        $stream = New-Object IO.FileStream($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        try { $digest = Get-PraStreamSha256 $stream } finally { $stream.Dispose() }
+        $token = ([IO.File]::ReadAllText($sidecar).Trim() -split '\s+')[0]
+        $declared = [string](Get-PraValue (Get-PraValue $Record 'Events' $null) 'Sha256' '')
+        if ($token -notmatch '\A[0-9a-fA-F]{64}\z' -or -not (Test-PraOrdinalIgnoreCaseEqual $token $digest) -or -not (Test-PraOrdinalIgnoreCaseEqual $declared $digest)) { throw 'the checksum of the events file does not match (the file was changed)' }
+        $read = Read-PraEventLine -Path $path
+        $byGuid = New-Object 'Collections.Generic.Dictionary[string,object]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        $byPlace = New-Object 'Collections.Generic.Dictionary[int,object]'
+        $known = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::OrdinalIgnoreCase)
+        $objects = @(Get-PraList $Record 'Objects')
+        foreach ($object in $objects) { [void]$known.Add([string](Get-PraValue $object 'ObjectGuid' '')) }
+        $unattached = New-Object 'Collections.Generic.List[object]'
+        $issues = New-Object 'Collections.Generic.List[object]'
+        $warnings = New-Object 'Collections.Generic.List[object]'
+        $skipped = $read.Skipped
+        foreach ($item in $read.Items) {
+            $kind = [string](Get-PraValue $item 'K' '')
+            $code = if ($kind.Length -eq 1) { [int][char]$kind } else { 0 }
+            if ($code -eq 69) {
+                $guid = if ($null -ne $item.PSObject.Properties['G']) { [string]$item.G } else { '' }
+                $placeValue = if ($null -ne $item.PSObject.Properties['I']) { $item.I } else { $null }
+                if ($placeValue -is [int] -or $placeValue -is [long]) {
+                    # The place in the list of objects tells the object; the GUID is only a check that the line is for it.
+                    $place = [long]$placeValue
+                    if ($place -ge 0 -and $place -lt $objects.Count -and (Test-PraOrdinalIgnoreCaseEqual $guid ([string](Get-PraValue $objects[$place] 'ObjectGuid' '')))) {
+                        $list = $byPlace[[int]$place]
+                        if ($null -eq $list) { $list = New-Object 'Collections.Generic.List[object]'; $byPlace[[int]$place] = $list }
+                        $list.Add($item)
+                    }
+                    else { $unattached.Add($item) }
+                }
+                elseif ($guid -and $known.Contains($guid)) {
+                    $list = $byGuid[$guid]
+                    if ($null -eq $list) { $list = New-Object 'Collections.Generic.List[object]'; $byGuid[$guid] = $list }
+                    $list.Add($item)
+                }
+                else { $unattached.Add($item) }
+            }
+            elseif ($code -eq 73) { $issues.Add($item) }
+            elseif ($code -eq 87) { $warnings.Add($item) }
+            else { $skipped++ }
+        }
+        for ($place = 0; $place -lt $objects.Count; $place++) {
+            $list = $byPlace[$place]
+            if ($null -eq $list) { $list = $byGuid[[string](Get-PraValue $objects[$place] 'ObjectGuid' '')] }
+            if ($null -ne $list) { Add-Member -InputObject $objects[$place] -NotePropertyName Steps -NotePropertyValue $list.ToArray() -Force }
+        }
+        Add-Member -InputObject $Record -NotePropertyName Issues -NotePropertyValue $issues.ToArray() -Force
+        Add-Member -InputObject $Record -NotePropertyName Warnings -NotePropertyValue $warnings.ToArray() -Force
+        Add-Member -InputObject $Record -NotePropertyName Unattached -NotePropertyValue $unattached.ToArray() -Force
+        Add-Member -InputObject $Record -NotePropertyName EventLinesSkipped -NotePropertyValue ([int]$skipped) -Force
+    }
+    catch { return [string]$_.Exception.Message }
+    return ''
+}
+
+function Get-PraRerunCommand {
+    <# The command that runs this run again: the command line of the entry script when it gave the context a way to write one, otherwise the action, phase and batch of the context. #>
+    param([hashtable]$Context)
+    $action = [string](Get-PraValue $Context 'Action' ''); $phase = [string](Get-PraValue $Context 'Phase' ''); $batch = [string](Get-PraValue $Context 'BatchId' '')
+    $hook = Get-PraValue $Context 'CommandLineFor' $null
+    if ($hook -is [scriptblock]) { return [string](& $hook $action $phase $batch) }
+    $parts = @('.\Invoke-PraRemoteMailbox.ps1', "-Action $action")
+    if ($phase) { $parts += "-Phase $phase" }
+    $parts += '-Mode Apply'
+    if ($batch) { $parts += "-Batch $batch" }
+    return ($parts -join ' ')
+}
+
 function Read-PraPhaseData {
     <#
     .SYNOPSIS
-        Reads the PhaseData files of some folders as untrusted input: size, .sha256, schema, Kind and Environment are checked; a file that fails is reported
-        in Problems and ignored (the global report then says the side is not available), never trusted.
+        Reads the PhaseData files of some folders (and the events file of each) as untrusted input: size, .sha256, schema, Kind and Environment are checked; a file that fails is
+        reported in Problems and ignored (the global report then says the side is not available), never trusted. An events file that fails is not used: the phase is read without
+        its steps, errors and warnings and the record says why (EventsProblem). At most MaxFiles files of a folder are read, the newest first.
     .OUTPUTS
         Phases (validated records, as read) and Problems (texts).
     #>
     [CmdletBinding()]
-    param([string[]]$Folder = @(), [string]$Environment = '')
+    param([string[]]$Folder = @(), [string]$Environment = '', [hashtable]$Context, [string]$SkipRunId = '')
     $limits = $script:PraPhaseLimits
     $phases = New-Object 'Collections.Generic.List[object]'
     $problems = New-Object 'Collections.Generic.List[string]'
     $seen = New-Object 'Collections.Generic.HashSet[string]' -ArgumentList ([StringComparer]::Ordinal)
-    $total = 0
+    $budget = [long]0
+    $eventsBudget = @{ Bytes = [long]0 }
     foreach ($directory in @($Folder | Where-Object { $_ } | Get-PraOrdinalUnique -IgnoreCase)) {
         if (-not [IO.Directory]::Exists($directory)) { continue }
         $files = [string[]][IO.Directory]::GetFiles($directory, $script:PraPhaseFilter)
         [Array]::Sort([Array]$files, [Collections.IComparer][StringComparer]::Ordinal)
+        if ($files.Length -gt $limits.MaxFiles) {
+            $problems.Add(('Phase data: {0} older file(s) of the folder {1} were not read (the newest {2} are read for one report). To report on them, move the newer PhaseData files (with their PhaseEvents and .sha256 files) out of the batch folder, then run the same command again{3}' -f ($files.Length - $limits.MaxFiles), (Get-PraSafeText ([IO.Path]::GetFileName($directory.TrimEnd('\')))), $limits.MaxFiles, $(if ($null -ne $Context) { ': ' + (Get-PraRerunCommand $Context) } else { '' })))
+            $files = [string[]]@($files[($files.Length - $limits.MaxFiles)..($files.Length - 1)])
+        }
         foreach ($file in $files) {
             $leaf = Get-PraSafeText ([IO.Path]::GetFileName($file))
-            $total++
-            if ($total -gt $limits.MaxFiles) { $problems.Add('Phase data: too many files, the rest is ignored.'); break }
             try {
                 $length = ([IO.FileInfo]$file).Length
-                if ($length -lt 2 -or $length -gt $limits.MaxBytes) { throw 'the size is not acceptable' }
+                # One file is read up to the limit of the whole report, whatever size the writer keeps.
+                if ($length -lt 2 -or $length -gt $limits.MaxBytes) { throw ('the size is not acceptable (at most {0} MB for one file)' -f [long]($limits.MaxBytes / 1MB)) }
+                if (($budget + $length) -gt $limits.MaxBytes) {
+                    throw ('not read: the files read before it already use {0} MB of the {1} MB allowed for one report. Move the PhaseData files of other batches out of the batch folder (a batch folder holds only the files of its own batch), then run the same command again: {2}' -f [long]($budget / 1MB), [long]($limits.MaxBytes / 1MB), (Get-PraRerunCommand $Context))
+                }
+                $budget += $length
                 $sidecar = $file + '.sha256'
                 if (-not [IO.File]::Exists($sidecar)) { throw 'the .sha256 file is missing' }
                 $stream = New-Object IO.FileStream($file, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
@@ -2646,15 +3458,34 @@ function Read-PraPhaseData {
                 if ($token -notmatch '\A[0-9a-fA-F]{64}\z' -or -not (Test-PraOrdinalIgnoreCaseEqual $token $digest)) { throw 'the checksum does not match (the file was changed)' }
                 $record = [IO.File]::ReadAllText($file, [Text.Encoding]::UTF8) | ConvertFrom-PraJson
                 $schema = Get-PraValue $record 'SchemaVersion' $null
-                if (($schema -isnot [int] -and $schema -isnot [long]) -or [int]$schema -ne 1) { throw 'unsupported schema' }
+                if ($schema -isnot [int] -and $schema -isnot [long]) { throw 'unsupported schema' }
+                $version = [int]$schema
+                if ($version -ne 1 -and $version -ne 2) { throw 'unsupported schema' }
                 if (-not (Test-PraOrdinalEqual (Get-PraValue $record 'Kind' '') 'PhaseData')) { throw 'not phase data' }
                 if ($Environment -and -not (Test-PraOrdinalIgnoreCaseEqual (Get-PraValue $record 'Environment' '') $Environment)) { throw 'another Environment' }
                 $phase = Get-PraValue $record 'Phase' $null
                 $runId = [string](Get-PraValue $phase 'RunId' '')
                 if ($null -eq $phase -or -not $runId -or -not [string](Get-PraValue $phase 'Action' '') -or -not [string](Get-PraValue $phase 'StartedUtc' '')) { throw 'incomplete' }
-                if ($seen.Add($runId + '|' + [string](Get-PraValue $phase 'Phase' ''))) { $phases.Add($record) }
+                if ($SkipRunId -and (Test-PraOrdinalEqual $runId $SkipRunId)) { continue }
+                if ($seen.Add($runId + '|' + [string](Get-PraValue $phase 'Phase' ''))) {
+                    $reason = ''
+                    if ($version -eq 2) { $reason = Add-PraPhaseEvent -Record $record -DataFile $file -Budget $eventsBudget }
+                    elseif ((Get-PraValue $record 'Truncated' $false) -eq $true) { $reason = 'the steps of this phase were left out when it was saved (the file was too large)' }
+                    Add-Member -InputObject $record -NotePropertyName EventsProblem -NotePropertyValue $reason -Force
+                    $phases.Add($record)
+                }
             }
-            catch { $problems.Add(('Phase data {0}: {1}.' -f $leaf, $_.Exception.Message)) }
+            catch {
+                $why = [string]$_.Exception.Message
+                if ($why -notmatch 'run the same command again') {
+                    $again = if ($null -ne $Context) { ' then run the same command again: ' + (Get-PraRerunCommand $Context) } else { ' then run the same command again' }
+                    $step = if ($why -match 'checksum|\.sha256') { ' Copy the file and its .sha256 file again from the server that wrote them (they are in the transfer package), or move both out of the batch folder,' }
+                        elseif ($why -match 'unsupported schema') { ' The file was written by another version of this tool: move it out of the batch folder,' }
+                        else { ' Move the file out of the batch folder,' }
+                    $why = $why + '.' + $step + $again
+                }
+                $problems.Add(('Phase data {0}: {1}' -f $leaf, $why))
+            }
         }
     }
     return [pscustomobject]@{ Phases = $phases.ToArray(); Problems = $problems.ToArray() }
@@ -2672,6 +3503,7 @@ function Format-PraUtcText {
     <# 'yyyy-MM-dd HH:mm:ss UTC' from an ISO 8601 text; the text itself when it cannot be read. #>
     param([AllowNull()][string]$Iso)
     if (-not $Iso) { return '' }
+    if ($Iso.Length -ge 20 -and $Iso[$Iso.Length - 1] -eq [char]'Z' -and $Iso[4] -eq [char]'-' -and $Iso[10] -eq [char]'T' -and $Iso[13] -eq [char]':') { return $Iso.Substring(0, 10) + ' ' + $Iso.Substring(11, 8) + ' UTC' }
     $parsed = [datetimeoffset]::MinValue
     if ([datetimeoffset]::TryParse($Iso, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) {
         return $parsed.UtcDateTime.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ' UTC'
@@ -2687,21 +3519,33 @@ function Get-PraPhaseDuration {
     return ''
 }
 
+function Get-PraGlobalStep {
+    <# The steps of a phase record entry as uniform objects: Time as UTC text, Step, Status, Text. #>
+    [CmdletBinding()]
+    param([AllowNull()]$Item)
+    $raw = Get-PraValue $Item 'Steps' $null
+    if ($null -eq $raw) { return }
+    foreach ($step in $raw) {
+        if ($null -eq $step) { continue }
+        try { [pscustomobject]@{ Time = (Format-PraUtcText ([string]$step.Time)); Step = [string]$step.Step; Status = [string]$step.Status; Text = [string]$step.Text } }
+        catch { [pscustomobject]@{ Time = (Format-PraUtcText ([string](Get-PraValue $step 'Time' ''))); Step = [string](Get-PraValue $step 'Step' ''); Status = [string](Get-PraValue $step 'Status' ''); Text = [string](Get-PraValue $step 'Text' '') } }
+    }
+}
+
 function Get-PraGlobalModel {
     <#
     .SYNOPSIS
         The data of the global report: the phases of the batch (earlier phases read from the PhaseData files of $Context.PhaseFolders, then this run),
         and one entry per object with its stage in each phase, its journey across the servers and its verdict.
     .DESCRIPTION
-        Verdict: failed when any phase failed it; otherwise pending when its last stage is Pending (it is expected on a later side, or it was
+        Verdict: failed when any phase failed it (the cloud error of a stage that did both sides is replaced by a later stage that covers the cloud side); otherwise pending when its last stage is Pending (it is expected on a later side, or it was
         filtered out there); skipped; done with warnings when a warning was raised; otherwise done. A side that was not carried is listed as not available.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context)
     $environment = [string](Get-PraValue (Get-PraValue $Context 'Config' @{}) 'Environment' '')
-    $history = Read-PraPhaseData -Folder @(Get-PraList $Context 'PhaseFolders') -Environment $environment
-    $currentJson = (New-PraPhaseRecord -Context $Context) | ConvertTo-Json -Depth 8 -Compress
-    $current = $currentJson | ConvertFrom-PraJson
+    $history = Read-PraPhaseData -Folder @(Get-PraList $Context 'PhaseFolders') -Environment $environment -Context $Context -SkipRunId ([string](Get-PraValue $Context 'RunId' ''))
+    $current = New-PraPhaseRecord -Context $Context
     $action = [string](Get-PraValue $Context 'Action' '')
     $mainActions = if (Test-PraOrdinalIn $action @('Recover', 'Finalize')) { @('Recover', 'Finalize') } else { @($action) }
     $all = New-Object 'Collections.Generic.List[object]'
@@ -2769,36 +3613,52 @@ function Get-PraGlobalModel {
             $guid = [string](Get-PraValue $item 'ObjectGuid' ''); $name = [string](Get-PraValue $item 'Name' '')
             $key = if ($guid) { $guid.ToLowerInvariant() } else { $name.ToLowerInvariant() }
             if (-not $key) { continue }
-            $entry = $null
-            if (-not $byKey.TryGetValue($key, [ref]$entry)) {
+            $entry = $byKey[$key]
+            if ($null -eq $entry) {
                 $entry = [pscustomobject]@{ Key = $key; ObjectGuid = $guid; Name = $name; Sam = [string](Get-PraValue $item 'SamAccountName' ''); Upn = [string](Get-PraValue $item 'UserPrincipalName' '')
-                    IsShared = [bool](Get-PraValue $item 'IsShared' $false); Stages = (New-Object 'Collections.Generic.List[object]'); Verdict = ''; Note = ''; Backup = '' }
+                    IsShared = [bool](Get-PraValue $item 'IsShared' $false); Stages = (New-Object 'Collections.Generic.List[object]'); Verdict = ''; Note = ''; Backup = ''; Journey = @() }
                 $byKey[$key] = $entry; $objects.Add($entry)
             }
             $backup = [string](Get-PraValue $item 'BackupPath' '')
             if ($backup -and -not $entry.Backup) { $entry.Backup = $backup }
-            $same = @($entry.Stages | Where-Object { [object]::ReferenceEquals($_.Phase, $stagePhase) })
-            if ($same.Count) {
-                $stage = $same[0]
-                $earlierResult = [ordered]@{ Time = ''; Step = 'Earlier run'; Status = 'Info'; Text = (Limit-PraText (('{0} - {1}' -f $stage.Status, $stage.Detail).Trim(' ', '-')) 300) }
+            $stage = $null
+            foreach ($candidate in $entry.Stages) { if ([object]::ReferenceEquals($candidate.Phase, $stagePhase)) { $stage = $candidate; break } }
+            if ($null -ne $stage) {
+                $earlierResult = [pscustomobject]@{ Time = ''; Step = 'Earlier run'; Status = 'Info'; Text = (Limit-PraText (('{0} - {1}' -f $stage.Status, $stage.Detail).Trim(' ', '-')) 300) }
                 $warnings = (@($stage.Warnings, [string](Get-PraValue $item 'Warnings' '')) | Where-Object { $_ } | Get-PraOrdinalUnique) -join ' | '
-                $stage.Status = [string](Get-PraValue $item 'FinalStatus' ''); $stage.Detail = [string](Get-PraValue $item 'Detail' ''); $stage.Warnings = $warnings
-                $stage.Steps = @(@($stage.Steps) + @($earlierResult) + @(Get-PraList $item 'Steps'))
+                $stage.Status = [string](Get-PraValue $item 'FinalStatus' ''); $stage.Detail = [string](Get-PraValue $item 'Detail' ''); $stage.Warnings = $warnings; $stage.ADVerified = ((Get-PraValue $item 'ADVerified' $null) -eq $true)
+                $stage.Steps = @(@($stage.Steps) + @($earlierResult) + @(Get-PraGlobalStep $item))
                 continue
             }
             [void]$entry.Stages.Add([pscustomobject]@{ Phase = $stagePhase; Present = $true; HandedOverTo = ''; StatusDisplay = ''; Status = [string](Get-PraValue $item 'FinalStatus' ''); Detail = [string](Get-PraValue $item 'Detail' ''); Warnings = [string](Get-PraValue $item 'Warnings' '')
-                    Steps = @(Get-PraList $item 'Steps') })
+                    ADVerified = ((Get-PraValue $item 'ADVerified' $null) -eq $true); Superseded = $false; Steps = @(Get-PraGlobalStep $item) })
         }
     }
     $verdicts = @{ Done = 0; Warn = 0; Failed = 0; Pending = 0; Skipped = 0 }
+    $position = 0
     foreach ($entry in $objects) {
         # One stage per main phase, in order; a phase that does not list the object leaves an explicit gap.
         $staged = New-Object 'Collections.Generic.List[object]'
         foreach ($phase in $stagePhases) {
-            $stage = @($entry.Stages | Where-Object { [object]::ReferenceEquals($_.Phase, $phase) })
-            if ($stage.Count) { $staged.Add($stage[0]) } else { $staged.Add([pscustomobject]@{ Phase = $phase; Present = $false; HandedOverTo = ''; StatusDisplay = ''; Status = ''; Detail = ''; Warnings = ''; Steps = @() }) }
+            $stage = $null
+            foreach ($candidate in $entry.Stages) { if ([object]::ReferenceEquals($candidate.Phase, $phase)) { $stage = $candidate; break } }
+            if ($null -ne $stage) { $staged.Add($stage) } else { $staged.Add([pscustomobject]@{ Phase = $phase; Present = $false; HandedOverTo = ''; StatusDisplay = ''; Status = ''; Detail = ''; Warnings = ''; ADVerified = $false; Superseded = $false; Steps = @() }) }
         }
         $entry.Stages = $staged
+        # An error of the cloud part of a stage that did both sides (its AD part was verified) is not final when a later stage of the same operation covers the cloud side for this object:
+        # that stage replaces the cloud result, and the earlier error stays in its journey as an "Earlier run" line.
+        for ($i = 0; $i -lt $staged.Count; $i++) {
+            $stage = $staged[$i]
+            if (-not $stage.Present -or -not (Test-PraOrdinalEqual $stage.Status 'Error') -or -not $stage.ADVerified -or -not (Test-PraOrdinalEqual ([string](Get-PraValue $stage.Phase.Header 'Phase' '')) 'Both')) { continue }
+            for ($j = $i + 1; $j -lt $staged.Count; $j++) {
+                $later = $staged[$j]
+                if (-not $later.Present -or -not (Test-PraOrdinalEqual ([string](Get-PraValue $later.Phase.Header 'Action' '')) ([string](Get-PraValue $stage.Phase.Header 'Action' ''))) -or
+                    -not (Test-PraOrdinalIn ([string](Get-PraValue $later.Phase.Header 'Phase' '')) @('Cloud', 'Both'))) { continue }
+                $stage.Superseded = $true
+                $later.Steps = @([pscustomobject]@{ Time = ''; Step = 'Earlier run'; Status = 'Info'; Text = (Limit-PraText (('{0} - {1}' -f $stage.Status, $stage.Detail).Trim(' ', '-')) 300) }) + @($later.Steps)
+                break
+            }
+        }
         # Display only: a Pending stage that a later phase lists for this object reads "Handed over" (it is Pending when no later phase lists it).
         for ($i = 0; $i -lt $staged.Count; $i++) {
             $stage = $staged[$i]
@@ -2809,10 +3669,18 @@ function Get-PraGlobalModel {
                 if ($staged[$j].Present) { $stage.HandedOverTo = $staged[$j].Phase.Label; $stage.StatusDisplay = $script:PraHandedOver; break }
             }
         }
-        $present = @($staged | Where-Object { $_.Present })
+        $present = New-Object 'Collections.Generic.List[object]'
+        $failedAnywhere = $false; $warned = $false
+        foreach ($stage in $staged) {
+            if (-not $stage.Present) { continue }
+            $present.Add($stage)
+            if (-not $stage.Superseded -and [string]::Equals($stage.Status, 'Error', [StringComparison]::Ordinal)) { $failedAnywhere = $true }
+            if (-not $warned) {
+                if ($stage.Warnings.Trim()) { $warned = $true }
+                else { foreach ($step in $stage.Steps) { if ([string]::Equals($step.Status, 'Warn', [StringComparison]::Ordinal)) { $warned = $true; break } } }
+            }
+        }
         $last = $present[$present.Count - 1]
-        $failedAnywhere = @($present | Where-Object { Test-PraOrdinalEqual $_.Status 'Error' }).Count -gt 0
-        $warned = @($present | Where-Object { $_.Warnings.Trim() -or @($_.Steps | Where-Object { Test-PraOrdinalEqual (Get-PraValue $_ 'Status' '') 'Warn' }).Count }).Count -gt 0
         $lastStage = $staged[$staged.Count - 1]
         if ($failedAnywhere) { $entry.Verdict = 'failed' }
         elseif (Test-PraOrdinalEqual $last.Status 'Pending') {
@@ -2825,28 +3693,66 @@ function Get-PraGlobalModel {
         else { $entry.Verdict = 'done' }
         if ((Test-PraOrdinalEqual $entry.Verdict 'failed')) { $verdicts.Failed++ } elseif ((Test-PraOrdinalEqual $entry.Verdict 'pending')) { $verdicts.Pending++ } elseif ((Test-PraOrdinalEqual $entry.Verdict 'skipped')) { $verdicts.Skipped++ }
         elseif ((Test-PraOrdinalEqual $entry.Verdict 'done with warnings')) { $verdicts.Warn++ } else { $verdicts.Done++ }
+        $entry.Journey = @(Get-PraGlobalJourney -Entry $entry -Index $position)
+        $position++
+    }
+    # What a limit left out (counted by the phase that wrote it), the journey lines that name no object, and every error and warning of every phase.
+    $omittedList = New-Object 'Collections.Generic.List[object]'
+    $unattachedList = New-Object 'Collections.Generic.List[object]'
+    $issueList = New-Object 'Collections.Generic.List[object]'
+    $number = { param($Value) ([long]$Value).ToString('N0', [Globalization.CultureInfo]::InvariantCulture) }
+    foreach ($entry in $ordered) {
+        if (-not $entry.Available) { continue }
+        $header = $entry.Header; $record = $entry.Record
+        $omit = Get-PraValue $record 'Omitted' $null
+        $limit = Get-PraValue $record 'Limits' $null
+        $limitOf = { param($Name) $value = Get-PraValue $limit $Name $null; if ($null -eq $value) { $script:PraPhaseLimits[$Name] } else { $value } }
+        $eventsLimit = [long](& $limitOf 'MaxEventsBytes')
+        $eventsLimitText = if ($eventsLimit -ge 1MB) { '{0} MB' -f (& $number ($eventsLimit / 1MB)) } else { '{0} bytes' -f (& $number $eventsLimit) }
+        $sentences = New-Object 'Collections.Generic.List[string]'
+        $bySize = [long](Get-PraValue $omit 'ObjectsBySize' 0)
+        $byCount = [long](Get-PraValue $omit 'Objects' 0) - $bySize
+        if ($byCount -gt 0) { $sentences.Add(('{0} object(s) are not in this phase data (more than {1} objects in one phase)' -f (& $number $byCount), (& $number (& $limitOf 'MaxObjects')))) }
+        if ($bySize -gt 0) { $sentences.Add(('{0} object(s) are not in this phase data (the file would pass {1} MB); their journey lines are in the events file' -f (& $number $bySize), (& $number ([long](& $limitOf 'MaxFileBytes') / 1MB)))) }
+        if ([long](Get-PraValue $omit 'JourneyLines' 0) -gt 0) { $sentences.Add(('{0} journey line(s) were not kept (more than {1} lines in one phase)' -f (& $number (Get-PraValue $omit 'JourneyLines' 0)), (& $number (& $limitOf 'MaxJourney')))) }
+        if ([long](Get-PraValue $omit 'Texts' 0) -gt 0) { $sentences.Add(('{0} text(s) were cut to their first characters (they end with "...")' -f (& $number (Get-PraValue $omit 'Texts' 0)))) }
+        if ([long](Get-PraValue $omit 'EventLines' 0) -gt 0) { $sentences.Add(('{0} line(s) were not written to the events file of this phase (it would pass {1})' -f (& $number (Get-PraValue $omit 'EventLines' 0)), $eventsLimitText)) }
+        if ([int](Get-PraValue $record 'EventLinesSkipped' 0) -gt 0) { $sentences.Add(('{0} line(s) of the events file could not be read and were skipped' -f (& $number (Get-PraValue $record 'EventLinesSkipped' 0)))) }
+        $eventsProblem = [string](Get-PraValue $record 'EventsProblem' '')
+        if ($eventsProblem) { $sentences.Add(('the steps, errors and warnings of this phase are not available: {0}' -f $eventsProblem)) }
+        if ($sentences.Count) {
+            $omittedList.Add([pscustomobject]@{ Label = [string]$entry.Label; Computer = [string](Get-PraValue $header 'Computer' ''); LogFile = [string](Get-PraValue $header 'LogFile' ''); Items = $sentences.ToArray() })
+        }
+        foreach ($line in @(Get-PraList $record 'Unattached')) { $unattachedList.Add([pscustomobject]@{ Phase = [string]$entry.Label; Item = $line }) }
+        foreach ($issue in @(Get-PraList $record 'Issues')) {
+            $issueList.Add([pscustomobject]@{ Phase = [string]$entry.Label; Kind = 'error'; Time = [string](Get-PraValue $issue 'Timestamp' ''); Step = [string](Get-PraValue $issue 'Phase' ''); Object = [string](Get-PraValue $issue 'Identity' ''); Message = [string](Get-PraValue $issue 'Message' '') })
+        }
+        foreach ($warning in @(Get-PraList $record 'Warnings')) {
+            $issueList.Add([pscustomobject]@{ Phase = [string]$entry.Label; Kind = 'warning'; Time = [string](Get-PraValue $warning 'Timestamp' ''); Step = [string](Get-PraValue $warning 'Phase' ''); Object = ''; Message = [string](Get-PraValue $warning 'Message' '') })
+        }
     }
     return [pscustomobject]@{
         Phases = $ordered.ToArray(); Objects = $objects.ToArray(); Counts = $verdicts; Problems = $history.Problems; Environment = $environment
         Missing = @($missing | ForEach-Object { $_.Label }); Version = [string](Get-PraValue $Context 'Version' ''); BatchId = [string](Get-PraValue $Context 'BatchId' '')
-        Action = $action; Current = $current
+        Action = $action; Current = $current; Omitted = $omittedList.ToArray(); Unattached = $unattachedList.ToArray(); Issues = $issueList.ToArray()
     }
 }
 
-$script:PraGlobalCss = @'
-:root{color-scheme:light dark;--bg:#f7f4ef;--surface:#fff;--soft:#f5f5f5;--border:#dedede;--text:#242424;--muted:#5c5c5c;--accent:#b11f4b;--accent-2:#9a1a41;--accent-fg:#fff;--highlight:rgba(177,31,75,.12);--ok:#16a34a;--warn:#b45309;--fail:#dc2626;--info:#0078d4}
-@media (prefers-color-scheme:dark){:root{--bg:#3d3b3a;--surface:#292929;--soft:#2e2e2e;--border:#474747;--text:#dedede;--muted:#a0a0a0;--accent:#fd8ea1;--accent-2:#fb7b91;--accent-fg:#1a1a1a;--highlight:rgba(253,142,161,.12);--ok:#4ade80;--warn:#fbbf24;--fail:#f87171;--info:#4da6ff}}
-*{box-sizing:border-box}body{margin:0;padding:28px 32px;background:var(--bg);color:var(--text);font:14px "Segoe UI",Aptos,Calibri,sans-serif}
-header{position:relative;overflow:hidden;border:1px solid var(--border);border-top:4px solid var(--accent);border-radius:16px;padding:24px;margin-bottom:20px;background:var(--surface)}
-.origin{color:var(--accent);font-size:11px;letter-spacing:.1em;text-transform:uppercase;font-weight:700}h1{font-size:28px;font-weight:650;margin:8px 0 6px}h2{font-size:16px;font-weight:600;margin:0 0 12px}.subtitle{color:var(--muted);margin:0}
-.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;margin:0 0 20px}.tile{padding:14px 16px;border:1px solid var(--border);border-radius:16px;background:var(--surface)}
-.tile-label{font-size:12px;font-weight:600;color:var(--muted)}.tile-value{font-size:26px;font-weight:650;margin-top:6px}.tile.ok .tile-value{color:var(--ok)}.tile.warn .tile-value{color:var(--warn)}.tile.fail .tile-value{color:var(--fail)}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;margin-bottom:20px;overflow-x:auto}.card.warn{border-left:4px solid var(--warn)}.card.fail{border-left:4px solid var(--fail)}
-table{border-collapse:collapse;width:100%;font-size:13px}th{text-align:left;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--accent);padding:6px 10px;border-bottom:1px solid var(--border)}td{padding:6px 10px;border-bottom:1px solid var(--border);vertical-align:top;word-break:break-word}
-.pill{display:inline-block;padding:1px 10px;border-radius:999px;font-weight:600;font-size:12px;background:var(--soft)}.pill.ok{color:var(--ok)}.pill.warn{color:var(--warn)}.pill.fail{color:var(--fail)}.pill.muted{color:var(--muted)}
-details{border-top:1px solid var(--border);padding:8px 0}summary{cursor:pointer;font-weight:600}.muted{color:var(--muted)}.mono{font-family:Consolas,"Cascadia Mono",monospace;font-size:12px}ul.plain{margin:6px 0 0;padding-left:18px}
-.missing{color:var(--warn);font-weight:600}
-'@
+function Get-PraGlobalJourney {
+    <# The journey lines of one object of the global model, in the order of its stages: the steps of each phase, then the result of the phase; a phase that does not list the object gets one line saying so. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Entry, [AllowNull()][object]$Index = $null)
+    foreach ($stage in $Entry.Stages) {
+        $label = [string]$stage.Phase.Label
+        if (-not $stage.Present) { [pscustomobject]@{ Object = $Index; Phase = $label; Step = ''; Status = ''; Time = ''; Text = 'This object is not in the results of this phase.' }; continue }
+        foreach ($step in @($stage.Steps)) {
+            [pscustomobject]@{ Object = $Index; Phase = $label; Step = $step.Step; Status = $step.Status; Time = $step.Time; Text = $step.Text }
+        }
+        $message = (('{0} {1}' -f $stage.Detail, $stage.Warnings)).Trim()
+        $resultText = if ($stage.HandedOverTo) { '{0} (handed over to {1})' -f $stage.Status, $stage.HandedOverTo } else { [string]$stage.Status }
+        [pscustomobject]@{ Object = $Index; Phase = $label; Step = 'Result of this phase'; Status = [string]$stage.StatusDisplay; Time = ''; Text = (('{0} - {1}' -f $resultText, $message).Trim(' ', '-')) }
+    }
+}
 
 function Get-PraStatusClass {
     <# Style class of a status or verdict text (display only). #>
@@ -2860,35 +3766,82 @@ function Get-PraStatusClass {
 function Write-PraGlobalReportHtml {
     <#
     .SYNOPSIS
-        Writes the global report (one page, no script, no external resource): the batch timeline across the servers, the run settings that differed
-        from the configuration file, one entry per object with its journey from one side to the other and its verdict, and the errors and warnings of each side.
-        Every value is HTML-encoded.
+        Writes the global report: one self-contained page (templates\GlobalReport.template.html), no external resource. The summary (tiles, side not available, what a limit left
+        out, batch timeline, run settings) is HTML-encoded markup that reads without script. The objects (one row each), their journey lines, the errors and warnings and the journey
+        lines that name no object are written by Write-PraReportChunks and read by the script of the page: no object, no line and no error or warning is left out of the page,
+        whatever their number.
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][IO.TextWriter]$Writer)
+    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][IO.TextWriter]$Writer, [string]$TemplateFolder = '', [string]$ObjectsCsvName = '', [string]$EventsCsvName = '', [string]$IssuesCsvName = '',
+        [int]$ChunkRows = $script:ReportChunkRows, [int]$ChunkChars = $script:ReportChunkChars)
     $h = { param($Value) ConvertTo-PraHtmlText $Value }
+    $dot = [char]0x00B7
     $counts = $Model.Counts
-    $total = $Model.Objects.Count
+    $objects = $Model.Objects
+    $total = $objects.Count
     $overall = if ($counts.Failed -gt 0) { 'Failed' } elseif ($counts.Pending -gt 0) { 'Pending' } else { 'Success' }
     $overallClass = if ($counts.Failed -gt 0) { 'fail' } elseif ($counts.Pending -gt 0) { 'warn' } else { 'ok' }
-    $sb = New-Object Text.StringBuilder
-    [void]$sb.Append('<!doctype html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>').Append((& $h ('PRA Remote Mailbox - global report - ' + $Model.Action))).Append('</title><style>').Append($script:PraGlobalCss).Append('</style></head><body>')
-    [void]$sb.Append('<header><div class="origin">PRA Remote Mailbox ').Append([char]0x00B7).Append(' global report</div><h1>').Append((& $h ('{0} across the servers' -f $(if (Test-PraOrdinalIn $Model.Action @('Recover', 'Finalize')) { 'Recover and Finalize' } else { $Model.Action })))).Append('</h1><p class="subtitle">')
-    [void]$sb.Append((& $h ('Environment {0} {1} batch {2} {1} tool v{3}' -f $Model.Environment, [char]0x00B7, $Model.BatchId, $Model.Version))).Append('</p></header>')
-    [void]$sb.Append('<div class="tiles">')
-    foreach ($tile in @(@('Result', $overall, $overallClass), @('Objects', $total, ''), @('Done', $counts.Done, 'ok'), @('Done with warnings', $counts.Warn, $(if ($counts.Warn) { 'warn' } else { '' })),
-            @('Failed', $counts.Failed, $(if ($counts.Failed) { 'fail' } else { '' })), @('Pending', $counts.Pending, $(if ($counts.Pending) { 'warn' } else { '' })), @('Skipped', $counts.Skipped, ''))) {
-        [void]$sb.Append('<div class="tile ').Append($tile[2]).Append('"><div class="tile-label">').Append((& $h $tile[0])).Append('</div><div class="tile-value">').Append((& $h $tile[1])).Append('</div></div>')
+
+    # Journey lines: one row per line, grouped by object (the index of the object in the objects list), then the lines that name no object.
+    $eventItems = New-Object 'Collections.Generic.List[object]'
+    $objectItems = New-Object 'Collections.Generic.List[object]'
+    for ($index = 0; $index -lt $total; $index++) {
+        $entry = $objects[$index]
+        $eventItems.AddRange($entry.Journey)
+        $stages = (@($entry.Stages | ForEach-Object { '{0}: {1}' -f $_.Phase.Label, $(if ($_.Present) { $_.StatusDisplay } else { '-' }) }) -join ' | ')
+        $objectItems.Add([pscustomobject]@{ Name = $entry.Name; ObjectGuid = $entry.ObjectGuid; Sam = $entry.Sam; Upn = $entry.Upn; Type = $(if ($entry.IsShared) { 'Shared mailbox' } else { 'User mailbox' })
+                Verdict = $entry.Verdict; Stages = $stages; Note = $entry.Note; Backup = $entry.Backup; Events = $entry.Journey.Count })
     }
-    [void]$sb.Append('</div>')
+    foreach ($pair in $Model.Unattached) {
+        $item = $pair.Item
+        $who = [string](Get-PraValue $item 'Name' '')
+        $eventItems.Add([pscustomobject]@{ Object = $null; Phase = $pair.Phase; Step = [string](Get-PraValue $item 'Step' ''); Status = [string](Get-PraValue $item 'Status' ''); Time = (Format-PraUtcText ([string](Get-PraValue $item 'Time' ''))); Text = ($(if ($who) { $who + ': ' } else { '' }) + [string](Get-PraValue $item 'Text' '')) })
+    }
+    $issueItems = [object[]]@($Model.Issues)
+    $errorCount = @($issueItems | Where-Object { Test-PraOrdinalEqual $_.Kind 'error' }).Count
+    $warningCount = $issueItems.Count - $errorCount
+    $objectFields = @('Name', 'ObjectGuid', 'Sam', 'Upn', 'Type', 'Verdict', 'Stages', 'Note', 'Backup', 'Events')
+    $eventFields = @('Object', 'Phase', 'Step', 'Status', 'Time', 'Text')
+    $issueFields = @('Phase', 'Kind', 'Time', 'Step', 'Object', 'Message')
+
+    $tiles = New-Object Text.StringBuilder
+    foreach ($tile in @(@('Result', $overall, $overallClass), @('Objects', $total, ''), @('Done', $counts.Done, 'ok'), @('Done with warnings', $counts.Warn, $(if ($counts.Warn) { 'warn' } else { '' })),
+            @('Failed', $counts.Failed, $(if ($counts.Failed) { 'fail' } else { '' })), @('Pending', $counts.Pending, $(if ($counts.Pending) { 'warn' } else { '' })), @('Skipped', $counts.Skipped, ''), @('Journey lines', $eventItems.Count, ''))) {
+        [void]$tiles.Append('<div class="tile ').Append($tile[2]).Append('"><div class="tile-label">').Append((& $h $tile[0])).Append('</div><div class="tile-value">').Append((& $h $tile[1])).Append('</div></div>')
+    }
+
+    $sb = New-Object Text.StringBuilder
     if ($Model.Missing.Count) {
         [void]$sb.Append('<section class="card warn"><h2>Side not available</h2>')
         foreach ($label in $Model.Missing) { [void]$sb.Append('<p class="missing">').Append((& $h ('{0}: {1}' -f $label, $script:PraNotAvailable))).Append('</p>') }
         [void]$sb.Append('<p class="muted">The objects below are reported from the sides that were carried. The verdicts do not include the missing side.</p></section>')
     }
     foreach ($problem in $Model.Problems) { [void]$sb.Append('<section class="card warn"><p class="missing">').Append((& $h $problem)).Append('</p></section>') }
+    if (@($Model.Omitted).Count) {
+        [void]$sb.Append('<section class="card warn" id="omitted"><h2>Not everything was kept</h2><p>What follows was left out of the data that the phases carried. Everything else is in this report.</p><div class="scroll"><table class="summary-table"><thead><tr><th>Phase</th><th>Left out</th><th>The complete data</th></tr></thead><tbody>')
+        foreach ($omit in $Model.Omitted) {
+            $where = if ($omit.LogFile) { 'the log of that run: {0}{1}' -f $omit.LogFile, $(if ($omit.Computer) { ' (on ' + $omit.Computer + ')' } else { '' }) } else { 'the log of that run' }
+            [void]$sb.Append('<tr><td>').Append((& $h $omit.Label)).Append('</td><td>').Append((($omit.Items | ForEach-Object { & $h $_ }) -join '<br>')).Append('</td><td>').Append((& $h $where)).Append('</td></tr>')
+        }
+        [void]$sb.Append('</tbody></table></div></section>')
+    }
+    if ($issueItems.Count) {
+        [void]$sb.Append('<section class="card ').Append($(if ($errorCount) { 'fail' } else { 'warn' })).Append('" id="issue-counts"><h2>Errors and warnings</h2><div class="scroll"><table class="summary-table"><thead><tr><th>Phase</th><th>Errors</th><th>Warnings</th></tr></thead><tbody>')
+        $perPhase = New-Object 'Collections.Generic.Dictionary[string,int[]]' -ArgumentList ([StringComparer]::Ordinal)
+        foreach ($issue in $issueItems) {
+            $pair = $null
+            if (-not $perPhase.TryGetValue($issue.Phase, [ref]$pair)) { $pair = [int[]]@(0, 0); $perPhase[$issue.Phase] = $pair }
+            if (Test-PraOrdinalEqual $issue.Kind 'error') { $pair[0]++ } else { $pair[1]++ }
+        }
+        foreach ($phaseLabel in $perPhase.Keys) { [void]$sb.Append('<tr><td>').Append((& $h $phaseLabel)).Append('</td><td>').Append($perPhase[$phaseLabel][0]).Append('</td><td>').Append($perPhase[$phaseLabel][1]).Append('</td></tr>') }
+        [void]$sb.Append('</tbody></table></div><p class="muted">Every error and warning is listed in the table at the end of this page')
+        if ($IssuesCsvName) { [void]$sb.Append(' and in ').Append((& $h $IssuesCsvName)) }
+        [void]$sb.Append('.</p></section>')
+    }
+    $noticesHtml = $sb.ToString(); [void]$sb.Clear()
+
     # Timeline.
-    [void]$sb.Append('<section class="card"><h2>Batch timeline</h2><table><thead><tr><th>Phase</th><th>Server</th><th>Operator</th><th>Started</th><th>Ended</th><th>Duration</th><th>Status</th><th>Mode</th><th>Tool</th></tr></thead><tbody>')
+    [void]$sb.Append('<section class="card"><h2>Batch timeline</h2><div class="scroll"><table class="summary-table"><thead><tr><th>Phase</th><th>Server</th><th>Operator</th><th>Started</th><th>Ended</th><th>Duration</th><th>Status</th><th>Mode</th><th>Tool</th></tr></thead><tbody>')
     foreach ($phase in $Model.Phases) {
         if (-not $phase.Available) {
             [void]$sb.Append('<tr><td>').Append((& $h $phase.Label)).Append('</td><td colspan="8" class="missing">').Append((& $h $phase.Note)).Append('</td></tr>'); continue
@@ -2902,7 +3855,9 @@ function Write-PraGlobalReportHtml {
         [void]$sb.Append((& $h (Format-PraUtcText (Get-PraValue $p 'StartedUtc' '')))).Append('</td><td>').Append((& $h (Format-PraUtcText (Get-PraValue $p 'EndedUtc' '')))).Append('</td><td>').Append((& $h (Get-PraPhaseDuration $p))).Append('</td><td><span class="pill ').Append((Get-PraStatusClass $shown)).Append('"').Append($rawTitle).Append('>')
         [void]$sb.Append((& $h $shown)).Append('</span></td><td>').Append((& $h (Get-PraValue $p 'Mode' ''))).Append('</td><td>').Append((& $h (Get-PraValue $phase.Record 'ToolVersion' ''))).Append('</td></tr>')
     }
-    [void]$sb.Append('</tbody></table></section>')
+    [void]$sb.Append('</tbody></table></div></section>')
+    $timelineHtml = $sb.ToString(); [void]$sb.Clear()
+
     # Run settings per phase.
     [void]$sb.Append('<section class="card"><h2>Run settings changed from the configuration file</h2>')
     $anyOverride = $false
@@ -2921,86 +3876,98 @@ function Write-PraGlobalReportHtml {
         if (-not $phase.Available) { continue }
         $settings = Get-PraValue $phase.Header 'Settings' $null
         if ($null -eq $settings) { continue }
-        [void]$sb.Append('<details><summary>Settings used ').Append([char]0x00B7).Append(' ').Append((& $h $phase.Label)).Append('</summary><ul class="plain">')
-        foreach ($property in $settings.PSObject.Properties) { [void]$sb.Append('<li><span class="muted">').Append((& $h $property.Name)).Append(':</span> ').Append((& $h $property.Value)).Append('</li>') }
+        $pairs = if ($settings -is [Collections.IDictionary]) { @($settings.Keys | ForEach-Object { , @([string]$_, $settings[$_]) }) } else { @($settings.PSObject.Properties | ForEach-Object { , @($_.Name, $_.Value) }) }
+        [void]$sb.Append('<details><summary>Settings used ').Append($dot).Append(' ').Append((& $h $phase.Label)).Append('</summary><ul class="plain">')
+        foreach ($pair in $pairs) { [void]$sb.Append('<li><span class="muted">').Append((& $h $pair[0])).Append(':</span> ').Append((& $h $pair[1])).Append('</li>') }
         [void]$sb.Append('</ul></details>')
     }
     [void]$sb.Append('</section>')
-    # Objects.
-    [void]$sb.Append('<section class="card"><h2>Objects, end to end</h2>')
-    $detailed = $total -le $script:PraPhaseLimits.DetailedObjects
-    if (-not $detailed) { [void]$sb.Append('<p class="muted">').Append((& $h ('More than {0} objects: the journey is written for the objects that are not simply done; the CSV file lists every object.' -f $script:PraPhaseLimits.DetailedObjects))).Append('</p>') }
-    [void]$sb.Append('<table><thead><tr><th>Object</th><th>Type</th><th>Verdict</th>')
-    $mainPhases = @($Model.Phases | Where-Object { (Test-PraOrdinalEqual $_.Role 'Main') -and $_.Available })
-    foreach ($phase in $mainPhases) { [void]$sb.Append('<th>').Append((& $h $phase.Label)).Append('</th>') }
-    [void]$sb.Append('</tr></thead><tbody>')
-    foreach ($entry in $Model.Objects) {
-        $class = Get-PraStatusClass $entry.Verdict
-        [void]$sb.Append('<tr><td>').Append((& $h $entry.Name)).Append('</td><td>').Append($(if ($entry.IsShared) { 'Shared mailbox' } else { 'User mailbox' })).Append('</td><td><span class="pill ').Append($class).Append('">').Append((& $h $entry.Verdict)).Append('</span></td>')
-        foreach ($stage in $entry.Stages) {
-            if ($stage.Present) { [void]$sb.Append('<td><span class="pill ').Append((Get-PraStatusClass $stage.StatusDisplay)).Append('">').Append((& $h $stage.StatusDisplay)).Append('</span></td>') }
-            else { [void]$sb.Append('<td class="muted">not in this phase</td>') }
-        }
-        [void]$sb.Append('</tr>')
-        if ($detailed -or (-not (Test-PraOrdinalEqual $entry.Verdict 'done'))) {
-            [void]$sb.Append('<tr><td colspan="').Append(3 + $mainPhases.Count).Append('"><details><summary>Journey of ').Append((& $h $entry.Name)).Append('</summary>')
-            if ($entry.Note) { [void]$sb.Append('<p class="missing">').Append((& $h $entry.Note)).Append('</p>') }
-            if ($entry.Backup) { [void]$sb.Append('<p class="muted">Backup: <span class="mono">').Append((& $h $entry.Backup)).Append('</span></p>') }
-            [void]$sb.Append('<table><thead><tr><th>Side</th><th>Step</th><th>Status</th><th>Time</th><th>Message</th></tr></thead><tbody>')
-            foreach ($stage in $entry.Stages) {
-                if (-not $stage.Present) { [void]$sb.Append('<tr><td>').Append((& $h $stage.Phase.Label)).Append('</td><td colspan="4" class="muted">This object is not in the results of this phase.</td></tr>'); continue }
-                foreach ($step in @($stage.Steps)) {
-                    $stepStatus = [string](Get-PraValue $step 'Status' '')
-                    [void]$sb.Append('<tr><td>').Append((& $h $stage.Phase.Label)).Append('</td><td>').Append((& $h (Get-PraValue $step 'Step' ''))).Append('</td><td><span class="pill ').Append((Get-PraStatusClass $stepStatus)).Append('">').Append((& $h $stepStatus)).Append('</span></td><td>')
-                    [void]$sb.Append((& $h (Format-PraUtcText (Get-PraValue $step 'Time' '')))).Append('</td><td>').Append((& $h (Get-PraValue $step 'Text' ''))).Append('</td></tr>')
-                }
-                $message = (('{0} {1}' -f $stage.Detail, $stage.Warnings)).Trim()
-                $resultText = if ($stage.HandedOverTo) { '{0} (handed over to {1})' -f $stage.Status, $stage.HandedOverTo } else { $stage.Status }
-                [void]$sb.Append('<tr><td>').Append((& $h $stage.Phase.Label)).Append('</td><td><strong>Result of this phase</strong></td><td><span class="pill ').Append((Get-PraStatusClass $stage.StatusDisplay)).Append('">').Append((& $h $resultText)).Append('</span></td><td></td><td>').Append((& $h $message)).Append('</td></tr>')
-            }
-            [void]$sb.Append('</tbody></table></details></td></tr>')
+    $settingsHtml = $sb.ToString()
+
+    $notice = '{0} object(s), {1} journey line(s), {2} error(s) and {3} warning(s) are stored in this file.' -f $total, $eventItems.Count, $errorCount, $warningCount
+    if ($ObjectsCsvName -and $EventsCsvName -and $IssuesCsvName) { $notice += ' The files {0}, {1} and {2} hold every object, every journey line and every error and warning.' -f $ObjectsCsvName, $EventsCsvName, $IssuesCsvName }
+    if (-not $TemplateFolder) { $TemplateFolder = Join-Path ([IO.Path]::GetDirectoryName($PSScriptRoot)) 'templates' }
+    $templatePath = Join-Path $TemplateFolder 'GlobalReport.template.html'
+    $template = if (Test-Path -LiteralPath $templatePath -PathType Leaf) { [IO.File]::ReadAllText($templatePath, [Text.Encoding]::UTF8) }
+        else { '<!doctype html><html><head><meta charset="utf-8"><title>{{TITLE}}</title></head><body><h1>{{HEADING}}</h1><p>{{SUBTITLE}}</p>{{TILES}}{{NOTICES}}{{TIMELINE}}{{SETTINGS}}<p>{{DATA_NOTICE}} Template missing: only the CSV files hold the objects, the journey lines and the errors and warnings.</p></body></html>' }
+    $heading = '{0} across the servers' -f $(if (Test-PraOrdinalIn $Model.Action @('Recover', 'Finalize')) { 'Recover and Finalize' } else { $Model.Action })
+    $values = @{
+        '{{TITLE}}' = (& $h ('PRA Remote Mailbox - global report - ' + $Model.Action))
+        '{{HEADING}}' = (& $h $heading)
+        '{{SUBTITLE}}' = (& $h ('Environment {0} {1} batch {2} {1} tool v{3}' -f $Model.Environment, $dot, $Model.BatchId, $Model.Version))
+        '{{VERSION}}' = (& $h $Model.Version)
+        '{{TILES}}' = $tiles.ToString(); '{{NOTICES}}' = $noticesHtml; '{{TIMELINE}}' = $timelineHtml; '{{SETTINGS}}' = $settingsHtml
+        '{{DATA_NOTICE}}' = (& $h $notice)
+    }
+    # One pass over the template: a value that holds a marker is written as it is, never replaced again. The place of the data is found before any value is put in.
+    $marker = '{{DATA}}'
+    $at = $template.LastIndexOf($marker, [StringComparison]::Ordinal)
+    $pattern = New-Object Text.RegularExpressions.Regex('\{\{[A-Z_]+\}\}', [Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    $evaluator = [Text.RegularExpressions.MatchEvaluator]({ param($Match) if ($values.ContainsKey($Match.Value)) { [string]$values[$Match.Value] } else { $Match.Value } }).GetNewClosure()
+    if ($at -lt 0) { $Writer.Write($pattern.Replace($template, $evaluator)); return }
+    $tail = $pattern.Replace($template.Substring($at + $marker.Length), $evaluator)
+    $Writer.Write($pattern.Replace($template.Substring(0, $at), $evaluator))
+    $objectChunks = Write-PraReportChunks -Writer $Writer -Kind 'objects' -Items ([object[]]$objectItems.ToArray()) -Fields $objectFields -SizeFields @('Stages', 'Note') -ChunkRows $ChunkRows -ChunkChars $ChunkChars
+    $eventChunks = Write-PraReportChunks -Writer $Writer -Kind 'events' -Items ([object[]]$eventItems.ToArray()) -Fields $eventFields -SizeFields @('Text') -ChunkRows $ChunkRows -ChunkChars $ChunkChars
+    $issueChunks = Write-PraReportChunks -Writer $Writer -Kind 'issues' -Items $issueItems -Fields $issueFields -SizeFields @('Message') -ChunkRows $ChunkRows -ChunkChars $ChunkChars
+    $fieldsJson = { param($fields) ($fields | ForEach-Object { ConvertTo-PraJsonString $_ }) -join ',' }
+    $json = '{{"format":1,"objects":{{"count":{0},"fields":[{1}]}},"events":{{"count":{2},"fields":[{3}]}},"issues":{{"count":{4},"fields":[{5}]}},"chunks":{{"objects":{6},"events":{7},"issues":{8}}}}}' -f
+        $total, (& $fieldsJson $objectFields), $eventItems.Count, (& $fieldsJson $eventFields), $issueItems.Count, (& $fieldsJson $issueFields), $objectChunks, $eventChunks, $issueChunks
+    $Writer.Write('<script type="application/json" id="pra-meta">' + $json + "</script>`r`n")
+    $Writer.Write($tail)
+}
+
+function Write-PraCsvFile {
+    <# Writes rows (arrays of text in the order of Fields) as a semicolon-separated CSV, UTF-8 with a byte order mark, every cell quoted, a text that starts like a formula with an apostrophe in front of it. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$Fields, [AllowEmptyCollection()][Collections.Generic.List[string[]]]$Rows)
+    $stream = New-Object IO.FileStream($Path, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    $writer = New-Object IO.StreamWriter($stream, (New-Object Text.UTF8Encoding($true)), 65536)
+    try {
+        $writer.Write('"' + ($Fields -join '";"') + "`"`r`n")
+        foreach ($row in $Rows) {
+            $cells = $row -replace '\A([=+\-@\t\r])', '''$1' -replace '"', '""'
+            $writer.Write('"' + [string]::Join('";"', $cells) + "`"`r`n")
         }
     }
-    if (-not $Model.Objects.Count) { [void]$sb.Append('<tr><td colspan="').Append(3 + $mainPhases.Count).Append('" class="muted">No object.</td></tr>') }
-    [void]$sb.Append('</tbody></table></section>')
-    # Errors and warnings.
-    foreach ($phase in $Model.Phases) {
-        if (-not $phase.Available) { continue }
-        $issues = @(Get-PraList $phase.Record 'Issues'); $warnings = @(Get-PraList $phase.Record 'Warnings')
-        if (-not $issues.Count -and -not $warnings.Count) { continue }
-        [void]$sb.Append('<section class="card ').Append($(if ($issues.Count) { 'fail' } else { 'warn' })).Append('"><h2>').Append((& $h ('Errors and warnings ' + [char]0x00B7 + ' ' + $phase.Label))).Append('</h2><table><thead><tr><th>Kind</th><th>Time</th><th>Step</th><th>Object</th><th>Message</th></tr></thead><tbody>')
-        foreach ($issue in ($issues | Select-Object -First 200)) { [void]$sb.Append('<tr><td><span class="pill fail">error</span></td><td>').Append((& $h (Get-PraValue $issue 'Timestamp' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Phase' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Identity' ''))).Append('</td><td>').Append((& $h (Get-PraValue $issue 'Message' ''))).Append('</td></tr>') }
-        foreach ($warning in ($warnings | Select-Object -First 200)) { [void]$sb.Append('<tr><td><span class="pill warn">warning</span></td><td>').Append((& $h (Get-PraValue $warning 'Timestamp' ''))).Append('</td><td>').Append((& $h (Get-PraValue $warning 'Phase' ''))).Append('</td><td></td><td>').Append((& $h (Get-PraValue $warning 'Message' ''))).Append('</td></tr>') }
-        [void]$sb.Append('</tbody></table></section>')
-    }
-    [void]$sb.Append('<p class="muted">Generated by PRA Remote Mailbox v').Append((& $h $Model.Version)).Append('. This report holds names and statuses only: no secret, no token.</p></body></html>')
-    $Writer.Write($sb.ToString())
+    finally { $writer.Dispose() }
 }
 
 function Write-PraGlobalReportCsv {
-    <# One line per object: verdict, the status of each side and the journey as text (formula guard on every text cell). Semicolon, UTF-8 with BOM. #>
+    <# One line per object: verdict, the status of each side, the number of journey lines and the run settings (formula guard on every text cell). The journey lines are in the events file (Write-PraGlobalEventsCsv). Semicolon, UTF-8 with BOM. #>
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][string]$Path)
-    $rows = foreach ($entry in $Model.Objects) {
-        $row = [ordered]@{ ObjectGuid = $entry.ObjectGuid; Name = $entry.Name; SamAccountName = $entry.Sam; UserPrincipalName = $entry.Upn; Type = $(if ($entry.IsShared) { 'Shared' } else { 'User' }); Verdict = $entry.Verdict }
-        $sides = New-Object 'Collections.Generic.List[string]'
-        foreach ($stage in $entry.Stages) { if ($stage.Present) { $sides.Add($stage.Phase.Label + ': ' + $stage.StatusDisplay) } else { $sides.Add($stage.Phase.Label + ': -') } }
-        $row['Sides'] = $sides -join ' | '
-        $row['Note'] = $entry.Note
-        $row['BackupPath'] = $entry.Backup
-        $journey = New-Object 'Collections.Generic.List[string]'
-        foreach ($stage in $entry.Stages) {
-            if (-not $stage.Present) { continue }
-            foreach ($step in @($stage.Steps)) { $journey.Add(('{0} / {1}: {2} {3} - {4}' -f $stage.Phase.Label, (Get-PraValue $step 'Step' ''), (Get-PraValue $step 'Status' ''), (Format-PraUtcText (Get-PraValue $step 'Time' '')), (Get-PraValue $step 'Text' ''))) }
-            $journey.Add(('{0} / result: {1} - {2}' -f $stage.Phase.Label, $(if ($stage.HandedOverTo) { '{0} (handed over to {1})' -f $stage.Status, $stage.HandedOverTo } else { $stage.Status }), (('{0} {1}' -f $stage.Detail, $stage.Warnings).Trim())))
-        }
-        $row['Journey'] = $journey -join ' | '
-        $row['RunSettings'] = (@($Model.Phases | Where-Object { $_.Available } | ForEach-Object { $label = $_.Label; @(Get-PraList $_.Header 'Overrides') | Where-Object { $_ } | ForEach-Object { $label + ': ' + $_ } }) -join ' | ')
-        ConvertTo-PraCsvRow ([pscustomobject]$row)
+    $runSettings = (@($Model.Phases | Where-Object { $_.Available } | ForEach-Object { $label = $_.Label; @(Get-PraList $_.Header 'Overrides') | Where-Object { $_ } | ForEach-Object { $label + ': ' + $_ } }) -join ' | ')
+    $rows = New-Object 'Collections.Generic.List[string[]]'
+    foreach ($entry in $Model.Objects) {
+        $sides = (@($entry.Stages | ForEach-Object { if ($_.Present) { $_.Phase.Label + ': ' + $_.StatusDisplay } else { $_.Phase.Label + ': -' } }) -join ' | ')
+        $rows.Add([string[]]@($entry.ObjectGuid, $entry.Name, $entry.Sam, $entry.Upn, $(if ($entry.IsShared) { 'Shared' } else { 'User' }), $entry.Verdict, $sides, $entry.Note, $entry.Backup, [string]$entry.Journey.Count, $runSettings))
     }
-    $fields = @('ObjectGuid', 'Name', 'SamAccountName', 'UserPrincipalName', 'Type', 'Verdict', 'Sides', 'Note', 'BackupPath', 'Journey', 'RunSettings')
-    if (@($rows).Count) { $rows | Export-Csv -LiteralPath $Path -NoTypeInformation -Delimiter ';' -Encoding utf8BOM -WhatIf:$false -Confirm:$false -ErrorAction Stop }
-    else { Set-Content -LiteralPath $Path -Value ('"' + ($fields -join '";"') + '"') -Encoding utf8BOM -WhatIf:$false -Confirm:$false -ErrorAction Stop }
+    Write-PraCsvFile -Path $Path -Fields @('ObjectGuid', 'Name', 'SamAccountName', 'UserPrincipalName', 'Type', 'Verdict', 'Sides', 'Note', 'BackupPath', 'EventCount', 'RunSettings') -Rows $rows
+}
+
+function Write-PraGlobalEventsCsv {
+    <# One line per journey line, none left out: the journey of every object, then the lines that name no object (ObjectGuid and Name empty or as the line names it). Same rules as the objects file. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][string]$Path)
+    $rows = New-Object 'Collections.Generic.List[string[]]'
+    foreach ($entry in $Model.Objects) {
+        foreach ($line in $entry.Journey) { $rows.Add([string[]]@($entry.ObjectGuid, $entry.Name, $line.Phase, $line.Step, $line.Status, $line.Time, $line.Text)) }
+    }
+    foreach ($pair in $Model.Unattached) {
+        $item = $pair.Item
+        $rows.Add([string[]]@('', [string](Get-PraValue $item 'Name' ''), $pair.Phase, [string](Get-PraValue $item 'Step' ''), [string](Get-PraValue $item 'Status' ''), (Format-PraUtcText ([string](Get-PraValue $item 'Time' ''))), [string](Get-PraValue $item 'Text' '')))
+    }
+    Write-PraCsvFile -Path $Path -Fields @('ObjectGuid', 'Name', 'Phase', 'Step', 'Status', 'Time', 'Text') -Rows $rows
+}
+
+function Write-PraGlobalIssuesCsv {
+    <# One line per error or warning of every phase, none left out. Same rules as the objects file. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Model, [Parameter(Mandatory)][string]$Path)
+    $rows = New-Object 'Collections.Generic.List[string[]]'
+    foreach ($issue in $Model.Issues) { $rows.Add([string[]]@($issue.Phase, $issue.Kind, $issue.Time, $issue.Step, $issue.Object, $issue.Message)) }
+    Write-PraCsvFile -Path $Path -Fields @('Phase', 'Kind', 'Time', 'Step', 'Object', 'Message') -Rows $rows
 }
 
 function Test-PraGlobalReportWanted {
@@ -3015,22 +3982,30 @@ function Test-PraGlobalReportWanted {
 }
 
 function Write-PraGlobalReport {
-    <# Writes the global HTML and CSV report of this run into the report folder. Returns Html and Csv (empty when a file could not be written: a warning says why). #>
+    <# Writes the global report of this run into the report folder: the HTML page and three CSV files (objects, journey lines, errors and warnings). Returns Html, Csv, EventsCsv and IssuesCsv (empty when a file could not be written: a warning says why). #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][hashtable]$Context)
-    $result = @{ Html = ''; Csv = '' }
+    $result = @{ Html = ''; Csv = ''; EventsCsv = ''; IssuesCsv = '' }
     try {
         $model = Get-PraGlobalModel -Context $Context
         Initialize-PraPrivateFolder -Path $Context.ReportFolder
         $stem = [string](Get-PraValue $Context '_PraArtifactStem' '')
         if (-not $stem) { $stem = Get-PraArtifactStem $Context }
         $html = Join-Path $Context.ReportFolder ($stem + '.global.html'); $csv = Join-Path $Context.ReportFolder ($stem + '.global.csv')
+        $eventsCsv = Join-Path $Context.ReportFolder ($stem + '.global.events.csv'); $issuesCsv = Join-Path $Context.ReportFolder ($stem + '.global.issues.csv')
+        $templates = ''
+        $root = [string](Get-PraValue $Context 'Root' '')
+        if ($root -and (Test-Path -LiteralPath (Join-Path $root 'templates\GlobalReport.template.html') -PathType Leaf)) { $templates = Join-Path $root 'templates' }
         $stream = [IO.File]::Open($html, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         $writer = New-Object IO.StreamWriter($stream, (New-Object Text.UTF8Encoding($true)), 65536)
-        try { Write-PraGlobalReportHtml -Model $model -Writer $writer } finally { $writer.Dispose() }
+        try { Write-PraGlobalReportHtml -Model $model -Writer $writer -TemplateFolder $templates -ObjectsCsvName ([IO.Path]::GetFileName($csv)) -EventsCsvName ([IO.Path]::GetFileName($eventsCsv)) -IssuesCsvName ([IO.Path]::GetFileName($issuesCsv)) } finally { $writer.Dispose() }
         $result.Html = $html
         Write-PraGlobalReportCsv -Model $model -Path $csv
         $result.Csv = $csv
+        Write-PraGlobalEventsCsv -Model $model -Path $eventsCsv
+        $result.EventsCsv = $eventsCsv
+        Write-PraGlobalIssuesCsv -Model $model -Path $issuesCsv
+        $result.IssuesCsv = $issuesCsv
         $Context['GlobalModel'] = $model
     }
     catch { Write-PraLog -Context $Context -Message ('The global report could not be written: {0}' -f $_.Exception.Message) -Level Warning }
@@ -3038,14 +4013,14 @@ function Write-PraGlobalReport {
 }
 #endregion
 
-Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
-    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
+Export-ModuleMember -Function Register-PraObjectName, Get-PraList, ConvertTo-PraImmutableId, Get-PraSourceAnchor, Register-PraObjectBackup, Save-PraPhaseData, Copy-PraPhaseData, Copy-PraPhaseFile, Read-PraPhaseData, New-PraPhaseRecord, Get-PraGlobalModel, Write-PraGlobalReport, Write-PraGlobalReportHtml, Write-PraGlobalReportCsv, Write-PraGlobalEventsCsv, Write-PraGlobalIssuesCsv, Get-PraGlobalJourney, Test-PraBatchSideFile, Write-PraRetentionProof, Get-PraRetentionProof, Test-PraRetentionCheckRecord, Test-PraCloudMailboxKept, Get-PraBatchApplyState, Get-PraConvertCloudDone, Test-PraGlobalReportWanted, Limit-PraText, Get-PraEventObjectName, Test-PraOrdinalEqual, Test-PraOrdinalIgnoreCaseEqual, Test-PraOrdinalIn, Test-PraOrdinalIgnoreCaseIn, Get-PraOrdinalSorted, Get-PraOrdinalUnique, New-PraRecordIndex, Get-PraRecordIndex, Find-PraRecord, Compare-PraX500Address, ConvertFrom-PraJson, Get-PraNativeProcessApi, Read-PraCsvText, Get-PraToolVersion, Get-PraCloudModuleReport, New-PraPrivateDirectorySecurity, Initialize-PraPrivateFolder, ConvertTo-PraCsvCell, Get-PraValue, Format-PraDuration, Add-PraIssue, Write-PraLog, Write-PraItem, Write-PraBanner, Write-PraStep,
+    Write-PraSummary, Write-PraHost, Resolve-PraPath, Import-PraConfiguration, Test-PraScopeConfiguration, Initialize-PraAudit, Get-PraOutcome, Complete-PraRun, Write-PraEvent, Get-PraWin32ErrorText, Test-PraOwnEntryProcess, Get-PraTargetOverride, Read-PraTargetCsv, Write-PraProgress, Get-PraTransferPackageName, Get-PraTransferPackage, Import-PraTransferPackage, New-PraTransferPackage, New-PraEffectiveConfiguration, Get-PraConfigurationDifference
 
 # SIG # Begin signature block
 # MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCvJhRiprdR7SOO
-# E9idbgfgQurBt8gsCGFyqHUyFghEhaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCCpZWlsKxedAVYg
+# GhISuy996/WYttpqQ5i33qoBW81REaCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -3122,23 +4097,23 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDMMohAfHeF
-# 6KMJM6TTbAtok+eL/RYsLC5xiyCdfdhfEzANBgkqhkiG9w0BAQEFAASCAgBn3t21
-# EGU0FZaE228TXzUrItna/eH5FrPm0KF9tbsDOqOmxajQzvJ23mYli2elTFH1WJts
-# oYcF7dvFCpMA8SRl1kfX5CnSo6vo7err3y1G+ugv4KLdS5cYv/wEKMGDRMz9ROw1
-# 6C6pwN8qMn2nU0R58DAJU1bjouUnay5FjyZZ0hbhXy2RY2+i1Bd44QthPJxbFVdm
-# RZ45yzF9AJLPNGYByEJ69fPr+OLrZ1xjS6dz08lTaqpSWImABxJHRhXSL2K3NzzQ
-# Q6AvYAmkyl61aJzFEjFhjWsvSEXwj9sVZfpYYnKG9oRafVq1bFgNesmuv4agq4eH
-# fl0z4Byjy74LdSjz5aC6Cb1mQEg/fqIxV9gDzE9cDY03BSDut4mQEUtn2ARbqMm9
-# nNlIs1DDrLJDZ7Zn8peRMDibds72PNOQW21vKv/PlzQ1nKedO4Qcq+icRqI0Pp/4
-# 5S1MjrPdcPqVa1g16oM+oBUdZ1LaFs2hVQZq9hgJIQXZq3NNyFTUFzAMdb3I4A0N
-# HhnR7wHiXfjzST9LpNC+hvmt0+6yzX8SxTkPBXGukakxc6YoAi66GF5Hl8S2rGsq
-# 5zMsGBmT5px+L6KT8oyFmu4VcrnaRgHtKcCmBjYgdQl4GpaHfEA2kGMgfSGON9Mz
-# sdRd4vbdQzN+Bq1MRmTSoIJMkZ0wDkub5E8LAKGCFM4wghTKBgorBgEEAYI3AwMB
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCCpvwRaegYY
+# 3wCr/AA8xWfLbHOXPxi5Jf7WpRLRIAuTkzANBgkqhkiG9w0BAQEFAASCAgBcaxgk
+# RAONWQ70LQqvxrwm8Iuj/thWws05G9J8WDm2fMjWIQV+4WBlbswIa9bZRUgBrRIk
+# Rrb3O7Ye1jhuzd6dh5Hj1xTZAbSVR4z+x4H1JcEXEPll1ZelD8YWVz2P3djl+9+Q
+# 7AQrRNu8nzUbmr6o6I1/yVuBVXWh/Fv5dh9kONDK5UoBTuxs2+nhlUDxZve3encA
+# YSyOB6Bll0G0CFX3dTM8dRUlPiWWTm+U7Uj67P14e9ux5E2qIpIFPgiGBBPHdDvf
+# PVpX9qsoVt6bCdmvMBOagd7yquupJkqnwMjxGswcfr7J0hB9POstv8M6wQ7jdcsk
+# /I2mienpCzrCzD1x9oSEeiOQHwAyqdueNfl0ZfnuMt1CrMvQJTSG3h+wmdX3964b
+# mrZ+qrzI3yHHkZFHUuOb18i1zmEF2j+Go+qeiogVgd0Kr8FsQAv+oJzK+/n8yMCl
+# tCIK1ot78qwR7qaDAW8tcnj3XbsYvYn3hp/zqv77yhDNSN7L4buCtFphmgdqkRsU
+# HmBQpmDhS0PAy/osbb2FdKdtc8KR0d311H3K6f4dueTwdHVt3uxc74DWe1NsOB53
+# K3ySSn7IUWUcQBcH0HqEGNCCAjV5NgxmLGCA2hbNmtfp1nxXiQhFwwQ2jjDSPhV4
+# NQI3wYYcbwDounrp1rjI70f3yj7AQa0gx7YWD6GCFM4wghTKBgorBgEEAYI3AwMB
 # MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIIEgEAwZls2KUHQWERm+Zpavqe14pq44sPBPMDsjq2+jAggnDvZ/iHhQ
-# qhgPMjAyNjExMTMxMjEyMzNaMAMCAQECEDm9zLsfd/GtxWBhQlsQK+SgghGnMIIE
+# BAIBBQAEIJ9pDnqOYkyB+vMDA3LoENRexlKSLnUBtAN357ws2fmZAghPAWcWztwW
+# GBgPMjAyNjExMjIyMTEyMTNaMAMCAQECEC2IG1KkY8h34sS5VnsrEMagghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -3237,13 +4212,13 @@ Export-ModuleMember -Function Register-PraObjectName, Get-PraList, Register-PraO
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMzEyMTIzM1owKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIL1x
-# 1k1q1+QY69wjVGpdtTDZIr77zMVvcUbHKsf4IkJHMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjIxMTIxM1owKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIOk0
+# UQqYojpJEKbX4eiuNGrku+94t9BhAixRsA8DsRmcMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiAygtmRn4BpBCn+ikiRvGYOhWnMIfk16MHTpVpOkNhF6gIhAPGf
-# XFy7YyDNoHNu+baUU9wILQqZecQ12eZXW3WRAJN0
+# zj0EAwIERzBFAiEAh4IuJPmE9uuryiYZo4WsEZj4JDN3UdHtPD5diByGlr0CIARs
+# GqOviIdh1VQeSJX8lFki30BTFhTrSHvchcRgV2R0
 # SIG # End signature block

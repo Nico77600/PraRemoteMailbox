@@ -1,9 +1,9 @@
 ﻿---
 title: PRA Remote Mailbox
 subtitle: User guide
-version: 3.1.4
+version: 3.2.0
 author: Nicolas Fabert
-updated: 2026-11-13
+updated: 2026-11-22
 runtime: PowerShell 7.5+ (engine and window)
 safety: Backup before every change
 ---
@@ -92,9 +92,16 @@ Read the table from the top. Each row is one step. Do the steps in this order.
 | **1 · Move, directory part** | Directory server | **Move mailboxes to Exchange Online**, then **Start a new batch (Active Directory part)**. The pill says **Phase: AD**. | `PRA-PROD-Convert-490cc62e-for-Cloud.zip` | The cloud server |
 | **2 · Move, cloud part** | Cloud server | **Move mailboxes to Exchange Online**, then **Continue a batch (cloud part)**, then **Import package…** | The global report | Nowhere. The move is done. |
 | **Wait** | Both servers | Nothing. Keep the `Backups` folder. Write down the batch ID. | Nothing | Nowhere |
+| **Before step 3 · Check the retention** | Cloud server | Run the command given under this table. | `RetentionProof-….json` and its `.sha256` file | The directory server, folder `Backups\Inbox` |
 | **3 · Roll back, directory part** | Directory server | **Roll back a conversion**. Pick the batch of the move. | `PRA-PROD-Recover-5ad39f71-for-Cloud.zip` | The cloud server |
 | **4 · Roll back, cloud part** | Cloud server | **Roll back a conversion**, then **Continue a rollback (cloud part)**, then **Import package…** | `PRA-PROD-Finalize-b7d41a9c-for-AD.zip`, only if something remains for the directory | The directory server |
 | **5 · Complete the rollback** | Directory server | **Complete a rollback**, then **Import package…** | The global report | Nowhere. The rollback is done. |
+
+The directory server often cannot reach Microsoft 365. It cannot see the retention by itself. So the cloud server looks first. On the cloud server, type this command with the batch ID of the move:
+
+`.\Invoke-PraRemoteMailbox.ps1 -Action Check -Batch 490cc62e -Expect Retained`
+
+It only reads. It writes a small proof of what it saw, in the folder `Backups\Outbox`. Copy the two `RetentionProof` files to the folder `Backups\Inbox` of the directory server. The directory server accepts a proof for 24 hours. That is its own setting. The rollback of step 3 uses the proof only if the directory server cannot ask Exchange Online. The proof must cover every mailbox. Only the newest proof counts. An older proof never completes it. The proof is a checked file, not a signature. Only the people who run the tool should write in the folder `Backups\Inbox`. The page **Task** says if a proof was found, and how old it is. If the proof is old, damaged or incomplete, the rollback is refused. The **Next steps** then give the same command again.
 
 Step 5 exists only if step 4 wrote a Finalize package. Shared mailboxes need it. So do mailboxes with a retention tag. If step 4 writes no package, it ends with the global report. The rollback is then done.
 
@@ -437,6 +444,8 @@ Press **What next? →**. The page shows the **name of the package**. The tool m
 
 ![The list with the package selected. Number 1: the line of the package. Number 2: the pink pill Phase: Cloud, in the card What will happen on this server. Number 3: the button to continue](images/console-task-package-selected-light.png)
 
+The list shows the work that is **still to do**. A line with an orange pill needs your attention: **Partial**, **Cloud part pending** or **Cloud part stopped**. A batch that is **Finished** is done. It is hidden, and you cannot pick it. Press **Finished** or **All**, above the list, to see it.
+
 **You should see:** the line turns pink. At the bottom of the **Task** page, in the card **What will happen on this server**, a pink pill says **Phase: Cloud** (number 2 in the picture).
 
 **If not:** if you see no pill, click a big card first: the card appears at the bottom after that. A red line **Invalid** means the file is damaged or comes from another environment. Copy it again, with its `.sha256` file. Check that both servers have the same `Environment` in their settings file. If it still fails, stop and ask.
@@ -493,6 +502,8 @@ On a directory server of a two-server rollback, the pink pill at the bottom says
 **You should see:** the **Run** page. The tool restores each person from the backup. For a shared mailbox, the directory first tells the cloud to take its mailbox back. The last directory change for it comes later. On two servers, this page is the directory part.
 
 **If not:** a red number means the tool refuses something. Read the reason. Stop and ask.
+
+**The retention check.** A rollback removes the cloud mailboxes. Before that, the Preview checks that your retention policy holds each one. Read the yellow lines of the Preview. If a mailbox is **not held**, the rollback is **refused**. It is also refused if the tool **could not check**. Nothing is changed. The **Next steps** say why and give the commands. Ask the person who looks after retention to fix the policy. Then press **Preview** again. On the page **Task**, one box lets a rollback go on anyway. It works for **one** run only. Tick it only if you accept that these mailboxes are removed without the hold of the policy. The run lists them in its warnings.
 
 ### 3 · Wait and read
 
@@ -640,6 +651,8 @@ On two servers, the **last** server writes a **global report**. It follows each 
 
 ![The global report: the times of each server, then every person from end to end](images/report-global-light.png)
 
+The page opens fast, even with thousands of people. The totals are at the top. The people are in a list. Type a name in the search box, or pick **failed** or **pending** in the filter. Click a person to see the **journey**: what each server did, step by step, and the result. The errors and warnings are at the bottom, in pages. Next to the page there are three CSV files. Open them in Excel. One has a line per person. One has a line per step. One has a line per error or warning. **Nothing is left out.** A limit may leave something out, but this is rare. Then a card at the top says so. Its title is **Not everything was kept**. It tells you what is missing, how many, and where to find the full log.
+
 <!-- icon: lifebuoy -->
 ## 7. When something goes wrong
 
@@ -655,6 +668,8 @@ Find what you **see** in the left column. The middle column says what it **means
 | *Microsoft Graph: found … The tool needs both in one same version 2.41.1 or later* | The Microsoft 365 programs on this server are too old, or not in the same version. **Nothing was changed.** | Ask your administrator to run the command written in the message. Press **Check again**. |
 | *Nothing was changed in AD. This account cannot write to …* | The directory server refused your account. | Run the tool on that directory server, or with an account that has the rights. The **Next steps** give the command: run the **Preview** first, then the same command with `-Mode Apply`. The backup folder that was written is kept: it is not a batch to continue. |
 | *… Microsoft 365 did not answer (network)* | The connection to Microsoft 365 did not work for a moment. **Nothing was changed** by a Preview or a Check. | Press the button again, or run the command of the **Next steps** again when the connection works. If it comes back, ask your administrator to check the network. |
+| *Microsoft 365 is limiting or not answering this run …* or *… kept limiting the requests …* | Microsoft 365 slowed the tool down, or did not answer, for too long. The tool already tried again many times. **Nothing was changed** on the people it did not reach. What it did is kept. | Wait a few minutes. Run the command of the **Next steps** again. If it comes back every time, ask your administrator to raise the retry time in the settings file. |
+| *… is not the account synchronised from this Active Directory object* (or *… returned 2 accounts …*) | In the cloud, the e-mail address of this person belongs to **another** account. It can be an account made by hand, or a duplicate. The tool stopped for this person. It never works on the wrong account. **Nothing was changed on it.** | Ask your administrator to give one of the two accounts another address, or to remove the duplicate. Then run the same command again. |
 | *The domain controller … does not answer from this machine* | This server cannot reach the directory server. **Nothing was changed.** | Run the check on a server that reaches the directory server, or give the e-mail address of the mailbox instead of the account name. |
 | *A Microsoft Graph session already exists in this console* | A cloud session is already open in the same window. | Close all PowerShell windows. Open a new one. Start again. |
 | **The red button stays grey** on **Verify** | The preview is not done, or the word is not typed. | Press **Preview**. Type the word **CONVERT**, **RECOVER** or **FINALIZE**. Spaces and capitals do not matter. |
@@ -662,7 +677,11 @@ Find what you **see** in the left column. The middle column says what it **means
 | An **orange triangle** (warning) | The tool can go on, but you must read. | Read the text. If you understand it, go on. If not, stop and ask. |
 | I do not see **Phase: …** on the **Task** page | You did not click a big card yet. | Click a big card. The card **What will happen on this server** appears at the bottom. The pink pill is on its left. |
 | The **wait is long** (*attempt 5 of 13*) | The directory is sending the news to the cloud. | Wait. It is normal up to **15 minutes**. The mailboxes can take up to **an hour** to appear. Do not close the window. |
-| A **step turns red** during the run | The tool stopped on purpose, at the first error. | Do not click anything. Take a photo. Stop and ask. The people already done are kept. |
+| A **step turns red** during the run | The tool stopped on purpose, at the first error. | Do not click anything. Take a photo. Stop and ask. The people already done are kept. The **Next steps** page names the commands: continue the people already moved, move the others later, or roll the batch back. |
+| The run ends with **Error** and says it was **interrupted** | The window or the black console was closed, or the run was stopped (Ctrl+C), before the end. What it did is kept: nothing is undone. | Do not start the move again. Read the **Next steps** page: it gives the command that goes on with the same batch. |
+| A batch is marked **Partial: 3 of 10 converted** | The move stopped at its first error. Three people were moved and checked, the other seven were not moved. | Continue the batch to finish the three people. Move the others in a new move after the cause is fixed, or roll the whole batch back. Ask your administrator. |
+| *Recover stopped before any change: the retention policy does not hold …* | Before a rollback removes the cloud mailboxes, the tool checks that the retention policy holds them. It does not hold some of them, or the tool could not check. **Nothing was changed.** | Read the yellow lines of the Preview and the **Next steps**. Ask the person who looks after retention to fix the policy, then run the **Preview** again. To go on anyway, for one run, tick the box on the **Task** page. |
+| A yellow line says *… changed since this batch left them* | Some people were changed after the move (an address was added, or they were moved again). The rollback puts the saved values back over them. | Read the planned values of these people in the **Preview** before the real run. Nothing is blocked. |
 | A package line is red: **Invalid** | The file is damaged, comes from another environment, or its `.zip.sha256` file is not next to it. | Copy the `.zip` and the `.zip.sha256` files again, together in the same folder, without renaming them. Check that both servers have the same `Environment`. |
 | *Active Directory replication was NOT confirmed on …* | One directory server did not receive the change in time. | Read the **Next steps** page. It says to start the synchronisation again later. Ask your administrator. |
 | The result says **Pending** | A part remains. It is **not** an error. | Do what the **Next steps** page says. On two servers: carry the package to the other server. |

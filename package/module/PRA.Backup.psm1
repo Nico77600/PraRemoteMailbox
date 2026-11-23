@@ -20,7 +20,7 @@
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.4 (format PraDataOnlyClixml-v1)
+    Version : 3.2.0 (format PraDataOnlyClixml-v1)
 #>
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -55,6 +55,10 @@ $script:PraRawFormat = 'PraDataOnlyClixml-v1'
 $script:PraRawNamespace = 'http://schemas.microsoft.com/powershell/2004/04'
 $script:PraRawDepth = 16
 $script:PraRawNodes = 1000000
+$script:PraXmlElement = [Xml.XmlNodeType]::Element
+$script:PraOrdinal = [StringComparison]::Ordinal
+$script:PraRawMemoryClock = $null
+$script:PraRawMemoryText = ''
 $script:PraRawCulture = [Globalization.CultureInfo]::InvariantCulture
 $script:PraRawEscape = [regex]'[_\x00-\x1f\x7f-\x9f\uD800-\uDFFF￾￿]'
 $script:PraRawUnescape = [regex]'_x([0-9a-fA-F]{4})_'
@@ -303,15 +307,18 @@ function Assert-PraRawDescriptor {
     $Budget.Left--
     if ($Depth -gt $script:PraRawDepth -or $Budget.Left -lt 0) { throw 'Raw: descriptor depth/node limit or cycle.' }
     if ($Descriptor -isnot [Collections.IDictionary] -or $Descriptor.Count -ne 4) { throw 'Raw: invalid descriptor shape.' }
-    foreach ($field in @('Kind','Type','Value','Items')) {
-        if (-not $Descriptor.Contains($field)) { throw "Raw: missing descriptor field $field." }
-    }
-    if ($Descriptor.Kind -isnot [string] -or $Descriptor.Type -isnot [string] -or $Descriptor.Items -isnot [object[]]) {
+    if (-not $Descriptor.Contains('Kind')) { throw 'Raw: missing descriptor field Kind.' }
+    if (-not $Descriptor.Contains('Type')) { throw 'Raw: missing descriptor field Type.' }
+    if (-not $Descriptor.Contains('Value')) { throw 'Raw: missing descriptor field Value.' }
+    if (-not $Descriptor.Contains('Items')) { throw 'Raw: missing descriptor field Items.' }
+    $kind = $Descriptor['Kind']; $type = $Descriptor['Type']; $value = $Descriptor['Value']; $items = $Descriptor['Items']
+    if ($kind -isnot [string] -or $type -isnot [string] -or $items -isnot [object[]]) {
         throw 'Raw: invalid descriptor field type.'
     }
-    Assert-PraRawScalar $Descriptor.Kind $Descriptor.Type $Descriptor.Value
-    if (-not [string]::Equals($Descriptor.Kind, 'Collection', [StringComparison]::Ordinal) -and $Descriptor.Items.Count -ne 0) { throw 'Raw: scalar has children.' }
-    foreach ($item in $Descriptor.Items) { Assert-PraRawDescriptor $item ($Depth+1) $Budget }
+    # A text value (the common attribute) needs no further check than its kind and type.
+    if (-not ([string]::Equals($kind, 'Scalar', [StringComparison]::Ordinal) -and [string]::Equals($type, 'String', [StringComparison]::Ordinal) -and $value -is [string])) { Assert-PraRawScalar $kind $type $value }
+    if (-not [string]::Equals($kind, 'Collection', [StringComparison]::Ordinal) -and $items.Count -ne 0) { throw 'Raw: scalar has children.' }
+    foreach ($item in $items) { Assert-PraRawDescriptor $item ($Depth+1) $Budget }
 }
 
 function Assert-PraRawSnapshot {
@@ -373,16 +380,30 @@ function Write-PraRawObjectStart {
 
 function Write-PraRawNode {
     param([hashtable]$State,$Descriptor,[int]$Depth)
-    Write-PraRawObjectStart $State
-    $State.Writer.WriteStartElement('MS',$script:PraRawNamespace)
-    Write-PraRawElement $State 'I32' 'Depth' $Depth.ToString($script:PraRawCulture)
-    Write-PraRawElement $State 'S' 'Kind' $Descriptor.Kind
-    Write-PraRawElement $State 'S' 'Type' $Descriptor.Type
-    $tag = if ($null -eq $Descriptor.Value) { 'Nil' } else { 'S' }
-    Write-PraRawElement $State $tag 'Value' $Descriptor.Value
-    Write-PraRawElement $State 'I32' 'Count' $Descriptor.Items.Count.ToString($script:PraRawCulture)
-    $State.Writer.WriteEndElement(); $State.Writer.WriteEndElement()
-    foreach ($item in $Descriptor.Items) { Write-PraRawNode $State $item ($Depth+1) }
+    # The elements of a node are written with direct writer calls (no helper function call per element), which keeps the cost of a node to a few calls.
+    $writer = $State.Writer; $ns = $script:PraRawNamespace; $culture = $script:PraRawCulture; $escape = $script:PraRawEscape
+    $writer.WriteStartElement('Obj',$ns); $writer.WriteAttributeString('RefId',$State.RefId.ToString($culture)); $State.RefId++
+    $writer.WriteStartElement('MS',$ns)
+    $writer.WriteStartElement('I32',$ns); $writer.WriteAttributeString('N','Depth'); $writer.WriteString($Depth.ToString($culture)); $writer.WriteEndElement()
+    $text = $Descriptor.Kind
+    $writer.WriteStartElement('S',$ns); $writer.WriteAttributeString('N','Kind')
+    if ($text.Length -gt 0) { if ($escape.IsMatch($text)) { Write-PraRawString $writer $text } else { $writer.WriteString($text) } }
+    $writer.WriteEndElement()
+    $text = $Descriptor.Type
+    $writer.WriteStartElement('S',$ns); $writer.WriteAttributeString('N','Type')
+    if ($text.Length -gt 0) { if ($escape.IsMatch($text)) { Write-PraRawString $writer $text } else { $writer.WriteString($text) } }
+    $writer.WriteEndElement()
+    $text = $Descriptor.Value
+    if ($null -eq $text) { $writer.WriteStartElement('Nil',$ns); $writer.WriteAttributeString('N','Value'); $writer.WriteEndElement() }
+    else {
+        $writer.WriteStartElement('S',$ns); $writer.WriteAttributeString('N','Value')
+        if ($text.Length -gt 0) { if ($escape.IsMatch($text)) { Write-PraRawString $writer $text } else { $writer.WriteString($text) } }
+        $writer.WriteEndElement()
+    }
+    $items = $Descriptor.Items
+    $writer.WriteStartElement('I32',$ns); $writer.WriteAttributeString('N','Count'); $writer.WriteString($items.Count.ToString($culture)); $writer.WriteEndElement()
+    $writer.WriteEndElement(); $writer.WriteEndElement()
+    foreach ($item in $items) { Write-PraRawNode $State $item ($Depth+1) }
 }
 
 function Write-PraRawProgress {
@@ -392,9 +413,14 @@ function Write-PraRawProgress {
     if ($null -ne $sam -and [string]::Equals($sam.Kind, 'Scalar', [StringComparison]::Ordinal) -and [string]::Equals($sam.Type, 'String', [StringComparison]::Ordinal)) { $name = $sam.Value }
     if ($name.Length -gt 128) { $name = $name.Substring(0,128) }
     $name = [regex]::Replace($name,'[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]','?')
-    $process = [Diagnostics.Process]::GetCurrentProcess()
-    try { $private = [Math]::Round($process.PrivateMemorySize64 / 1MB,1).ToString($script:PraRawCulture) }
-    finally { $process.Dispose() }
+    # The private memory of the process is read once a second, not for every object (the read takes milliseconds).
+    if ($null -eq $script:PraRawMemoryClock -or $script:PraRawMemoryClock.ElapsedMilliseconds -ge 1000) {
+        $process = [Diagnostics.Process]::GetCurrentProcess()
+        try { $script:PraRawMemoryText = [Math]::Round($process.PrivateMemorySize64 / 1MB,1).ToString($script:PraRawCulture) }
+        finally { $process.Dispose() }
+        $script:PraRawMemoryClock = [Diagnostics.Stopwatch]::StartNew()
+    }
+    $private = $script:PraRawMemoryText
     Write-PraLog -Context $Context -Message "RAW $Stage | GUID=$($Snapshot.ObjectGUID) | name=$name | attributes=$($Snapshot.Attributes.Count) | privateMiB=$private | bytes=$Bytes" -Level Debug
 }
 
@@ -431,10 +457,15 @@ function Write-PraRawCapture {
                 Write-PraRawElement $state 'S' $field $value
             }
             Write-PraRawObjectStart $state 'Attributes'; $writer.WriteStartElement('DCT',$script:PraRawNamespace)
+            $ns = $script:PraRawNamespace; $escape = $script:PraRawEscape
             foreach ($name in $snapshot.Attributes.Keys) {
-                $writer.WriteStartElement('En',$script:PraRawNamespace)
-                Write-PraRawElement $state 'S' 'Key' $name
-                Write-PraRawObjectStart $state 'Value'; $writer.WriteStartElement('LST',$script:PraRawNamespace)
+                # An entry of the dictionary: the key and the value elements are written with direct writer calls.
+                $writer.WriteStartElement('En',$ns)
+                $writer.WriteStartElement('S',$ns); $writer.WriteAttributeString('N','Key')
+                if ($name.Length -gt 0) { if ($escape.IsMatch($name)) { Write-PraRawString $writer $name } else { $writer.WriteString($name) } }
+                $writer.WriteEndElement()
+                $writer.WriteStartElement('Obj',$ns); $writer.WriteAttributeString('RefId',$state.RefId.ToString($script:PraRawCulture)); $state.RefId++
+                $writer.WriteAttributeString('N','Value'); $writer.WriteStartElement('LST',$ns)
                 Write-PraRawNode $state $snapshot.Attributes[$name] 0
                 $writer.WriteEndElement(); $writer.WriteEndElement(); $writer.WriteEndElement()
             }
@@ -476,7 +507,9 @@ function Assert-PraRawXmlStart {
 
 function Read-PraRawStart {
     param([Xml.XmlReader]$Reader,[string]$Tag)
-    Assert-PraRawXmlStart $Reader $Tag
+    # An element of the expected name and namespace without attribute is accepted here; any other one goes through Assert-PraRawXmlStart, which says what is wrong.
+    if (-not ($Reader.MoveToContent() -eq [Xml.XmlNodeType]::Element -and $Reader.AttributeCount -eq 0 -and [string]::Equals($Reader.LocalName, $Tag, [StringComparison]::Ordinal) -and
+            [string]::Equals($Reader.NamespaceURI, $script:PraRawNamespace, [StringComparison]::Ordinal))) { Assert-PraRawXmlStart $Reader $Tag }
     if ($Reader.IsEmptyElement) { throw "Raw XML: empty $Tag container." }
     $Reader.ReadStartElement()
 }
@@ -494,7 +527,10 @@ function Read-PraRawEnd {
 function Read-PraRawObjectStart {
     param([hashtable]$State,[string]$Name='')
     $reader = $State.Reader
-    Assert-PraRawXmlStart $reader 'Obj' @('RefId','N')
+    # The attributes an object has (RefId, and N when it is named) are checked here; any other shape goes through Assert-PraRawXmlStart, which says what is wrong.
+    $null = $reader.MoveToContent(); $attributes = $reader.AttributeCount
+    if (-not ($reader.NodeType -eq [Xml.XmlNodeType]::Element -and [string]::Equals($reader.LocalName, 'Obj', [StringComparison]::Ordinal) -and [string]::Equals($reader.NamespaceURI, $script:PraRawNamespace, [StringComparison]::Ordinal) -and
+            $null -ne $reader.GetAttribute('RefId') -and (($Name.Length -eq 0 -and $attributes -eq 1) -or ($Name.Length -gt 0 -and $attributes -eq 2 -and $null -ne $reader.GetAttribute('N'))))) { Assert-PraRawXmlStart $reader 'Obj' @('RefId','N') }
     if (-not [string]::Equals($reader.GetAttribute('RefId'), $State.RefId.ToString($script:PraRawCulture), [StringComparison]::Ordinal) -or
         -not [string]::Equals((ConvertFrom-PraRawString ([string]$reader.GetAttribute('N'))), $Name, [StringComparison]::Ordinal) -or $reader.IsEmptyElement) {
         throw 'Raw XML: object identity/name/sequence invalid; shared references are forbidden.'
@@ -504,8 +540,13 @@ function Read-PraRawObjectStart {
 
 function Read-PraRawElement {
     param([Xml.XmlReader]$Reader,[string]$Tag,[string]$Name)
-    Assert-PraRawXmlStart $Reader $Tag @('N')
-    if (-not [string]::Equals((ConvertFrom-PraRawString ([string]$Reader.GetAttribute('N'))), $Name, [StringComparison]::Ordinal)) { throw "Raw XML: expected member $Name." }
+    # A member element has the attribute N and no other: checked here, any other shape goes through Assert-PraRawXmlStart, which says what is wrong.
+    $null = $Reader.MoveToContent()
+    $member = $Reader.GetAttribute('N')
+    if (-not ($Reader.NodeType -eq [Xml.XmlNodeType]::Element -and $Reader.AttributeCount -eq 1 -and $null -ne $member -and [string]::Equals($Reader.LocalName, $Tag, [StringComparison]::Ordinal) -and
+            [string]::Equals($Reader.NamespaceURI, $script:PraRawNamespace, [StringComparison]::Ordinal))) { Assert-PraRawXmlStart $Reader $Tag @('N'); $member = [string]$Reader.GetAttribute('N') }
+    if ($member.IndexOf('_x', [StringComparison]::Ordinal) -ge 0) { $member = ConvertFrom-PraRawString $member }
+    if (-not [string]::Equals($member, $Name, [StringComparison]::Ordinal)) { throw "Raw XML: expected member $Name." }
     if ([string]::Equals($Tag, 'Nil', [StringComparison]::Ordinal)) {
         if (-not [string]::Equals($Reader.ReadElementContentAsString(), '', [StringComparison]::Ordinal)) { throw 'Raw XML: nonempty Nil.' }
         return $null
@@ -523,14 +564,46 @@ function Read-PraRawNode {
     $Budget.Left--
     if ($Depth -gt $script:PraRawDepth -or $Budget.Left -lt 0) { throw 'Raw XML: descriptor depth/node limit.' }
     $reader = $State.Reader
-    Read-PraRawObjectStart $State; Read-PraRawStart $reader 'MS'
-    if ((-not (Test-PraOrdinalIgnoreCaseEqual (Read-PraRawElement $reader 'I32' 'Depth') $Depth))) { throw 'Raw XML: invalid descriptor preorder depth.' }
-    $kind = Read-PraRawElement $reader 'S' 'Kind'; $type = Read-PraRawElement $reader 'S' 'Type'
+    # The opening of the object and of its member list, the five members of a descriptor and the two closings are read here when they are exactly what the writer produces
+    # (the right element, namespace, attributes, a text without escape); any other shape goes through the functions that check it and say what is wrong.
+    $ns = $script:PraRawNamespace; $element = $script:PraXmlElement; $ordinal = $script:PraOrdinal
+    $null = $reader.MoveToContent()
+    if ($reader.NodeType -eq $element -and $reader.AttributeCount -eq 1 -and [string]::Equals($reader.LocalName, 'Obj', $ordinal) -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal) -and
+        [string]::Equals($reader.GetAttribute('RefId'), $State.RefId.ToString($script:PraRawCulture), $ordinal) -and -not $reader.IsEmptyElement) { $State.RefId++; $reader.ReadStartElement() }
+    else { Read-PraRawObjectStart $State }
+    $null = $reader.MoveToContent()
+    if ($reader.NodeType -eq $element -and $reader.AttributeCount -eq 0 -and [string]::Equals($reader.LocalName, 'MS', $ordinal) -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal) -and -not $reader.IsEmptyElement) { $reader.ReadStartElement() }
+    else { Read-PraRawStart $reader 'MS' }
+    $null = $reader.MoveToContent()
+    if ($reader.NodeType -eq $element -and $reader.AttributeCount -eq 1 -and [string]::Equals($reader.LocalName, 'I32', $ordinal) -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal) -and [string]::Equals($reader.GetAttribute('N'), 'Depth', $ordinal)) { $number = $reader.ReadElementContentAsString() }
+    else { $number = [string](Read-PraRawElement $reader 'I32' 'Depth') }
+    if (-not [string]::Equals($number, $Depth.ToString($script:PraRawCulture), $ordinal)) {
+        $parsed = 0
+        if ([int]::TryParse($number, $script:PraRawCulture, [ref]$parsed) -and $parsed -eq [int]$Depth) { throw 'Raw XML: noncanonical Int32.' }
+        throw 'Raw XML: invalid descriptor preorder depth.'
+    }
+    $null = $reader.MoveToContent()
+    if ($reader.NodeType -eq $element -and $reader.AttributeCount -eq 1 -and [string]::Equals($reader.LocalName, 'S', $ordinal) -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal) -and [string]::Equals($reader.GetAttribute('N'), 'Kind', $ordinal)) { $kind = $reader.ReadElementContentAsString(); if ($kind.IndexOf('_x', $ordinal) -ge 0) { $kind = ConvertFrom-PraRawString $kind } }
+    else { $kind = Read-PraRawElement $reader 'S' 'Kind' }
+    $null = $reader.MoveToContent()
+    if ($reader.NodeType -eq $element -and $reader.AttributeCount -eq 1 -and [string]::Equals($reader.LocalName, 'S', $ordinal) -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal) -and [string]::Equals($reader.GetAttribute('N'), 'Type', $ordinal)) { $type = $reader.ReadElementContentAsString(); if ($type.IndexOf('_x', $ordinal) -ge 0) { $type = ConvertFrom-PraRawString $type } }
+    else { $type = Read-PraRawElement $reader 'S' 'Type' }
     $null = $reader.MoveToContent(); $tag = $reader.LocalName
-    if (-not ([string]::Equals($tag, 'S', [StringComparison]::Ordinal) -or [string]::Equals($tag, 'Nil', [StringComparison]::Ordinal))) { throw 'Raw XML: invalid descriptor value type.' }
-    $value = Read-PraRawElement $reader $tag 'Value'; $count = Read-PraRawElement $reader 'I32' 'Count'
+    if (-not ([string]::Equals($tag, 'S', $ordinal) -or [string]::Equals($tag, 'Nil', $ordinal))) { throw 'Raw XML: invalid descriptor value type.' }
+    if ($reader.NodeType -eq $element -and $reader.AttributeCount -eq 1 -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal) -and [string]::Equals($reader.GetAttribute('N'), 'Value', $ordinal) -and [string]::Equals($tag, 'S', $ordinal)) { $value = $reader.ReadElementContentAsString(); if ($value.IndexOf('_x', $ordinal) -ge 0) { $value = ConvertFrom-PraRawString $value } }
+    else { $value = Read-PraRawElement $reader $tag 'Value' }
+    $null = $reader.MoveToContent()
+    if ($reader.NodeType -eq $element -and $reader.AttributeCount -eq 1 -and [string]::Equals($reader.LocalName, 'I32', $ordinal) -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal) -and [string]::Equals($reader.GetAttribute('N'), 'Count', $ordinal)) {
+        $number = $reader.ReadElementContentAsString(); $count = [int]::Parse($number, $script:PraRawCulture)
+        if (-not [string]::Equals($count.ToString($script:PraRawCulture), $number, $ordinal)) { throw 'Raw XML: noncanonical Int32.' }
+    }
+    else { $count = Read-PraRawElement $reader 'I32' 'Count' }
     if ($count -lt 0 -or $count -gt $Budget.Left -or (-not [string]::Equals($kind, 'Collection', [StringComparison]::Ordinal) -and $count -ne 0)) { throw 'Raw XML: invalid item cardinality.' }
-    Read-PraRawEnd $reader 'MS'; Read-PraRawEnd $reader 'Obj'
+    $end = [Xml.XmlNodeType]::EndElement
+    $null = $reader.MoveToContent()
+    if ($reader.NodeType -eq $end -and [string]::Equals($reader.LocalName, 'MS', $ordinal) -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal)) { $reader.ReadEndElement() } else { Read-PraRawEnd $reader 'MS' }
+    $null = $reader.MoveToContent()
+    if ($reader.NodeType -eq $end -and [string]::Equals($reader.LocalName, 'Obj', $ordinal) -and [string]::Equals($reader.NamespaceURI, $ns, $ordinal)) { $reader.ReadEndElement() } else { Read-PraRawEnd $reader 'Obj' }
     $items = [Collections.Generic.List[object]]::new()
     for ($i=0; $i -lt $count; $i++) { $items.Add((Read-PraRawNode $State ($Depth+1) $Budget)) }
     return ,([ordered]@{Kind=$kind; Type=$type; Value=$value; Items=[object[]]$items.ToArray()})
@@ -822,10 +895,10 @@ function Test-PraRawCapture {
 Export-ModuleMember -Function ConvertTo-PraRawSnapshot,Write-PraRawCapture,Test-PraRawCapture
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKQYJKoZIhvcNAQcCoIImGjCCJhYCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCD8v96a9WvJQeA2
-# rrvwOOGFWPnyof4FvixtCQ3iFsbQh6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDx9cNhqwrrsoVi
+# otQuSJB6KLpnc3C//Rz0PPppaLI8cKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -897,28 +970,28 @@ Export-ModuleMember -Function ConvertTo-PraRawSnapshot,Write-PraRawCapture,Test-
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEDCCGAwCAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCBLkiFpsxd1
-# gSgKF5cN6D7gwh0BKRfU4NJDelg1o+uMwDANBgkqhkiG9w0BAQEFAASCAgCBvL1W
-# fmFlUz1tbhrJbrp4V7j0Pz/auA95j3ILER/YN4IYS8eZmEexttb854ZSMGhc347W
-# LCCXd+PwFwLbO6X41X+oOoiLzJmxpU01jwB38X0ST0fefkeD9femz2lJvHhGznsh
-# OIJwlu089caIraY7tDw1hcuY8f2RfWt4RfafuskRbu8GLnVZgv6UNfpDqoFBh3+m
-# BSxk+N6i/QtbW1xb2Ct5KfnZI27tPeVGmaeYBVTGzBeZbfK3IqKXiBAXFE3I73Xe
-# 1ZGd+B5ztxUQtbV6pbavLGFNgSEDkL0ojFnkoqZOuZ7VgeIUmNsdktMm2rBT+NKG
-# 7vijNX2u1dIYFGIAmfTY/BLwlGEx4utre8Lj6mZcX+ITisr5bdtNcjfn3ABWlcV1
-# GESNwDMd32CUWrE3AvwPLX42NhwB64h4C8P5c1G/LeZWqAtyniQa051AICBzs5mV
-# Fe4qcXTyfE7aCq9tCny1Ah/7JBA/i8yur7lUmnFHlAdiz1i7+Pgt5H2BB2+JlcoX
-# rf0kUBxKQoP5FcxFwH56GhBzSXTN9QA5GrmxVDZ27wPfvUJ3ay/ArCOHqTp/VNJx
-# tadc+FQsxi1u5Vnw8b25F5BbENtiTqE9+z0K+H3chvqEhQD7SfjOk4eCE8lIETic
-# Gb/R6eikuwfu5UrCY/vTjZdkXb/eG1QbsaiOp6GCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDkFsgxg6AK
+# I31ZRA82Mbcj8AcSRf62v6HrB/oKH0UpTDANBgkqhkiG9w0BAQEFAASCAgB3bH/6
+# /+M5oe3sNXScp9huTr6suDUiROWKLfrfGXD6iL5q6/pzaspP9EbVcaLpjB4YSW82
+# jzlpixavkMwoM4QHZgfDFKwXB1qxrU/wjS66sZgHN3LfDy7zJSRjwyF/GGrX/MIn
+# wlF0fRn4w/ItewZMwLj4b4pwtwYDGytZB094oA8ttHnqyRLv3I2oGAQwxANc2CPB
+# EawIQPPH2ws52uEPjllm867d8KYiAi4fv7ekJqq6+CBM9nOlhPKelSyry0Y/0hFz
+# 03xhdMcMmUwUsJ/0OPpZTq37UBNVUsVf/fOKb6J+5LR1z5axhQDyraK2eUuIKVtR
+# YDqUGn7ZFhM5dYR/eO3QawEvkyjGKlsLsG/gOQ4+r/NWrXRscjNv0rs3sJMcXr7n
+# kU446Ha5H/pWSKtwBAifvcNXa96kFD2UM1remegrYpYWqexA20vp6MTXz5AHhLA/
+# g4wrWxgYrbwS/2yyTuJyRHdF+Yu9O8aeazOB/AsI5jhprPA4fjIltF2PB+VHtdyx
+# V99zMdnx60Cfhme1JFhWSw9GZ+sL+Z3zwKKsUhIyw+rv0Zz4TyhhI8fcNy+/TKPO
+# 0NfZNB9lgyqpjlfnNz4oIXrkK4l0vJO+pOJ1TsYMEA2YfdodsexOWGn/lBuKJDd8
+# sMo2LgEevmlmIZmjZ0+wFW/ZLo6EW062QkBjU6GCFM0wghTJBgorBgEEAYI3AwMB
+# MYIUuTCCFLUGCSqGSIb3DQEHAqCCFKYwghSiAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIGMqiXZBL4wSGIbIE+bBnkREAtvYIaIzgWpQuBQjoMMuAggGinebGPr7
-# vxgPMjAyNjExMTMxMjEyMzlaMAMCAQECEBeevHMbvRqzME2MSZoZmJKgghGnMIIE
+# BAIBBQAEIKNgYJPKlV48eNzSX25C9L0PYyC/oOJu/BQamwDs8q4zAgh1F0AbU+X8
+# WRgPMjAyNjExMjIxMTA5MzBaMAMCAQECEENttyvVkl9psSavIOHh+j6gghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1013,17 +1086,17 @@ Export-ModuleMember -Function ConvertTo-PraRawSnapshot,Write-PraRawCapture,Test-
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlUwggJRAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMzEyMTIzOVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIGCm
-# c414KAd+eoDcAoO+T2olzxc2bdE+ge1499H5WiR6MIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjExMDkzMFowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIBus
+# 7cHLZUWzYdTICl5yOnFfk9WIC7zsI9ViZLsZa+P3MIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiEAnCv/arK/uDvSo8E/4syxSK5WXugrv/Nj4Cl/3NkJ53cCIGCx
-# KyN0FKk96ruZHnBETVJ9GS90zfJjoxuv1N+2oyNx
+# zj0EAwIERjBEAiB3zuJs4kkOS31WKe518e60EBdHG/95Yb8diG+pRz4HGwIgXadN
+# Y9Fmc5nsE9D9sLAgcCtsiaLeCTaoy1FqcfiikKs=
 # SIG # End signature block

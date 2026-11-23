@@ -2,7 +2,7 @@
 #  PRA Remote Mailbox - configuration file
 #  --------------------------------------------------------------------------
 #  Author  : Nicolas Fabert
-#  Version : 3.1.4
+#  Version : 3.2.0
 #
 #  This file is read by Invoke-PraRemoteMailbox.ps1. It is a PowerShell data
 #  file: text between quotes, $true / $false, numbers, and @( ) for lists.
@@ -147,6 +147,9 @@
         CheckLicense          = $true        # wait for a licence with Exchange enabled (users)
         MailboxCheckVia       = 'Exo'        # Exo (mailbox type in Exchange Online) or Graph (provisioning)
         RequiredSkuPartNumber = ''           # '' = any licence with Exchange; e.g. 'SPE_E3'
+        IdentityCheck         = 'Anchor'     # Anchor = the Entra ID account must carry the AD source anchor (objectGUID or ms-DS-ConsistencyGuid); Off = accounts are found by UPN only
+        RetryBudgetObjectSeconds = 180       # most seconds one object waits in retries of throttled or unreachable cloud calls (0 = no retry)
+        RetryBudgetRunMinutes    = 30        # most minutes the whole run waits in retries; used up, the run stops cleanly (0 = no retry)
     }
 
     # Exchange Online module.
@@ -167,13 +170,30 @@
     # ---------------------------------------------------------------------
     # Retention tag: written at Convert so that an adaptive scope of a Purview retention policy
     # keeps the old mailbox (extensionAttributeN on-premises = CustomAttributeN in Exchange Online).
-    # Recover restores the original value. PolicyGuid is only used by -Action Check -Expect Retained.
+    # Recover restores the original value. PolicyGuid is used by -Action Check -Expect Retained and by the
+    # retention check that comes before a Recover.
+    #   CheckBeforeRecover = $true : before it removes the cloud mailboxes, a Recover (Preview and Apply, AD part) reads each mailbox that
+    #                  carries the retention tag and checks that the retention policy holds it. The Apply STOPS, before any change, when a
+    #                  mailbox is not covered or cannot be checked (for instance PolicyGuid is empty); the Preview says so and the Apply
+    #                  is then refused. -AcceptRetentionRisk (a checkbox in the window) goes on for ONE run: the run says so in a warning.
+    #   CheckBeforeRecover = $false: the check is off for every run. Each Recover says so once, in a warning; it never claims the check passed.
+    #   ProofMaxAgeHours   : two-server setup. The AD server often cannot ask Exchange Online. A Check -Expect Retained -Batch <id> on the cloud
+    #                  server writes a retention proof (RetentionProof-...json and its .sha256 file, in its Backups\Outbox folder). Copied to the
+    #                  Backups\Inbox folder of the AD server, it stands in for the check of a Recover (phase AD) when it is intact, of this batch
+    #                  and Environment, not older than this many hours (1 to 720), and covers every object of the Recover. Where Exchange Online
+    #                  can be asked (phase Both, a certificate sign-in, or an interactive console) its answer decides and the proof is read only
+    #                  when Exchange Online cannot be reached. The hours are the setting of the server that reads the proof (the AD server).
+    #                  The proof must also be of the same Convert batch file and, when PolicyGuid is set here, of that policy. Only the NEWEST
+    #                  proof of the batch counts; an older proof never completes it. Without PolicyGuid here the proof is accepted and the run prints
+    #                  the policy GUID the proof names.
     # ---------------------------------------------------------------------
     Retention = @{
         Enabled              = $true
         PolicyName           = 'PRA-Converted-Retention'
         PolicyGuid           = ''            # (Get-RetentionCompliancePolicy '<name>').Guid
         UseComplianceSession = $false        # find the GUID from PolicyName (interactive Connect-IPPSSession)
+        CheckBeforeRecover   = $true         # $false = no retention check before a Recover
+        ProofMaxAgeHours     = 24            # age limit of a retention proof from the cloud server (1 to 720 hours)
         Tag = @{
             Enabled   = $true
             Attribute = 'extensionAttribute1'

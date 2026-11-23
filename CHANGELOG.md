@@ -4,6 +4,23 @@ All notable changes of PRA Remote Mailbox. Author: Nicolas Fabert. Versions foll
 a MAJOR version changes the command line or the configuration file, a MINOR version adds a feature,
 a PATCH version fixes a defect. The backup formats have their own version (see the guide, annex D).
 
+## 3.2.0 — 2026-11-22
+
+### Added
+- Batches of thousands of objects: planned, measured and documented for 5,000 objects per batch.
+- Retention check before a Recover: it stops when a cloud mailbox is not held by the retention policy. `-AcceptRetentionRisk` (a checkbox in the console) accepts the risk for one run; `Retention.CheckBeforeRecover` turns the check off; on two servers the cloud server writes a retention proof that the AD server accepts for `Retention.ProofMaxAgeHours` hours.
+- Cloud accounts are confirmed against Active Directory before any cloud write (`Cloud.IdentityCheck`); the cloud part now reads Microsoft Graph for every object, so `User.Read.All` is needed for every run.
+- Throttled or unavailable Microsoft Graph and Exchange Online reads are retried with a budget per object and per run (`Cloud.RetryBudgetObjectSeconds`, `Cloud.RetryBudgetRunMinutes`).
+- Console: **To do** and **Finished** sections in the batch lists, the retention checkbox and proof line on Recover, Ctrl+C in the terminal no longer stops the window, and the activity log keeps its last 2,000 lines.
+
+### Changed
+- The global report has no silent cap: full CSV files and a light HTML page that stays fast with thousands of objects.
+- A Recover warns about objects changed since their batch, and *Deny* entries of a shared mailbox are reported.
+- A phase can be run again from the same transfer package.
+
+### Fixed
+- A run that is interrupted (Ctrl+C, closed window) never ends as a success; a partly converted batch can be continued or rolled back.
+
 ## 3.1.4 — 2026-11-13
 
 ### Added

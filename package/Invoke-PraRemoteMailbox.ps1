@@ -93,6 +93,12 @@
     list), then read back on each of them. A domain controller that does not confirm is a warning that names it; the synchronisation still runs and the
     Next steps say how to run it again later. Needs the right to replicate a single object (normally Domain Admins). A Preview never replicates.
 
+.PARAMETER AcceptRetentionRisk
+    Recover, AD part only. Before it removes the cloud mailboxes, a Recover reads each mailbox that carries the retention tag and checks that the retention policy holds it
+    (Retention.CheckBeforeRecover in the configuration file). The Apply stops, before any change, when a mailbox is not covered or cannot be checked. This switch goes on for
+    this one run anyway: the run lists what is not covered in a warning, in the log, in the summary and in the report. It is not remembered. The check itself is turned off in
+    the configuration file (Retention.CheckBeforeRecover = $false), not here.
+
 .PARAMETER Force
     Apply without the confirmation prompt (scheduled or unattended runs). Never skips a safety check.
     The single confirmation of an Apply is also skipped when -Confirm is given explicitly, with either value:
@@ -149,7 +155,7 @@
 
 .NOTES
     Author     : Nicolas Fabert
-    Version    : 3.1.4
+    Version    : 3.2.0
     Requires   : PowerShell 7.5 or later (pwsh.exe; Windows PowerShell 5.1 is refused), RSAT ActiveDirectory,
                  ExchangeOnlineManagement 3.10.1+, Microsoft.Graph.Authentication and Microsoft.Graph.Users 2.41.1+ in one same
                  version (cloud part), ADSync (sync; through the Windows PowerShell compatibility layer when local).
@@ -183,6 +189,7 @@ param(
     [string]$ConfigPath,
     [Parameter(ParameterSetName = 'Run')][string]$BaseConfigPath,
     [Parameter(ParameterSetName = 'Run')][switch]$ForceAdReplication,
+    [Parameter(ParameterSetName = 'Run')][switch]$AcceptRetentionRisk,
     [Parameter(ParameterSetName = 'Run')][switch]$Force,
     [Parameter(ParameterSetName = 'Run')][switch]$Once,
     [Parameter(ParameterSetName = 'Run')][switch]$PassThru,
@@ -283,7 +290,7 @@ $context = @{
     Once = [bool]$Once; IntervalMinutes = 0; TimeoutMinutes = 0
     VerboseEnabled = ((Test-PraOrdinalIgnoreCaseEqual $VerbosePreference 'Continue') -or (Test-PraOrdinalIgnoreCaseEqual $DebugPreference 'Continue'))
     SourceBackupHash = ''; Source = $null; Proof = $null; LastVerifiedReceipt = $null; OperationFailed = $false; JournalPath = ''
-    BatchId = ''; NextSteps = @()
+    BatchId = ''; NextSteps = @(); RunReachedEnd = $false; ChangesStarted = $false
 }
 $context.Approval = New-PraApprovalCallback $caller $context
 # Lets the modules write a command line of this run's own style (-ConfigPath kept) in a message; defined here because Get-PraCommandLine is a function of this script.
@@ -312,13 +319,13 @@ function ConvertTo-PraLiteral {
 function Get-PraCommandLine {
     <# Command line suggested in "Next step", with the options of this run that still apply. Every free-text value is quoted as data. #>
     param([string]$ActionName, [string]$ModeName = 'Apply', [string]$PhaseName = '', [string]$BatchId = '', [switch]$KeepFilters, [switch]$OtherServer,
-        [ValidateSet('', 'Identity', 'SearchBase', 'CsvPath', 'Group', 'None')][string]$Only = '', [string]$GroupName = '')
+        [ValidateSet('', 'Identity', 'SearchBase', 'CsvPath', 'Group', 'None')][string]$Only = '', [string]$GroupName = '', [string]$CsvOverride = '')
     $parts = @('.\Invoke-PraRemoteMailbox.ps1', "-Action $ActionName")
     # With -Only, the one object selector kept (-Identity, -SearchBase, -CsvPath or -Group; None keeps no selector): the others are left out.
     $keepSelector = { param([string]$Name) (-not $Only) -or (Test-PraOrdinalIgnoreCaseEqual $Only $Name) }
     if ($PhaseName) { $parts += "-Phase $PhaseName" }
     if ((Test-PraOrdinalIgnoreCaseEqual $ModeName 'Apply')) { $parts += '-Mode Apply' }
-    if ($BatchId) { $parts += $(if ($BatchId -match '^[0-9a-fA-F]+$') { "-Batch $BatchId" } else { '-Batch ' + (ConvertTo-PraLiteral $BatchId) }) }
+    if ($BatchId) { $parts += $(if ($BatchId -match '^[0-9a-fA-F]+\z') { "-Batch $BatchId" } else { '-Batch ' + (ConvertTo-PraLiteral $BatchId) }) }
     if ($KeepFilters) {
         if ($Identity -and (& $keepSelector 'Identity')) { $parts += '-Identity ' + (ConvertTo-PraLiteral $Identity) }
         if ((-not (Test-PraOrdinalIgnoreCaseEqual $Scope 'All'))) { $parts += "-Scope $Scope" }
@@ -327,10 +334,12 @@ function Get-PraCommandLine {
         $groupValue = if ($GroupName) { $GroupName } else { $Group }
         if ($groupValue -and (& $keepSelector 'Group')) { $parts += '-Group ' + (ConvertTo-PraLiteral $groupValue) }
         # On another server the CSV file is a file of that server: only its name is written, the operator copies the file there.
-        if ($CsvPath -and (& $keepSelector 'CsvPath')) { $parts += '-CsvPath ' + (ConvertTo-PraLiteral $(if ($OtherServer) { [IO.Path]::GetFileName($CsvPath) } else { $CsvPath })) }
+        if ($CsvPath -and -not $CsvOverride -and (& $keepSelector 'CsvPath')) { $parts += '-CsvPath ' + (ConvertTo-PraLiteral $(if ($OtherServer) { [IO.Path]::GetFileName($CsvPath) } else { $CsvPath })) }
         if ((Test-PraOrdinalIgnoreCaseEqual $ActionName 'Check') -and -not (Test-PraOrdinalIgnoreCaseEqual $Expect 'Provisioned')) { $parts += "-Expect $Expect" }
         if ($Once) { $parts += '-Once' }
     }
+    # A file made by this run for the objects that are still to convert replaces the CSV of the run.
+    if ($CsvOverride) { $parts += '-CsvPath ' + (ConvertTo-PraLiteral $CsvOverride) }
     # On another server the configuration file is that server's own: -ConfigPath is not repeated.
     # Run from the window, -ConfigPath is the generated configuration of that run: the suggested command names the configuration file itself.
     if ($script:ConfigPathBound -and -not $OtherServer) { $parts += '-ConfigPath ' + (ConvertTo-PraLiteral $(if ($BaseConfigPath) { $BaseConfigPath } else { $ConfigPath })) }
@@ -392,12 +401,30 @@ function Get-PraFallbackNext {
     }
     if ($applied -and $newBatch) {
         $batchId = [string]$context.BatchId
+        $partial = Get-PraValue $context 'PartialBatch' $null
+        if ($null -ne $partial) { return @(Get-PraPartialStopStep $partial) }
         if ($null -ne $context.Proof -and $batchId) {
             $kept = 'What this run already did is kept (Active Directory is changed and verified).'
             if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) {
                 return @(('{0} Fix the problem named above, then finish the batch (Entra Connect sync and transfer package; AD is not changed again):' -f $kept), (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -BatchId $batchId))
             }
             return @(('{0} Fix the problem named above, then run the Exchange Online part:' -f $kept), (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $batchId))
+        }
+        $mayBe = @(Get-PraList $context 'MayBeChanged')
+        if (($written -gt 0 -or $mayBe.Count) -and $batchId -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert')) {
+            $changed = [Math]::Max($written, $mayBe.Count)
+            $verified = @($context.Rows | Where-Object { (Get-PraValue $_ 'ADVerified' $false) -eq $true }).Count
+            $stateFolder = [string](Get-PraValue $context 'PhaseWriteFolder' '')
+            $stateWritten = [bool]($stateFolder -and (Test-Path -LiteralPath $stateFolder -PathType Container) -and @(Get-ChildItem -LiteralPath $stateFolder -File -Filter ('State-' + $batchId + '*.json') -ErrorAction SilentlyContinue).Count)
+            $rollback = @('To put them back as they were, roll the batch back (run the Preview first, then the same command with -Mode Apply):',
+                (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $batchId),
+                'To see first what the batch holds in Exchange Online, run the Check:', (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $batchId))
+            if ($verified -ge $changed -and $verified -gt 0 -and $stateWritten) {
+                return @(('Active Directory was changed for {0} object(s) before the stop (see the journal and the backup named above) and all {1} were verified: the stop came after the verification. To go on with this batch (the verified objects are not changed again: it runs the Entra Connect synchronisation and writes the transfer package), run:' -f $changed, $verified),
+                    (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -BatchId $batchId)) + $rollback
+            }
+            $state = if ($verified -gt 0) { ('{0} of them {1} verified, the others are not' -f $verified, $(if ($verified -eq 1) { 'is' } else { 'are' })) } else { 'none of them is verified' }
+            return @(('Active Directory {0} for {1} object(s) before the stop (see the journal and the backup named above) and {2}. Do not run the Apply again before reading what is left. {3}' -f $(if ($written -gt 0) { 'was changed' } else { 'may have been changed' }), $changed, $state, $rollback[0])) + @($rollback | Select-Object -Skip 1)
         }
         if ($written -gt 0) {
             return @(('Active Directory was changed for {0} object(s) before the stop (see the journal and the backup named above). Do not run the Apply again before reading what is left: run the Preview of the same command:' -f $written),
@@ -407,6 +434,49 @@ function Get-PraFallbackNext {
     $didWork = $applied -and ([bool][string](Get-PraValue $context 'JournalPath' '') -or $written -gt 0)
     if ($didWork) { return @('What this run already did is kept. Fix the problem named above, then run the same command again:', $same) }
     return @('Fix the problem named above, then run the same command again:', $same)
+}
+
+function Get-PraJsonHeader {
+    <#
+    .SYNOPSIS
+        Some scalar fields of a batch JSON file (Operation, BatchId, SourceBackupHash), read without parsing the whole file.
+    .DESCRIPTION
+        A backup of thousands of objects is tens of megabytes; the scalar fields of its envelope come before its records. The head of the file is read and each field
+        is taken from it when only plain scalar properties (text without escapes, numbers, true, false, null) come before it, so that a nested property of the same name
+        is never taken. Any other shape, a field that is not there, or a file that cannot be read this way is parsed in full.
+    .OUTPUTS
+        An object with the requested fields (the whole parsed file when it had to be parsed).
+    #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string[]]$Name)
+    $head = ''
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        try {
+            $buffer = New-Object 'byte[]' 8192
+            $count = $stream.Read($buffer, 0, $buffer.Length)
+            $head = [Text.Encoding]::UTF8.GetString($buffer, 0, $count).TrimStart([char]0xFEFF)
+        } finally { $stream.Dispose() }
+    } catch { $head = '' }
+    $values = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    $open = [regex]::Match($head, '\A\s*\{')
+    if ($open.Success) {
+        $pair = [regex]::new('\G\s*"(?<n>[^"\\]*)"\s*:\s*(?:"(?<s>[^"\\]*)"|(?<x>-?[0-9]+(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|true|false|null))\s*(?<end>,|\})')
+        $position = $open.Length
+        while ($true) {
+            $m = $pair.Match($head, $position)
+            if (-not $m.Success) { break }
+            $position = $m.Index + $m.Length
+            $key = $m.Groups['n'].Value
+            if (-not $values.ContainsKey($key)) { $values[$key] = $(if ($m.Groups['s'].Success) { $m.Groups['s'].Value } else { $m.Groups['x'].Value }) }
+            if (Test-PraOrdinalEqual $m.Groups['end'].Value '}') { break }
+        }
+    }
+    $header = [ordered]@{}
+    foreach ($field in $Name) {
+        if (-not $values.ContainsKey($field)) { return ([IO.File]::ReadAllText($Path) | ConvertFrom-PraJson) }
+        $header[$field] = $values[$field]
+    }
+    return [pscustomobject]$header
 }
 
 function Get-PraBatchFile {
@@ -429,7 +499,7 @@ function Get-PraBatchFile {
         elseif (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
         else { throw "Batch file or folder not found: $candidate" }
     } else {
-        if ($Value -notmatch '^[0-9a-fA-F]{8,32}$') { throw "Invalid batch ID '$Value': use the 8 characters (or more) shown at the end of the previous run, or the path of the batch JSON file." }
+        if ($Value -notmatch '^[0-9a-fA-F]{8,32}\z') { throw "Invalid batch ID '$Value': use the 8 characters (or more) shown at the end of the previous run, or the path of the batch JSON file." }
         if (-not (Test-Path -LiteralPath $context.BackupFolder -PathType Container)) {
             $isCheck = (Test-PraOrdinalIgnoreCaseEqual $Action 'Check')
             $packageSuffix = if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Finalize')) { '-for-AD.zip' } else { '-for-Cloud.zip' }
@@ -449,8 +519,8 @@ function Get-PraBatchFile {
     }
     $found = New-Object 'Collections.Generic.List[string]'
     foreach ($folder in $folders) {
-        foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not $_.Name.StartsWith('State-', [StringComparison]::OrdinalIgnoreCase) })) {
-            try { $operation = [string](([IO.File]::ReadAllText($file.FullName) | ConvertFrom-PraJson).Operation) } catch { continue }
+        foreach ($file in @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter '*.json' -ErrorAction Stop | Where-Object { -not (Test-PraBatchSideFile $_.Name) })) {
+            try { $operation = [string](Get-PraJsonHeader $file.FullName @('Operation')).Operation } catch { continue }
             # In a Finalize package only the manifest counts (the other JSON files are copies of the source batches).
             if ((Test-PraOrdinalIn $operation $Operations) -and ($folder.Name -match '^Batch-' -or (Test-PraOrdinalEqual $operation 'RecoverFinalize'))) { $found.Add($file.FullName) }
         }
@@ -496,16 +566,15 @@ function Initialize-PraCloudAuthority {
     <#
     .SYNOPSIS
         Callbacks given to the cloud module. Before each Exchange Online write, AssertCloudAuthorization
-        re-reads the AD proof of the object; JournalMutation records the write in the batch journal.
+        checks the AD proof of the object (read in full once, then by its stamps) and the backup; JournalMutation records the write in the batch journal.
     #>
     # GetNewClosure captures local variables, not the $context of the script: copy it first.
     $capturedContext = $context
     $context.AssertCloudAuthorization = {
         param($Row)
         if (-not $capturedContext.AllowMutation -or $capturedContext.OperationFailed -or $capturedContext.Issues.Count -gt 0 -or $null -eq $capturedContext.Proof) { throw 'Cloud write refused: no authorisation or the run already has an error.' }
-        $proof = Import-PraProof $capturedContext $capturedContext.Proof.Path $capturedContext.Source $capturedContext.Action
-        if (@($proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $Row.ObjectGuid }).Count -ne 1) { throw 'Cloud write refused: the object is not in a verified AD phase.' }
-        Assert-PraReceipt $capturedContext $capturedContext.Source $Row.ObjectGuid
+        Assert-PraCloudProofObject -Context $capturedContext -ProofPath $capturedContext.Proof.Path -Source $capturedContext.Source -Operation $capturedContext.Action -ObjectGuid ([string]$Row.ObjectGuid)
+        Assert-PraReceipt $capturedContext $capturedContext.Source ([string]$Row.ObjectGuid)
     }.GetNewClosure()
     $context.JournalMutation = { param($Target, $Operation, $Status, $Detail) Write-PraJournal $capturedContext $Target $Operation $Status ([string]$Detail) }.GetNewClosure()
 }
@@ -591,27 +660,33 @@ function Get-PraFinalizeInput {
     }
     $context.Source = Import-PraBackup $context (Join-Path (Split-Path $path -Parent) $manifest.SourceBackupFile)
     $context.PhaseFolders = @(Split-Path $path -Parent)
+    if ($context.AllowMutation) { $context.PhaseWriteFolder = Split-Path $path -Parent }
     $context.Proof = Import-PraProof $context (Join-Path (Split-Path $path -Parent) $manifest.StateFile) $context.Source 'Recover'
     if (-not (Test-PraOrdinalIgnoreCaseEqual $context.Source.Hash $manifest.SourceBackupHash) -or -not (Test-PraOrdinalIgnoreCaseEqual $context.Proof.Hash $manifest.StateHash)) { throw 'Finalize package: manifest and proofs do not match.' }
     $records = @(Select-PraSourceRecord $context.Source); $seen = @{}
     $items = @($manifest.Items)
     if (-not $items.Count) { throw 'Finalize package is empty.' }
+    $proofIndex = Get-PraRecordIndex $context.Proof.Data.Records
+    $snapshotIndex = Get-PraRecordIndex $context.Proof.Receipt.Data.Records
+    $sourceIndex = Get-PraRecordIndex $context.Source.Data.Records
     foreach ($item in $items) {
         if ($item.CloudConfirmed -isnot [bool] -or -not $item.CloudConfirmed -or $item.DeprovisionConfirmed -isnot [bool] -or -not $item.DeprovisionConfirmed -or $item.RestoreShared -isnot [bool] -or $item.RestoreTag -isnot [bool] -or
-            -not (Test-PraOrdinalIn $item.ObjectGuid @($context.Proof.Data.Records.ObjectGuid) -IgnoreCase) -or $seen.ContainsKey($item.ObjectGuid)) { throw 'Finalize package: invalid object confirmation.' }
-        $proofEntry = @($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
-        $snapshotEntry = @($context.Proof.Receipt.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
-        $sourceEntry = @($context.Source.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $item.ObjectGuid })[0]
+            $null -eq (Find-PraRecord $proofIndex ([string]$item.ObjectGuid)) -or $seen.ContainsKey($item.ObjectGuid)) { throw 'Finalize package: invalid object confirmation.' }
+        $proofEntry = Find-PraRecord $proofIndex ([string]$item.ObjectGuid)
+        $snapshotEntry = Find-PraRecord $snapshotIndex ([string]$item.ObjectGuid)
+        $sourceEntry = Find-PraRecord $sourceIndex ([string]$item.ObjectGuid)
         if ($snapshotEntry.PreserveCloudMailbox -or ($item.RestoreShared -and (-not (Test-PraOrdinalEqual $proofEntry.Operation 'Deprovision') -or -not $sourceEntry.IsShared)) -or
             ($item.RestoreTag -and -not [bool](Get-PraValue (Get-PraValue $sourceEntry 'Retention' $null) 'Enabled' $false)) -or
             (-not $item.RestoreShared -and -not $item.RestoreTag)) { throw 'Finalize package does not match the AD operations it proves.' }
         $seen[$item.ObjectGuid] = $true
     }
-    if ($Identity -and @($records | Where-Object { Test-PraOrdinalIn $_.ObjectGuid @($items.ObjectGuid) -IgnoreCase }).Count -ne 1) { throw "Identity '$Identity' is not authorised by this Finalize package." }
+    $itemByGuid = New-Object 'Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in $items) { $itemByGuid[[string]$item.ObjectGuid] = $item }
+    $authorised = New-Object 'Collections.Generic.List[object]'
+    foreach ($record in $records) { if ($itemByGuid.ContainsKey([string]$record.ObjectGuid)) { $authorised.Add($record) } }
+    if ($Identity -and $authorised.Count -ne 1) { throw "Identity '$Identity' is not authorised by this Finalize package." }
     $context.BatchId = Get-PraShortId ((Split-Path (Split-Path $path -Parent) -Leaf) -replace '^Finalize-', '')
-    return @($records | Where-Object { Test-PraOrdinalIn $_.ObjectGuid @($items.ObjectGuid) -IgnoreCase } | ForEach-Object {
-            $recordGuid = $_.ObjectGuid
-            [pscustomobject]@{ Record = $_; Item = ($items | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $recordGuid }) } })
+    return @($authorised | ForEach-Object { [pscustomobject]@{ Record = $_; Item = $itemByGuid[[string]$_.ObjectGuid] } })
 }
 
 function Format-PraByteSize {
@@ -640,8 +715,14 @@ function Publish-PraTransferPackage {
     $context.HandOff = $Kind
     $phaseFolder = [string](Get-PraValue $context 'PhaseWriteFolder' '')
     if ($phaseFolder -and -not [bool](Get-PraValue $context 'PhaseDataSaved' $false)) {
-        try { $null = Save-PraPhaseData -Context $context -Folder $phaseFolder -HandOff $Kind; $context.PhaseDataSaved = $true }
-        catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}): the package is complete, the other server will report this side as not available.' -f $_.Exception.Message) -Level Warning }
+        $saved = ''
+        try { $saved = Save-PraPhaseData -Context $context -Folder $phaseFolder -HandOff $Kind; $context.PhaseDataSaved = $true }
+        catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}): the package is complete and the other server can go on, but its global report will say that this side is not available. To find the cause, check the rights on the batch folder with: Get-Acl -LiteralPath ''{1}'' | Format-List Owner, AccessToString  and the free space with: Get-PSDrive -PSProvider FileSystem' -f $_.Exception.Message, $phaseFolder.Replace("'", "''")) -Level Warning }
+        # The cloud phase of a Recover also leaves its data in the batch of the AD rollback, so that the console can tell that its cloud part is done.
+        if ($saved -and (Test-PraOrdinalIgnoreCaseEqual $Kind 'Finalize') -and $null -ne (Get-PraValue $context 'Proof' $null)) {
+            try { $null = Copy-PraPhaseFile -Path $saved -Destination (Split-Path $context.Proof.Path -Parent) }
+            catch { Write-PraLog -Context $context -Message ('The data of this phase could not be copied to the batch of the AD rollback ({0}).' -f $_.Exception.Message) -Level Detail }
+        }
     }
     try {
         $name = Get-PraTransferPackageName -Kind $Kind -Environment $context.Config.Environment -BatchId $BatchId
@@ -720,6 +801,313 @@ function Test-PraCloudModuleAvailable {
     $context.ApplyBlockers = @(Get-PraList $context 'ApplyBlockers') + 'install or update the cloud modules with the commands in the warning above'
 }
 
+function Get-PraRetentionProofFolder {
+    <# The folders where a retention proof is looked for, as for a transfer package: Inbox, Outbox (under Storage.BackupFolder) and the folder of the Convert batch. #>
+    $folders = @((Join-Path $context.BackupFolder 'Inbox'), (Join-Path $context.BackupFolder 'Outbox'))
+    if ($null -ne $context.Source -and [string](Get-PraValue $context.Source 'Path' '')) { $folders += (Split-Path ([string]$context.Source.Path) -Parent) }
+    return [string[]]$folders
+}
+
+function Get-PraRunHostState {
+    <# What this process says about being interactive: the arguments of its command line, whether it has a user, whether its input is redirected. #>
+    $redirected = $true
+    try { $redirected = [Console]::IsInputRedirected } catch { $redirected = $true }
+    return [pscustomobject]@{ CommandLine = [string[]]@([Environment]::GetCommandLineArgs()); UserInteractive = [bool][Environment]::UserInteractive; InputRedirected = [bool]$redirected }
+}
+
+function Test-PraRunCanSignIn {
+    <# True when a person can answer an interactive sign-in in this run: no -Force, no -NonInteractive on the command line of the process (with one or two dashes, a slash, an en or em dash, or an abbreviation of at least -noni), a host with a user, and an input that is not redirected (the window starts the engine with its input closed). #>
+    if ($Force) { return $false }
+    $state = Get-PraRunHostState
+    foreach ($argument in $state.CommandLine) { if ($argument -match '(?i)\A(--?|/|[–—])noni') { return $false } }
+    return ([bool]$state.UserInteractive -and -not [bool]$state.InputRedirected)
+}
+function Save-PraRetentionProof {
+    <#
+    .SYNOPSIS
+        Check -Expect Retained on a batch: writes the retention proof (the verdict of each object) in the Outbox folder, with its .sha256 file, for the AD server that cannot ask Exchange Online.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
+    if ($null -eq $context.Source -or -not $Batch -or -not $Rows.Count) { return }
+    $objects = New-Object 'Collections.Generic.List[object]'
+    $checked = 0
+    foreach ($row in $Rows) {
+        $verdict = [string](Get-PraValue $row 'RetentionVerdict' 'NotChecked')
+        if (-not (Test-PraOrdinalEqual $verdict 'NotChecked')) { $checked++ }
+        $objects.Add([pscustomobject]@{ ObjectGuid = [string]$row.ObjectGuid; Upn = [string]$row.UserPrincipalName; Verdict = $verdict })
+    }
+    if (-not $checked) { return }
+    $context.CurrentOperation = 'Write-RetentionProof'; $context.CurrentIdentity = ''
+    # The proof is for the other server: it goes to the Outbox of the backup folder of this server, also when the batch was read from a package in a temporary preview folder.
+    $outbox = Join-Path ([string]$context.Config.Storage.BackupFolder) 'Outbox'
+    try {
+        $guids = @([string](Get-PraValue $context 'RetentionPolicyGuid' ''))
+        $written = Write-PraRetentionProof -Folder $outbox -BatchId ([string]$context.Source.Data.BatchId) -SourceBackupHash ([string]$context.Source.Hash) -Environment ([string]$context.Config.Environment) -PolicyGuid $guids -Object $objects.ToArray()
+        $withoutMailbox = @($objects | Where-Object { Test-PraOrdinalEqual $_.Verdict 'NoMailbox' }).Count
+        Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Retention proof written: {0} of {1} object(s) covered{2} ({3})' -f $written.CoveredCount, $written.ObjectCount, $(if ($withoutMailbox) { ', {0} without a mailbox in Exchange Online (nothing to retain)' -f $withoutMailbox } else { '' }), $written.Path) -Detail $written.Path
+        $next = Get-PraCommandLine -ActionName 'Recover' -PhaseName 'AD' -ModeName 'Preview' -BatchId (Get-PraShortId ([string]$context.Source.Data.BatchId)) -OtherServer
+        $context.NextSteps = @(Get-PraList $context 'NextSteps') + @(('For the Recover on the AD server, copy these two files to its Backups\Inbox folder: {0} and {1}. The AD server accepts a proof for as many hours as its own Retention.ProofMaxAgeHours says (24 by default), so copy them soon. Then run there:' -f $written.Path, $written.Sidecar), $next)
+    }
+    catch {
+        Write-PraItem -Context $context -Status Warn -Icon Batch -Text ('The retention proof could not be written ({0}): the check itself is not affected.' -f $_.Exception.Message)
+        $typedBatch = if ($script:PackageArgument) { $script:PackageArgument } else { $Batch }
+        $context.NextSteps = @(Get-PraList $context 'NextSteps') + @(('To write the retention proof, make sure this account can write in the folder {0} (rights, free space), then run the same Check again:' -f $outbox), (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $typedBatch -KeepFilters))
+    }
+}
+
+function Write-PraRetentionNoMailbox {
+    <#
+    .SYNOPSIS
+        Objects that Exchange Online has no mailbox for (active or inactive): a warning for each (the first ten, the others are in the log) and one for the count, unless the cloud part of the Convert is recorded as not completed for the object (then the log only). Nothing is retained for them; the Recover is not stopped.
+    .PARAMETER Entry
+        ObjectGuid and Upn of each object.
+    #>
+    param([AllowEmptyCollection()][object[]]$Entry = @())
+    if (-not @($Entry).Count) { return }
+    $done = $null
+    try { $done = Get-PraConvertCloudDone -Folder (Split-Path ([string]$context.Source.Path) -Parent) -BatchId ([string]$context.Source.Data.BatchId) -Environment ([string]$context.Config.Environment) } catch { $done = $null }
+    $visible = New-Object 'Collections.Generic.List[object]'
+    foreach ($item in $Entry) {
+        $completed = ($null -ne $done -and $done.Known -and $done.Done.Contains([string]$item.ObjectGuid))
+        if ($null -eq $done -or -not $done.Known -or $completed) { $visible.Add($item) }
+        else { Write-PraLog -Context $context -Message ('{0}: no mailbox in Exchange Online, and the cloud part of the Convert is not recorded as complete for it: nothing to retain' -f $item.Upn) -Level Detail }
+    }
+    $limit = 10; $shown = 0
+    foreach ($item in $visible) {
+        if ($shown -ge $limit) { Write-PraLog -Context $context -Message ('{0}: no mailbox in Exchange Online (active or inactive)' -f $item.Upn) -Level Detail; continue }
+        $context.CurrentIdentity = [string]$item.ObjectGuid
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: Exchange Online has no mailbox for this object, active or inactive, and its mailbox is expected to be there after the Convert. Nothing is retained for it and the Recover goes on. Check that this is expected (Get-EXOMailbox -Identity ''{1}''; Get-EXOMailbox -InactiveMailboxOnly -Filter "UserPrincipalName -eq ''{1}''").' -f $item.Upn, ([string]$item.Upn).Replace("'", "''"))
+        $shown++
+    }
+    $context.CurrentIdentity = ''
+    if ($visible.Count) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0} object(s) have no mailbox in Exchange Online: nothing is retained for them{1}.' -f $visible.Count, $(if ($visible.Count -gt $shown) { ' (the others are named in the log)' } else { '' })) }
+}
+
+function Invoke-PraRetentionGate {
+    <#
+    .SYNOPSIS
+        Recover, AD part: before the cloud mailboxes are removed, checks that the retention policy holds each mailbox that carries the retention tag (Retention.CheckBeforeRecover).
+    .DESCRIPTION
+        Read only. Exchange Online is asked wherever this run can ask it without a person (phase Both, a certificate sign-in) or with the person who runs it (phase AD at an interactive console, without -Force);
+        the mailboxes that carry the tag are read in bulk (Test-PraRetentionCoverage). When Exchange Online answers, its answer decides and no retention proof is read. When it cannot be reached or asked on the AD part
+        (no sign-in, no answer, throttling, the cloud modules missing, no person to sign in), the retention proof that a Check wrote on the cloud server stands in for it when it is intact, recent, of this batch and
+        covers every object. Apply: a mailbox that the policy does not hold, or that cannot be checked, STOPS the run here, before the confirmation and before any change, unless -AcceptRetentionRisk was given (then a warning,
+        the summary and the report say so). Preview: the same answer as warnings; the Apply is refused until it is fixed. Retention.CheckBeforeRecover = $false: no check, said once in a warning.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Plans)
+    if (-not [bool]$context.Config.Retention.CheckBeforeRecover) {
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text 'The retention check before a Recover is turned off (Retention.CheckBeforeRecover = $false in the configuration file): the mailboxes are removed from Exchange Online without checking that the retention policy holds them.'
+        return
+    }
+    $context.CurrentOperation = 'Check-Retention'; $context.CurrentIdentity = ''
+    $rows = New-Object 'Collections.Generic.List[object]'
+    foreach ($plan in $Plans) {
+        if (Test-PraOrdinalEqual $plan.Operation 'AlreadyRecovered') { continue }
+        if (Test-PraRetentionCheckRecord -Record $plan.Row.BackupRec -PreserveCloudMailbox ([bool]$plan.Row.PreserveCloudMailbox)) { $rows.Add($plan.Row) }
+    }
+    if (-not $rows.Count) {
+        Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('Retention: none of the {0} object(s) carries the retention tag, so there is no retention to check before the mailboxes are removed.' -f $Plans.Count)
+        return
+    }
+    $cloudNotDone = @()
+    try {
+        $doneInfo = Get-PraConvertCloudDone -Folder (Split-Path ([string]$context.Source.Path) -Parent) -BatchId ([string]$context.Source.Data.BatchId) -Environment ([string]$context.Config.Environment)
+        if ($null -ne $doneInfo -and $doneInfo.Known) { $cloudNotDone = @($rows | Where-Object { -not $doneInfo.Done.Contains([string]$_.ObjectGuid) }) }
+    } catch { $cloudNotDone = @() }
+    if ($cloudNotDone.Count) {
+        Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('Retention: the Exchange Online part of the Convert is not recorded as complete for {0} of the {1} object(s) that carry the retention tag. They are checked like the others, on purpose: the licence group that the Convert adds gives a mailbox as soon as Entra Connect has synchronised, with or without that part, and the Recover removes the licence again. When Exchange Online has no mailbox for an object, the check says so (no mailbox, nothing to retain) and the Recover goes on.' -f $cloudNotDone.Count, $rows.Count)
+    }
+    $needGraph = -not (Test-PraOrdinalIgnoreCaseEqual ([string]$context.Config.Cloud.IdentityCheck) 'Off')
+    $report = Get-PraCloudModuleReport -MinExo ([string]$context.Config.Exo.MinModuleVersion)
+    $modulesOk = $report.Exo.Ok -and ($report.Graph.Ok -or -not $needGraph)
+    $isAd = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')
+    $certificate = [bool][string]$context.Config.Cloud.AppId
+    $canAsk = $modulesOk -and ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -or $certificate -or ($isAd -and (Test-PraRunCanSignIn)))
+    $script:RetentionProofReason = ''; $script:RetentionProofRoute = $false; $script:RetentionProof = $null; $script:RetentionProofMissing = @()
+    if ($canAsk) {
+        Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
+        $keepSession = $context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')
+        $answer = Test-PraRetentionCoverage -Context $context -Rows $rows.ToArray() -CloseSession:(-not $keepSession)
+    }
+    else {
+        $unavailable = if (-not $modulesOk) { 'The cloud modules of this server cannot check the retention. ' + ($report.Messages -join ' ') }
+            else { 'This run cannot sign in to Exchange Online by itself: the configuration has no certificate sign-in (Cloud.AppId), and no person can answer a sign-in (-Force, or no interactive console).' }
+        $answer = [pscustomobject]@{ Checked = 0; Covered = 0; NoMailbox = 0; NoMailboxList = @(); NotCovered = @(); StopReason = $unavailable; CouldNotAsk = $true
+            Unverified = @(foreach ($row in $rows) { [pscustomobject]@{ ObjectGuid = [string]$row.ObjectGuid; Upn = [string]$row.UserPrincipalName; Reason = $unavailable } }) }
+    }
+    $context.CurrentOperation = 'Check-Retention'; $context.CurrentIdentity = ''
+    $notCovered = @($answer.NotCovered); $unverified = @($answer.Unverified)
+    $couldNotAsk = [bool](Get-PraValue $answer 'CouldNotAsk' $false)
+    $viaProof = $false; $coveredCount = [int](Get-PraValue $answer 'Covered' 0); $noMailboxCount = [int](Get-PraValue $answer 'NoMailbox' 0); $proofKinds = @{ Unverified = 0; NotChecked = 0; NotListed = 0 }
+    if ($isAd -and $couldNotAsk -and -not $notCovered.Count) {
+        $script:RetentionProofRoute = $true
+        $proof = Get-PraRetentionProof -Folder (Get-PraRetentionProofFolder) -BatchId ([string]$context.Source.Data.BatchId) -Environment ([string]$context.Config.Environment) -MaxAgeHours ([int]$context.Config.Retention.ProofMaxAgeHours) -Row $rows.ToArray() -SourceBackupHash ([string]$context.Source.Hash) -PolicyGuid ([string]$context.Config.Retention.PolicyGuid)
+        $script:RetentionProof = $proof
+        if ($proof.Found -and $proof.Complete) {
+            $item = $proof.Proofs[0]
+            $accepted = [pscustomobject]@{ Path = [string]$item.Path; Sha256 = [string]$item.Sha256; CreatedUtc = $item.CreatedUtc; PolicyGuid = [string[]]@($item.PolicyGuid); ObjectCount = [int]$item.ObjectCount }
+            $hours = ([DateTime]::UtcNow - $item.CreatedUtc).TotalHours.ToString('0.#', [Globalization.CultureInfo]::InvariantCulture)
+            $policyNamed = if ([string]$context.Config.Retention.PolicyGuid) { '' } else { ' (policy {0}, as the proof names it: Retention.PolicyGuid is not set on this server)' -f $(if (@($accepted.PolicyGuid).Count) { @($accepted.PolicyGuid) -join ', ' } else { 'none recorded' }) }
+            Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: accepted from the retention proof {0} ({1} hours old, written by a Check on the cloud server): the {2} object(s) that carry the retention tag are covered{3}' -f [IO.Path]::GetFileName($accepted.Path), $hours, $rows.Count, $policyNamed)
+            $detail = 'SHA-256 {0}, created {1} UTC, policy {2}, {3} object(s)' -f $accepted.Sha256, $accepted.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), $(if (@($accepted.PolicyGuid).Count) { @($accepted.PolicyGuid) -join ', ' } else { '(none recorded)' }), $accepted.ObjectCount
+            $signInFailed = [bool](Get-PraValue $answer 'SignInFailed' $false)
+            Write-PraItem -Context $context -Status $(if ($signInFailed) { 'Warn' } else { 'Info' }) -Icon Cloud -Text ('Exchange Online could not be asked by this run: {0} The proof: {1}.' -f ([string]$answer.StopReason).Trim(), $detail)
+            $context.RetentionProofAccepted = [object[]]@($accepted)
+            Write-PraLog -Context $context -Message ('Retention proof accepted: {0} | SHA-256 {1} | created {2} UTC | policy {3} | {4} object(s) | live check: {5}' -f $accepted.Path, $accepted.Sha256, $accepted.CreatedUtc.ToString('yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture), (@($accepted.PolicyGuid) -join ','), $accepted.ObjectCount, ([string]$answer.StopReason -replace '\s+', ' ')) -Level Detail
+            if ($proof.Duplicates) { Write-PraLog -Context $context -Message ('{0} copy(ies) of the retention proof were found in the folders and counted once' -f $proof.Duplicates) -Level Detail }
+            if ($AcceptRetentionRisk) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text '-AcceptRetentionRisk was given and is not needed: the retention proof covers every mailbox.' }
+            Write-PraRetentionNoMailbox -Entry @($proof.NoMailbox)
+            return
+        }
+        $shownBlocked = 0
+        $says = @{ NotCovered = 'says that the retention policy does not hold this mailbox'; Unverified = 'says that the retention of this mailbox could not be checked when the proof was written'; NotChecked = 'says that this mailbox was not checked when the proof was written (the Check stopped before it)'; NotListed = 'does not list this mailbox' }
+        foreach ($entry in @($proof.Blocked)) {
+            if ($shownBlocked -ge 10) { Write-PraLog -Context $context -Message ('{0}: the newest retention proof {1} {2}' -f $entry.Upn, $entry.Proof, $says[[string]$entry.Verdict]) -Level Detail; continue }
+            $context.CurrentIdentity = [string]$entry.ObjectGuid
+            Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the newest retention proof {1} {2}.' -f $entry.Upn, $entry.Proof, $says[[string]$entry.Verdict])
+            $shownBlocked++
+        }
+        $context.CurrentIdentity = ''
+        if (@($proof.Blocked).Count) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text 'Only the newest retention proof counts: an older proof never completes it.' }
+        $script:RetentionProofReason = if ($proof.Reason) { [string]$proof.Reason } else { 'no usable retention proof' }
+        if ($proof.Missing.Count) { Write-PraLog -Context $context -Message ('Retention proof {0}: not covered or not in it: {1}' -f [IO.Path]::GetFileName($proof.Path), ($proof.Missing -join ', ')) -Level Detail }
+        $script:RetentionProofMissing = @($proof.Blocked)
+        if ($proof.Found) {
+            # A proof that was read and does not cover every object is the answer: its verdicts are the counts and the words.
+            $viaProof = $true
+            $notCovered = @(@($proof.Blocked) | Where-Object { Test-PraOrdinalEqual ([string]$_.Verdict) 'NotCovered' } | ForEach-Object { [pscustomobject]@{ ObjectGuid = [string]$_.ObjectGuid; Upn = [string]$_.Upn; Reason = ('the newest retention proof {0} {1}' -f $_.Proof, $says['NotCovered']) } })
+            $unverified = @(@($proof.Blocked) | Where-Object { -not (Test-PraOrdinalEqual ([string]$_.Verdict) 'NotCovered') } | ForEach-Object { [pscustomobject]@{ ObjectGuid = [string]$_.ObjectGuid; Upn = [string]$_.Upn; Reason = ('the newest retention proof {0} {1}' -f $_.Proof, $says[[string]$_.Verdict]) } })
+            foreach ($kind in @('Unverified', 'NotChecked', 'NotListed')) { $proofKinds[$kind] = @(@($proof.Blocked) | Where-Object { Test-PraOrdinalEqual ([string]$_.Verdict) $kind }).Count }
+            $noMailboxCount = @($proof.NoMailbox).Count
+            $coveredCount = [Math]::Max(0, $rows.Count - @($proof.Blocked).Count - $noMailboxCount)
+        }
+    }
+    $withoutMailbox = if ($viaProof) { @($proof.NoMailbox) } else { Get-PraValue $answer 'NoMailboxList' @() }
+    Write-PraRetentionNoMailbox -Entry @($withoutMailbox)
+    $bad = $notCovered.Count + $unverified.Count
+    $without = if ($noMailboxCount) { ' ({0} without a mailbox in Exchange Online: nothing to retain, see the warnings above)' -f $noMailboxCount } else { '' }
+    if (-not $bad) {
+        Write-PraItem -Context $context -Status Ok -Icon Cloud -Text ('Retention: the retention policy holds the {0} mailbox(es) that carry the retention tag{1}' -f $coveredCount, $without)
+        if ($AcceptRetentionRisk) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text '-AcceptRetentionRisk was given and is not needed: every mailbox is held.' }
+        return
+    }
+    $lines = New-Object 'Collections.Generic.List[string]'
+    foreach ($entry in $notCovered) { $lines.Add(('Retention not covered | {0} | {1}' -f $entry.Upn, $entry.Reason)) }
+    foreach ($entry in $unverified) { $lines.Add(('Retention not checked | {0} | {1}' -f $entry.Upn, $entry.Reason)) }
+    Write-PraLog -Context $context -Lines $lines.ToArray() -Level Detail
+    $shorten = { param([string]$Text) if ($Text.Length -gt 300) { $Text.Substring(0, 300) + '...' } else { $Text } }
+    $limit = 10; $shown = 0
+    # The mailboxes concerned are named in the warning: the first ten, then how many more (the full list is in the log).
+    $namesOf = { param($Items) $names = @(@($Items) | ForEach-Object { [string]$_.Upn }); $text = (@($names | Select-Object -First 10) -join ', '); if ($names.Count -gt 10) { $text += (' and {0} more (the full list is in the log)' -f ($names.Count - 10)) }; $text }
+    if (-not $viaProof) {
+        foreach ($entry in $notCovered) {
+            if ($shown -ge $limit) { break }
+            $context.CurrentIdentity = [string]$entry.ObjectGuid
+            Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the retention policy does not hold this mailbox. {1}' -f $entry.Upn, (& $shorten ([string]$entry.Reason)))
+            $shown++
+        }
+    }
+    $context.CurrentIdentity = ''
+    if ($viaProof) {
+        if ([string]$answer.StopReason) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('Exchange Online could not be asked by this run ({0}), so the newest retention proof was read.' -f (& $shorten (([string]$answer.StopReason).Trim().TrimEnd('.')))) }
+    }
+    elseif ([string]$answer.StopReason) {
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('The retention of {0} mailbox(es) could not be checked: {1}' -f $unverified.Count, (& $shorten ([string]$answer.StopReason)))
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('Mailboxes concerned ({0}): {1}.' -f $unverified.Count, (& $namesOf $unverified))
+    }
+    else {
+        foreach ($entry in $unverified) {
+            if ($shown -ge $limit) { break }
+            $context.CurrentIdentity = [string]$entry.ObjectGuid
+            Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}: the retention of this mailbox could not be checked. {1}' -f $entry.Upn, (& $shorten ([string]$entry.Reason)))
+            $shown++
+        }
+        $context.CurrentIdentity = ''
+    }
+    if ($bad -gt $shown -and -not $viaProof -and -not [string]$answer.StopReason) { Write-PraItem -Context $context -Status Info -Icon Cloud -Text ('{0} more mailbox(es) are listed in the log.' -f ($bad - $shown)) }
+    if ($viaProof) {
+        $kinds = ''
+        if ($proofKinds.Unverified) { $kinds += (', {0} unverified (the Check could not check them)' -f $proofKinds.Unverified) }
+        if ($proofKinds.NotChecked) { $kinds += (', {0} not checked (the Check stopped before them)' -f $proofKinds.NotChecked) }
+        if ($proofKinds.NotListed) { $kinds += (', {0} not in the proof' -f $proofKinds.NotListed) }
+        $summary = '{0} mailbox(es) held, {1} not held by the retention policy{2}{3}' -f $coveredCount, $notCovered.Count, $kinds, $without
+    }
+    else { $summary = '{0} mailbox(es) held, {1} not held by the retention policy, {2} not checked{3}' -f $coveredCount, $notCovered.Count, $unverified.Count, $without }
+    if ($script:RetentionProofRoute) { Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('No retention proof stands in for the check: {0}.' -f $script:RetentionProofReason) }
+    if ($AcceptRetentionRisk) {
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('Retention risk accepted for this run (-AcceptRetentionRisk). {0}. The {1} mailbox(es) that are not held or not checked are removed from Exchange Online without a retention hold of the policy.' -f $summary, $bad)
+        $context.ConfigOverrides = @(@(Get-PraList $context 'ConfigOverrides') + ('Retention check before Recover: {0} mailbox(es) not held or not checked, accepted for this run (-AcceptRetentionRisk)' -f $bad))
+        return
+    }
+    $shortBatch = Get-PraShortId ([string]$context.Source.Data.BatchId)
+    $check = (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $shortBatch -OtherServer:$script:RetentionProofRoute) + ' -Expect Retained'
+    $typedBatch = if ($script:PreviewPackage) { $script:PreviewPackage } elseif ($script:PackageArgument) { $script:PackageArgument } else { $Batch }
+    $again = Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -ModeName 'Preview' -BatchId $typedBatch -KeepFilters
+    $anyway = (Get-PraCommandLine -ActionName 'Recover' -PhaseName $(if ($Phase) { $Phase } else { '' }) -ModeName 'Apply' -BatchId $typedBatch -KeepFilters) + ' -AcceptRetentionRisk'
+    $refusal = if ($script:RetentionProofRoute -and $null -ne $script:RetentionProof) { [string]$script:RetentionProof.Refusal } else { '' }
+    $proofRoute = [bool]($script:RetentionProofRoute -and $null -ne $script:RetentionProof)
+    $proofPolicy = if ($proofRoute) { (@($script:RetentionProof.PolicyGuid) -join ', ') } else { '' }
+    if (-not $proofPolicy) { $proofPolicy = 'none recorded' }
+    $damagedPath = if ($proofRoute) { [string](Get-PraValue $script:RetentionProof 'RefusedPath' '') } else { '' }
+    $inboxFolder = Join-Path $context.BackupFolder 'Inbox'
+    $policyName = [string]$context.Config.Retention.PolicyName
+    $lookup = if ($policyName) { 'Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity {0}).Guid' -f (ConvertTo-PraLiteral $policyName) } else { 'Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid' }
+    if (-not $context.AllowMutation) {
+        Write-PraItem -Context $context -Status Warn -Icon Cloud -Text ('{0}. The Apply will be refused as things stand.' -f $summary)
+        $blocker = if ($proofRoute -and (Test-PraOrdinalEqual $refusal 'CopyAgain')) { 'copy both files of the newest retention proof again from the Backups\Outbox folder of the cloud server to {0}{1} ({2}); an older proof never stands in for it, and run the Check again on the cloud server if the files are damaged at the source ({3}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $inboxFolder, $(if ($damagedPath) { ', and delete the damaged copy at ' + $damagedPath } else { '' }), $script:RetentionProofReason, $check }
+            elseif ($proofRoute -and (Test-PraOrdinalEqual $refusal 'Clock')) { 'compare the clocks of the two servers (Get-Date on each: the newest retention proof is dated in the future), then run the Check again on the cloud server ({0}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $check }
+            elseif ($proofRoute -and (Test-PraOrdinalEqual $refusal 'PolicyMismatch')) { 'align Retention.PolicyGuid on the two servers (the newest retention proof names the policy {0}, this server has {1}; read the GUID with: {2}), then run the full Check again on the cloud server ({3}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $proofPolicy, [string]$context.Config.Retention.PolicyGuid, $lookup, $check }
+            elseif ($proofRoute -and (Test-PraOrdinalEqual $refusal 'PolicyGuid')) { 'correct Retention.PolicyGuid in the configuration file (it is not a GUID; read the GUID with: {0}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $lookup }
+            else { 'make the retention policy hold the mailboxes named above (see them with: {0}{1}), or add -AcceptRetentionRisk to the Apply command to go on anyway for this one run' -f $check, $(if ($script:RetentionProofRoute) { ', on the cloud server' } else { '' }) }
+        $context.ApplyBlockers = @(Get-PraList $context 'ApplyBlockers') + $blocker
+        return
+    }
+    $steps = @()
+    if (-not [string]$context.Config.Retention.PolicyGuid) {
+        $steps += 'The retention policy is not named in the configuration file. Read its GUID in a Security and Compliance session, then put it in Retention.PolicyGuid:'
+        $steps += $lookup
+    }
+    $configuredGuid = [string]$context.Config.Retention.PolicyGuid; $parsedGuid = [guid]::Empty
+    if ($configuredGuid -and (-not [guid]::TryParse($configuredGuid, [ref]$parsedGuid) -or $parsedGuid -eq [guid]::Empty)) {
+        $steps += ('Retention.PolicyGuid in the configuration file ({0}) is not a GUID. Read the GUID of the retention policy, then put it in Retention.PolicyGuid:' -f $configuredGuid)
+        $steps += $lookup
+    }
+    if ($proofRoute -and (Test-PraOrdinalEqual $refusal 'CopyAgain')) {
+        $steps += ('The newest retention proof cannot be used: {0}. Copy both files again, RetentionProof-...json and its .sha256 file, from the Backups\Outbox folder of the cloud server to the folder {1} of this server (together, and wait for the copy to end), then run the Preview of the Recover again. An older proof never stands in for it.' -f $script:RetentionProofReason, $inboxFolder)
+        if ($damagedPath) { $steps += ('Before that, delete the damaged copy at {0} (and its .sha256 file), so that it is not read again.' -f $damagedPath) }
+        $steps += 'If the files are damaged at the source, run the Check again on the cloud server; it writes a new proof:'
+        $steps += $check
+    }
+    elseif ($proofRoute -and (Test-PraOrdinalEqual $refusal 'PolicyMismatch')) {
+        $steps += ('The newest retention proof, {0}, is of another retention policy: it names {1}, and Retention.PolicyGuid in the configuration file of this server is {2}. Make the two servers name the same policy: put the GUID of the policy that holds the mailboxes in Retention.PolicyGuid of the configuration file on the cloud server and on this server (read the GUID with the command below), then run the full Check again on the cloud server. An older proof never stands in for it.' -f [IO.Path]::GetFileName($damagedPath), $proofPolicy, [string]$context.Config.Retention.PolicyGuid)
+        $steps += $lookup
+        $steps += 'Then, on the cloud server, run the Check (read only); it writes a new proof:'
+        $steps += $check
+        $steps += ('Copy those two files to the folder {0} of this server, then run the Preview of the Recover again.' -f $inboxFolder)
+    }
+    elseif ($script:RetentionProofRoute) {
+        $steps += 'This server could not ask Exchange Online, and no retention proof stands in for it. On the cloud server, with the batch folder there, make the retention policy hold the mailboxes named above (an adaptive scope can take several days), then run the Check (read only). It writes a retention proof, RetentionProof-...json and its .sha256 file, in the Backups\Outbox folder of that server:'
+        if (@($script:RetentionProofMissing).Count) { $steps += ('The newest retention proof, {0}, does not cover {1} object(s) of this Recover (for example {2}). Only the newest proof counts: run the full Check again on the cloud server, after the policy holds those mailboxes; it writes a new proof for every object.' -f $script:RetentionProofMissing[0].Proof, @($script:RetentionProofMissing).Count, ((@($script:RetentionProofMissing | Select-Object -First 3 | ForEach-Object { [string]$_.Upn }) -join ', '))) }
+        $steps += $check
+        $steps += ('Copy those two files to the folder {0} of this server, then run the Preview of the Recover again. This server accepts a proof for as many hours as its own Retention.ProofMaxAgeHours says ({1}).' -f (Join-Path $context.BackupFolder 'Inbox'), $context.Config.Retention.ProofMaxAgeHours)
+        $steps += ('Why no proof was accepted: {0}.' -f $script:RetentionProofReason)
+        if ($null -ne $script:RetentionProof -and [bool](Get-PraValue $script:RetentionProof 'FutureDated' $false)) {
+            $steps += 'A proof is dated in the future: the clocks of the two servers differ. Compare them: run Get-Date on each server, or run on this server (replace <cloud server> by its name): w32tm /stripchart /computer:<cloud server> /samples:3 /dataonly. Fix the clock of the server that is wrong (domain time: w32tm /resync), then write the proof again with the Check above.'
+        }
+    }
+    else {
+        $steps += 'Make the retention policy hold the mailboxes named above (an adaptive scope can take several days). To see what Exchange Online says about each mailbox, run the Check (read only):'
+        $steps += $check
+    }
+    $steps += 'Then run the Preview of the Recover again:'
+    $steps += $again
+    $steps += 'To turn this check off for every run, set Retention.CheckBeforeRecover = $false in the configuration file (not recommended).'
+    $steps += 'To go on anyway, for this one run only (the mailboxes that are not held are removed without a retention hold of the policy), add -AcceptRetentionRisk to the Apply:'
+    $steps += $anyway
+    $context.NextSteps = $steps; $context.NextOnFailure = $true; $context.NoChangeMade = $true
+    throw ('Recover stopped before any change: the retention policy does not hold {0} mailbox(es) and {1} could not be checked ({2} object(s) carry the retention tag). Nothing was changed.' -f $notCovered.Count, $unverified.Count, $rows.Count)
+}
+
 function Confirm-PraApply {
     <#
     .SYNOPSIS
@@ -776,6 +1164,224 @@ function Send-PraPlanCount {
     Write-PraEvent -Kind count -Data @{ count = $Count; stepIds = $ids }
 }
 
+function Set-PraRowsAwaitCloud {
+    <# Phase Both: the AD part is verified and the Exchange Online part is still to come. The objects are Pending until the cloud part confirms them. #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes the status of the in-memory result rows only.')]
+    param()
+    foreach ($row in $context.Rows) {
+        if ((Test-PraOrdinalIn ([string]$row.FinalStatus) @('Success', 'AlreadyDone'))) { $row.FinalStatus = 'Pending' }
+    }
+}
+
+function Assert-PraBatchNotRolledBack {
+    <# A Convert batch that a Recover batch rolled back, or started to roll back, cannot be resumed: its objects are not converted any more (or not for certain), and a resume would hand over, or grant permissions, for a batch whose conversion is undone. #>
+    param([Parameter(Mandatory)][string[]]$ObjectGuid)
+    $recover = Find-PraRecoverOfBatch -Context $context -SourceHash ([string]$context.Source.Hash) -ObjectGuid $ObjectGuid
+    if ($null -eq $recover) { return }
+    $short = Get-PraShortId ([string]$context.Source.Data.BatchId)
+    $check = (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $recover.ShortId) -replace '^(\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Batch [0-9a-fA-F]+)', '$1 -Expect Deprovisioned'
+    $what = if (Test-PraOrdinalEqual $recover.Basis 'State') { 'already rolled back objects of it' }
+        elseif (Test-PraOrdinalEqual $recover.Basis 'Journal') { 'started to roll back objects of it (it stopped before its proof)' }
+        elseif (Test-PraOrdinalEqual $recover.Basis 'Damaged') { 'was started on it and its journal has lines that cannot be read: every object counts as rolled back' }
+        else { 'was started on it and its journal is not here: every object counts as rolled back' }
+    $steps = @(('Batch {0} was rolled back by Recover batch {1}: its objects are not converted any more. To check what the rollback left, run:' -f $short, $recover.ShortId), $check)
+    if (-not (Test-PraOrdinalEqual $recover.Basis 'State')) {
+        $steps = @(('Recover batch {1} {2}. To see what is left, run:' -f $short, $recover.ShortId, $what), $check,
+            ('To finish the rollback of batch {0}, run the Preview of the Recover (then the same command with -Mode Apply):' -f $short), (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $short))
+    }
+    $context.NextSteps = $steps + @('To convert objects again, start a new Convert (run its Preview first):', (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -ModeName 'Preview' -KeepFilters))
+    $context.NextOnFailure = $true; $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+    throw ('Convert batch {0} cannot be resumed: Recover batch {1} {2}. Nothing was changed.' -f $short, $recover.ShortId, $what)
+}
+
+function Get-PraBatchTouchedSet {
+    <# The objects that the journal of the Convert batch in $context.Source shows as written or about to be written. #>
+    $journal = Join-Path (Split-Path $context.Source.Path -Parent) ('Journal-' + [string]$context.Source.Data.BatchId + '.jsonl')
+    $skipped = 0
+    $set = Get-PraJournalTouchedObject -Path $journal -Context $context -SkippedCount ([ref]$skipped)
+    $script:TouchedSkipped = $skipped
+    return , $set
+}
+
+function Get-PraPartialSourceProof {
+    <# The AD proof of the Convert batch in $context.Source when it is marked partial (checked in full), else $null. A batch without a State file is not partial for this purpose.
+       A State file that cannot be read, or that fails its checks (missing or wrong .sha256, damaged content), gives Unusable = $true with the Reason: the caller falls back to the journal. #>
+    $path = Join-Path (Split-Path $context.Source.Path -Parent) ('State-' + [string]$context.Source.Data.BatchId + '.json')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try { $raw = [IO.File]::ReadAllText($path) | ConvertFrom-PraJson } catch { return [pscustomobject]@{ Unusable = $true; Reason = 'the State file cannot be read' } }
+    if ($null -eq $raw -or $null -eq (Get-PraValue $raw 'Kind' $null)) { return [pscustomobject]@{ Unusable = $true; Reason = 'the State file is not an AD proof' } }
+    if ((Get-PraValue $raw 'Partial' $false) -ne $true) { return $null }
+    try { return (Import-PraProof $context $path $context.Source 'Convert') }
+    catch { return [pscustomobject]@{ Unusable = $true; Reason = (([string]$_.Exception.Message -split '\r?\n')[0]).Trim() } }
+}
+
+function Set-PraUnprovenRow {
+    <#
+    .SYNOPSIS
+        A record of a partial batch that its AD proof does not list: the batch stopped on it after a write was started (it may be partly changed: Pending, to roll back),
+        or never reached it (Skipped, nothing was written). Either way it leaves this run.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes the status of an in-memory result row only.')]
+    param([Parameter(Mandatory)]$Row, [Parameter(Mandatory)]$Record, [Parameter(Mandatory)][string]$Reason)
+    $guid = [string]$Record.ObjectGuid
+    $Row.ADApplied = $false; $Row.ADVerified = $false
+    if ($script:Touched.Contains($guid)) {
+        $Row.FinalStatus = 'Pending'
+        $Row.Detail = 'may be partly changed: the batch stopped on this object after a write was started; roll the batch back (Recover) to restore it'
+        [void]$script:MayBeChanged.Add($guid)
+        $text = 'may be partly changed (the batch stopped on it after a write was started)'; $status = 'Warn'
+    }
+    else {
+        $Row.FinalStatus = 'Skipped'; $Row.Detail = 'not converted by this batch: it stopped at its first error before this object, nothing was written to it'
+        $text = $Reason; $status = 'Skip'
+    }
+    $context.Rows.Add($Row); [void]$script:NotConverted.Add($guid)
+    $context.CurrentIdentity = $guid
+    Write-PraItem -Context $context -Status $status -Text $text
+    $context.CurrentIdentity = ''
+}
+
+function New-PraPartialContinuation {
+    <# What the Next steps need of a partial batch that this run leaves partly out: who was not converted, who may be partly changed, who can be written in a CSV. #>
+    param([Parameter(Mandatory)][string]$Side, [Parameter(Mandatory)][int]$Verified)
+    $left = @($context.Rows | Where-Object { $script:NotConverted.Contains([string]$_.ObjectGuid) -and -not $script:MayBeChanged.Contains([string]$_.ObjectGuid) })
+    $maybe = @($context.Rows | Where-Object { $script:MayBeChanged.Contains([string]$_.ObjectGuid) })
+    $ids = New-Object 'Collections.Generic.List[string]'
+    foreach ($row in $left) { foreach ($value in @([string]$row.SamAccountName, [string]$row.UserPrincipalName, [string]$row.ObjectGuid, [string](Get-PraValue $row.BackupRec 'DistinguishedName' ''))) { if ($value) { $ids.Add($value) } } }
+    return [pscustomobject]@{ ShortId = $context.BatchId; Verified = $Verified; Complete = $false; Side = $Side
+        NotConverted = [string[]]@($left | ForEach-Object { [string]$_.SamAccountName }); NotConvertedIdentifiers = [string[]]$ids.ToArray(); MayBeChanged = [string[]]@($maybe | ForEach-Object { [string]$_.SamAccountName }) }
+}
+
+function ConvertTo-PraIdentityKey {
+    <# The key an identity is matched by: a GUID in any form (braces, no dashes, any case) is its 32 lower-case digits, any other text is itself (the comparison ignores the case). #>
+    param([AllowNull()][string]$Value)
+    $text = ([string]$Value).Trim()
+    $guid = [guid]::Empty
+    if ($text -and [guid]::TryParse($text, [ref]$guid)) { return $guid.ToString('N') }
+    return $text
+}
+
+function Write-PraRemainingCsv {
+    <#
+    .SYNOPSIS
+        A CSV of the objects that are still to convert, to give to a new Convert (-CsvPath): the lines of the CSV of this run that name them, with the same columns, or one
+        Identity column. Written in the log folder (private). Returns its path, or '' when there is nothing to write or the file cannot be written.
+    #>
+    param([Parameter(Mandatory)]$Partial)
+    $names = @($Partial.NotConverted)
+    if (-not $names.Count -or (Test-PraOrdinalEqual $Partial.Side 'Cloud')) { return '' }
+    $folder = [string]$context.LogFolder
+    if (-not $folder -or -not (Test-Path -LiteralPath $folder -PathType Container)) { return '' }
+    $source = ''
+    if (Test-PraOrdinalEqual $Partial.Side 'Run') {
+        $source = if ($CsvPath) { $CsvPath } elseif ((Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue (Get-PraValue $context.Config 'Scope' @{}) 'Mode' '')) 'Csv')) { [string](Get-PraValue $context.Config.Scope 'CsvPath' '') } else { '' }
+        if (-not $source) { return '' }
+    }
+    try {
+        $delimiter = ','
+        if ($source) {
+            $text = Read-PraCsvText -Path $source
+            $header = ($text -split '\r?\n', 2)[0]
+            $delimiter = if ($header -match '(?i)(^|,)\s*"?Identity"?\s*(,|$)') { ',' } else { ';' }
+            $rows = @(ConvertFrom-Csv -InputObject $text -Delimiter $delimiter -ErrorAction Stop)
+            $wanted = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($id in @($Partial.NotConvertedIdentifiers)) { [void]$wanted.Add((ConvertTo-PraIdentityKey $id)) }
+            $converted = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($row in @($context.Rows | Where-Object { -not $script:NotConverted.Contains([string]$_.ObjectGuid) })) {
+                foreach ($value in @([string]$row.SamAccountName, [string]$row.UserPrincipalName, [string]$row.ObjectGuid, [string](Get-PraValue $row.BackupRec 'DistinguishedName' ''))) { if ($value) { [void]$converted.Add((ConvertTo-PraIdentityKey $value)) } }
+            }
+            $keep = New-Object 'Collections.Generic.List[object]'; $unknown = New-Object 'Collections.Generic.List[string]'; $leftOut = 0
+            foreach ($row in $rows) {
+                $key = ConvertTo-PraIdentityKey ([string](Get-PraValue $row 'Identity' ''))
+                if ($wanted.Contains($key)) { $keep.Add($row) }
+                elseif ($converted.Contains($key)) { $leftOut++ }
+                else { $keep.Add($row); $unknown.Add([string](Get-PraValue $row 'Identity' '')) }
+            }
+            if ($unknown.Count) { Write-PraItem -Context $context -Status Warn -Text ('{0} line(s) of the file {1} name no object of batch {2} ({3}): they are kept in the new file, check them.' -f $unknown.Count, $source, $Partial.ShortId, (($unknown | Select-Object -First 5) -join ', ')) }
+            if ($leftOut) { Write-PraItem -Context $context -Status Info -Text ('{0} line(s) of the file {1} name objects that batch {2} converted or stopped on: they are left out of the new file.' -f $leftOut, $source, $Partial.ShortId) }
+            if (-not $keep.Count) { return '' }
+            $columns = @($rows[0].PSObject.Properties.Name)
+        }
+        else { $keep = @($names | ForEach-Object { [pscustomobject]@{ Identity = $_ } }); $columns = @('Identity') }
+        $quote = { param($value) '"' + ([string]$value).Replace('"', '""') + '"' }
+        $lines = New-Object 'Collections.Generic.List[string]'
+        $lines.Add((($columns | ForEach-Object { & $quote $_ }) -join $delimiter))
+        foreach ($row in $keep) { $lines.Add((($columns | ForEach-Object { & $quote (Get-PraValue $row $_ '') }) -join $delimiter)) }
+        $path = Join-Path $folder ('ToConvert-{0}-{1}.csv' -f $Partial.ShortId, $context.RunId.Substring(0, 15))
+        Write-PraImmutableFile $path (($lines -join "`r`n") + "`r`n")
+        return $path
+    }
+    catch { return '' }
+}
+
+function Get-PraPartialRestStep {
+    <# The objects that a partial Convert batch did not convert: how to convert them (a CSV of those only), what to do about the objects that may be partly changed, how to undo the batch. #>
+    param([Parameter(Mandatory)]$Partial)
+    $cloud = (Test-PraOrdinalEqual $Partial.Side 'Cloud')
+    $where = if ($cloud) { 'On the AD server: ' } else { '' }
+    $names = @($Partial.NotConverted); $shown = @($names | Select-Object -First 10)
+    $list = ($shown -join ', ') + $(if ($names.Count -gt $shown.Count) { ', and {0} more' -f ($names.Count - $shown.Count) } else { '' })
+    $steps = @()
+    if ($names.Count) {
+        $csv = Write-PraRemainingCsv $Partial
+        if ($csv) {
+            $steps += ('{0} object(s) were not converted by batch {1} (it stopped at its first error, nothing was written to them): {2}. To convert them, fix the problem named by that error, then run a new Convert with the file {3}, which lists only them (run the Preview first):' -f $names.Count, $Partial.ShortId, $list, $csv)
+            $steps += (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -ModeName 'Preview' -KeepFilters:(Test-PraOrdinalEqual $Partial.Side 'Run') -CsvOverride $csv)
+        }
+        else {
+            $steps += ('{0}{1} object(s) were not converted by batch {2} (it stopped at its first error, nothing was written to them): {3}. To convert them, fix the problem named by that error, then run a new Convert for those objects only{4}; the converted ones are skipped or refused (run the Preview first):' -f $where, $names.Count, $Partial.ShortId, $list, $(if ($cloud) { ' (a CSV file with an Identity column that lists only them)' } else { '' }))
+            $steps += (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -ModeName 'Preview' -KeepFilters:(Test-PraOrdinalEqual $Partial.Side 'Run') -OtherServer:$cloud)
+        }
+    }
+    $maybe = @($Partial.MayBeChanged)
+    if ($maybe.Count) {
+        $steps += ('{0}{1} object(s) may be partly changed: {2}. The batch stopped on them after a write was started, so they are not in the list above. Roll batch {3} back to restore them (its converted objects are restored too, the others are left as they are): run the Preview, then the same command with -Mode Apply:' -f $where, $maybe.Count, ($maybe -join ', '), $Partial.ShortId)
+    }
+    else {
+        $steps += ('{0}To undo batch {1} instead (its {2} converted object(s) are restored, the others are left as they are), run the Preview of the rollback, then the same command with -Mode Apply:' -f $where, $Partial.ShortId, $Partial.Verified)
+    }
+    $steps += (Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $Partial.ShortId -OtherServer:$cloud)
+    return $steps
+}
+
+function Get-PraPartialStopStep {
+    <# A Convert batch stopped after some objects were converted and verified: how to continue them, then how to convert the others, what to do about an object that may be partly changed, or how to undo the batch. #>
+    param([Parameter(Mandatory)]$Partial)
+    $both = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')
+    $what = if ($Partial.Complete) { 'All {1} object(s) are converted and verified (their AD proof is written) but the run stopped before it finished' } else { 'The batch stopped at its first error: {0} of {1} object(s) are converted and verified (their AD proof is written), the others were not converted by it' }
+    $steps = @((($what + '. What this run already did is kept. To continue the {0} converted object(s) ({2}; AD is not changed again):') -f $Partial.Verified, $Partial.Planned, $(if ($both) { 'Entra Connect synchronisation' } else { 'Entra Connect synchronisation, then the transfer package' })),
+        (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -BatchId $Partial.ShortId))
+    if ($both) { $steps += @('Then the Exchange Online part of those objects:', (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'Cloud' -BatchId $Partial.ShortId)) }
+    if ($Partial.Complete) { return $steps }
+    return $steps + @(Get-PraPartialRestStep ([pscustomobject]@{ ShortId = $Partial.ShortId; Verified = $Partial.Verified; NotConverted = $Partial.NotConverted; NotConvertedIdentifiers = $Partial.NotConvertedIdentifiers; MayBeChanged = $Partial.MayBeChanged; Side = 'Run' }))
+}
+
+function Initialize-PraGrantSetting {
+    <#
+    .SYNOPSIS
+        The shared mailbox permissions that the cloud phase of a Convert batch grants follow the settings that the Convert run had: they are stored in the batch.
+        When this server's configuration differs, the batch values are used and a warning names them. A batch from an older version has none: this server's configuration is used, with a warning.
+    #>
+    # A Check of one account has no batch: this server's configuration decides.
+    if ($null -eq $context.Source) { return }
+    $sharedCount = @($context.Source.Data.Records | Where-Object { [bool](Get-PraValue $_ 'IsShared' $false) }).Count
+    $local = Get-PraValue $context.Config 'SharedMailbox' @{}
+    $names = @('Enabled', 'PermissionSource', 'GrantFullAccess', 'GrantSendAs', 'GrantSendOnBehalf')
+    $stored = Get-PraValue $context.Source.Data 'GrantSettings' $null
+    if ($null -eq $stored) {
+        $context.GrantSettingsSource = 'Configuration'
+        if ($sharedCount) { Write-PraItem -Context $context -Status Warn -Text ('This batch was written by an older version: it does not record the shared mailbox permission settings, so the configuration of this server decides ({0}).' -f (($names | ForEach-Object { '{0} = {1}' -f $_, (Get-PraValue $local $_ '') }) -join ', ')) }
+        return
+    }
+    $context.GrantSettingsSource = 'Batch'
+    $context.BatchGrantSettings = @{}
+    foreach ($name in $names) { $context.BatchGrantSettings[$name] = Get-PraValue $stored $name $null }
+    $different = @($names | Where-Object { -not (Test-PraOrdinalIgnoreCaseEqual ([string](Get-PraValue $stored $_ '')) ([string](Get-PraValue $local $_ ''))) })
+    if ($different.Count -and $sharedCount) {
+        Write-PraItem -Context $context -Status Warn -Text ('The shared mailbox permission settings of this server differ from the ones of the batch ({0}). The batch values are used: {1}.' -f (($different | ForEach-Object { '{0}: batch {1}, this server {2}' -f $_, (Get-PraValue $stored $_ ''), (Get-PraValue $local $_ '') }) -join '; '), (($names | ForEach-Object { '{0} = {1}' -f $_, (Get-PraValue $stored $_ '') }) -join ', '))
+    }
+}
+
 function Get-PraSkipReason {
     param([bool]$HasWork = $true)
     if (-not $HasWork) { return 'Nothing to do.' }
@@ -791,9 +1397,18 @@ $script:PreviewPackage = ''
 $script:PackageArgument = ''
 $script:ImportedFolders = @()
 $script:ConfirmBound = $PSBoundParameters.ContainsKey('Confirm')
+# The objects of a partial Convert batch that this run leaves out (not converted by that batch), and what the Next steps need to name them.
+$script:NotConverted = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$script:PartialContinuation = $null
+# The objects that the journal of a partial batch shows as written or about to be written, those among them that the batch did not verify, and whether the proof of the source is partial.
+$script:Touched = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$script:TouchedSkipped = 0
+$script:MayBeChanged = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+$script:SourcePartial = $false
 # Known from the start; the run sets it from the configuration.
 $effectivePhase = [string]$Phase
 try {
+    $context.RunReachedEnd = $false
     # ---------------------------------------------------------------------------------------------
     # Configuration, audit files, banner.
     # ---------------------------------------------------------------------------------------------
@@ -868,6 +1483,9 @@ try {
     foreach ($difference in $configDifferences) {
         Write-PraItem -Context $context -Status Info -Icon Config -Text ('Run setting: {0} {1} (configuration file: {2})' -f $difference.Key, $(if ($difference.Effective) { $difference.Effective } else { '(empty)' }), $(if ($difference.Base) { $difference.Base } else { '(empty)' }))
     }
+    if ($AcceptRetentionRisk -and -not ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover') -and (Test-PraOrdinalIn $effectivePhase @('Both','AD') -IgnoreCase))) {
+        Write-PraItem -Context $context -Status Warn -Text '-AcceptRetentionRisk only applies to the Active Directory part of a Recover (-Phase Both or AD): it is ignored in this run.'
+    }
 
     # Steps of this run (numbered x/total in the console).
     $steps = switch ($Action) {
@@ -929,8 +1547,14 @@ try {
         if (-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) { $script:PreviewPackage = [string]$Batch }
         $imported = Import-PraTransferPackage -Path $packagePath -BackupFolder $importRoot -Environment $config.Environment -ExpectedKind $expectedKind
         Write-PraItem -Context $context -Status Ok -Icon Batch -Text ('Transfer package {0} verified (checksums, Environment, names): {1} folder(s) extracted, {2} already present and identical' -f $imported.Name, $imported.Created.Count, $imported.Existing.Count)
-        if ((-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply'))) { Write-PraItem -Context $context -Status Info -Text 'Preview: the package was verified and read from a private temporary folder, deleted at the end. Nothing was written to the backup folder.' }
+        if ((-not (Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply'))) { Write-PraItem -Context $context -Status Info -Text ('Preview: the package was verified and read from a private temporary folder, deleted at the end. Nothing was written to the backup folder' + $(if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { ' except the retention proof, which is written to the Outbox folder of the backup folder.' } else { '.' })) }
         $script:ImportedFolders = @($imported.Created)
+        if ((Test-PraOrdinalIgnoreCaseEqual $effectiveMode 'Apply')) {
+            # The console tells an imported batch from one converted here by this file (outside the batch folder, which travels with the package).
+            $markerFolder = Join-Path $importRoot 'Imported'
+            Initialize-PraPrivateFolder -Path $markerFolder
+            [IO.File]::WriteAllText((Join-Path $markerFolder (([string]$imported.BatchId).ToLowerInvariant() + '.txt')), ('{0} {1}' -f $imported.Name, [DateTime]::UtcNow.ToString('o')), (New-Object Text.UTF8Encoding($false)))
+        }
         $Batch = [string]$imported.BatchId
         if ($PSBoundParameters.ContainsKey('Batch')) { $PSBoundParameters['Batch'] = $Batch }
     }
@@ -985,17 +1609,33 @@ try {
         if ($context.Source.Legacy) { throw 'This batch was written by an old version and has no AD proof (State file): it cannot be finished from here. Nothing was changed.' }
         $batchFolder = Split-Path $context.Source.Path -Parent
         $proofPath = Join-Path $batchFolder ('State-' + $context.Source.Data.BatchId + '.json')
-        if (-not (Test-Path -LiteralPath $proofPath -PathType Leaf)) { throw 'This batch has no AD proof (State file): its AD changes were not verified, so it cannot be finished from here. Nothing was changed.' }
+        if (-not (Test-Path -LiteralPath $proofPath -PathType Leaf)) {
+            if (Test-PraOrdinalEqual (Get-PraBatchApplyState -Folder $batchFolder -BatchId ([string]$context.Source.Data.BatchId) -SchemaVersion ([int](Get-PraValue $context.Source.Data 'SchemaVersion' 2))) 'NotApplied') {
+                $short = Get-PraShortId ([string]$context.Source.Data.BatchId)
+                $context.NextSteps = @(('Nothing was written to Active Directory by batch {0}: its folder {1} holds the backup only (no AD proof, no journal line of a write), because the run that made it stopped before its first write. You can delete that folder, or keep it as evidence. It is not a batch to finish.' -f $short, $batchFolder),
+                    'To convert the objects, run the Convert again with the same selection (-Group, -SearchBase, -CsvPath or -Identity), the Preview first:',
+                    (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -ModeName 'Preview'))
+                $context.NextOnFailure = $true; $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+                throw ('Batch {0} did not change Active Directory (it stopped before its first AD write), so there is nothing to finish. Nothing was changed.' -f $short)
+            }
+            throw 'This batch has no AD proof (State file): its AD changes were not verified, so it cannot be finished from here. Nothing was changed.'
+        }
         $context.SourceBackupHash = $context.Source.Hash
         $context.Proof = Import-PraProof $context $proofPath $context.Source 'Convert'
+        Assert-PraBatchNotRolledBack -ObjectGuid @($context.Proof.Data.Records | ForEach-Object { [string]$_.ObjectGuid })
         $context.BatchId = Get-PraShortId ([string]$context.Source.Data.BatchId)
         $context.PhaseFolders = @($batchFolder)
         # The preflight runs before any object is marked: a refused run has touched nothing and must not show objects as done.
         Test-PraSyncAvailable
+        if ($context.Proof.Partial) { $script:Touched = Get-PraBatchTouchedSet }
+        $provenIndex = Get-PraRecordIndex $context.Proof.Data.Records
         foreach ($record in @($context.Source.Data.Records)) {
-            if (@($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid }).Count -ne 1) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName). The batch cannot be finished from here. Nothing was changed." }
+            $provenCount = if ($null -eq (Find-PraRecord $provenIndex ([string]$record.ObjectGuid))) { 0 } elseif ($provenIndex.Duplicates.Contains([string]$record.ObjectGuid)) { 2 } else { 1 }
+            if ($provenCount -ne 1 -and -not ($context.Proof.Partial -and $provenCount -eq 0)) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName). The batch cannot be finished from here. Nothing was changed." }
             $row = New-PraRow $context $record
-            $row.ADVerified = $true; $row.ADApplied = $true; $row.BackupPath = $context.Proof.Receipt.Path
+            $row.BackupPath = $context.Proof.Receipt.Path
+            if ($provenCount -eq 0) { Set-PraUnprovenRow -Row $row -Record $record -Reason 'not converted by this batch (it stopped at its first error before this object)'; continue }
+            $row.ADVerified = $true; $row.ADApplied = $true
             $row.FinalStatus = if ($context.AllowMutation) { 'Success' } else { 'Planned' }
             $row.Detail = 'AD changes made and verified by an earlier run of this batch; they are not changed again.'
             $context.Rows.Add($row)
@@ -1004,8 +1644,15 @@ try {
             Write-PraItem -Context $context -Status Info -Text 'AD changes made and verified by an earlier run of this batch; not changed again'
             $context.CurrentIdentity = ''
         }
-        Send-PraPlanCount $context.Rows.Count
-        Write-PraItem -Context $context -Status Ok -Text ("Batch {0}: {1} object(s), AD changes already made and verified (they are not changed again), backup and proof checked" -f $context.BatchId, $context.Rows.Count)
+        $convertedCount = $context.Rows.Count - $script:NotConverted.Count
+        Send-PraPlanCount $convertedCount
+        Write-PraItem -Context $context -Status Ok -Text ("Batch {0}: {1} object(s), AD changes already made and verified (they are not changed again), backup and proof checked" -f $context.BatchId, $convertedCount)
+        if ($script:NotConverted.Count) {
+            $script:PartialContinuation = New-PraPartialContinuation -Side 'AD' -Verified $convertedCount
+            $leftOut = $script:NotConverted.Count - $script:MayBeChanged.Count
+            if ($leftOut) { Write-PraItem -Context $context -Status Warn -Text ('{0} object(s) of this batch were not converted by it (it stopped at its first error): they are left out of this run, see the next steps.' -f $leftOut) }
+            if ($script:MayBeChanged.Count) { Write-PraItem -Context $context -Status Warn -Text ('{0} object(s) may be partly changed (the batch stopped on them after a write was started): {1}. Roll the batch back to restore them, see the next steps.' -f $script:MayBeChanged.Count, (@($script:PartialContinuation.MayBeChanged) -join ', ')) }
+        }
         if ($context.AllowMutation) {
             Confirm-PraApply ("Finish batch {0}? {1}A transfer package is written. AD is not changed again." -f $context.BatchId, $(if ($config.EntraConnect.Sync) { 'Entra Connect synchronises first. ' } else { '' }))
             $context.PhaseWriteFolder = $batchFolder
@@ -1062,6 +1709,7 @@ try {
             $context.Proof = Import-PraProof $context $receipt.StatePath $receipt 'Convert'
             $context.BatchId = Get-PraShortId $receipt.Data.BatchId
             Invoke-PraSync $context
+            if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { Set-PraRowsAwaitCloud }
             # The Exchange Online part does not start when the synchronisation could not run: its mailboxes would not appear. The Next steps say how to go on.
             $runCloud = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -and ($null -eq (Get-PraValue $context 'SyncFailure' $null))
             if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) {
@@ -1085,9 +1733,57 @@ try {
         if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { Test-PraCloudModuleAvailable }
         $context.Source = Import-PraBackup $context (Get-PraBatchFile -Value $Batch -Operations @('Convert'))
         if (-not (Test-PraOrdinalEqual $context.Source.Data.Operation 'Convert')) { throw 'Recover needs the original Convert batch.' }
+        $applyState = Get-PraBatchApplyState -Folder (Split-Path $context.Source.Path -Parent) -BatchId ([string]$context.Source.Data.BatchId) -SchemaVersion ([int](Get-PraValue $context.Source.Data 'SchemaVersion' 2))
+        if (Test-PraOrdinalEqual $applyState 'NotApplied') {
+            $leftover = Split-Path $context.Source.Path -Parent
+            $short = Get-PraShortId ([string]$context.Source.Data.BatchId)
+            $context.NextSteps = @(('Batch {0} did not change Active Directory: its folder {1} holds the backup only (no AD proof, no journal line of a write), because the run that made it stopped before its first write. You can delete that folder, or keep it as evidence. It is not a batch to roll back.' -f $short, $leftover),
+                'To convert the objects, run the Convert again with the same selection (-Group, -SearchBase, -CsvPath or -Identity), the Preview first:',
+                (Get-PraCommandLine -ActionName 'Convert' -PhaseName 'AD' -ModeName 'Preview'))
+            $context.NextOnFailure = $true; $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+            throw ('Recover stopped before any change: batch {0} did not change Active Directory (it stopped before its first AD write), so there is nothing to roll back.' -f $short)
+        }
         $context.SourceBackupHash = $context.Source.Hash
         $records = @(Select-PraSourceRecord $context.Source)
         $context.PhaseFolders = @(Split-Path $context.Source.Path -Parent)
+        # A Convert batch that stopped at its first error converted only some objects: the rollback takes those, and the object that the batch stopped on (it may be partly changed).
+        # The others were never touched by it, and may have been converted by another batch since: they are not rolled back.
+        $sourceProof = Get-PraPartialSourceProof
+        if ($null -ne $sourceProof) {
+            $script:Touched = Get-PraBatchTouchedSet
+            $proven = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            if ([bool](Get-PraValue $sourceProof 'Unusable' $false)) {
+                # The proof cannot be trusted: the journal says which objects the batch may have changed, and those are rolled back. A named object (-Identity) is rolled back on its own.
+                $backupFolder = Split-Path $context.Source.Path -Parent
+                $short = Get-PraShortId ([string]$context.Source.Data.BatchId)
+                Write-PraItem -Context $context -Status Warn -Text ('The AD proof of batch {0} is marked partial but cannot be used ({1}): the journal of the batch decides which objects are rolled back.' -f $short, $sourceProof.Reason)
+                if (-not $Identity -and ($script:TouchedSkipped -gt 0 -or -not $script:Touched.Count)) {
+                    $first = $records | Select-Object -First 1
+                    $journalDamaged = ($script:TouchedSkipped -gt 0)
+                    $context.NextSteps = @(('The backup of batch {0} is {1}: it holds the original values of every object of the batch.' -f $short, $context.Source.Path),
+                        'If you know that an object was converted by this batch, roll it back on its own (run the Preview, then the same command with -Mode Apply):',
+                        ((Get-PraCommandLine -ActionName 'Recover' -ModeName 'Preview' -BatchId $short) + ' -Identity ' + (ConvertTo-PraLiteral ([string](Get-PraValue $first 'SamAccountName' 'user')))),
+                        'Otherwise restore the attributes of the objects from that backup file by hand (the backups are the only way back), or copy the original State file and its .sha256 file back into the batch folder and run the same Recover again.')
+                    if ($journalDamaged) { $context.NextSteps = @(('The journal of batch {0} has {1} line(s) that cannot be read: it may not name every object that the batch changed, so the rollback is not guessed.' -f $short, $script:TouchedSkipped)) + @($context.NextSteps) }
+                    $context.NextOnFailure = $true; $context.NoChangeMade = $true; $context.CurrentIdentity = ''
+                    if ($journalDamaged) { throw ('Recover of batch {0} cannot go on: its AD proof is partial but unusable ({1}) and {2} line(s) of its journal cannot be read, so the objects that the batch wrote cannot be told for certain. Nothing was changed.' -f $short, $sourceProof.Reason, $script:TouchedSkipped) }
+                    throw ('Recover of batch {0} cannot go on: its AD proof is partial but unusable ({1}) and its journal lists no object that was written. Nothing was changed.' -f $short, $sourceProof.Reason)
+                }
+                if ($Identity) { foreach ($record in $records) { [void]$script:Touched.Add([string]$record.ObjectGuid) } }
+            }
+            else { foreach ($entry in @($sourceProof.Data.Records)) { [void]$proven.Add([string]$entry.ObjectGuid) } }
+            $taken = New-Object 'Collections.Generic.List[object]'; $left = New-Object 'Collections.Generic.List[object]'
+            foreach ($record in $records) { if ($proven.Contains([string]$record.ObjectGuid) -or $script:Touched.Contains([string]$record.ObjectGuid)) { $taken.Add($record) } else { $left.Add($record) } }
+            foreach ($record in $left) {
+                $row = New-PraRow $context $record
+                $row.FinalStatus = 'Skipped'; $row.Detail = 'not converted by this batch (it stopped at its first error before this object): nothing to roll back'
+                $context.Rows.Add($row); [void]$script:NotConverted.Add([string]$record.ObjectGuid)
+                $context.CurrentIdentity = [string]$record.ObjectGuid
+                Write-PraItem -Context $context -Status Skip -Text 'not converted by this batch: nothing to roll back'
+                $context.CurrentIdentity = ''
+            }
+            $records = $taken.ToArray()
+        }
         Send-PraPlanCount $records.Count
         Write-PraItem -Context $context -Status Ok -Text ("Convert batch {0}: {1} object(s) selected, backup and SHA-256 verified" -f (Get-PraShortId ([string]$context.Source.Data.BatchId)), $records.Count)
         Write-PraStep -Context $context -Title 'Active Directory connection' -Icon Directory
@@ -1095,15 +1791,22 @@ try {
         Write-PraStep -Context $context -Title 'Planned restore' -Icon Plan
         $plans = @(foreach ($record in $records) {
                 $operation = if ($record.IsShared -and -not $context.KeepCloudShared) { 'Deprovision' } else { 'Recover' }
-                New-PraPlan $context $record.ObjectGuid $operation $record
+                New-PraPlan $context $record.ObjectGuid $operation $record -CheckDrift
             })
         if ($plans.Count) {
             $null = Show-PraPlanSummary $plans
             Invoke-PraAdPreview $context $plans
         }
+        $drifted = New-Object 'Collections.Generic.List[object]'
+        foreach ($plan in $plans) { if (@($plan.Drift).Count) { $drifted.Add($plan) } }
+        if ($drifted.Count) {
+            $context.CurrentOperation = 'Check-ObjectState'; $context.CurrentIdentity = ''
+            Write-PraItem -Context $context -Status Warn -Icon Plan -Text ('{0} of the {1} object(s) changed since this batch left them (named above): the saved values are put back over what is there now. Read their PLANNED values before the Apply.' -f $drifted.Count, $plans.Count)
+        }
         if ($plans.Count) { Test-PraSyncAvailable }
+        if ($plans.Count) { Invoke-PraRetentionGate $plans }
         if ($context.AllowMutation -and $plans.Count) {
-            Confirm-PraApply ("Roll back the {0} object(s) listed above? Users get their on-premises attributes back; shared mailboxes are first deprovisioned in Exchange Online." -f $plans.Count)
+            Confirm-PraApply ("Roll back the {0} object(s) listed above?{1} Users get their on-premises attributes back; shared mailboxes are first deprovisioned in Exchange Online." -f $plans.Count, $(if ($drifted.Count) { ' {0} of them changed since the batch left them: their current values are overwritten.' -f $drifted.Count } else { '' }))
         }
         if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) {
             if ($context.AllowMutation -and $plans.Count) {
@@ -1126,6 +1829,7 @@ try {
             $context.Proof = Import-PraProof $context $receipt.StatePath $context.Source 'Recover'
             $context.BatchId = Get-PraShortId $receipt.Data.BatchId
             Invoke-PraSync $context
+            if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both')) { Set-PraRowsAwaitCloud }
             $runCloud = (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -and ($null -eq (Get-PraValue $context 'SyncFailure' $null))
             if ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'AD')) {
                 Write-PraStep -Context $context -Title 'Creating the transfer package' -Icon Batch
@@ -1153,6 +1857,7 @@ try {
                 Initialize-PraDirectory $context
                 $user = Get-PraUser $context $Identity
                 $record = [pscustomobject]@{ ObjectGuid = ([guid]$user.ObjectGUID).ToString(); SamAccountName = $user.SamAccountName; UserPrincipalName = $user.UserPrincipalName; IsShared = ((Test-PraOrdinalIn $user.msExchRecipientTypeDetails @(4, 34359738368) -IgnoreCase))
+                    SourceAnchor = [pscustomobject]@{ ObjectGuid = [string](ConvertTo-PraImmutableId -Value $user.ObjectGUID); ConsistencyGuid = [string](ConvertTo-PraImmutableId -Value (Get-PraValue $user 'mS-DS-ConsistencyGuid' $null)) }
                     ExpectedX500 = [string[]]@(Get-PraExpectedX500 -LegacyExchangeDN ([string](Get-PraValue $user 'legacyExchangeDN' '')) -ProxyAddresses @($user.proxyAddresses)) }
             }
             $context.Rows.Add((New-PraRow $context $record))
@@ -1164,19 +1869,35 @@ try {
             $proofPath = ''
             if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover')) {
                 $batchFile = Get-PraBatchFile -Value $Batch -Operations @('Recover','Convert')
-                $batchData = [IO.File]::ReadAllText($batchFile) | ConvertFrom-PraJson
+                $batchData = Get-PraJsonHeader $batchFile @('Operation', 'BatchId')
                 if (Test-PraOrdinalEqual $batchData.Operation 'Recover') {
                     $proofPath = Join-Path (Split-Path $batchFile -Parent) ('State-' + $batchData.BatchId + '.json')
-                    $context.Source = Import-PraBackup $context (Find-PraConvertSource -Hash ([string]$batchData.SourceBackupHash))
+                    $context.Source = Import-PraBackup $context (Find-PraConvertSource -Hash ([string](Get-PraJsonHeader $batchFile @('SourceBackupHash')).SourceBackupHash))
                     $context.BatchId = Get-PraShortId $batchData.BatchId
                 }
                 elseif ($context.AllowMutation) { throw "Batch $Batch is a Convert batch: the cloud phase of a Recover needs the batch printed by its AD phase (it proves that AD was restored)." }
                 else { $context.Source = Import-PraBackup $context $batchFile; $context.BatchId = Get-PraShortId $batchData.BatchId }
             }
             else {
-                $context.Source = Import-PraBackup $context (Get-PraBatchFile -Value $Batch -Operations @('Convert'))
-                $context.BatchId = Get-PraShortId ([string]$context.Source.Data.BatchId)
-                if (-not $context.Source.Legacy) { $proofPath = Join-Path (Split-Path $context.Source.Path -Parent) ('State-' + $context.Source.Data.BatchId + '.json') }
+                $isCheck = (Test-PraOrdinalIgnoreCaseEqual $Action 'Check')
+                $batchFile = Get-PraBatchFile -Value $Batch -Operations $(if ($isCheck) { @('Convert', 'Recover') } else { @('Convert') })
+                $fromRecover = $false
+                if ($isCheck) {
+                    # A Recover batch ID given to Check: the Convert batch that it rolled back is the source (as in the cloud phase of a Recover).
+                    $batchData = Get-PraJsonHeader $batchFile @('Operation', 'BatchId')
+                    if (Test-PraOrdinalEqual $batchData.Operation 'Recover') {
+                        $fromRecover = $true
+                        $context.Source = Import-PraBackup $context (Find-PraConvertSource -Hash ([string](Get-PraJsonHeader $batchFile @('SourceBackupHash')).SourceBackupHash))
+                        $context.BatchId = Get-PraShortId ([string]$batchData.BatchId)
+                        Write-PraItem -Context $context -Status Info -Text ('Batch {0} is a Recover batch: the Convert batch {1} that it rolled back is checked.' -f $context.BatchId, (Get-PraShortId ([string]$context.Source.Data.BatchId)))
+                        if (-not (Test-PraOrdinalIgnoreCaseEqual $Expect 'Deprovisioned')) { Write-PraItem -Context $context -Status Warn -Text 'The default expectation is Provisioned; to check a rollback, give -Expect Deprovisioned.' }
+                    }
+                }
+                if (-not $fromRecover) {
+                    $context.Source = Import-PraBackup $context $batchFile
+                    $context.BatchId = Get-PraShortId ([string]$context.Source.Data.BatchId)
+                    if (-not $context.Source.Legacy) { $proofPath = Join-Path (Split-Path $context.Source.Path -Parent) ('State-' + $context.Source.Data.BatchId + '.json') }
+                }
             }
             if (-not (Test-PraOrdinalEqual $context.Source.Data.Operation 'Convert')) { throw 'The source of a cloud phase must be the original Convert batch.' }
             $context.SourceBackupHash = $context.Source.Hash
@@ -1187,25 +1908,49 @@ try {
                 # The journal folder is created after the operator's confirmation (below), never before it.
                 $needCloudJournal = $true
             }
+            if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Convert')) {
+                Assert-PraBatchNotRolledBack -ObjectGuid @($(if ($null -ne $context.Proof) { $context.Proof.Data.Records | ForEach-Object { [string]$_.ObjectGuid } } else { $records | ForEach-Object { [string]$_.ObjectGuid } }))
+            }
+            $script:SourcePartial = ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover') -and $null -ne $context.Proof -and $null -ne (Get-PraPartialSourceProof))
+            if (($null -ne $context.Proof -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and $context.Proof.Partial) -or $script:SourcePartial) { $script:Touched = Get-PraBatchTouchedSet }
+            $verifiedIndex = if ($null -ne $context.Proof) { Get-PraRecordIndex $context.Proof.Data.Records } else { $null }
+            $plannedIndex = if ($null -ne $context.Proof) { Get-PraRecordIndex $context.Proof.Receipt.Data.Records } else { $null }
             foreach ($record in $records) {
                 $row = New-PraRow $context $record
                 $originalLicensing = Get-PraValue $record 'Licensing' $null
                 $row.PreserveLicense = ((Test-PraOrdinalIgnoreCaseEqual $cloudAction 'Recover')) -and [bool](Get-PraValue $originalLicensing 'Enabled' $false) -and [bool](Get-PraValue $originalLicensing 'WasMember' $false)
-                $row.PreserveCloudMailbox = ((Test-PraOrdinalIgnoreCaseEqual $cloudAction 'Recover')) -and $row.IsShared -and $context.KeepCloudShared
+                $row.PreserveCloudMailbox = Test-PraCloudMailboxKept -IsShared ([bool]$row.IsShared) -Operation $cloudAction -KeepCloudShared ([bool]$context.KeepCloudShared)
                 $holders = Get-PraValue $record 'SharedPermissions' $null
                 $row.SharedFullAccess = Get-PraValue $holders 'FullAccess' @(); $row.SharedSendAs = Get-PraValue $holders 'SendAs' @(); $row.SharedSendOnBehalf = Get-PraValue $holders 'SendOnBehalf' @()
                 if ($null -ne $context.Proof) {
-                    $verified = @($context.Proof.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid })
-                    if ($verified.Count -ne 1) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName)" }
-                    $row.ADVerified = $true; $row.DeproPending = (Test-PraOrdinalEqual $verified[0].Operation 'Deprovision'); $row.BackupPath = $context.Proof.Receipt.Path
-                    $provenPlan = @($context.Proof.Receipt.Data.Records | Where-Object { Test-PraOrdinalIgnoreCaseEqual $_.ObjectGuid $record.ObjectGuid })[0]
+                    $verifiedRecord = Find-PraRecord $verifiedIndex ([string]$record.ObjectGuid)
+                    $verifiedCount = if ($null -eq $verifiedRecord) { 0 } elseif ($verifiedIndex.Duplicates.Contains([string]$record.ObjectGuid)) { 2 } else { 1 }
+                    if ($verifiedCount -eq 0 -and ($context.Proof.Partial -or $script:SourcePartial)) {
+                        # Partial batch: this object was not converted by it (or may be partly changed); the cloud part leaves it out.
+                        $row.BackupPath = $context.Proof.Receipt.Path
+                        Set-PraUnprovenRow -Row $row -Record $record -Reason 'not converted by this batch (it stopped at its first error before this object)'
+                        $row.CloudStatus = 'Skipped'
+                        continue
+                    }
+                    if ($verifiedCount -ne 1) { throw "Object not verified by the AD phase of this batch: $($record.SamAccountName)" }
+                    $row.ADVerified = $true; $row.DeproPending = (Test-PraOrdinalEqual $verifiedRecord.Operation 'Deprovision'); $row.BackupPath = $context.Proof.Receipt.Path
+                    $provenPlan = Find-PraRecord $plannedIndex ([string]$record.ObjectGuid)
                     $row.PreserveCloudMailbox = [bool]$provenPlan.PreserveCloudMailbox; $row.PreserveLicense = [bool]$provenPlan.PreserveLicense
                 }
                 $context.Rows.Add($row)
             }
             $context.PhaseFolders = @(@(Split-Path $context.Source.Path -Parent) + $(if ($proofPath) { @(Split-Path $proofPath -Parent) } else { @() }))
-            Send-PraPlanCount $context.Rows.Count
-            Write-PraItem -Context $context -Status Ok -Text ("Batch {0}: {1} object(s){2}" -f $context.BatchId, $records.Count, $(if ($null -ne $context.Proof) { ', AD proof verified' } else { '' }))
+            # The cloud phase of a Convert keeps what it did in the batch folder, so that the console can tell a finished batch from one that is still to do.
+            if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) { $context.PhaseWriteFolder = Split-Path $context.Source.Path -Parent }
+            $convertedCount = $context.Rows.Count - $script:NotConverted.Count
+            Send-PraPlanCount $convertedCount
+            Write-PraItem -Context $context -Status Ok -Text ("Batch {0}: {1} object(s){2}" -f $context.BatchId, $convertedCount, $(if ($null -ne $context.Proof) { ', AD proof verified' } else { '' }))
+            if ($script:NotConverted.Count -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert')) {
+                $script:PartialContinuation = New-PraPartialContinuation -Side 'Cloud' -Verified $convertedCount
+                $leftOut = $script:NotConverted.Count - $script:MayBeChanged.Count
+                if ($leftOut) { Write-PraItem -Context $context -Status Warn -Text ('{0} object(s) of this batch were not converted by it (it stopped at its first error): they are left out of this run, see the next steps.' -f $leftOut) }
+                if ($script:MayBeChanged.Count) { Write-PraItem -Context $context -Status Warn -Text ('{0} object(s) may be partly changed (the batch stopped on them after a write was started): {1}. They are left out of this run, see the next steps.' -f $script:MayBeChanged.Count, (@($script:PartialContinuation.MayBeChanged) -join ', ')) }
+            }
         }
         $runCloud = $true
     }
@@ -1213,7 +1958,8 @@ try {
     # ---------------------------------------------------------------------------------------------
     # Exchange Online part (after the AD part in phase Both, or alone in phase Cloud / Check).
     # ---------------------------------------------------------------------------------------------
-    if ($runCloud -and $context.Rows.Count -gt 0) {
+    $cloudRows = @($context.Rows | Where-Object { -not $script:NotConverted.Contains([string]$_.ObjectGuid) })
+    if ($runCloud -and $cloudRows.Count -gt 0) {
         if ($context.Issues.Count) { throw 'Cloud part not started: the AD part has errors.' }
         $cloudTitle = switch ($cloudAction) { 'Recover' { 'Exchange Online: deprovisioning checks' } default { 'Exchange Online: mailboxes, licences and permissions' } }
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check')) { $cloudTitle = 'Exchange Online checks' }
@@ -1221,30 +1967,60 @@ try {
         # A preview of the cloud phase looks once: it never waits for the cloud.
         if (-not $context.AllowMutation -and (-not (Test-PraOrdinalIgnoreCaseEqual $Action 'Check'))) { $context.Once = $true }
         if ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert')) {
-            $grants = 0; foreach ($row in $context.Rows) { $grants += @($row.SharedFullAccess).Count + @($row.SharedSendAs).Count + @($row.SharedSendOnBehalf).Count }
-            Confirm-PraApply ("Complete {0} object(s) in Exchange Online (wait for the mailboxes, grant up to {1} shared mailbox permission(s))?" -f $context.Rows.Count, $grants)
+            $grants = 0; foreach ($row in $cloudRows) { $grants += @($row.SharedFullAccess).Count + @($row.SharedSendAs).Count + @($row.SharedSendOnBehalf).Count }
+            Confirm-PraApply ("Complete {0} object(s) in Exchange Online (wait for the mailboxes, grant up to {1} shared mailbox permission(s))?" -f $cloudRows.Count, $grants)
         }
         elseif ($context.AllowMutation -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Recover')) {
-            Confirm-PraApply ("Check the deprovisioning of {0} object(s) in Exchange Online, then package any final shared mailbox and tag restoration for the AD server?" -f $context.Rows.Count)
+            Confirm-PraApply ("Check the deprovisioning of {0} object(s) in Exchange Online, then package any final shared mailbox and tag restoration for the AD server?" -f $cloudRows.Count)
         }
         if ($needCloudJournal) { Initialize-PraCloudJournal }
         Initialize-PraCloudAuthority
+        if ((Test-PraOrdinalIgnoreCaseEqual $cloudAction 'Convert')) { Initialize-PraGrantSetting }
         Import-Module (Join-Path $PSScriptRoot 'module\PRA.Cloud.psm1') -Force -ErrorAction Stop
-        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { Invoke-PraRetentionCheck -Context $context -Rows $context.Rows.ToArray() }
-        else { Invoke-PraCloudPhase -Context $context -Rows $context.Rows.ToArray() -Act $cloudAction }
+        if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained')) { Invoke-PraRetentionCheck -Context $context -Rows $cloudRows; Save-PraRetentionProof -Rows $cloudRows }
+        else { Invoke-PraCloudPhase -Context $context -Rows $cloudRows -Act $cloudAction }
+        # Each grant checks the backup cheaply; a Convert that sent at least one (phase Cloud or Both) ends its grant work with one complete check.
+        if ($context.AllowMutation -and (Test-PraOrdinalIn $effectivePhase @('Cloud','Both') -IgnoreCase) -and (Test-PraOrdinalIgnoreCaseEqual $Action 'Convert') -and [int](Get-PraValue $context 'GrantsSent' 0) -gt 0) {
+            try {
+                Assert-PraReceipt -Context $context -Receipt $context.Source -Full
+                Write-PraItem -Context $context -Status Ok -Icon Backup -Text ('Backup of the batch checked in full after {0} permission grant(s)' -f [int]$context.GrantsSent)
+            }
+            catch {
+                $context.NextSteps = @('The backup of this batch changed while the shared mailbox permissions were granted. Check the Backups folder of this server (nobody should write there during a run), then run the same command again, it reads the permissions first and grants only what is missing:',
+                    (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $(if ($script:PackageArgument) { $script:PackageArgument } elseif ($Batch) { $Batch } else { $context.BatchId }) -KeepFilters))
+                $context.NextOnFailure = $true
+                throw ('The final check of the backup failed after {0} grant(s): {1}' -f [int]$context.GrantsSent, $_.Exception.Message)
+            }
+        }
         $cloudErrors = @($context.Rows | Where-Object { Test-PraOrdinalEqual $_.CloudStatus 'Error' })
         $runErrors = @($cloudErrors | Where-Object { [bool](Get-PraValue $_ 'RunError' $false) }).Count
         $notExpected = $cloudErrors.Count - $runErrors
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Check') -and $notExpected -and -not $runErrors -and -not $context.CloudConnectFailed) {
             Write-PraItem -Context $context -Status Fail -Text ('Check finished: {0} object(s) not in the expected state. Nothing was changed.' -f $notExpected)
             $context.CheckFinished = $true
-            $context.NextSteps = @('If the Entra Connect sync has not run since the Active Directory changes, run it first (Start-ADSyncSyncCycle -PolicyType Delta on the Entra Connect server, or wait for the next automatic cycle, about 30 minutes), then run the Check again:',
-                (Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $Batch }) -KeepFilters))
+            $rerunCheck = Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $Batch }) -KeepFilters
+            if (Test-PraOrdinalIgnoreCaseEqual $Expect 'Retained') {
+                $checkedGuid = [string](Get-PraValue $context 'RetentionPolicyGuid' '')
+                $policyLabel = if ($checkedGuid) { ' (' + $checkedGuid + ')' } else { '' }
+                $policyName = [string]$context.Config.Retention.PolicyName
+                $detailCommand = if ($checkedGuid) { 'Connect-IPPSSession; Get-RetentionCompliancePolicy -Identity {0} -DistributionDetail | Format-List Name,Guid,Enabled,Mode,DistributionStatus,*Location*' -f (ConvertTo-PraLiteral $checkedGuid) }
+                    elseif ($policyName) { 'Connect-IPPSSession; Get-RetentionCompliancePolicy -Identity {0} -DistributionDetail | Format-List Name,Guid,Enabled,Mode,DistributionStatus,*Location*' -f (ConvertTo-PraLiteral $policyName) }
+                    else { 'Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid' }
+                $keepProof = @(Get-PraList $context 'NextSteps')
+                $context.NextSteps = @(('The retention policy{0} does not hold, or could not be checked for, {1} mailbox(es) of this batch (named above). Look at what the policy covers: the mailbox must be in its scope and not excluded, and an adaptive scope can take several days to catch up. Read the policy with:' -f $policyLabel, $notExpected),
+                    $detailCommand, 'Make the policy hold those mailboxes, then run the Check again (it writes a new retention proof):', $rerunCheck) + $keepProof
+            }
+            else {
+                $context.NextSteps = @('If the Entra Connect sync has not run since the Active Directory changes, run it first (Start-ADSyncSyncCycle -PolicyType Delta on the Entra Connect server, or wait for the next automatic cycle, about 30 minutes), then run the Check again:', $rerunCheck)
+            }
             $context.NextOnFailure = $true
         }
         elseif ($context.Issues.Count -or $cloudErrors.Count) {
             $isCheck = (Test-PraOrdinalIgnoreCaseEqual $Action 'Check')
-            $network = [bool](Get-PraValue $context 'NetworkFailure' $false)
+            $throttled = [bool](Get-PraValue $context 'CloudThrottled' $false)
+            $network = [bool](Get-PraValue $context 'NetworkFailure' $false) -or $throttled
+            $unanswered = if ($throttled) { 'Microsoft 365 limited the requests of this run' } else { 'Microsoft 365 did not answer from this machine' }
+            $whenAgain = if ($throttled) { 'in a few minutes' } else { 'when the connection works' }
             # The stop names the first object whose check failed.
             if (-not [int](Get-PraValue $context 'CloudNotReached' 0) -and -not (Test-PraOrdinalIn ([string]$context.CurrentOperation) @('Connect-MgGraph', 'Connect-ExchangeOnline'))) {
                 $failedIssues = @($context.Issues.ToArray() | Where-Object { Test-PraOrdinalEqual ([string](Get-PraValue $_ 'Source' '')) 'Cloud' })
@@ -1253,12 +2029,12 @@ try {
                     $context.CurrentIdentity = [string](Get-PraValue $failedIssues[0] 'Identity' '')
                 }
             }
-            $lead = if ($network) { 'Microsoft 365 did not answer' } elseif ($isCheck) { 'The Exchange Online check could not be done' } else { 'Exchange Online check failed' }
+            $lead = if ($throttled) { 'Microsoft 365 limited the requests of this run' } elseif ($network) { 'Microsoft 365 did not answer' } elseif ($isCheck) { 'The Exchange Online check could not be done' } else { 'Exchange Online check failed' }
             if (-not $context.AllowMutation) {
                 $again = if ($isCheck) { 'Check' } else { 'Preview' }
                 $stop = '{0}. Nothing was changed. Run the {1} again.' -f $lead, $again
                 $rerun = Get-PraCommandLine -ActionName $Action -PhaseName $(if ($isCheck) { '' } else { $effectivePhase }) -ModeName 'Preview' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $Batch }) -KeepFilters
-                $first = if ($network) { 'Microsoft 365 did not answer from this machine. Nothing was changed: run the {0} again when the connection works:' -f $again } else { 'Nothing was changed. Fix the problem named above, then run the {0} again:' -f $again }
+                $first = if ($network) { '{0}. Nothing was changed: run the {1} again {2}:' -f $unanswered, $again, $whenAgain } else { 'Nothing was changed. Fix the problem named above, then run the {0} again:' -f $again }
                 $context.NextSteps = @($first, $rerun)
                 $context.NextOnFailure = $true
                 throw $stop
@@ -1267,7 +2043,7 @@ try {
             # The command is given as the operator typed it: the package path or the batch ID.
             $typedBatch = if ($script:PackageArgument) { $script:PackageArgument } elseif ($Batch) { $Batch } else { $context.BatchId }
             if ($network -and (Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) {
-                $context.NextSteps = @('Microsoft 365 did not answer from this machine. What this run already did is kept: run the same command again when the connection works:', (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $typedBatch -KeepFilters))
+                $context.NextSteps = @(('{0}. What this run already did is kept: run the same command again {1}:' -f $unanswered, $whenAgain), (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $typedBatch -KeepFilters))
                 $context.NextOnFailure = $true
             }
             elseif ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud')) {
@@ -1286,7 +2062,7 @@ try {
             elseif ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Both') -and $context.BatchId -and $null -ne $context.Proof) {
                 # The Active Directory part of the batch is written and verified (Convert or Recover): only the Exchange Online part is left, and the batch is continued by its ID.
                 $bothContinues = $true
-                $bothFirst = if ($network) { 'Microsoft 365 did not answer from this machine. What this run already did is kept (Active Directory is changed and verified): run the Exchange Online part when the connection works:' } else { 'What this run already did is kept (Active Directory is changed and verified). Fix the problem named above, then run the Exchange Online part:' }
+                $bothFirst = if ($network) { '{0}. What this run already did is kept (Active Directory is changed and verified): run the Exchange Online part {1}:' -f $unanswered, $whenAgain } else { 'What this run already did is kept (Active Directory is changed and verified). Fix the problem named above, then run the Exchange Online part:' }
                 $context.NextSteps = @($bothFirst, (Get-PraCommandLine -ActionName $Action -PhaseName 'Cloud' -BatchId $context.BatchId))
                 $context.NextOnFailure = $true
             }
@@ -1297,11 +2073,13 @@ try {
         if ((Test-PraOrdinalIgnoreCaseEqual $Action 'Recover')) {
             Write-PraStep -Context $context -Title 'Final restore of shared mailboxes and tags' -Icon Write
             if ($context.AllowMutation) {
-                $tagged = @($context.Rows | Where-Object { [bool](Get-PraValue (Get-PraValue $_.BackupRec 'Retention' $null) 'Enabled' $false) })
+                $tagged = @($cloudRows | Where-Object { [bool](Get-PraValue (Get-PraValue $_.BackupRec 'Retention' $null) 'Enabled' $false) })
                 foreach ($row in $tagged | Where-Object PreserveCloudMailbox) {
                     $row.FinalStatus = 'Pending'; $row.Detail += ' | Cloud mailbox kept on purpose: the retention tag stays.'
                 }
-                $followup = @($context.Rows | Where-Object { -not $_.PreserveCloudMailbox -and ($_.DeproPending -or $tagged.Contains($_)) })
+                $taggedSet = New-Object 'Collections.Generic.HashSet[object]' ([Collections.Generic.ReferenceEqualityComparer]::Instance)
+                foreach ($taggedRow in $tagged) { [void]$taggedSet.Add($taggedRow) }
+                $followup = @($cloudRows | Where-Object { -not $_.PreserveCloudMailbox -and ($_.DeproPending -or $taggedSet.Contains($_)) })
                 foreach ($row in $followup) { if (-not (Test-PraOrdinalEqual $row.CloudStatus 'Success') -or $row.DeprovisionConfirmed -ne $true -or $row.ADVerified -ne $true) { throw 'Cloud deprovisioning or AD proof not confirmed: restore and tag clean-up blocked.' } }
                 if (-not $followup.Count) { Write-PraItem -Context $context -Status Skip -Text 'Nothing left to restore.' }
                 elseif ((Test-PraOrdinalIgnoreCaseEqual $effectivePhase 'Cloud') -or $defer -or -not @(Get-Module -ListAvailable ActiveDirectory).Count) {
@@ -1379,6 +2157,10 @@ try {
         $checkCommand = Get-PraCommandLine -ActionName 'Check' -ModeName 'Preview' -BatchId $(if ($script:PreviewPackage) { $script:PreviewPackage } else { $context.BatchId }) -KeepFilters
         $context.NextSteps = @(@(Get-PraList $context 'NextSteps') + ('X500 missing in Exchange Online for {0} object(s) (replies to old messages can bounce): run an Entra Connect synchronisation, then check again: {1}' -f $x500Missing.Count, $checkCommand))
     }
+
+    # The objects of a partial batch that this run leaves out: how to convert them, or how to undo the batch.
+    if ($null -ne $script:PartialContinuation) { $context.NextSteps = @(Get-PraList $context 'NextSteps') + @(Get-PraPartialRestStep $script:PartialContinuation) }
+    $context.RunReachedEnd = $true
 }
 catch {
     $failure = $_; $failureOperation = $context.CurrentOperation
@@ -1431,6 +2213,16 @@ catch {
     }
 }
 finally {
+    # A run that ends without reaching the end of the main block and without an error (Ctrl+C, a closed window, a stop of the host) is never a success.
+    $interrupted = $false
+    if (-not [bool](Get-PraValue $context 'RunReachedEnd' $false) -and [int]$context.ExitCode -ne 1) {
+        $interrupted = $true
+        try {
+            $where = "Stopped at step '{0}' (operation {1}{2}): the run was interrupted before it finished (Ctrl+C, a closed window or a stop of the host)." -f $context.CurrentPhase, $context.CurrentOperation, $(if ($context.CurrentIdentity) { ', object ' + $context.CurrentIdentity } else { '' })
+            Write-PraLog -Context $context -Message $where -Level Error
+        } catch { $null = $_ }
+        $context.ExitCode = 1
+    }
     Initialize-PraPermissionCache -Context $context
     if ([string](Get-PraValue $context 'PreviewStaging' '')) {
         try { [IO.Directory]::Delete($context.PreviewStaging, $true) } catch { try { Write-PraLog -Context $context -Message ('The temporary Preview folder could not be deleted: {0}' -f $_.Exception.Message) -Level Detail } catch { $null = $_ } }
@@ -1440,21 +2232,23 @@ finally {
         catch { Write-PraLog -Context $context -Message ('The data for the global report could not be saved ({0}).' -f $_.Exception.Message) -Level Detail }
     }
     if (Get-Command Close-PraCloudSession -ErrorAction SilentlyContinue) {
-        try { Close-PraCloudSession -Context $context } catch { $context.Issues.Add([pscustomobject]@{ Message = "Cloud sign-out: $($_.Exception.Message)"; Source = 'Cloud' }) }
+        try { Close-PraCloudSession -Context $context } catch { Write-PraItem -Context $context -Status Warn -Text ('The sign-out of Microsoft 365 failed ({0}). What this run did is not affected. If a session is still open, close it: Disconnect-ExchangeOnline -Confirm:$false; Disconnect-MgGraph' -f ([string]$_.Exception.Message -replace '\s+', ' ')) }
     }
     # What a failed run proposes when no step set a more specific next step.
     try { $context.FallbackNext = @(Get-PraFallbackNext) }
     catch { $context.FallbackNext = @('Fix the problem named above, then run the same command again with the same options.') }
     $result = Complete-PraRun -Context $context
+    # A run whose pipeline was stopped gives its exit code to the process only through the host.
+    if ($interrupted -and (Test-PraOwnEntryProcess)) { try { $Host.SetShouldExit([int]$result.ExitCode) } catch { $null = $_ } }
     if ($PassThru) { $result }
     exit $result.ExitCode
 }
 
 # SIG # Begin signature block
-# MIImKgYJKoZIhvcNAQcCoIImGzCCJhcCAQExDzANBglghkgBZQMEAgEFADB5Bgor
+# MIImKwYJKoZIhvcNAQcCoIImHDCCJhgCAQExDzANBglghkgBZQMEAgEFADB5Bgor
 # BgEEAYI3AgEEoGswaTA0BgorBgEEAYI3AgEeMCYCAwEAAAQQH8w7YFlLCE63JNLG
-# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCDBldMnzAsM7r0A
-# Gou1kqH4Jk/bBL1tsc1AXt+MCK0OM6CCDW8wggZyMIIEWqADAgECAghkM1HTxzif
+# KX7zUQIBAAIBAAIBAAIBAAIBADAxMA0GCWCGSAFlAwQCAQUABCA0s4hin6IYQ1tx
+# 4wsCyP33sM4Dwn5dud5YIa3CBhdMTKCCDW8wggZyMIIEWqADAgECAghkM1HTxzif
 # CDANBgkqhkiG9w0BAQsFADB8MQswCQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMx
 # EDAOBgNVBAcMB0hvdXN0b24xGDAWBgNVBAoMD1NTTCBDb3Jwb3JhdGlvbjExMC8G
 # A1UEAwwoU1NMLmNvbSBSb290IENlcnRpZmljYXRpb24gQXV0aG9yaXR5IFJTQTAe
@@ -1526,28 +2320,28 @@ finally {
 # ULeH38N0Vr83psiJVuBSxQyt5nRVrpYz7FACq5gtXELkyViq/rGOlJKaRrgQ6WWq
 # eoIXqKhVFAdP/jAEm2M8ezoVYsUgPyKY2OcuecV9coulAcxUIUydx6qYiOfsGj5u
 # Dy7l4aYjvB771wkUMzUQwxzcDYXJtMMTaWRe6n9EemR67jc73u5CJyFg3PfA5WR1
-# wZislcdCZuS6MYIYETCCGA0CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
+# wZislcdCZuS6MYIYEjCCGA4CAQEwgYwweDELMAkGA1UEBhMCVVMxDjAMBgNVBAgM
 # BVRleGFzMRAwDgYDVQQHDAdIb3VzdG9uMREwDwYDVQQKDAhTU0wgQ29ycDE0MDIG
 # A1UEAwwrU1NMLmNvbSBDb2RlIFNpZ25pbmcgSW50ZXJtZWRpYXRlIENBIFJTQSBS
 # MQIQBof4ljXihJpmCqqt2mhAWzANBglghkgBZQMEAgEFAKCBhDAYBgorBgEEAYI3
 # AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEMBgorBgEEAYI3AgEEMBwGCisG
-# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDYzGeT4QJ0
-# mLviBq1DwbnIeDV6hi41sAL4ZP0SwOyGmjANBgkqhkiG9w0BAQEFAASCAgBKYRwi
-# J0x/ApfEULuAtHpJl5qpKKAtQvImHSkfhJuGEGgzQvOsgbHLI2o8h9Wxd5oUqfTg
-# jh1EYmbKtbtZs6kIDGpd5rMHu3WutGMrq0BVBP7ccP2FsP6zIWRc5JREZmU3Owq1
-# ieca2Erg7Qq/lGAgTSwKM4SOijtp8m1t1ye/MIVSnommjKbQk8R6aDmTyOUluK2Y
-# gPw8oOr1pRIZ1xlkfogeMu2kbV+6rd8m5cIvj/C24d639BB7Vb0GtTR1enVfBuUx
-# KqGwaIB3qts87MdurboKDPoedFT6XaRAb3n2yF04PHEtopBIaHNxHU2oBQNFAPwv
-# OWPDY15qttdx3Dct8DbIN9cVddFMZfNxRxgiyM+0ncrkJiOgRs+PPFjVSJZ7B1z7
-# zNQwmMXv4CIaBeolCs/q2B22Fcqgi0jsotkCX4fhkIYjTk+J7xaFuTdFWczti6m1
-# 1eOwPw0R8VKTclI9Lu7/6CeKu2BaJWnzO088S4i+oWEpdGZBBG/XIrzLmJ2kMX51
-# alzoZxl89pPjXakKmA9PayZxiP2iiIxmhGz5tWJvlcettvvOL9sZflrvDBHKXTex
-# dX/3vkkal7HiIWZo/sUaLFFXL+qDn6W6xyDmYq4sBAAvC6Qj3S/hQUmhV/fjqDpJ
-# Ifrfu2ABS2aGF5i8w1wpESGc0qPvupTzJg6J0aGCFM4wghTKBgorBgEEAYI3AwMB
-# MYIUujCCFLYGCSqGSIb3DQEHAqCCFKcwghSjAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
+# AQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMC8GCSqGSIb3DQEJBDEiBCDdHvQHXJr7
+# AUrlIeVPUVmJS3QV0AYL+CaTAhBa6fHdKzANBgkqhkiG9w0BAQEFAASCAgCF/Dey
+# l7wMPpne+tFzJ6G9VtiFppo6tVUs1toihWNZDkqYY5LJA056JzqOmm9+zG2ZjRo4
+# mbPE4VYjNTNKQ/EeVJoTx4oNBGEjub1rShkn+rqqPRxGco3j8Dsh58nR8vJJvL2r
+# rFnZ09dLjMbdHXobIcGp8nZsQvzU7MDMgE1+x0/0rKgX0yf+GVK7ZnhHxXa9swHo
+# tAOch7NvUv3+R77BKsGq7UO3F0CLdiSsIKMLlSKG0E+OY++AWV4i9BX+pbOM97uh
+# UApPvcJU/q4HKbfJgG5HAecjnNpgnJYYcygSpIQzjjb1kSqXGLChLCqeZkElZqIF
+# tNPMpKcgIVQDXhXQSjB/aAIzV7AenkqzjfhG4YtStIDHNAvSEEHUsefrXwBu6cAF
+# Bs784nAHPHIJIvbEyFwVxTuL4HCaPgdT5ygPAI2gVzCmgi/JCypVV5rlba10s7ND
+# EPS0vQISEC4zygHjZQImgIUPbUV0U/W2HCsCP67BjQ+4vQPicDYPHsM5SFCSsMqX
+# DPIluuZF2oNo5ZKvTnHl1PvYxrtKmmidL2G+ZYaDkff/ddDq3/nfzOOBYPwhY9Gf
+# 7nFYetsWFumno9IUBAiF7vply3TB1o2lXy+JBujIqvee7IdnkIYm5IH2K8ILFRo9
+# gNUxjcFKkU76wZis3nRpF44UR3mFK7MwdXGhoaGCFM8wghTLBgorBgEEAYI3AwMB
+# MYIUuzCCFLcGCSqGSIb3DQEHAqCCFKgwghSkAgEDMQ0wCwYJYIZIAWUDBAIBMIGJ
 # BgsqhkiG9w0BCRABBKB6BHgwdgIBAQYMKwYBBAGCqTABAwYBMDEwDQYJYIZIAWUD
-# BAIBBQAEIJSZDW2X4jLgbeJOZgF6uNEPauyEQV36nQY+0mTWNn7OAghedq6dLFGE
-# LxgPMjAyNjExMTMxMjEyMTlaMAMCAQECEFVxsNmG3SdglhkMxTPQhWCgghGnMIIE
+# BAIBBQAEIAPsFyd4a1F4e3q9BrG1AoCWGJwgrh4BbIyneoJstfGAAgg45FMZYCrU
+# zxgPMjAyNjExMjIxMTA5MTJaMAMCAQECEGV++/L/cNG5mWzghLplx3igghGnMIIE
 # 8zCCAtugAwIBAgIQVEP4N71a7hgBhHK4XNqO4zANBgkqhkiG9w0BAQsFADByMQsw
 # CQYDVQQGEwJVUzEOMAwGA1UECAwFVGV4YXMxEDAOBgNVBAcMB0hvdXN0b24xETAP
 # BgNVBAoMCFNTTCBDb3JwMS4wLAYDVQQDDCVTU0wuY29tIFRpbWVzdGFtcGluZyBJ
@@ -1642,17 +2436,17 @@ finally {
 # rDMtXndUg3qhJL4pA3ZUlo7w5lM5ml+A7ijr/3Gk2v4QRoDeE2ShmTXdHgtqo8L/
 # fT119mYcETycE2NYGRXsBl3N0rzDsHRr8P3TrprqhRrX04iS0P7eQ+lDxgS3yhGn
 # 3OzWGhDt9Gf2x1qe0/qdhFAVOkXxzMZz4Uat6xsAfzX0+/m8GEKW5Ojw/HY+kLvV
-# wzSPOzGCAlYwggJSAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
+# wzSPOzGCAlcwggJTAgEBMIGGMHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhh
 # czEQMA4GA1UEBwwHSG91c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMM
 # JVNTTC5jb20gVGltZXN0YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4Y
 # AYRyuFzajuMwCwYJYIZIAWUDBAIBoIIBYDAaBgkqhkiG9w0BCQMxDQYLKoZIhvcN
-# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTExMzEyMTIxOVowKAYJKoZIhvcNAQk0
-# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIJ29
-# L8WUh8wLyNf7PfnTOYVo580xkemdTSzzV0g0NHtEMIHIBgsqhkiG9w0BCRACLzGB
+# AQkQAQQwHAYJKoZIhvcNAQkFMQ8XDTI2MTEyMjExMDkxMlowKAYJKoZIhvcNAQk0
+# MRswGTALBglghkgBZQMEAgGhCgYIKoZIzj0EAwIwLwYJKoZIhvcNAQkEMSIEIHHk
+# ZC8BKUGbSoSWnft9VPZfMQRVb+G9+SHG1l4FTaeCMIHIBgsqhkiG9w0BCRACLzGB
 # uDCBtTCBsjCBrwQgV0/qF6r6XnxqK5sIyZixc15FCzhzykTmokygkw5j87AwgYow
 # dqR0MHIxCzAJBgNVBAYTAlVTMQ4wDAYDVQQIDAVUZXhhczEQMA4GA1UEBwwHSG91
 # c3RvbjERMA8GA1UECgwIU1NMIENvcnAxLjAsBgNVBAMMJVNTTC5jb20gVGltZXN0
 # YW1waW5nIElzc3VpbmcgUlNBIENBIDICEFRD+De9Wu4YAYRyuFzajuMwCgYIKoZI
-# zj0EAwIERzBFAiA1EZ9P6Ni8sI8O00cfV8G+6L0RCpTVDRoQaBpgHC5UMwIhAPOV
-# THRc9Bp4e+tJJR3MzAKNWCcO42J50nSSSfqpG1L4
+# zj0EAwIESDBGAiEAuJ6A8HqlHfL57jnFm1HqyTOPQUr002HGlkFkhTC6d+4CIQDM
+# iKnggeb820lajgt3m97e5M+dpj4JWbJV3J2plY3meQ==
 # SIG # End signature block

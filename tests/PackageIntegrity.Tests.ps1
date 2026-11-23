@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Package integrity tests for PRA Remote Mailbox 3.1.4 (offline; no AD, Exchange, Graph, signing key or network).
+    Package integrity tests for PRA Remote Mailbox 3.2.0 (offline; no AD, Exchange, Graph, signing key or network).
 .DESCRIPTION
     Three kinds of evidence, never mixed up:
       * Static: bootstrap identity and order, exact inventory, git attributes, no bypass, no private data.
@@ -12,7 +12,7 @@
         assertion depends on the observed signature state, so it is never skipped and never weakened.
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.4
+    Version : 3.2.0
 #>
 #Requires -Version 7.5
 
@@ -78,7 +78,7 @@ Describe 'Static package contract' {
         $required = @($assignment.Right.FindAll({ param($n) $n -is [Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object Value)
         $expected = @(Get-PraExpectedInventory | Where-Object { $_ -ne 'CHANGELOG.md' })
         (($required | Sort-Object) -join '|') | Should -BeExactly (($expected | Sort-Object) -join '|')
-        $expected.Count | Should -Be 93
+        $expected.Count | Should -Be 94
         $text = [IO.File]::ReadAllText((Join-Path $script:Source 'module\Test-PackageIntegrity.ps1'))
         $text | Should -Match "\`$distributionOnly = @\('CHANGELOG\.md'\)"
     }
@@ -230,7 +230,7 @@ Describe 'Module manifest - PraRemoteMailbox.psd1 and its root module' {
         ([regex]::Matches($root, '(?m)^\s*Import-Module ')).Count | Should -Be 2
         $script:ManifestData.ContainsKey('NestedModules') | Should -BeFalse
         $entry = [IO.File]::ReadAllText((Join-Path $script:Source 'Invoke-PraRemoteMailbox.ps1'))
-        ([regex]::Matches($entry, 'Import-Module \(Join-Path \$PSScriptRoot ''module\\PRA\.Cloud\.psm1''\)')).Count | Should -Be 3
+        ([regex]::Matches($entry, 'Import-Module \(Join-Path \$PSScriptRoot ''module\\PRA\.Cloud\.psm1''\)')).Count | Should -Be 4
         ([regex]::Matches($entry, 'Import-Module \(Join-Path \$PSScriptRoot ''module\\PRA\.Gui\.psm1''\)')).Count | Should -Be 1
     }
     It 'loads the exact list of the manifest, and only PRA.Common, PRA.Directory and PRA.Backup, in a fresh process' {
@@ -299,7 +299,7 @@ Describe 'Controlled fixture - real verifier, bootstrap, hash and path logic (si
         @{ Name = 'entry'; Path = 'Invoke-PraRemoteMailbox.ps1' }, @{ Name = 'Common module'; Path = 'module\PRA.Common.psm1' },
         @{ Name = 'Cloud module'; Path = 'module\PRA.Cloud.psm1' }, @{ Name = 'GUI helper'; Path = 'module\PRA.Gui.Directory.ps1' },
         @{ Name = 'module manifest'; Path = 'PraRemoteMailbox.psd1' }, @{ Name = 'root module'; Path = 'PraRemoteMailbox.psm1' },
-        @{ Name = 'XAML'; Path = 'module\PRA.Gui.xaml' }, @{ Name = 'report template'; Path = 'templates\Report.template.html' },
+        @{ Name = 'XAML'; Path = 'module\PRA.Gui.xaml' }, @{ Name = 'report template'; Path = 'templates\Report.template.html' }, @{ Name = 'global report template'; Path = 'templates\GlobalReport.template.html' },
         @{ Name = 'sample CSV'; Path = 'config\Targets.sample.csv' }, @{ Name = 'README'; Path = 'README.md' }, @{ Name = 'licence'; Path = 'LICENSE' },
         @{ Name = 'guide'; Path = 'docs\PraRemoteMailbox-Guide.html' }, @{ Name = 'user guide'; Path = 'docs\PraRemoteMailbox-UserGuide.html' }, @{ Name = 'image'; Path = 'docs\images\console-verify-light.png' },
         @{ Name = 'changelog'; Path = 'CHANGELOG.md' }, @{ Name = 'verifier'; Path = 'module\Test-PackageIntegrity.ps1' }

@@ -32,11 +32,11 @@
 
 .EXAMPLE
     .\tools\New-PraPackage.ps1
-    Creates ..\package\PraRemoteMailbox-3.1.4.
+    Creates ..\package\PraRemoteMailbox-3.2.0.
 
 .NOTES
     Author  : Nicolas Fabert
-    Version : 3.1.4
+    Version : 3.2.0
 #>
 [CmdletBinding()]
 param(
@@ -88,7 +88,7 @@ if (Test-Path -LiteralPath $Destination) {
 
 # ---- Files needed at run time (paths relative to package\, the same as in the extracted ZIP) ----------------
 $files = New-Object 'Collections.Generic.List[string]'
-foreach ($f in 'Invoke-PraRemoteMailbox.ps1', 'PraRemoteMailbox.psd1', 'PraRemoteMailbox.psm1', 'PackageIntegrity.psd1', 'README.md', 'LICENSE', 'CHANGELOG.md', 'templates\Report.template.html',
+foreach ($f in 'Invoke-PraRemoteMailbox.ps1', 'PraRemoteMailbox.psd1', 'PraRemoteMailbox.psm1', 'PackageIntegrity.psd1', 'README.md', 'LICENSE', 'CHANGELOG.md', 'templates\Report.template.html', 'templates\GlobalReport.template.html',
     'config\Targets.sample.csv', 'config\SharedPermissions.sample.csv', 'docs\PraRemoteMailbox-Guide.html', 'docs\PraRemoteMailbox-Guide.md',
     'docs\PraRemoteMailbox-UserGuide.html', 'docs\PraRemoteMailbox-UserGuide.md') { $files.Add($f) }
 foreach ($m in 'PRA.Common.psm1', 'PRA.Directory.psm1', 'PRA.Backup.psm1', 'PRA.Cloud.psm1', 'PRA.Gui.psm1', 'PRA.Gui.xaml', 'PRA.Gui.Directory.ps1', 'Test-PackageIntegrity.ps1') { $files.Add("module\$m") }

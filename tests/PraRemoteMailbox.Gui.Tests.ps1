@@ -660,17 +660,17 @@ try {
  if(-not $g.Pending){throw ('Preview not authorized: '+$c.SumText.Text+' '+$g.PreviewError)}
  if($c.VerList.Items.Count -ne 1){throw 'The grid is not populated by the Preview report'}
  if($g.Model.Steps.Count -ne 3 -or $g.Model.Steps[2].Status -ne 'Ok'){throw 'The plan and step events did not drive the steps'}
- $c.ConfirmBox.Text='CONVERTX'
+ $c.ConfirmBox.Text='CONVERTX'; Pump 350
  if($c.BtnNext.IsEnabled){throw 'A wrong confirmation word enabled Run'}
- $c.ConfirmBox.Text='convert'
+ $c.ConfirmBox.Text='convert'; Pump 350
  if(-not $c.BtnNext.IsEnabled){throw 'Lowercase confirmation did not enable Run'}
- $c.ConfirmBox.Text=' CoNvErT '
+ $c.ConfirmBox.Text=' CoNvErT '; Pump 350
  if(-not $c.BtnNext.IsEnabled){throw 'Mixed-case confirmation with spaces did not enable Run'}
  $c.F_Identity.Text='other@example.invalid'; Pump
  if($g.Pending -or $c.BtnNext.IsEnabled -or $c.ConfirmBox.Text){throw 'Changing the object source preserved the authorization'}
  $c.F_Identity.Text='synthetic@example.invalid'; Pump
  Click $g 'BtnPreview'; Wait-Run $g
- $c.ConfirmBox.Text='CONVERT'
+ $c.ConfirmBox.Text='CONVERT'; Pump 350
  if(-not $c.BtnNext.IsEnabled){throw 'A fresh Preview did not reauthorize Run'}
  [IO.File]::AppendAllText($Config,"`n# Changed input")
  Click $g 'BtnNext'
@@ -1727,7 +1727,7 @@ try {
  if($packaged.State -cne 'AD part done, cloud part to do' -or $packaged.Finish){throw ('Packaged row: '+$packaged.State)}
  if($c.BatchHelp.Text -cnotmatch 'finish it here'){throw 'The list help does not explain "finish it here"'}
  $orphanRow=RowOf $g $OrphanId
- if(-not $orphanRow -or $orphanRow.Selectable -or $orphanRow.Finish -or $orphanRow.State -cne 'Nothing was written to AD: not a batch to continue' -or $orphanRow.Level -cne 'Warn'){throw ('A folder marked not applied is not a batch to continue: '+$orphanRow.State)}
+ if(-not $orphanRow -or $orphanRow.Selectable -or $orphanRow.Finish -or $orphanRow.State -cne 'Nothing was written to AD: nothing to roll back, not a batch to continue' -or $orphanRow.Level -cne 'Warn'){throw ('A folder marked not applied is not a batch to continue: '+$orphanRow.State)}
  $c.BatchList.SelectedItem=$failed; Pump 80
  if($c.PhasePillText.Text -cne 'Phase: AD'){throw ('Finish phase pill: '+$c.PhasePillText.Text)}
  if($c.PhaseText.Text -cnotmatch 'Active Directory is NOT changed again.*Entra Connect synchronisation again.*ONE transfer package'){throw ('Finish phase text: '+$c.PhaseText.Text)}
@@ -2023,5 +2023,919 @@ AfterAll {
             try { Remove-Item -LiteralPath $script:GuiEvidence -Recurse -Force -ErrorAction Stop; break }
             catch { if($attempt -eq 20) { throw }; Start-Sleep -Milliseconds 500 }
         }
+    }
+}
+
+Describe 'Release 3.2.0 - scale: the console reads a batch file again only when it changed, finds an object of an event without a scan, and reads its CSV files by their stamp (synthetic, no engine)' -Tag 'Release320c' {
+    It 'keeps what it read of a batch while the file and its .sha256 file are unchanged, and reads again only the file that changed' {
+        $runtime=New-GuiTestRoot
+        $batches=@(1..3 | ForEach-Object { New-GuiTestBatch $runtime })
+        $first=Read-PraGuiState $runtime.Root $runtime.Config
+        $first.Batches.Count | Should -Be 3
+        $second=Read-PraGuiState $runtime.Root $runtime.Config
+        foreach ($item in $second.Batches) {
+            $before=@($first.Batches | Where-Object Path -eq $item.Path)[0]
+            [object]::ReferenceEquals($item.Data,$before.Data) | Should -BeTrue -Because 'the batch was not read again'
+        }
+        $changed=$batches[1]
+        $data=$changed.Data.Clone(); $data.Records=@($data.Records[0],$data.Records[0]); $data.Environment='GuiSynthetic'
+        Write-GuiTestJson $changed.Path $data
+        $third=Read-PraGuiState $runtime.Root $runtime.Config
+        foreach ($item in $third.Batches) {
+            $before=@($second.Batches | Where-Object Path -eq $item.Path)[0]
+            [object]::ReferenceEquals($item.Data,$before.Data) | Should -Be ($item.Path -ne $changed.Path)
+        }
+        @($third.Batches | Where-Object Path -eq $changed.Path)[0].Data.RecordCount | Should -Be 2
+        [IO.File]::WriteAllText($batches[2].Path+'.sha256',('0'*64),$script:GuiEncoding)
+        [IO.File]::SetLastWriteTimeUtc($batches[2].Path+'.sha256',[DateTime]::UtcNow.AddSeconds(5))
+        $fourth=Read-PraGuiState $runtime.Root $runtime.Config
+        @($fourth.Batches | Where-Object Path -eq $batches[2].Path)[0].Status | Should -Match 'SHA-256 mismatch' -Because 'a changed .sha256 file is a change of the batch'
+    }
+    It 'keeps in the batch only what the window shows (the counts), so that a batch of thousands of objects costs little memory, and counts the shared mailboxes' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $data=$batch.Data.Clone()
+        $data.Records=@(1..2000 | ForEach-Object { @{ObjectGuid=[guid]::NewGuid().ToString();SamAccountName=('user'+$_);UserPrincipalName=('user'+$_+'@contoso.invalid');IsShared=(($_ % 4) -eq 0)} })
+        Write-GuiTestJson $batch.Path $data
+        $item=Read-PraGuiBatch $batch.Path 'GuiSynthetic'
+        $item.Valid | Should -BeTrue
+        $item.Data.RecordCount | Should -Be 2000
+        $item.Data.SharedCount | Should -Be 500
+        $item.Data.PSObject.Properties.Name | Should -Not -Contain 'Records'
+        $item.Data.BatchId | Should -BeExactly $batch.Id
+        (Read-PraGuiBatch $batch.Path 'OtherSynthetic').EnvMismatch | Should -BeTrue
+        (Read-PraGuiBatch $batch.Path 'otherSYNTHETIC' -AnyEnvironment).Valid | Should -BeTrue
+        (Read-PraGuiBatch $batch.Path 'guisynthetic').Valid | Should -BeTrue -Because 'the Environment is compared ignoring the letter case'
+    }
+    It 'finds the row of an object in a step by its name in any letter case, without scanning the rows of the step' {
+        $result=& (Get-Module PRA.Gui) {
+            $model=@{ Objects=@{}; ObjectIndex=@{} }
+            $clock=[Diagnostics.Stopwatch]::StartNew()
+            for ($i=1; $i -le 3000; $i++) { Add-PraGuiModelObject $model 's3' ('User'+$i+'@contoso.invalid') (New-PraGuiRow @{ Name=('User'+$i+'@contoso.invalid'); Result='ok' }) }
+            $hits=0
+            for ($i=1; $i -le 3000; $i++) { $row=Get-PraGuiModelObject $model 's3' ('USER'+$i+'@CONTOSO.INVALID'); if ($row -and $row.Result -ceq 'ok') { $hits++ } }
+            $plain=@{ Objects=@{ s1=(New-Object 'Collections.ObjectModel.ObservableCollection[object]') } }
+            $plain.Objects.s1.Add((New-PraGuiRow @{ Name='Only@contoso.invalid'; Result='x' }))
+            @{ Rows=$model.Objects['s3'].Count; Hits=$hits; Seconds=$clock.Elapsed.TotalSeconds; Missing=(Get-PraGuiModelObject $model 's3' 'nobody@contoso.invalid'); NoStep=(Get-PraGuiModelObject $model 's9' 'x'); Scan=(Get-PraGuiModelObject $plain 's1' 'ONLY@contoso.invalid') }
+        }
+        $result.Rows | Should -Be 3000
+        $result.Hits | Should -Be 3000
+        $result.Missing | Should -BeNullOrEmpty
+        $result.NoStep | Should -BeNullOrEmpty
+        $result.Scan.Result | Should -BeExactly 'x' -Because 'a model built without the dictionary is still searched'
+        $result.Seconds | Should -BeLessThan 60
+    }
+    It 'says how many rows its target CSV file has from the stamp of the file, and reads the file again when it changes' {
+        $runtime=New-GuiTestRoot
+        $csv=Join-Path $runtime.Root 'targets.csv'
+        Write-GuiTestFile $csv ("Identity`r`n"+((1..50 | ForEach-Object { 'user'+$_+'@contoso.invalid' }) -join "`r`n"))
+        $global:PraGuiCsv=$csv
+        $text=& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }
+        $text | Should -BeExactly ' 50 rows.'
+        & (Get-Module PRA.Gui) { $script:PraGuiCsvCache[$global:PraGuiCsv].Text=' kept from the first reading.' }
+        (& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }) | Should -BeExactly ' kept from the first reading.' -Because 'the file was not read again'
+        Write-GuiTestFile $csv ("Identity`r`n"+((1..7 | ForEach-Object { 'user'+$_+'@contoso.invalid' }) -join "`r`n"))
+        (& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }) | Should -BeExactly ' 7 rows.'
+        Write-GuiTestFile $csv "Wrong`r`nsynthetic@example.invalid"
+        (& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }) | Should -Match 'requires an Identity column'
+        Remove-Variable PraGuiCsv -Scope Global
+        $source=Get-Content -LiteralPath $script:GuiModule -Raw
+        $source | Should -Match '\$c\.ConfirmBox\.Add_TextChanged\(\{ \$script:Gui\.ConfirmTimer\.Stop\(\); \$script:Gui\.ConfirmTimer\.Start\(\) \}\)' -Because 'a refresh follows a pause in the typing, not each key'
+        $source | Should -Not -Match 'ConfirmBox\.Add_TextChanged\(\{ Update-PraGuiView \}\)'
+    }
+    It 'reads the per-run CSV of thousands of rows with the formula guard removed from the columns it shows, and the shared flag as a boolean' {
+        $runtime=New-GuiTestRoot
+        $path=Join-Path $runtime.Root 'run.csv'
+        $lines=New-Object 'Collections.Generic.List[string]'
+        $lines.Add('"ObjectGuid";"SamAccountName";"UserPrincipalName";"IsShared";"BackupPath";"Warnings";"FinalStatus";"Detail";"CloudDetail"')
+        for ($i=1; $i -le 3000; $i++) { $lines.Add(('"{0}";"''=user{1}";"user{1}@contoso.invalid";"{2}";"B{1}";"";"Planned";"''-detail {1}";"''=kept"' -f [guid]::NewGuid(),$i,$(if ($i % 2) { 'True' } else { 'False' }))) }
+        [IO.File]::WriteAllText($path,($lines -join "`r`n"),$script:GuiEncoding)
+        $global:PraGuiReport=$path
+        $clock=[Diagnostics.Stopwatch]::StartNew()
+        $rows=@(& (Get-Module PRA.Gui) { Read-PraGuiReport $global:PraGuiReport })
+        $seconds=$clock.Elapsed.TotalSeconds
+        Remove-Variable PraGuiReport -Scope Global
+        $rows.Count | Should -Be 3000
+        $rows[0].SamAccountName | Should -BeExactly '=user1'
+        $rows[0].Detail | Should -BeExactly '-detail 1'
+        $rows[0].IsShared | Should -BeTrue
+        $rows[1].IsShared | Should -BeFalse
+        $rows[0].UserPrincipalName | Should -BeExactly 'user1@contoso.invalid'
+        $rows[0].CloudDetail | Should -BeExactly "'=kept" -Because 'a column the window does not show keeps its guard'
+        $seconds | Should -BeLessThan 60
+    }
+    It 'counts the rows of a preview once for a given list (a refresh follows each key typed in the confirmation box)' {
+        $result=& (Get-Module PRA.Gui) {
+            $saved=$script:Gui
+            try {
+                $rows=New-Object 'Collections.ObjectModel.ObservableCollection[object]'
+                for ($i=1; $i -le 3000; $i++) { $rows.Add((New-PraGuiRow @{ Type=$(if ($i % 3 -eq 0) { 'Shared' } else { 'User' }); Status=$(if ($i % 10 -eq 0) { 'Warn' } elseif ($i % 50 -eq 0) { 'Fail' } else { 'Ok' }) })) }
+                $script:Gui=@{ VerRows=$rows }
+                $first=[pscustomobject]@{ }
+                $tally=Get-PraGuiVerTally
+                $first=[pscustomobject]@{ Count=$tally.Count; Shared=$tally.Shared; Warn=$tally.Warn; Failed=$tally.Failed }
+                $script:Gui.VerTally.Warn=-1
+                $second=Get-PraGuiVerTally
+                $keptWarn=$second.Warn
+                $rows.Add((New-PraGuiRow @{ Type='Shared'; Status='Fail' }))
+                $third=Get-PraGuiVerTally
+                @{ First=$first; Same=($keptWarn -eq -1); Third=$third }
+            } finally { $script:Gui=$saved }
+        }
+        $result.First.Count | Should -Be 3000
+        $result.First.Shared | Should -Be 1000
+        $result.First.Warn | Should -Be 300
+        $result.First.Failed | Should -Be 0 -Because 'a row that is a multiple of 50 is also a multiple of 10 and counts as a warning'
+        $result.Same | Should -BeTrue
+        $result.Third.Count | Should -Be 3001
+        $result.Third.Shared | Should -Be 1001
+        $result.Third.Failed | Should -Be 1
+    }
+}
+
+Describe 'Release 3.2.0 - the console: the data files of the global report are not batches, an Apply with planned objects is not Done, a partial batch is labelled (synthetic, no engine)' -Tag 'Release320a' {
+    It 'does not list PhaseData and PhaseEvents files as unreadable batches, and resolves a batch folder that holds them' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestJson (Join-Path $batch.Folder 'PhaseData-20261116101010-AD-1a2b3c4d.json') @{ SchemaVersion = 1; Kind = 'PhaseData'; Environment = 'GuiSynthetic'; Objects = @() }
+        Write-GuiTestFile (Join-Path $batch.Folder 'phasedata-20261116101011-cloud-1a2b3c4d.json') '{"Kind":"PhaseData"}'
+        Write-GuiTestFile (Join-Path $batch.Folder 'PhaseEvents-20261116101010-AD-1a2b3c4d.json') '{"Step":"x"}'
+        Write-GuiTestFile (Join-Path $batch.Folder 'PhaseEvents-20261116101010-AD-1a2b3c4d.jsonl') '{"Step":"x"}'
+        $state = Read-PraGuiState $runtime.Root $runtime.Config
+        @($state.Batches).Count | Should -Be 1 -Because (($state.Batches | ForEach-Object Label) -join "`n")
+        @($state.Batches | Where-Object { -not $_.Valid }).Count | Should -Be 0
+        $found = Resolve-PraGuiBatch $batch.Folder 'Convert' $state
+        $found.Path | Should -BeExactly $batch.Path
+        (Resolve-PraGuiBatch $batch.Id 'Convert' $state).Path | Should -BeExactly $batch.Path
+    }
+    It 'an Apply whose result is Planned, or has planned objects, is not a success; a Preview that plans is still valid' {
+        $apply = New-PraGuiRequest -Phase AD -Mode Apply
+        Test-PraGuiResult (New-GuiTestResult $apply) $apply 0 | Should -BeFalse -Because 'Planned is the status of a Preview'
+        $mixed = New-GuiTestResult $apply -Planned 1 -Success 2; $mixed.status = 'Success'
+        Test-PraGuiResult $mixed $apply 0 | Should -BeFalse -Because 'an object is still planned'
+        Test-PraGuiResult (New-GuiTestResult $apply -Planned 0 -Success 2) $apply 0 | Should -BeTrue
+        Test-PraGuiResult (New-GuiTestResult $apply -ExitCode 2 -Planned 0 -Pending 2) $apply 2 | Should -BeTrue
+        $preview = New-PraGuiRequest -Phase AD -Mode Preview
+        Test-PraGuiResult (New-GuiTestResult $preview) $preview 0 | Should -BeTrue
+        $apply = New-PraGuiRequest -Phase AD -Mode 'APPLY'
+        Test-PraGuiResult (New-GuiTestResult $apply) $apply 0 | Should -BeFalse -Because 'the mode is not case sensitive'
+    }
+    It 'labels a batch whose AD proof is partial with the number of objects converted, and nothing for a complete proof' {
+        $runtime = New-GuiTestRoot
+        $partial = New-GuiTestBatch -Runtime $runtime
+        $records = @(1..3 | ForEach-Object { @{ ObjectGuid = [guid]::NewGuid().ToString(); Operation = 'Convert'; ADVerified = $true } })
+        Write-GuiTestJson $partial.Proof @{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'GuiSynthetic'; Partial = $true; PlannedCount = 10; Records = $records }
+        (& (Get-Module PRA.Gui) { param($path) Get-PraGuiPartialText $path } $partial.Proof) | Should -BeExactly 'Partial: 3 of 10 converted'
+        $complete = New-GuiTestBatch -Runtime $runtime
+        (& (Get-Module PRA.Gui) { param($path) Get-PraGuiPartialText $path } $complete.Proof) | Should -BeExactly ''
+        (& (Get-Module PRA.Gui) { param($path) Get-PraGuiPartialText $path } (Join-Path $runtime.Root 'missing.json')) | Should -BeExactly ''
+    }
+}
+
+Describe 'Release 3.2.0 - the console continues a partial batch, or a batch whose synchronisation is not confirmed, with the AD part first (synthetic, no engine)' -Tag 'Release320a' {
+    It 'offers the AD part first for a partial batch, and for a batch without a good Entra Connect entry when the configuration asks for the synchronisation' {
+        $runtime = New-GuiTestRoot
+        $partial = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestJson $partial.Proof @{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'GuiSynthetic'; Partial = $true; PlannedCount = 10; Records = @(@{ ObjectGuid = [guid]::NewGuid().ToString(); Operation = 'Convert'; ADVerified = $true }) }
+        $plain = New-GuiTestBatch -Runtime $runtime
+        $synced = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $synced.Folder ('Journal-' + $synced.Id + '.jsonl')) ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Completed`"}`r`n")
+        $items = @{}
+        foreach ($name in 'partial', 'plain', 'synced') { $batch = Get-Variable $name -ValueOnly; $items[$name] = [pscustomobject]@{ Folder = $batch.Folder; BatchId = $batch.Id; Environment = 'GuiSynthetic' } }
+        $reasons = & (Get-Module PRA.Gui) {
+            param($Items, $Folder)
+            $saved = $script:Gui
+            try {
+                $result = @{}
+                foreach ($sync in $false, $true) {
+                    $script:Gui = [pscustomobject]@{ State = [pscustomobject]@{ Config = @{ EntraConnect = @{ Sync = $sync }; Storage = @{ BackupFolder = $Folder } } }; Detect = $null }
+                    foreach ($name in 'partial', 'plain', 'synced') { $result[$name + '-' + $sync] = [string](Get-PraGuiFinishReason $Items[$name]) }
+                }
+                $result
+            }
+            finally { $script:Gui = $saved }
+        } $items (Join-Path $runtime.Root 'Backups')
+        $reasons['partial-False'] | Should -BeExactly 'AD part partly done, sync not run: finish it here'
+        $reasons['partial-True'] | Should -BeExactly 'AD part partly done, sync not run: finish it here'
+        $reasons['plain-True'] | Should -BeExactly 'AD part done, sync not confirmed: finish it here'
+        $reasons['plain-False'] | Should -Not -Match 'finish it here' -Because 'the configuration leaves the synchronisation to the operator'
+        $reasons['synced-True'] | Should -Not -Match 'finish it here' -Because 'its journal has an Entra Connect entry that ended well'
+    }
+    It 'finishes a batch here only when it was converted on this server and this server can run the AD part: an imported batch, or a cloud-only server, goes on with the cloud part (partial, plain and sync-failed batches, Sync on and off)' {
+        $runtime = New-GuiTestRoot
+        $backups = Join-Path $runtime.Root 'Backups'
+        $makeBatch = {
+            param([string]$Kind, [bool]$Imported)
+            $batch = New-GuiTestBatch -Runtime $runtime
+            if ($Kind -eq 'partial') { Write-GuiTestJson $batch.Proof @{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'GuiSynthetic'; Partial = $true; PlannedCount = 10; Records = @(@{ ObjectGuid = [guid]::NewGuid().ToString(); Operation = 'Convert'; ADVerified = $true }) } }
+            if ($Kind -eq 'failed') { Write-GuiTestFile (Join-Path $batch.Folder ('Journal-' + $batch.Id + '.jsonl')) ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Failed`"}`r`n") }
+            if ($Imported) { Write-GuiTestFile (Join-Path $backups ('Imported\' + $batch.Id + '.txt')) 'Convert-package 2026-11-17' }
+            [pscustomobject]@{ Folder = $batch.Folder; BatchId = $batch.Id; Environment = 'GuiSynthetic' }
+        }
+        $items = @{}
+        foreach ($kind in 'plain', 'partial', 'failed') { foreach ($imported in $false, $true) { $items[$kind + '-' + $imported] = & $makeBatch $kind $imported } }
+        $inbox = & $makeBatch 'plain' $false
+        $package = & (Get-Module PRA.Gui) { param($Item) Get-PraTransferPackageName -Kind Convert -Environment $Item.Environment -BatchId $Item.BatchId } $inbox
+        Write-GuiTestFile (Join-Path $backups ('Inbox\' + $package)) 'synthetic package'
+        $items['inbox'] = $inbox
+        $reasons = & (Get-Module PRA.Gui) {
+            param($Items, $Folder)
+            $saved = $script:Gui
+            try {
+                $result = @{}
+                foreach ($role in 'Cloud', 'AD', 'Both') {
+                    foreach ($sync in $false, $true) {
+                        $script:Gui = [pscustomobject]@{ State = [pscustomobject]@{ Config = @{ EntraConnect = @{ Sync = $sync }; Storage = @{ BackupFolder = $Folder } } }; Detect = [pscustomobject]@{ Role = $role; AD = ($role -ne 'Cloud'); Cloud = ($role -ne 'AD') } }
+                        foreach ($name in $Items.Keys) { $result[$role + '-' + $sync + '-' + $name] = [string](Get-PraGuiFinishReason $Items[$name]) }
+                    }
+                }
+                $result
+            }
+            finally { $script:Gui = $saved }
+        } $items $backups
+        foreach ($sync in $false, $true) {
+            foreach ($kind in 'plain', 'partial', 'failed', 'inbox') {
+                foreach ($role in 'Cloud', 'AD', 'Both') {
+                    $name = if ($kind -eq 'inbox') { 'inbox' } else { $kind + '-True' }
+                    $reasons[$role + '-' + $sync + '-' + $name] | Should -Not -Match 'finish it here' -Because ('imported batch, role ' + $role + ', sync ' + $sync + ', ' + $kind)
+                }
+            }
+            foreach ($kind in 'partial', 'failed') {
+                $reasons['Cloud-' + $sync + '-' + $kind + '-False'] | Should -Not -Match 'finish it here' -Because 'a cloud-only server has no AD part to finish'
+                $reasons['AD-' + $sync + '-' + $kind + '-False'] | Should -Match 'finish it here' -Because 'a local batch of a server that has AD'
+                $reasons['Both-' + $sync + '-' + $kind + '-False'] | Should -Match 'finish it here'
+            }
+            $reasons['Cloud-' + $sync + '-plain-False'] | Should -Not -Match 'finish it here'
+            $reasons['AD-' + $sync + '-plain-False'] | Should -Match 'finish it here' -Because 'a server that only has AD and no package yet finishes its own batch'
+        }
+        $reasons['AD-True-plain-False'] | Should -BeExactly 'AD part done, sync not confirmed: finish it here'
+        $reasons['Both-False-plain-False'] | Should -Not -Match 'finish it here' -Because 'a plain local batch with Sync off is left to the operator when the cloud part can run here'
+        $reasons['Both-True-plain-False'] | Should -BeExactly 'AD part done, sync not confirmed: finish it here'
+    }
+}
+
+Describe 'Release 3.2.0 - the console does not keep a failure to read a file, and Reload forgets what it kept (synthetic, no engine)' -Tag 'Release320c' {
+    It 'a batch file that is locked is told but not kept: the next refresh reads it; an answer about the content (not a batch) is kept while the file is unchanged' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $global:PraGuiLocked=$batch.Path
+        $lock=[IO.File]::Open($batch.Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { $locked=& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked } } finally { $lock.Dispose() }
+        $locked.Error | Should -Not -BeNullOrEmpty
+        $locked.Data | Should -BeNullOrEmpty
+        (& (Get-Module PRA.Gui) { $script:PraGuiBatchCache.ContainsKey($global:PraGuiLocked) }) | Should -BeFalse -Because 'a lock that ends must not stick'
+        $after=& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked }
+        $after.Error | Should -BeExactly ''
+        $after.Data.RecordCount | Should -Be 1
+        [object]::ReferenceEquals($after,(& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked })) | Should -BeTrue
+        $other=Join-Path $runtime.Root 'Backups\Batch-notabatch\Other-fixture.json'
+        Write-GuiTestJson $other @{SchemaVersion=2;Operation='Other';Records=@()}
+        $global:PraGuiLocked=$other
+        $first=& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked }
+        $first.Error | Should -Match 'Not a Convert, Recover or RecoverFinalize package'
+        [object]::ReferenceEquals($first,(& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked })) | Should -BeTrue -Because 'the content of the unchanged file will not answer differently'
+        Remove-Variable PraGuiLocked -Scope Global
+    }
+    It 'the sentence about a target CSV file is not kept when the file cannot be read (a lock), and is read again when the lock ends' {
+        $runtime=New-GuiTestRoot
+        $csv=Join-Path $runtime.Root 'targets-locked.csv'
+        Write-GuiTestFile $csv ("Identity`r`n"+((1..3 | ForEach-Object { 'user'+$_+'@contoso.invalid' }) -join "`r`n"))
+        $global:PraGuiCsv=$csv
+        $lock=[IO.File]::Open($csv,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { $locked=& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv } } finally { $lock.Dispose() }
+        $locked | Should -Not -Match '^ 3 rows\.$'
+        $locked.Trim().Length | Should -BeGreaterThan 0
+        (& (Get-Module PRA.Gui) { $script:PraGuiCsvCache.ContainsKey($global:PraGuiCsv) }) | Should -BeFalse
+        (& (Get-Module PRA.Gui) { Get-PraGuiCsvRowText $global:PraGuiCsv }) | Should -BeExactly ' 3 rows.'
+        Remove-Variable PraGuiCsv -Scope Global
+    }
+    It 'Reload clears the caches of batch files, CSV files and hashes, and the Reload button does it before it reads the state' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $global:PraGuiLocked=$batch.Path
+        $null=& (Get-Module PRA.Gui) { Get-PraGuiBatchCore $global:PraGuiLocked; $script:PraGuiCsvCache['x']=[pscustomobject]@{Stamp='s';Text='t'}; $script:PraGuiHashCache['y']=[pscustomobject]@{Stamp='s';Hash='h'} }
+        (& (Get-Module PRA.Gui) { $script:PraGuiBatchCache.Count + $script:PraGuiCsvCache.Count + $script:PraGuiHashCache.Count }) | Should -BeGreaterThan 2
+        & (Get-Module PRA.Gui) { Clear-PraGuiFileCache }
+        (& (Get-Module PRA.Gui) { $script:PraGuiBatchCache.Count + $script:PraGuiCsvCache.Count + $script:PraGuiHashCache.Count }) | Should -Be 0
+        Remove-Variable PraGuiLocked -Scope Global
+        (Get-Content -LiteralPath $script:GuiModule -Raw) | Should -Match "'BtnReload' \{ if \(-not \`$g\.Run\) \{ Clear-PraGuiFileCache; Update-PraGuiState \} \}"
+    }
+}
+
+Describe 'Release 3.2.0 - the console does not keep a checksum that it could not read (synthetic, no engine)' -Tag 'Release320c' {
+    It 'a locked .sha256 file is told but not kept: the next refresh reads it again; a real mismatch is kept until the stamp changes' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $global:PraGuiLocked=$batch.Path
+        $lock=[IO.File]::Open($batch.Path+'.sha256',[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { $locked=& (Get-Module PRA.Gui) { Get-PraGuiBatchCoreProblem (Get-PraGuiBatchCore $global:PraGuiLocked) $global:PraGuiLocked } } finally { $lock.Dispose() }
+        $locked | Should -Match '^The checksum cannot be read: '
+        (& (Get-Module PRA.Gui) { (Get-PraGuiBatchCore $global:PraGuiLocked).Problem }) | Should -BeNullOrEmpty -Because 'a failure to read is not kept on the cached core'
+        (& (Get-Module PRA.Gui) { Get-PraGuiBatchCoreProblem (Get-PraGuiBatchCore $global:PraGuiLocked) $global:PraGuiLocked }) | Should -BeExactly '' -Because 'the lock ended'
+        [IO.File]::WriteAllText($batch.Path+'.sha256',('0'*64),$script:GuiEncoding)
+        [IO.File]::SetLastWriteTimeUtc($batch.Path+'.sha256',[DateTime]::UtcNow.AddSeconds(5))
+        (& (Get-Module PRA.Gui) { Get-PraGuiBatchCoreProblem (Get-PraGuiBatchCore $global:PraGuiLocked) $global:PraGuiLocked }) | Should -BeExactly 'SHA-256 mismatch.'
+        (& (Get-Module PRA.Gui) { (Get-PraGuiBatchCore $global:PraGuiLocked).Problem }) | Should -BeExactly 'SHA-256 mismatch.' -Because 'a real mismatch stays until the stamp changes'
+        Remove-Variable PraGuiLocked -Scope Global
+    }
+}
+
+Describe 'Release 3.2.0 - the console tells a finished batch from one that is still to do, a partial or pending one stands out, and a finished one never looks continuable (synthetic, no engine)' -Tag 'Release320d' {
+    BeforeAll {
+        function Write-GuiPhaseData {
+            param([string]$Folder, [string]$Action, [string]$Side, [string]$Status, [int]$Pending = 0, [string]$HandOff = '', [string]$Stamp = '20261116101010', [string]$BatchId = '', [string]$Environment = 'GuiSynthetic')
+            # The data of a run names the batch of the folder it is written in.
+            if (-not $BatchId) { $BatchId = (Split-Path $Folder -Leaf) -replace '^(Batch|Finalize)-', ''; $BatchId = $BatchId.Substring(0, [Math]::Min(8, $BatchId.Length)) }
+            $record = [ordered]@{ SchemaVersion = 2; Kind = 'PhaseData'; Environment = $Environment; BatchId = $BatchId; ToolVersion = '3.2.0'; Truncated = $false
+                Phase = [ordered]@{ RunId = ('20261116_101010-' + [guid]::NewGuid().ToString('N')); Action = $Action; Phase = $Side; Mode = 'Apply'; Computer = 'SRV1'; Account = 'CONTOSO\admin'; Server = 'dc01'
+                    StartedUtc = '2026-11-16T10:10:10.0000000Z'; EndedUtc = '2026-11-16T10:20:10.0000000Z'; Status = $Status; ExitCode = 0; HandOff = $HandOff; Overrides = @(); Settings = [ordered]@{ Environment = 'GuiSynthetic' }; Steps = @()
+                    Counts = [ordered]@{ Success = 1; Error = 0; Pending = $Pending; Skipped = 0; Planned = 0 } }
+                Omitted = [ordered]@{ Objects = 0; JourneyLines = 0; Texts = 0; EventLines = 0 }
+                Objects = @([ordered]@{ ObjectGuid = [guid]::NewGuid().ToString(); Name = 'synthetic@example.invalid' }); Issues = @(); Warnings = @() }
+            $path = Join-Path $Folder ('PhaseData-{0}-{1}-{2}.json' -f $Stamp, ($Side -replace '[^0-9A-Za-z]', ''), [guid]::NewGuid().ToString('N').Substring(0, 8))
+            Write-GuiTestFile $path ($record | ConvertTo-Json -Depth 8 -Compress)
+            Write-GuiTestFile ($path + '.sha256') ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant())
+            $path
+        }
+        function Get-GuiRowOf {
+            param($Rows, [string]$BatchId)
+            foreach ($candidate in $Rows) { if ($candidate.BatchId -ceq $BatchId) { return , $candidate } }
+        }
+        function Get-GuiBatchRows {
+            param($Runtime, [string]$Action, [string]$Mode)
+            & (Get-Module PRA.Gui) {
+                param($Root, $Config, $Action, $Mode)
+                $saved = $script:Gui
+                try {
+                    $state = Read-PraGuiState $Root $Config
+                    $script:Gui = @{ Action = $Action; Mode = $Mode; State = $state; Detect = $null }
+                    @(Get-PraGuiBatchEntry)
+                }
+                finally { $script:Gui = $saved }
+            } $Runtime.Root $Runtime.Config $Action $Mode
+        }
+    }
+
+    It 'labels the batches of Continue a batch: finished, pending, stopped, partial and still to do, with the letter case of the phase data ignored; the ones that need attention come first, the finished ones last' {
+        $runtime = New-GuiTestRoot
+        $todo = New-GuiTestBatch -Runtime $runtime
+        $finished = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $finished.Folder 'convert' 'cLoUd' 'SUCCESS'
+        $both = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $both.Folder 'CONVERT' 'both' 'success'
+        $pending = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $pending.Folder 'Convert' 'BOTH' 'pENDING' -Pending 3
+        $stopped = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $stopped.Folder 'Convert' 'CLOUD' 'Failed'
+        $adOnly = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $adOnly.Folder 'Convert' 'AD' 'Pending' -HandOff 'Convert'
+        $garbage = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestFile (Join-Path $garbage.Folder 'PhaseData-20261116101010-Cloud-1a2b3c4d.json') 'not json at all'
+        $partial = New-GuiTestBatch -Runtime $runtime
+        Write-GuiTestJson $partial.Proof @{ SchemaVersion = 2; Operation = 'Convert'; Kind = 'ADVerified'; Environment = 'GuiSynthetic'; Partial = $true; PlannedCount = 10; Records = @(1..3 | ForEach-Object { @{ ObjectGuid = [guid]::NewGuid().ToString(); Operation = 'Convert'; ADVerified = $true } }) }
+        $null = Write-GuiPhaseData $partial.Folder 'Convert' 'Cloud' 'Success'
+        $rows = Get-GuiBatchRows $runtime 'Convert' 'Continue'
+        $row = { param($batch) Get-GuiRowOf $rows $batch.Id }
+        $mark = [string][char]0xE73E
+        foreach ($case in @($todo, $adOnly, $garbage)) {
+            $r = & $row $case
+            $r.State | Should -BeExactly 'AD part done, cloud part to do'
+            $r.Group | Should -BeExactly 'To do'; $r.Level | Should -BeExactly 'Todo'; $r.Selectable | Should -BeTrue; $r.Finish | Should -BeFalse
+        }
+        foreach ($case in @($finished, $both)) {
+            $r = & $row $case
+            $r.State | Should -BeExactly 'Finished: cloud part done'
+            $r.Group | Should -BeExactly 'Finished'; $r.Level | Should -BeExactly 'Ok'; $r.Selectable | Should -BeFalse -Because 'a finished batch cannot be continued'; $r.Finish | Should -BeFalse; $r.Mark | Should -BeExactly $mark
+        }
+        $r = & $row $pending
+        $r.State | Should -BeExactly 'Cloud part pending: 3 objects not ready, run it again'
+        $r.Level | Should -BeExactly 'Warn'; $r.Group | Should -BeExactly 'To do'; $r.Selectable | Should -BeTrue
+        $r = & $row $stopped
+        $r.State | Should -BeExactly 'Cloud part stopped: run it again'
+        $r.Level | Should -BeExactly 'Warn'; $r.Selectable | Should -BeTrue
+        $r = & $row $partial
+        $r.State | Should -BeLike 'Partial: 3 of 10 converted * AD part*' -Because 'the cloud part of the objects that were converted does not make a partial batch finished'
+        $r.Level | Should -BeExactly 'Warn'; $r.Group | Should -BeExactly 'To do'; $r.Selectable | Should -BeTrue
+        $order = @($rows | ForEach-Object { $_.BatchId })
+        $position = { param($batch) [array]::IndexOf($order, $batch.Id) }
+        foreach ($attention in @($pending, $stopped, $partial)) { foreach ($plain in @($todo, $adOnly, $garbage)) { (& $position $attention) | Should -BeLessThan (& $position $plain) -Because 'a pending, stopped or partial batch comes before a batch that is simply to do' } }
+        foreach ($done in @($finished, $both)) { foreach ($other in @($todo, $pending, $stopped, $partial, $adOnly, $garbage)) { (& $position $done) | Should -BeGreaterThan (& $position $other) -Because 'finished batches are last' } }
+    }
+
+    It 'a Convert batch that never wrote to AD (a killed run left the backup only) is not offered as a batch to roll back, in the console as in the command line' -Tag 'Release320j' {
+        $runtime = New-GuiTestRoot
+        $leftover = New-GuiTestBatch -Runtime $runtime
+        Remove-Item -LiteralPath $leftover.Proof, ($leftover.Proof + '.sha256') -Force -ErrorAction SilentlyContinue
+        $journalOnly = New-GuiTestBatch -Runtime $runtime
+        Remove-Item -LiteralPath $journalOnly.Proof, ($journalOnly.Proof + '.sha256') -Force -ErrorAction SilentlyContinue
+        Write-GuiTestFile (Join-Path $journalOnly.Folder ('Journal-' + $journalOnly.Id + '.jsonl')) ('{"RunId":"r","Utc":"u","Target":"00000000-0000-0000-0000-000000000001","Operation":"Set-ADUser","Status":"Started","Detail":""}' + "`r`n")
+        $applied = New-GuiTestBatch -Runtime $runtime
+        $rows = Get-GuiBatchRows $runtime 'Recover' 'New'
+        $r = Get-GuiRowOf $rows $leftover.Id
+        $r.State | Should -BeExactly 'Nothing was written to AD: nothing to roll back, not a batch to continue'
+        $r.Selectable | Should -BeFalse; $r.Group | Should -BeExactly 'Other'; $r.Level | Should -BeExactly 'Warn'
+        (Get-GuiRowOf $rows $journalOnly.Id).State | Should -BeExactly 'Can be rolled back'
+        (Get-GuiRowOf $rows $applied.Id).State | Should -BeExactly 'Can be rolled back'
+    }
+    It 'labels the batches of a rollback: a finished conversion is still a batch to roll back, and says it is finished; a Recover whose cloud part is done says so and cannot be continued' {
+        $runtime = New-GuiTestRoot
+        $todo = New-GuiTestBatch -Runtime $runtime
+        $finished = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $finished.Folder 'Convert' 'Cloud' 'Success'
+        $rows = Get-GuiBatchRows $runtime 'Recover' 'New'
+        $r = Get-GuiRowOf $rows $todo.Id
+        $r.State | Should -BeExactly 'Can be rolled back'; $r.Selectable | Should -BeTrue; $r.Group | Should -BeExactly 'To do'
+        $r = Get-GuiRowOf $rows $finished.Id
+        $r.State | Should -BeExactly 'Finished · can be rolled back'; $r.Selectable | Should -BeTrue; $r.Group | Should -BeExactly 'Finished'
+        $runtime = New-GuiTestRoot
+        $plain = New-GuiTestBatch -Runtime $runtime -Operation 'Recover'
+        $handed = New-GuiTestBatch -Runtime $runtime -Operation 'Recover'
+        $null = Write-GuiPhaseData $handed.Folder 'RECOVER' 'cloud' 'Pending' -HandOff 'Finalize'
+        $waiting = New-GuiTestBatch -Runtime $runtime -Operation 'Recover'
+        $null = Write-GuiPhaseData $waiting.Folder 'Recover' 'Cloud' 'Pending' -Pending 2
+        $rows = Get-GuiBatchRows $runtime 'Recover' 'Continue'
+        $r = Get-GuiRowOf $rows $plain.Id
+        $r.State | Should -BeExactly 'AD rollback done, cloud part to do'; $r.Level | Should -BeExactly 'Todo'; $r.Selectable | Should -BeTrue
+        $r = Get-GuiRowOf $rows $handed.Id
+        $r.State | Should -BeExactly 'Cloud part done: finalize on the AD server'; $r.Group | Should -BeExactly 'Finished'; $r.Selectable | Should -BeFalse
+        $r = Get-GuiRowOf $rows $waiting.Id
+        $r.State | Should -BeExactly 'Cloud part pending: 2 objects not ready, run it again'; $r.Level | Should -BeExactly 'Warn'; $r.Selectable | Should -BeTrue
+    }
+
+    It 'reads the progress of a batch from the last cloud-side run: a later failed run reopens a finished batch, a Finalize that succeeded is finished, and the header is read from the start of a large file only' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $progress = { param($folder, $operation) & (Get-Module PRA.Gui) { param($f, $o) Get-PraGuiBatchProgress $f $o } $folder $operation }
+        (& $progress $batch.Folder 'Convert').Kind | Should -BeExactly 'None'
+        $null = Write-GuiPhaseData $batch.Folder 'Convert' 'Cloud' 'Success' -Stamp '20261116101010'
+        (& $progress $batch.Folder 'convert').Kind | Should -BeExactly 'Finished'
+        $null = Write-GuiPhaseData $batch.Folder 'Convert' 'Cloud' 'Failed' -Stamp '20261116111111'
+        (& $progress $batch.Folder 'Convert').Kind | Should -BeExactly 'Stopped' -Because 'the last run decides'
+        $final = New-GuiTestBatch -Runtime $runtime -Operation 'RecoverFinalize'
+        $null = Write-GuiPhaseData $final.Folder 'FINALIZE' 'finalize' 'SUCCESS'
+        (& $progress $final.Folder 'RecoverFinalize').Kind | Should -BeExactly 'Finished'
+        (& $progress (Join-Path $runtime.Root 'missing-folder') 'Convert').Kind | Should -BeExactly 'None'
+        $large = New-GuiTestBatch -Runtime $runtime
+        $path = Write-GuiPhaseData $large.Folder 'Convert' 'Cloud' 'Success'
+        $text = [IO.File]::ReadAllText($path)
+        $objects = ((1..30000 | ForEach-Object { '{"ObjectGuid":"' + [guid]::NewGuid().ToString() + '","Name":"synthetic' + $_ + '@example.invalid","Detail":"' + ('x' * 100) + '"}' }) -join ',')
+        [IO.File]::WriteAllText($path, $text.Replace('"Objects":[', '"Objects":[' + $objects + ','), (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText($path + '.sha256', (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant(), (New-Object Text.UTF8Encoding($false)))
+        ([IO.FileInfo]$path).Length | Should -BeGreaterThan 4MB
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        (& $progress $large.Folder 'Convert').Kind | Should -BeExactly 'Finished'
+        $clock.Elapsed.TotalSeconds | Should -BeLessThan 5 -Because 'only the first bytes of the file are read, and the answer is kept while the file does not change'
+    }
+
+    It 'does not take a phase data file for a batch that it is not: another batch, another Environment, no checksum file or a checksum that does not match count as no phase data, and a file that cannot be opened just now is not remembered as unreadable' -Tag 'Release320f' {
+        $runtime = New-GuiTestRoot
+        $progress = { param($folder, $environment) & (Get-Module PRA.Gui) { param($f, $e) Get-PraGuiBatchProgress $f 'Convert' $e } $folder $environment }
+        $other = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $other.Folder 'Convert' 'Cloud' 'Success' -BatchId 'FFFFFFFF'
+        (& $progress $other.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'the file names another batch'
+        $null = Write-GuiPhaseData $other.Folder 'Convert' 'Cloud' 'Success' -Stamp '20261116121212' -BatchId $other.Id.ToUpperInvariant().Substring(0, 8)
+        (& $progress $other.Folder 'GuiSynthetic').Kind | Should -BeExactly 'Finished' -Because 'the batch id is compared in any letter case'
+        $env = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $env.Folder 'Convert' 'Cloud' 'Success' -Environment 'Another'
+        (& $progress $env.Folder 'guisynthetic').Kind | Should -BeExactly 'None' -Because 'the file is for another Environment'
+        (& $progress $env.Folder '').Kind | Should -BeExactly 'Finished' -Because 'an empty Environment is not compared'
+        $sum = New-GuiTestBatch -Runtime $runtime
+        $path = Write-GuiPhaseData $sum.Folder 'Convert' 'Cloud' 'Success'
+        $good = [IO.File]::ReadAllText($path + '.sha256')
+        Remove-Item -LiteralPath ($path + '.sha256') -Force
+        (& $progress $sum.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'no checksum file: the batch is not shown as finished'
+        [IO.File]::WriteAllText($path + '.sha256', ('0' * 64))
+        (& $progress $sum.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'the checksum does not match the file'
+        [IO.File]::WriteAllText($path + '.sha256', $good.ToUpperInvariant())
+        [IO.File]::SetLastWriteTimeUtc($path + '.sha256', [DateTime]::UtcNow.AddSeconds(5))
+        (& $progress $sum.Folder 'GuiSynthetic').Kind | Should -BeExactly 'Finished' -Because 'a checksum file written afterwards is read at the next refresh, in any letter case'
+        $busy = New-GuiTestBatch -Runtime $runtime
+        $busyPath = Write-GuiPhaseData $busy.Folder 'Convert' 'Cloud' 'Success'
+        $lock = [IO.File]::Open($busyPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try { (& $progress $busy.Folder 'GuiSynthetic').Kind | Should -BeExactly 'None' -Because 'the file is held by another process' }
+        finally { $lock.Dispose() }
+        (& $progress $busy.Folder 'GuiSynthetic').Kind | Should -BeExactly 'Finished' -Because 'the failed read was not kept'
+    }
+
+    It 'shows the sections in the window: To do is shown first for a list that continues a batch, Finished and All are one click away, a finished batch cannot be picked, and an empty section says why' {
+        $runtime = New-GuiTestRoot
+        $todo = New-GuiTestBatch -Runtime $runtime
+        $pending = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $pending.Folder 'Convert' 'Cloud' 'Pending' -Pending 1
+        $finished = New-GuiTestBatch -Runtime $runtime
+        $null = Write-GuiPhaseData $finished.Folder 'Convert' 'Cloud' 'Success'
+        $onlyFinished = New-GuiTestRoot
+        $done = New-GuiTestBatch -Runtime $onlyFinished
+        $null = Write-GuiPhaseData $done.Folder 'Convert' 'Cloud' 'Success'
+        $probe = Join-Path $runtime.Root 'wpf-probe-sections.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$OnlyRoot,$OnlyConfig,$TodoId,$PendingId,$FinishedId)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$true; Role='Both' } }
+function New-SectionWindow($WindowRoot,$WindowConfig){
+  $window=New-PraGuiWindow -Root $WindowRoot -ConfigPath $WindowConfig -Version 'Synthetic' -PrerequisiteProbe $detect
+  $window.Form.Show()
+  Click $window 'BtnNext'
+  $window.Controls['T_Convert'].IsChecked=$true; Pump 80
+  $window.Controls['Mode_Continue'].IsChecked=$true; Pump 80
+  Click $window 'BtnReload'; Pump 80
+  return $window
+}
+function Ids($Window){ return @($Window.BatchRows | ForEach-Object { $_.BatchId }) }
+function RowOf($Window,[string]$Id){ return ,@($Window.BatchRows | Where-Object { $_.BatchId -ceq $Id })[0] }
+$g=New-SectionWindow $Root $Config
+try {
+ $c=$g.Controls
+ if($c.Bf_ToDo.Content -cne 'To do (2)' -or $c.Bf_Finished.Content -cne 'Finished (1)' -or $c.Bf_All.Content -cne 'All (3)'){throw ('Section counts: '+$c.Bf_ToDo.Content+' / '+$c.Bf_Finished.Content+' / '+$c.Bf_All.Content)}
+ if(-not $c.Bf_ToDo.IsChecked -or $c.BatchFilterBar.Visibility -ne 'Visible'){throw 'To do is not the section in force'}
+ $ids=@(Ids $g)
+ if($ids.Count -ne 2 -or $ids -contains $FinishedId -or $ids[0] -cne $PendingId -or $ids[1] -cne $TodoId){throw ('To do section: '+($ids -join ','))}
+ $pending=RowOf $g $PendingId
+ if($pending.Level -cne 'Warn' -or $pending.State -cnotmatch '^Cloud part pending: 1 object not ready'){throw ('Pending row: '+$pending.State+' / '+$pending.Level)}
+ $c.Bf_Finished.IsChecked=$true; Pump 80
+ $ids=@(Ids $g)
+ if($ids.Count -ne 1 -or $ids[0] -cne $FinishedId -or -not $c.Bf_Finished.IsChecked){throw ('Finished section: '+($ids -join ','))}
+ $row=$g.BatchRows[0]
+ if($row.Selectable -or $row.Group -cne 'Finished' -or $row.State -cne 'Finished: cloud part done'){throw ('Finished row: '+$row.State)}
+ if($c.BtnNext.IsEnabled){throw 'A finished batch must not let the operator go on'}
+ $c.Bf_All.IsChecked=$true; Pump 80
+ $ids=@(Ids $g)
+ if($ids.Count -ne 3 -or $ids[2] -cne $FinishedId){throw ('All section: '+($ids -join ','))}
+ $c.BatchList.SelectedItem=(RowOf $g $TodoId); Pump 80
+ if($null -eq $g.SelectedBatch -or $g.SelectedBatch.BatchId -cne $TodoId -or -not $c.BtnNext.IsEnabled){throw 'A batch that is to do can be picked'}
+ $c.Mode_New.IsChecked=$true; Pump 80; $c.Mode_Continue.IsChecked=$true; Pump 80
+ if(-not $c.Bf_ToDo.IsChecked -or @(Ids $g).Count -ne 2){throw 'Changing the mode puts the list back to To do'}
+} finally { $g.Form.Close() }
+$g=New-SectionWindow $OnlyRoot $OnlyConfig
+try {
+ $c=$g.Controls
+ if($g.BatchRows.Count -ne 0 -or $c.BatchEmpty.Text -cnotmatch '^Nothing is left to do here: 1 finished and hidden\. Click Finished or All to see it\.$'){throw ('Only finished: '+$g.BatchRows.Count+' / '+$c.BatchEmpty.Text)}
+ $c.Bf_Finished.IsChecked=$true; Pump 80
+ if($g.BatchRows.Count -ne 1 -or $c.BatchEmpty.Text){throw 'The finished batch is listed in its section'}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('SECTIONS-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config, '-OnlyRoot', $onlyFinished.Root, '-OnlyConfig', $onlyFinished.Config,
+            '-TodoId', $todo.Id, '-PendingId', $pending.Id, '-FinishedId', $finished.Id)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(180000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'SECTIONS-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.2.0 - the console: the retention override, the header of the activity log, the old files of logs\gui, the steps after a valid run, Ctrl+C and the time limit of the OU lookup (synthetic, no engine)' -Tag 'Release320e' {
+    It 'the request, the command line and the guard carry -AcceptRetentionRisk for the AD part of a Recover only, whatever the letter case of the words' -TestCases @(
+        @{Action='Recover';Phase='AD';Batch='01234567';Expected=$true}
+        @{Action='recover';Phase='both';Batch='01234567';Expected=$true}
+        @{Action='RECOVER';Phase='BOTH';Batch='01234567';Expected=$true}
+        @{Action='Recover';Phase='Cloud';Batch='01234567';Expected=$false}
+        @{Action='Convert';Phase='Both';Batch='';Expected=$false}
+        @{Action='Finalize';Phase='AD';Batch='01234567';Expected=$false}
+        @{Action='Check';Phase='Cloud';Batch='01234567';Expected=$false}
+    ) {
+        param($Action,$Phase,$Batch,$Expected)
+        $request=New-PraGuiRequest -Action $Action -Phase $Phase -Batch $Batch -AcceptRetentionRisk $true
+        [bool]$request.AcceptRetentionRisk | Should -Be $Expected
+        $command=Get-PraGuiCommand -Root 'C:\Synthetic root' -ConfigPath 'C:\Synthetic root\config.psd1' -Request $request
+        ($command.Tokens -contains '-AcceptRetentionRisk') | Should -Be $Expected
+        ($command.Display -match '-AcceptRetentionRisk') | Should -Be $Expected
+        $plain=New-PraGuiRequest -Action $Action -Phase $Phase -Batch $Batch
+        [bool]$plain.AcceptRetentionRisk | Should -BeFalse
+        (Get-PraGuiCommand -Root 'C:\Synthetic root' -ConfigPath 'C:\Synthetic root\config.psd1' -Request $plain).Tokens | Should -Not -Contain '-AcceptRetentionRisk'
+    }
+    It 'the switch changes the guard of the Preview: an Apply after the box was ticked or cleared needs a new Preview' {
+        $runtime=New-GuiTestRoot
+        $batch=New-GuiTestBatch $runtime
+        $without=Get-PraGuiGuard $runtime.Root $runtime.Config (New-PraGuiRequest -Action Recover -Phase AD -Batch $batch.Path)
+        $with=Get-PraGuiGuard $runtime.Root $runtime.Config (New-PraGuiRequest -Action Recover -Phase AD -Batch $batch.Path -AcceptRetentionRisk $true)
+        $with | Should -Not -Be $without
+        Get-PraGuiGuard $runtime.Root $runtime.Config (New-PraGuiRequest -Action Recover -Phase AD -Batch $batch.Path -AcceptRetentionRisk $true) | Should -Be $with
+    }
+    It 'the window has the checkbox on the Recover task, off by default, and the engine switch is documented in the entry script' {
+        $xaml=Get-Content -LiteralPath (Join-Path $script:GuiProjectRoot 'module\PRA.Gui.xaml') -Raw
+        $xaml | Should -Match 'x:Name="F_AcceptRetention"'
+        $xaml | Should -Not -Match 'F_AcceptRetention"[^>]*IsChecked="True"'
+        $gui=Get-Content -LiteralPath $script:GuiModule -Raw
+        $gui | Should -Match 'F_AcceptRetention\.Add_Checked'
+        $gui | Should -Match 'F_AcceptRetention\.IsChecked=\$false'
+        (Get-Content -LiteralPath (Join-Path $script:GuiProjectRoot 'Invoke-PraRemoteMailbox.ps1') -Raw) | Should -Match '\[switch\]\$AcceptRetentionRisk'
+    }
+    It 'the header of the activity log says where the complete log is, and goes back to the plain title' {
+        Add-Type -AssemblyName PresentationFramework,PresentationCore,WindowsBase
+        & (Get-Module PRA.Gui) {
+            $expander=[pscustomobject]@{ Header='Activity log' }
+            $script:Gui=@{ Controls=@{ LogExpander=$expander } }
+            try {
+                Set-PraGuiLogHeader 'C:\Synthetic root\logs\run.log'
+                $expander.Header | Should -BeOfType ([Windows.Controls.TextBlock])
+                $expander.Header.Text | Should -BeExactly ('Activity log: the last {0} lines. The complete log is in C:\Synthetic root\logs\run.log' -f $script:PraGuiLogLines)
+                Set-PraGuiLogHeader ''
+                $expander.Header | Should -BeExactly 'Activity log'
+            } finally { $script:Gui=$null }
+        }
+        $text=Get-Content -LiteralPath $script:GuiModule -Raw
+        $text | Should -Match "Set-PraGuiLogHeader \(\`$base\+'\.stdout\.txt'\)"
+        $text | Should -Match 'if \(\$logFile\) \{ Set-PraGuiLogHeader \$logFile \}'
+    }
+    It 'after a valid run a step that never started is Skip, the running one is Ok; after a failed run the running one is Fail and the others stay Pending' {
+        & (Get-Module PRA.Gui) {
+            foreach ($valid in @($true,$false)) {
+                $rows=@('Ok','Running','Wait','Pending','Skip','Warn' | ForEach-Object { New-PraGuiRow @{ Status=$_; Note='n'; NoteBase='n'; NextAt=1; Progress=[double]0.5 } })
+                Close-PraGuiRunStep -Step $rows -Valid $valid
+                $states=@($rows | ForEach-Object { $_.Status }) -join ','
+                if ($valid) { $states | Should -BeExactly 'Ok,Ok,Ok,Skip,Skip,Warn' }
+                else { $states | Should -BeExactly 'Ok,Fail,Fail,Pending,Skip,Warn' }
+                $rows[1].Progress | Should -Be 1
+            }
+        }
+        Get-Content -LiteralPath $script:GuiModule -Raw | Should -Match 'Close-PraGuiRunStep -Step @\(\$g\.Model\.Steps\) -Valid \$valid'
+    }
+    It 'the window removes what it left in logs\gui more than 30 days ago, files and run folders, and nothing else' {
+        $runtime=New-GuiTestRoot
+        $gui=Join-Path $runtime.Root 'logs\gui'
+        $old=(Get-Date).AddDays(-31); $recent=(Get-Date).AddDays(-29)
+        $null=New-Item -ItemType Directory -Path (Join-Path $gui 'run-old'),(Join-Path $gui 'run-recent') -Force
+        Write-GuiTestFile (Join-Path $gui 'run-old\effective.config.psd1') '@{ }'
+        Write-GuiTestFile (Join-Path $gui 'run-recent\effective.config.psd1') '@{ }'
+        foreach ($name in @('a-old.events.jsonl','a-old.stdout.txt','b-recent.stdout.txt','OU-OLD.json')) { Write-GuiTestFile (Join-Path $gui $name) 'x' }
+        Write-GuiTestFile (Join-Path $runtime.Root 'logs\engine-old.log') 'engine log, never touched'
+        Write-GuiTestFile (Join-Path $runtime.Root 'reports\report-old.html') 'report, never touched'
+        foreach ($path in @((Join-Path $gui 'a-old.events.jsonl'),(Join-Path $gui 'a-old.stdout.txt'),(Join-Path $gui 'OU-OLD.json'),(Join-Path $gui 'run-old\effective.config.psd1'),(Join-Path $gui 'run-old'),(Join-Path $runtime.Root 'logs\engine-old.log'),(Join-Path $runtime.Root 'reports\report-old.html'))) { (Get-Item -LiteralPath $path).LastWriteTime=$old }
+        foreach ($path in @((Join-Path $gui 'b-recent.stdout.txt'),(Join-Path $gui 'run-recent\effective.config.psd1'),(Join-Path $gui 'run-recent'))) { (Get-Item -LiteralPath $path).LastWriteTime=$recent }
+        Remove-PraGuiOldLog -Root $runtime.Root | Should -Be 4
+        @(Get-ChildItem -LiteralPath $gui -Force | ForEach-Object Name | Sort-Object) -join ',' | Should -BeExactly 'b-recent.stdout.txt,run-recent'
+        Test-Path -LiteralPath (Join-Path $runtime.Root 'logs\engine-old.log') | Should -BeTrue
+        Test-Path -LiteralPath (Join-Path $runtime.Root 'reports\report-old.html') | Should -BeTrue
+        Remove-PraGuiOldLog -Root $runtime.Root | Should -Be 0
+        Remove-PraGuiOldLog -Root (Join-Path $runtime.Root 'does-not-exist') | Should -Be 0
+    }
+    It 'a file of logs\gui that is held open is left, the others are removed, and nothing is thrown' {
+        $runtime=New-GuiTestRoot
+        $gui=Join-Path $runtime.Root 'logs\gui'
+        foreach ($name in @('held.stdout.txt','free.stdout.txt')) { Write-GuiTestFile (Join-Path $gui $name) 'x'; (Get-Item -LiteralPath (Join-Path $gui $name)).LastWriteTime=(Get-Date).AddDays(-60) }
+        $lock=[IO.File]::Open((Join-Path $gui 'held.stdout.txt'),[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
+        try { { Remove-PraGuiOldLog -Root $runtime.Root } | Should -Not -Throw } finally { $lock.Dispose() }
+        @(Get-ChildItem -LiteralPath $gui | ForEach-Object Name) | Should -BeExactly @('held.stdout.txt')
+    }
+    It 'Show-PraGui prunes logs\gui and keeps Ctrl+C out of the window only while it is open, only when the input is a console, and gives the setting back' {
+        $text=Get-Content -LiteralPath $script:GuiModule -Raw
+        $body=[regex]::Match($text,'(?s)function Show-PraGui \{.*?\r?\n\}\r?\n').Value
+        $body | Should -Match 'Remove-PraGuiOldLog -Root \$Root'
+        $body | Should -Match '\[Console\]::IsInputRedirected'
+        $body.IndexOf('TreatControlCAsInput=$true') | Should -BeGreaterThan 0
+        $body.IndexOf('TreatControlCAsInput=$true') | Should -BeLessThan $body.IndexOf('ShowDialog()')
+        $body.IndexOf('finally') | Should -BeGreaterThan $body.IndexOf('ShowDialog()')
+        $body.Substring($body.IndexOf('finally')) | Should -Match 'TreatControlCAsInput=\$previousCtrlC'
+        Get-Command -Module PRA.Gui -Name Remove-PraGuiOldLog | Should -Not -BeNullOrEmpty
+    }
+    It 'an OU lookup that does not answer within its time limit is stopped, says so, and frees the window; one that is within its time is left alone' {
+        $info=New-Object Diagnostics.ProcessStartInfo
+        $info.FileName=(Join-Path $PSHOME 'pwsh.exe'); $info.Arguments='-NoProfile -NonInteractive -Command Start-Sleep -Seconds 120'; $info.UseShellExecute=$false; $info.CreateNoWindow=$true
+        $process=[Diagnostics.Process]::Start($info)
+        $processId=$process.Id; $processStart=$process.StartTime
+        $global:PraOuProcess=$process; $global:PraOuMessages=New-Object 'Collections.Generic.List[string]'
+        try {
+            Mock Show-PraGuiError { $global:PraOuMessages.Add($Message) } -ModuleName PRA.Gui
+            Mock Set-PraGuiBusy { } -ModuleName PRA.Gui
+            Mock Update-PraGuiView { } -ModuleName PRA.Gui
+            Mock Sync-PraGuiTimer { } -ModuleName PRA.Gui
+            & (Get-Module PRA.Gui) {
+                $global:PraOuStopped=0
+                $timer=[pscustomobject]@{}; Add-Member -InputObject $timer -MemberType ScriptMethod -Name Stop -Value { $global:PraOuStopped=[int]$global:PraOuStopped+1 }
+                $script:Gui=@{ Timer=$timer; OuLookup=@{ Process=$global:PraOuProcess; Output=[pscustomobject]@{IsCompleted=$false}; Errors=[pscustomobject]@{IsCompleted=$false}; Path='none'; Base='none'; Clock=[Diagnostics.Stopwatch]::StartNew() } }
+                try {
+                    Complete-PraGuiOuLookup
+                    $script:Gui.OuLookup | Should -Not -BeNullOrEmpty -Because 'the time limit is not reached'
+                    $global:PraOuMessages.Count | Should -Be 0
+                    $script:PraGuiOuLookupSeconds | Should -Be 60
+                    $script:Gui.OuLookup.Clock=[Diagnostics.Stopwatch]::StartNew()
+                    $keep=$script:PraGuiOuLookupSeconds; $script:PraGuiOuLookupSeconds=0
+                    Start-Sleep -Milliseconds 30
+                    Complete-PraGuiOuLookup
+                    $script:PraGuiOuLookupSeconds=$keep
+                    $script:Gui.OuLookup | Should -BeNullOrEmpty
+                } finally { $script:Gui=$null }
+            }
+            $global:PraOuMessages.Count | Should -Be 1
+            $global:PraOuMessages[0] | Should -Match 'Active Directory did not answer within 0 seconds'
+            $global:PraOuMessages[0] | Should -Match 'type the distinguished name of the OU'
+            $deadline=[datetime]::UtcNow.AddSeconds(10)
+            while ((Get-Process -Id $processId -ErrorAction SilentlyContinue) -and [datetime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+            $still=Get-Process -Id $processId -ErrorAction SilentlyContinue
+            ($null -eq $still -or $still.StartTime -ne $processStart) | Should -BeTrue -Because 'the lookup process is stopped'
+        } finally {
+            $left=Get-Process -Id $processId -ErrorAction SilentlyContinue
+            if ($left -and $left.StartTime -eq $processStart) { $left.Kill() }
+            Remove-Variable PraOuProcess,PraOuMessages,PraOuStopped -Scope Global -ErrorAction SilentlyContinue
+        }
+        (Get-Content -LiteralPath $script:GuiModule -Raw) | Should -Match 'Clock=\[Diagnostics\.Stopwatch\]::StartNew\(\) \}\r?\n    Set-PraGuiBusy \$true\r?\n    Add-PraGuiLine ''Reading the OUs'
+    }
+}
+
+Describe 'Release 3.2.0 - the console: the retention checkbox in the window (synthetic window, no engine)' -Tag 'Release320e' {
+    It 'shows the checkbox for a Recover whose AD part runs on this server only, cleared at the start and whenever the task changes, and sends it to the request and to the command line' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $probe = Join-Path $runtime.Root 'wpf-probe-retention.ps1'
+        Write-GuiTestFile $probe @'
+param($Common,$Gui,$Root,$Config,$BatchPath)
+$ErrorActionPreference='Stop'
+Import-Module $Common -Force
+Import-Module $Gui -Force
+function Pump([int]$Milliseconds=60){
+ $frame=New-Object Windows.Threading.DispatcherFrame
+ $pump=New-Object Windows.Threading.DispatcherTimer
+ $pump.Interval=[timespan]::FromMilliseconds($Milliseconds);$pump.Tag=$frame
+ $pump.Add_Tick({param($s)$s.Tag.Continue=$false;$s.Stop()})
+ $pump.Start();[Windows.Threading.Dispatcher]::PushFrame($frame)
+}
+function Click($Window,[string]$Name){ $Window.Controls[$Name].RaiseEvent((New-Object Windows.RoutedEventArgs ([Windows.Controls.Button]::ClickEvent))) }
+$detect={ param($Request) [pscustomobject]@{ Lights=@([ordered]@{Name='RSAT ActiveDirectory';Status='Ok';Detail='synthetic'}); AD=$true; Cloud=$true; Role='Both' } }
+$g=New-PraGuiWindow -Root $Root -ConfigPath $Config -Version 'Synthetic' -PrerequisiteProbe $detect
+$g.Form.Show()
+try {
+ $c=$g.Controls
+ Click $g 'BtnNext'
+ $c.T_Convert.IsChecked=$true; Pump 80
+ if($c.RetentionBox.Visibility -ne 'Collapsed'){throw 'A Convert has no retention check'}
+ $c.T_Recover.IsChecked=$true; Pump 80
+ if($c.RetentionBox.Visibility -ne 'Visible'){throw 'A Recover whose AD part runs here shows the box'}
+ if($c.F_AcceptRetention.IsChecked){throw 'The box starts cleared'}
+ if($c.RetentionHint.Text -notmatch 'checks that the retention policy holds them'){throw ('Hint: '+$c.RetentionHint.Text)}
+ $c.F_AcceptRetention.IsChecked=$true; Pump 80
+ $g.SelectedBatch=[pscustomobject]@{ Path=$BatchPath }
+ $request=& (Get-Module PRA.Gui) { Get-PraGuiWindowRequest 'Apply' }
+ if(-not $request.AcceptRetentionRisk -or $request.Phase -ne 'Both'){throw ('The request does not carry the box: '+($request|ConvertTo-Json -Compress))}
+ $display=(& (Get-Module PRA.Gui) { param($r) (Get-PraGuiCommand $script:Gui.Root $script:Gui.ConfigPath $r).Display } $request)
+ if($display -notmatch '-AcceptRetentionRisk'){throw ('The command line does not carry the box: '+$display)}
+ $c.Mode_Continue.IsChecked=$true; Pump 80
+ if($c.RetentionBox.Visibility -ne 'Collapsed' -or $c.F_AcceptRetention.IsChecked){throw 'The cloud part never checks the retention: the box goes away and is cleared'}
+ $c.Mode_New.IsChecked=$true; Pump 80
+ if($c.RetentionBox.Visibility -ne 'Visible' -or $c.F_AcceptRetention.IsChecked){throw 'Back on the AD part: the box is shown again, still cleared'}
+ $c.F_AcceptRetention.IsChecked=$true; Pump 80
+ $c.T_Convert.IsChecked=$true; Pump 80
+ $c.T_Recover.IsChecked=$true; Pump 80
+ if($c.F_AcceptRetention.IsChecked){throw 'Another task cleared the box: the acceptance is never carried to another run'}
+} finally { $g.Form.Close() }
+[Console]::WriteLine('RETENTION-PASS')
+'@
+        $tokens = @('-NoProfile', '-NonInteractive', '-STA', '-File', $probe, '-Common', $script:GuiCommon, '-Gui', $script:GuiModule, '-Root', $runtime.Root, '-Config', $runtime.Config, '-BatchPath', $batch.Path)
+        $info = New-Object Diagnostics.ProcessStartInfo
+        $info.FileName = (Join-Path $PSHOME 'pwsh.exe'); $info.Arguments = (@($tokens | ForEach-Object { ConvertTo-PraGuiNativeArgument $_ }) -join ' ')
+        $info.UseShellExecute = $false; $info.CreateNoWindow = $true; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
+        $process = [Diagnostics.Process]::Start($info)
+        $out = $process.StandardOutput.ReadToEndAsync(); $err = $process.StandardError.ReadToEndAsync()
+        try {
+            $process.WaitForExit(180000) | Should -BeTrue
+            $process.ExitCode | Should -Be 0 -Because ($out.Result + $err.Result)
+            $out.Result | Should -Match 'RETENTION-PASS'
+        } finally { $process.Dispose() }
+    }
+}
+
+Describe 'Release 3.2.0 - the console shows whether the retention proof of the selected batch is found, and how old it is (synthetic, no engine)' -Tag 'Release320e', 'Release320i' {
+    BeforeAll {
+        function global:Get-G320GuiText {
+            param($Case)
+            $global:PraGuiProofCase = $Case
+            try {
+                & (Get-Module PRA.Gui) {
+                    $case = $global:PraGuiProofCase
+                    $config = [pscustomobject]@{ Environment = 'GUISYNTHETIC'; Storage = [pscustomobject]@{ BackupFolder = $case.Backup }; Retention = [pscustomobject]@{ ProofMaxAgeHours = $case.Hours; PolicyGuid = $(if ($case.ContainsKey('PolicyGuid')) { [string]$case.PolicyGuid } else { '' }); PolicyName = $(if ($case.ContainsKey('PolicyName')) { [string]$case.PolicyName } else { '' }) }; Cloud = [pscustomobject]@{ AppId = $(if ($case.Certificate) { 'app' } else { '' }) }; SharedMailbox = [pscustomobject]@{ KeepCloudSharedOnRecover = $(if ($case.ContainsKey('KeepShared')) { [bool]$case.KeepShared } else { $false }) } }
+                    $script:Gui = @{ SelectedBatch = [pscustomobject]@{ BatchId = $case.Batch.Id; Path = $case.Batch.Path; Data = [pscustomobject]@{ TaggedRows = $case.Tagged } }; State = [pscustomobject]@{ Config = $config } }
+                    try { Get-PraGuiRetentionProofText } finally { $script:Gui = $null }
+                }
+            } finally { Remove-Variable PraGuiProofCase -Scope Global -ErrorAction SilentlyContinue }
+        }
+    }
+    AfterAll { Remove-Item -LiteralPath 'Function:\Get-G320GuiText' -ErrorAction SilentlyContinue }
+    It 'says that no proof is usable (with the reason), that one is found and covers every mailbox (with its age), or that it does not cover every mailbox, for the objects that the Recover would check, and whether this server needs the proof or reads it only when Exchange Online cannot be reached' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $inbox = Join-Path $runtime.Root 'Backups\Inbox'
+        $hash = (Get-FileHash -LiteralPath $batch.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $tagged = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'a@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } }, [pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000002'; UserPrincipalName = 'b@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } })
+        $case = @{ Batch = $batch; Backup = (Join-Path $runtime.Root 'Backups'); Inbox = $inbox; Hours = 24; Certificate = $false; Tagged = $tagged }
+        (Get-G320GuiText $case) | Should -Match '^No valid retention proof for this batch \(no retention proof of this batch was found\)\. This server cannot sign in to Exchange Online without a person, so the run needs one: run Check with Expected state Retained on the cloud server \(\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Batch [0-9a-f]{8} -Expect Retained\), then copy the two proof files \(RetentionProof-\.\.\.json and its \.sha256 file\) to the folder '
+        $certificate = @{} + $case; $certificate.Certificate = $true
+        (Get-G320GuiText $certificate) | Should -Match '^No valid retention proof for this batch \(no retention proof of this batch was found\)\. This server asks Exchange Online itself \(certificate sign-in\), so a proof matters only if Exchange Online cannot be reached: then run Check'
+        $objects = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'Covered' }, [pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000002'; Upn = 'b@example.invalid'; Verdict = 'NotCovered' })
+        $null = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash $hash -Environment 'guisynthetic' -Object $objects
+        (Get-G320GuiText $case) | Should -Match '^A retention proof was found \(\d+(\.\d)? hours old\) but it does not cover every mailbox: 1 of the 2 object\(s\) of this Recover are not covered in it\. The run cannot use it\. Only the newest proof counts, and an older one never completes it: run Check with Expected state Retained again on the cloud server \(\.\\Invoke-PraRemoteMailbox\.ps1 -Action Check -Batch [0-9a-f]{8} -Expect Retained\), then copy the two proof files to the folder .+ The run leaves out the objects that are already rolled back or were not converted, which only the run can tell: this is an estimate\.$'
+        (Get-G320GuiText $certificate) | Should -Match 'It matters only if Exchange Online cannot be reached\. Only the newest proof counts, and an older one never completes it: .* The run leaves out the objects that are already rolled back or were not converted, which only the run can tell: this is an estimate\.$'
+        Start-Sleep -Milliseconds 30
+        $withoutMailbox = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'Covered' }, [pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000002'; Upn = 'b@example.invalid'; Verdict = 'NoMailbox' })
+        $null = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash $hash -Environment 'GuiSynthetic' -Object $withoutMailbox
+        (Get-G320GuiText $case) | Should -Match '^A valid retention proof was found: \d+(\.\d)? hours old, 1 of 2 mailbox\(es\) covered, 1 without a mailbox in Exchange Online \(nothing to retain; the run warns about them\)\. This server cannot sign in to Exchange Online without a person: the run uses this proof\.$'
+        (Get-G320GuiText $certificate) | Should -Match 'the run reads this proof only when Exchange Online cannot be reached\.$'
+        $other = @{} + $case; $other.Tagged = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000077'; UserPrincipalName = 'a@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } })
+        (Get-G320GuiText $other) | Should -Match 'does not cover every mailbox: 1 of the 1 object\(s\) of this Recover are not covered in it' -Because 'the same objects as the engine judges, found by ObjectGuid'
+        $untagged = @{} + $case; $untagged.Tagged = @()
+        (Get-G320GuiText $untagged) | Should -Match '^No object of this batch carries the retention tag'
+    }
+    It 'the newest proof decides in the console too: an older complete proof does not complete a newer one that says NotCovered, and a damaged newest proof says to copy both files again with the folder' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $inbox = Join-Path $runtime.Root 'Backups\Inbox'
+        $hash = (Get-FileHash -LiteralPath $batch.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $tagged = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'a@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } })
+        $case = @{ Batch = $batch; Backup = (Join-Path $runtime.Root 'Backups'); Inbox = $inbox; Hours = 24; Certificate = $false; Tagged = $tagged }
+        $null = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash $hash -Environment 'GuiSynthetic' -Object @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'Covered' })
+        (Get-G320GuiText $case) | Should -Match '^A valid retention proof was found'
+        Start-Sleep -Milliseconds 30
+        $newest = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash $hash -Environment 'GuiSynthetic' -Object @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'NotCovered' })
+        (Get-G320GuiText $case) | Should -Match '^A retention proof was found \(\d+(\.\d)? hours old\) but it does not cover every mailbox: 1 of the 1 object\(s\) of this Recover are not covered in it\. The run cannot use it\. Only the newest proof counts, and an older one never completes it: run Check with Expected state Retained again'
+        [IO.File]::AppendAllText($newest.Path, ' ')
+        & (Get-Module PRA.Gui) { $script:PraGuiProofCache.Clear() }
+        (Get-G320GuiText $case) | Should -Match '^The newest retention proof cannot be used \(.*RetentionProof-.*its SHA-256 does not match its \.sha256 file.*\)\. Copy both files, RetentionProof-\.\.\.json and its \.sha256 file, again from the Backups\\Outbox folder of the cloud server to the folder .*Inbox, together and after the copy has ended\. An older proof never stands in for it\. Delete the damaged copy at .*RetentionProof-.* \(and its \.sha256 file\) so that it is not read again\.$'
+    }
+    It 'a Retention.PolicyGuid that is not a GUID gives the command that reads the GUID, with the policy name when there is one and the list of policies when there is none' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $tagged = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'a@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } })
+        $case = @{ Batch = $batch; Backup = (Join-Path $runtime.Root 'Backups'); Hours = 24; Certificate = $false; Tagged = $tagged; PolicyGuid = 'not-a-guid'; PolicyName = '' }
+        (Get-G320GuiText $case) | Should -Match ([regex]::Escape('Connect-IPPSSession; Get-RetentionCompliancePolicy | Format-Table Name,Guid'))
+        $named = @{} + $case; $named.PolicyName = 'Policy-Synthetic'
+        (Get-G320GuiText $named) | Should -Match ([regex]::Escape('Connect-IPPSSession; (Get-RetentionCompliancePolicy -Identity ''Policy-Synthetic'').Guid'))
+    }
+    It 'a proof made from another copy of the batch file is not valid for the console either, a lock does not stay in the cache, and a proof that cannot be looked for gets a command to see the folder' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $inbox = Join-Path $runtime.Root 'Backups\Inbox'
+        $tagged = @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'a@example.invalid'; IsShared = $false; Retention = [pscustomobject]@{ Enabled = $true } })
+        $case = @{ Batch = $batch; Backup = (Join-Path $runtime.Root 'Backups'); Inbox = $inbox; Hours = 24; Certificate = $false; Tagged = $tagged }
+        $written = Write-PraRetentionProof -Folder $inbox -BatchId $batch.Id -SourceBackupHash 'ffff' -Environment 'GuiSynthetic' -Object @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'a@example.invalid'; Verdict = 'Covered' })
+        (Get-G320GuiText $case) | Should -Match 'another copy of the Convert batch file'
+        & (Get-Module PRA.Gui) { $script:PraGuiProofCache.Clear() }
+        $locked = [IO.File]::Open($written.Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        try { (Get-G320GuiText $case) | Should -Match 'it cannot be read' } finally { $locked.Dispose() }
+        (& (Get-Module PRA.Gui) { $script:PraGuiProofCache.Count }) | Should -Be 0 -Because 'a failure to read says nothing about the file and is not kept'
+        (Get-G320GuiText $case) | Should -Match 'another copy of the Convert batch file'
+        (& (Get-Module PRA.Gui) { $script:PraGuiProofCache.Count }) | Should -Be 1
+        $unreadable = @{} + $case; $unreadable.Hours = 0
+        (Get-G320GuiText $unreadable) | Should -Match '^The retention proof cannot be looked for: .* To see what these folders hold, run: Get-ChildItem -LiteralPath ''.*Inbox'' -Filter ''RetentionProof-\*''\. Then choose Refresh in the window\.$'
+    }
+    It 'keeps for the console every object of a Convert batch that carries the retention tag, with whether it is shared, and judges the objects like the run: a shared mailbox kept on purpose is left out, the others are estimated' {
+        $runtime = New-GuiTestRoot
+        $id = [guid]::NewGuid().ToString('N')
+        $path = Join-Path $runtime.Root ('Backups\Batch-' + $id + '\Convert-fixture.json')
+        $records = @(
+            @{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; UserPrincipalName = 'tagged@example.invalid'; IsShared = $false; Retention = @{ Enabled = $true; Attribute = 'extensionAttribute1'; Value = 'Converted' } }
+            @{ ObjectGuid = '00000000-0000-0000-0000-000000000002'; UserPrincipalName = 'shared@example.invalid'; IsShared = $true; Retention = @{ Enabled = $true; Attribute = 'extensionAttribute1'; Value = 'Converted' } }
+            @{ ObjectGuid = '00000000-0000-0000-0000-000000000003'; UserPrincipalName = 'plain@example.invalid'; IsShared = $false; Retention = @{ Enabled = $false } }
+            @{ ObjectGuid = '00000000-0000-0000-0000-000000000004'; UserPrincipalName = 'old@example.invalid'; IsShared = $false })
+        Write-GuiTestJson $path @{ SchemaVersion = 2; Operation = 'Convert'; Environment = 'GuiSynthetic'; BatchId = $id; SourceBackupHash = ''; Records = $records }
+        $rows = @(& (Get-Module PRA.Gui) { param($p) (Get-PraGuiBatchCore -Path $p).Data.TaggedRows } $path)
+        $rows.Count | Should -Be 2
+        $rows[0].UserPrincipalName | Should -BeExactly 'tagged@example.invalid'
+        $rows[1].IsShared | Should -BeTrue
+        $inbox = Join-Path $runtime.Root 'Backups\Inbox'
+        $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $null = Write-PraRetentionProof -Folder $inbox -BatchId $id -SourceBackupHash $hash -Environment 'GuiSynthetic' -Object @([pscustomobject]@{ ObjectGuid = '00000000-0000-0000-0000-000000000001'; Upn = 'tagged@example.invalid'; Verdict = 'Covered' })
+        $case = @{ Batch = @{ Id = $id; Path = $path }; Backup = (Join-Path $runtime.Root 'Backups'); Hours = 24; Certificate = $false; Tagged = $rows; KeepShared = $false }
+        (Get-G320GuiText $case) | Should -Match '^A retention proof was found \(\d+(\.\d)? hours old\) but it does not cover every mailbox: 1 of the 2 object\(s\) of this Recover are not covered in it\.'
+        $case.KeepShared = $true
+        (Get-G320GuiText $case) | Should -Match '^A valid retention proof was found: \d+(\.\d)? hours old, 1 of 1 mailbox\(es\) covered\.' -Because 'the shared mailbox that the Recover keeps is not checked'
+    }
+    It 'shows the proof line only for the AD part of a Recover, in the window, and a proof file in a batch folder is a side file there, by the common function' {
+        $xaml = Get-Content -LiteralPath (Join-Path $script:GuiProjectRoot 'module\PRA.Gui.xaml') -Raw
+        $xaml | Should -Match 'x:Name="RetentionProofText"'
+        $text = Get-Content -LiteralPath $script:GuiModule -Raw
+        $text | Should -Match "Test-GuiOrdinal \(Get-PraGuiPhase\) 'AD' -IgnoreCase\)\) \{ Get-PraGuiRetentionProofText \}"
+        (& (Get-Module PRA.Common) { Test-PraBatchSideFile 'RetentionProof-abcdef01-20261119101010000.json' }) | Should -BeTrue
+        (& (Get-Module PRA.Common) { Test-PraBatchSideFile 'retentionproof-abcdef01-20261119101010000.json.sha256' }) | Should -BeTrue
+        (& (Get-Module PRA.Common) { Test-PraBatchSideFile 'Convert-x.json' }) | Should -BeFalse
+        (& (Get-Module PRA.Gui) { $null -eq (Get-Command Test-PraGuiBatchSideFile -ErrorAction SilentlyContinue) }) | Should -BeTrue
+    }
+}
+
+Describe 'Release 3.2.0 - the console does not keep a batch journal open after it read it (synthetic, no engine)' -Tag 'Release320a' {
+    It 'the journal can be opened at once with no sharing after the sync is found completed, although that line is not the last one' {
+        $runtime = New-GuiTestRoot
+        $batch = New-GuiTestBatch -Runtime $runtime
+        $journal = Join-Path $batch.Folder ('Journal-' + $batch.Id + '.jsonl')
+        Write-GuiTestFile $journal ("{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Started`"}`r`n{`"RunId`":`"r`",`"Operation`":`"ADSync`",`"Status`":`"Completed`"}`r`n{`"RunId`":`"r`",`"Operation`":`"Backup`",`"Status`":`"Verified`"}`r`n")
+        $global:PraGuiJournalCase = @{ Folder = $batch.Folder; Id = $batch.Id }
+        try { $completed = & (Get-Module PRA.Gui) { Test-PraGuiBatchSyncCompleted $global:PraGuiJournalCase.Folder $global:PraGuiJournalCase.Id } }
+        finally { Remove-Variable PraGuiJournalCase -Scope Global -ErrorAction SilentlyContinue }
+        $completed | Should -BeTrue
+        { [IO.File]::Open($journal, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None).Dispose() } | Should -Not -Throw -Because 'the engine appends to this journal'
     }
 }
